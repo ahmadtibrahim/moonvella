@@ -7,7 +7,18 @@ name = "MoonVella"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products,write_metaobjects,write_metaobject_definitions"
+#
+# write_products / write_metaobjects / write_metaobject_definitions: already granted (catalog + app metafields).
+# read_orders: receive and read orders for MoonVella item matching and rankings (60-day window by default).
+# read/write_merchant_managed_fulfillment_orders: fulfillmentCreate requires one of the write fulfillment-order
+#   scopes (NOT write_orders); merchant-managed covers fulfillments assigned to the merchant's own location.
+# read/write_assigned_fulfillment_orders: needed when a fulfillment order is assigned to a specific location/service.
+# write_inventory + read_locations: set inventory levels for imported variants at a location.
+# write_files: upload product images to Shopify files.
+# read_reports: ShopifyQL analytics (sales, sessions, visitors) for owner application review.
+# NOT requested: write_orders (not required by fulfillmentCreate), read_all_orders (separate approval; 60-day
+#   window only until granted).
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,write_inventory,read_locations,write_files,read_reports"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
@@ -43,6 +54,16 @@ api_version = "2026-10"
   [[webhooks.subscriptions]]
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
+
+# NOTE: Order webhooks carry protected customer data. Shopify refuses to register
+# these subscriptions until the app is approved for protected customer data access,
+# and an unapproved subscription aborts `shopify app dev`. Intake is fully implemented
+# in app/services/orderIntake.server.ts; uncomment the block below after approval so
+# delivery starts automatically. orders/paid is intentionally not subscribed (payment
+# state also arrives via orders/updated).
+#   [[webhooks.subscriptions]]
+#   uri = "/webhooks/orders"
+#   topics = [ "orders/create", "orders/updated", "orders/cancelled" ]
 
 [auth]
 redirect_urls = [ "https://example.com/api/auth" ]

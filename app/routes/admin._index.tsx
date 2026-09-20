@@ -1,10 +1,11 @@
 import { Link, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth } from "~/utils/ownerAuth.server";
+import { requireOwnerRole } from "~/utils/ownerAuth.server";
 import { prisma } from "~/db.server";
+import { listIntegrationStates } from "~/services/integrationHealth.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerAuth(request);
+  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
 
   const [
     totalSellers,
@@ -14,7 +15,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
     recentApplications,
     topSellersRaw,
     integrationFailures,
-    lastSync,
+    integrations,
   ] = await Promise.all([
     prisma.seller.count(),
     prisma.merchantApplication.count({ where: { status: "PENDING" } }),
@@ -54,7 +55,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
       },
     }),
-    prisma.seller.aggregate({ _max: { lastSyncAt: true } }),
+    listIntegrationStates(),
   ]);
 
   const topSellers = topSellersRaw
@@ -68,6 +69,30 @@ export async function loader({ request }: LoaderFunctionArgs) {
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 5);
 
+  const failed = integrations.filter((i) => i.status === "FAILED");
+  const healthy = integrations.filter((i) => i.status === "HEALTHY");
+  const lastSync =
+    integrations
+      .map((i) => i.lastSuccessAt)
+      .filter((d): d is Date => !!d)
+      .sort((a, b) => b.getTime() - a.getTime())[0] ?? null;
+
+  let overall: "OPERATIONAL" | "ISSUES" | "NOT_CONFIGURED" | "PARTIAL";
+  let overallLabel: string;
+  if (failed.length > 0) {
+    overall = "ISSUES";
+    overallLabel = "Issues detected";
+  } else if (healthy.length === 0) {
+    overall = "NOT_CONFIGURED";
+    overallLabel = "Not configured";
+  } else if (healthy.length < integrations.length) {
+    overall = "PARTIAL";
+    overallLabel = "Partially connected";
+  } else {
+    overall = "OPERATIONAL";
+    overallLabel = "Operational";
+  }
+
   return {
     stats: {
       totalSellers,
@@ -76,10 +101,13 @@ export async function loader({ request }: LoaderFunctionArgs) {
       moonvellaRevenue: ordersAgg._sum.moonvellaTotal || 0,
       totalOrders: ordersAgg._count,
       integrationFailures,
-      lastSync: lastSync._max.lastSyncAt,
+      lastSync,
+      overall,
+      overallLabel,
     },
     recentApplications,
     topSellers,
+    integrations,
   };
 }
 
@@ -141,7 +169,23 @@ const section: React.CSSProperties = {
 };
 
 export default function AdminDashboard() {
-  const { stats, recentApplications, topSellers } = useLoaderData<typeof loader>();
+  const { stats, recentApplications, topSellers, integrations } = useLoaderData<typeof loader>();
+
+  const failuresSubtitle =
+    stats.overall === "NOT_CONFIGURED"
+      ? "No integrations connected"
+      : stats.integrationFailures > 0
+        ? "Needs attention"
+        : "No failures in 24h";
+
+  const overallColor =
+    stats.overall === "ISSUES"
+      ? "#dc2626"
+      : stats.overall === "OPERATIONAL"
+        ? "#059669"
+        : stats.overall === "PARTIAL"
+          ? "#b45309"
+          : "#64748b";
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -181,8 +225,8 @@ export default function AdminDashboard() {
         <StatCard
           title="Integration Failures (24h)"
           value={stats.integrationFailures}
-          subtitle={stats.integrationFailures > 0 ? "Needs attention" : "All systems operational"}
-          accent={stats.integrationFailures > 0 ? "#dc2626" : "#059669"}
+          subtitle={failuresSubtitle}
+          accent={stats.integrationFailures > 0 ? "#dc2626" : stats.overall === "OPERATIONAL" ? "#059669" : "#94a3b8"}
         />
       </div>
 
@@ -302,49 +346,53 @@ export default function AdminDashboard() {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
             gap: "1rem",
+            marginBottom: "1rem",
           }}
         >
-          <div
-            style={{
-              padding: "1rem",
-              background: stats.integrationFailures > 0 ? "#fef2f2" : "#f0fdf4",
-              border: `1px solid ${stats.integrationFailures > 0 ? "#fecaca" : "#bbf7d0"}`,
-              borderRadius: 8,
-            }}
-          >
-            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Failed Webhooks (24h)</div>
-            <div
-              style={{
-                fontSize: "1.5rem",
-                fontWeight: 700,
-                color: stats.integrationFailures > 0 ? "#dc2626" : "#059669",
-              }}
-            >
-              {stats.integrationFailures}
-            </div>
-          </div>
           <div style={{ padding: "1rem", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8 }}>
-            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Last Sync</div>
+            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Last successful sync</div>
             <div style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a" }}>
               {formatDateTime(stats.lastSync)}
             </div>
           </div>
           <div style={{ padding: "1rem", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8 }}>
-            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>System Status</div>
-            <div
-              style={{
-                fontSize: "1rem",
-                fontWeight: 600,
-                color: stats.integrationFailures > 0 ? "#dc2626" : "#059669",
-              }}
-            >
-              {stats.integrationFailures > 0 ? "Issues Detected" : "Operational"}
+            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Overall status</div>
+            <div style={{ fontSize: "1rem", fontWeight: 600, color: overallColor }}>
+              {stats.overallLabel}
             </div>
           </div>
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+          {integrations.map((i) => (
+            <div
+              key={i.key}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "190px 140px 1fr",
+                gap: "0.75rem",
+                padding: "0.6rem 0.75rem",
+                border: "1px solid #e2e8f0",
+                borderRadius: 8,
+                fontSize: "0.8rem",
+                alignItems: "center",
+              }}
+            >
+              <span style={{ fontWeight: 600, color: "#1e293b" }}>{i.key}</span>
+              <span style={{ color: integrationColor(i.status), fontWeight: 600 }}>{i.status}</span>
+              <span style={{ color: "#64748b" }}>{i.message}</span>
+            </div>
+          ))}
         </div>
       </section>
     </div>
   );
+}
+
+function integrationColor(status: string) {
+  if (status === "HEALTHY") return "#059669";
+  if (status === "FAILED") return "#dc2626";
+  if (status === "DELAYED") return "#b45309";
+  return "#64748b";
 }

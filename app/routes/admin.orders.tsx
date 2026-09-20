@@ -1,48 +1,40 @@
 import { Link, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth } from "~/utils/ownerAuth.server";
+import { requireOwnerRole } from "~/utils/ownerAuth.server";
 import { prisma } from "~/db.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerAuth(request);
-
-  const [orders, totals] = await Promise.all([
-    prisma.order.findMany({
-      orderBy: { createdAt: "desc" },
-      take: 50,
-      select: {
-        id: true,
-        shopifyOrderName: true,
-        moonvellaTotal: true,
-        totalPrice: true,
-        currency: true,
-        paymentStatus: true,
-        fulfillmentStatus: true,
-        createdAt: true,
-        seller: { select: { storeName: true } },
-      },
-    }),
-    prisma.order.aggregate({
-      _sum: { moonvellaTotal: true },
-      _count: true,
-    }),
-  ]);
-
-  return {
-    orders,
-    totalRevenue: totals._sum.moonvellaTotal || 0,
-    totalOrders: totals._count,
-  };
+  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
+  const orders = await prisma.order.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 100,
+    select: {
+      id: true,
+      shopifyOrderName: true,
+      supplierReference: true,
+      currency: true,
+      moonvellaTotal: true,
+      customerName: true,
+      paymentStatus: true,
+      wholesalePaymentStatus: true,
+      fulfillmentStatus: true,
+      createdAt: true,
+      seller: { select: { storeName: true } },
+      _count: { select: { items: true, shipments: true } },
+    },
+  });
+  return { orders };
 }
 
-function money(cents: number) {
-  return `$${(cents / 100).toFixed(2)}`;
+function money(cents: number, currency = "CAD") {
+  return `${(cents / 100).toFixed(2)} ${currency}`;
 }
 
-const grid = "1.2fr 1.5fr 110px 110px 120px 110px";
+const th: React.CSSProperties = { textAlign: "left", padding: "0.5rem", fontSize: "0.68rem", color: "#64748b" };
+const td: React.CSSProperties = { padding: "0.5rem", fontSize: "0.8rem" };
 
 export default function AdminOrders() {
-  const { orders, totalRevenue, totalOrders } = useLoaderData<typeof loader>();
+  const { orders } = useLoaderData<typeof loader>();
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -50,94 +42,54 @@ export default function AdminOrders() {
         Orders
       </h1>
       <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1.5rem" }}>
-        Order management and tracking
+        MoonVella supplier orders created from verified Shopify order webhooks.
       </p>
 
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-          gap: "1rem",
-          marginBottom: "2rem",
-        }}
-      >
-        <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1.5rem" }}>
-          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Total Orders</div>
-          <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a" }}>
-            {totalOrders}
-          </div>
-        </div>
-        <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1.5rem" }}>
-          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>MoonVella Revenue</div>
-          <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a" }}>
-            {money(totalRevenue)}
-          </div>
-        </div>
+      <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, overflow: "hidden" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
+              <th style={th}>Order</th>
+              <th style={th}>Seller</th>
+              <th style={th}>Items</th>
+              <th style={th}>MoonVella total</th>
+              <th style={th}>Customer paid</th>
+              <th style={th}>Wholesale</th>
+              <th style={th}>Fulfillment</th>
+            </tr>
+          </thead>
+          <tbody>
+            {orders.length === 0 ? (
+              <tr>
+                <td colSpan={7} style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.85rem" }}>
+                  No supplier orders yet. They are created when a verified Shopify order contains an imported MoonVella product.
+                </td>
+              </tr>
+            ) : (
+              orders.map((o) => (
+                <tr key={o.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                  <td style={td}>
+                    <Link to={`/admin/orders/${o.id}`} style={{ fontWeight: 600, color: "#082a4a" }}>
+                      {o.shopifyOrderName}
+                    </Link>
+                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>{o.supplierReference}</div>
+                  </td>
+                  <td style={td}>{o.seller?.storeName}</td>
+                  <td style={td}>{o._count.items}</td>
+                  <td style={td}>{money(o.moonvellaTotal, o.currency)}</td>
+                  <td style={td}>{o.paymentStatus}</td>
+                  <td style={{ ...td, color: o.wholesalePaymentStatus === "SUCCEEDED" ? "#059669" : "#b45309" }}>
+                    {o.wholesalePaymentStatus}
+                  </td>
+                  <td style={td}>
+                    {o.fulfillmentStatus} {o._count.shipments > 0 ? `(${o._count.shipments} shipment)` : ""}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
       </div>
-
-      <div
-        style={{
-          background: "white",
-          border: "1px solid #e2e8f0",
-          borderRadius: 12,
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: grid,
-            padding: "1rem",
-            background: "#f8fafc",
-            borderBottom: "1px solid #e2e8f0",
-            fontSize: "0.7rem",
-            fontWeight: 700,
-            color: "#082a4a",
-          }}
-        >
-          <span>Order</span>
-          <span>Seller</span>
-          <span style={{ textAlign: "right" }}>MoonVella</span>
-          <span style={{ textAlign: "right" }}>Total</span>
-          <span>Payment</span>
-          <span>Fulfillment</span>
-        </div>
-
-        {orders.length === 0 ? (
-          <p style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.875rem" }}>
-            No orders yet.
-          </p>
-        ) : (
-          orders.map((o) => (
-            <div
-              key={o.id}
-              style={{
-                display: "grid",
-                gridTemplateColumns: grid,
-                padding: "0.75rem 1rem",
-                borderBottom: "1px solid #f1f5f9",
-                fontSize: "0.8rem",
-                alignItems: "center",
-              }}
-            >
-              <span style={{ fontWeight: 600, color: "#1e293b" }}>{o.shopifyOrderName}</span>
-              <span style={{ color: "#64748b" }}>{o.seller?.storeName || "Unknown"}</span>
-              <span style={{ textAlign: "right", fontWeight: 700, color: "#082a4a" }}>
-                {money(o.moonvellaTotal)}
-              </span>
-              <span style={{ textAlign: "right", color: "#64748b" }}>{money(o.totalPrice)}</span>
-              <span style={{ color: "#64748b" }}>{o.paymentStatus}</span>
-              <span style={{ color: "#64748b" }}>{o.fulfillmentStatus}</span>
-            </div>
-          ))
-        )}
-      </div>
-
-      <p style={{ marginTop: "1.5rem", fontSize: "0.75rem" }}>
-        <Link to="/admin" style={{ color: "#082a4a", fontWeight: 500 }}>
-          &larr; Back to Dashboard
-        </Link>
-      </p>
     </div>
   );
 }

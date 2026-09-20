@@ -1,4 +1,4 @@
-import { useLoaderData } from "react-router";
+import { Link, useLoaderData, useNavigate } from "react-router";
 
 export const loader = async ({ request }) => {
   const url = new URL(request.url);
@@ -56,6 +56,7 @@ const getStatusConfig = (status) => {
 
 export default function StatusPage() {
   const { status, submittedAt } = useLoaderData();
+  const navigate = useNavigate();
   const applicationStatus = status || "pending";
   const isApproved = applicationStatus === "approved";
   const submittedLabel = submittedAt
@@ -135,7 +136,7 @@ export default function StatusPage() {
                 <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
                   You can now view wholesale pricing and import MoonVella products.
                 </p>
-                <button className="mv-btn mv-btn-primary" onClick={() => window.location.href = "/app/catalog"}>
+                <button className="mv-btn mv-btn-primary" onClick={() => navigate("/app/catalog")}>
                   View Product Catalog
                 </button>
               </>
@@ -146,7 +147,7 @@ export default function StatusPage() {
                 <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
                   Your product catalog preview is available, but wholesale pricing and import tools unlock after approval.
                 </p>
-                <button className="mv-btn mv-btn-secondary" onClick={() => window.location.href = "/app/application"}>
+                <button className="mv-btn mv-btn-secondary" onClick={() => navigate("/app/application")}>
                   View Application
                 </button>
               </>
@@ -158,11 +159,11 @@ export default function StatusPage() {
           <div className="mv-section-card">
             <h3 className="mv-section-title">Next steps</h3>
             <ul className="mv-rules-list" style={{ maxWidth: '600px' }}>
-              <li>Browse the <a href="/app/catalog" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Product Catalog</a> to view wholesale pricing</li>
+              <li>Browse the <Link to="/app/catalog" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Product Catalog</Link> to view wholesale pricing</li>
               <li>Import products to your Shopify store using the <strong>Import to Store</strong> button</li>
-              <li>Configure your <a href="/app/shipping" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Shipping settings</a></li>
-              <li>Set up your <a href="/app/settings" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Branded Packing Slip</a></li>
-              <li>Monitor orders in the <a href="/app/orders" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Orders</a> page</li>
+              <li>Configure your <Link to="/app/shipping" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Shipping settings</Link></li>
+              <li>Set up your <Link to="/app/settings" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Branded Packing Slip</Link></li>
+              <li>Monitor orders in the <Link to="/app/orders" style={{ color: 'var(--primary-color)', fontWeight: '600' }}>Orders</Link> page</li>
             </ul>
           </div>
         )}

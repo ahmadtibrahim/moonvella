@@ -1,7 +1,6 @@
 import {
   redirect,
   type ActionFunctionArgs,
-  type LoaderFunctionArgs,
 } from "react-router";
 import { prisma } from "~/db.server";
 import { getSessionToken, buildSessionCookie } from "~/utils/ownerAuth.server";
@@ -16,7 +15,7 @@ export async function action({ request }: ActionFunctionArgs) {
   });
 }
 
-export async function loader(_args: LoaderFunctionArgs) {
+export async function loader() {
   return redirect("/admin/login");
 }
 

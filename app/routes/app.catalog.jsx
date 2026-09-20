@@ -1,212 +1,149 @@
 import React from "react";
-import { useAppBridge } from "@shopify/app-bridge-react";
-import { products as moonvillaProducts } from "../data/moonvillaData";
-import { applicationStatus } from "../data/moonvellaState";
-
-const isApproved = applicationStatus === "approved";
+import { useFetcher, useLoaderData } from "react-router";
+import { requireSellerContext } from "../services/seller.server";
+import { listCatalog } from "../services/catalog.server";
 
 export const loader = async ({ request }) => {
-  const url = new URL(request.url);
+  const context = await requireSellerContext(request);
+  const products = await listCatalog(context);
 
-  if (url.searchParams.get("shop")) {
-    const { authenticate } = await import("../shopify.server");
-    await authenticate.admin(request);
-  }
-
-  return null;
+  return {
+    access: context.access,
+    canViewWholesale: context.canViewWholesale,
+    canImport: context.canImport,
+    products,
+  };
 };
 
-export default function CatalogPage() {
-  const shopify = useAppBridge();
-  const handleImport = (product) => {
-    shopify.toast.show(
-      `${product.name} added to My Products. Real Shopify product import will be connected later.`,
-    );
+export const action = async ({ request }) => {
+  const { requireApprovedSeller, AccessError } = await import(
+    "../services/seller.server"
+  );
+  const { authenticate } = await import("../shopify.server");
+  const { importProductForSeller } = await import(
+    "../services/shopifyImport.server"
+  );
+
+  let context;
+  try {
+    context = await requireApprovedSeller(request);
+  } catch (error) {
+    if (error instanceof AccessError) {
+      return { ok: false, error: error.message };
+    }
+    throw error;
+  }
+
+  const formData = await request.formData();
+  const productId = String(formData.get("productId") || "");
+  if (!productId) {
+    return { ok: false, error: "Missing product." };
+  }
+
+  const markupRaw = Number(formData.get("markupPercent") || 0);
+  const markupPercent = Number.isFinite(markupRaw) && markupRaw >= 0 ? markupRaw : 0;
+  const customWholesalePrice = parseOptionalCents(formData.get("customWholesalePrice"));
+  const customRetailPrice = parseOptionalCents(formData.get("customRetailPrice"));
+
+  const { admin } = await authenticate.admin(request);
+  const result = await importProductForSeller(admin, context.seller.id, productId, {
+    markupPercent,
+    customWholesalePrice,
+    customRetailPrice,
+  });
+
+  if (!result.ok) {
+    return { ok: false, error: result.error || "Import failed." };
+  }
+
+  return {
+    ok: true,
+    updated: result.updated === true,
+    alreadyImported: result.alreadyImported === true,
+    shopifyProductId: result.shopifyProductId,
+    warnings: result.warnings || [],
   };
+};
+
+function parseOptionalCents(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const amount = Number(raw);
+  if (!Number.isFinite(amount) || amount < 0) return null;
+  return Math.round(amount * 100);
+}
+
+function money(cents) {
+  return `$${(cents / 100).toFixed(2)}`;
+}
+
+export default function CatalogPage() {
+  const { access, canViewWholesale, canImport, products } = useLoaderData();
+  const fetcher = useFetcher();
 
   const [search, setSearch] = React.useState("");
   const [selectedCategory, setSelectedCategory] = React.useState("");
-  const [selectedSize, setSelectedSize] = React.useState("");
-  const [selectedFeature, setSelectedFeature] = React.useState("");
   const [sortBy, setSortBy] = React.useState("name");
 
-  const products = moonvillaProducts;
+  const categories = Array.from(new Set(products.map((p) => p.category))).sort();
 
-  const filteredProducts = products.filter((product) => {
+  const filtered = products.filter((product) => {
     const matchesSearch =
       product.name.toLowerCase().includes(search.toLowerCase()) ||
-      product.sku.toLowerCase().includes(search.toLowerCase());
-
-    const matchesCategory =
-      !selectedCategory || product.category === selectedCategory;
-
+      (product.description || "").toLowerCase().includes(search.toLowerCase());
+    const matchesCategory = !selectedCategory || product.category === selectedCategory;
     return matchesSearch && matchesCategory;
   });
 
-  const sortedProducts = [...filteredProducts].sort((a, b) => {
-    if (sortBy === "name") {
-      return a.name.localeCompare(b.name);
+  const sorted = [...filtered].sort((a, b) => {
+    if (sortBy === "price-low" && canViewWholesale) {
+      return a.wholesalePrice - b.wholesalePrice;
     }
-    if (sortBy === "price-low") {
-      return a.wholesaleCost - b.wholesaleCost;
+    if (sortBy === "price-high" && canViewWholesale) {
+      return b.wholesalePrice - a.wholesalePrice;
     }
-    if (sortBy === "price-high") {
-      return b.wholesaleCost - a.wholesaleCost;
-    }
-    return 0;
+    return a.name.localeCompare(b.name);
   });
 
-  if (!isApproved) {
-    return (
-      <s-page heading="Product Catalog">
-        <div className="mv-container">
-          <div className="mv-page-header">
-            <h2 className="mv-page-title">Product Catalog Preview</h2>
-            <p className="mv-page-subtitle">
-              Browse MoonVella products. Wholesale pricing and import tools unlock after approval.
-            </p>
-          </div>
-
-          <div className="mv-section-card" style={{ textAlign: 'center', padding: '2rem' }}>
-            <span className="mv-badge mv-badge-warning" style={{ fontSize: '0.875rem', padding: '0.5rem 1rem', marginBottom: '1rem', display: 'inline-block' }}>
-              Preview Mode — Wholesale pricing locked
-            </span>
-          </div>
-
-          <div className="mv-filter-row">
-            <input
-              type="text"
-              className="mv-search-input"
-              placeholder="Search products..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            <div className="mv-filter-group">
-              <span className="mv-filter-label">Category</span>
-              <select
-                className="mv-filter-select"
-                value={selectedCategory}
-                onChange={(e) => setSelectedCategory(e.target.value)}
-              >
-                <option value="">All Categories</option>
-                <option value="Pillows">Pillows</option>
-                <option value="Duvets">Duvets</option>
-                <option value="Mattress Protectors">Mattress Protectors</option>
-                <option value="Pillow Protectors">Pillow Protectors</option>
-                <option value="Bundles">Bundles</option>
-              </select>
-            </div>
-            <div className="mv-filter-group">
-              <span className="mv-filter-label">Size</span>
-              <select
-                className="mv-filter-select"
-                value={selectedSize}
-                onChange={(e) => setSelectedSize(e.target.value)}
-              >
-                <option value="">All Sizes</option>
-                <option value="Small">Small</option>
-                <option value="Medium">Medium</option>
-                <option value="Large">Large</option>
-              </select>
-            </div>
-            <div className="mv-filter-group">
-              <span className="mv-filter-label">Feature</span>
-              <select
-                className="mv-filter-select"
-                value={selectedFeature}
-                onChange={(e) => setSelectedFeature(e.target.value)}
-              >
-                <option value="">All Features</option>
-                <option value="Bestseller">Bestseller</option>
-                <option value="New">New</option>
-                <option value="Popular">Popular</option>
-                <option value="Hypoallergenic">Hypoallergenic</option>
-              </select>
-            </div>
-            <div className="mv-filter-group">
-              <span className="mv-filter-label">Sort</span>
-              <select
-                className="mv-filter-select"
-                value={sortBy}
-                onChange={(e) => setSortBy(e.target.value)}
-              >
-                <option value="name">Sort by Name</option>
-                <option value="price-low">Wholesale Cost (Low to High)</option>
-                <option value="price-high">Wholesale Cost (High to Low)</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="mv-product-grid">
-            {sortedProducts.map((product) => (
-              <div className="mv-product-card" key={product.id} style={{ opacity: 0.85 }}>
-                <div className="mv-product-image">
-                  <span className="mv-product-placeholder">{product.name.substring(0, 2)}</span>
-                </div>
-                <div className="mv-product-info">
-                  <h4 className="mv-product-name">{product.name}</h4>
-                  <p className="mv-product-sku">SKU: {product.sku}</p>
-                  <span className="mv-product-category">{product.category}</span>
-                </div>
-                <div className="mv-product-details">
-                  <div className="mv-product-detail-row">
-                    <span className="mv-product-detail-label">Category</span>
-                    <span className="mv-product-detail-value">{product.category}</span>
-                  </div>
-                  <div className="mv-product-detail-row">
-                    <span className="mv-product-detail-label">Status</span>
-                    <span className="mv-product-detail-value">
-                      <span className="mv-badge mv-badge-instock">In Stock</span>
-                    </span>
-                  </div>
-                </div>
-                <div className="mv-product-tags">
-                  {product.tags.map((tag, i) => (
-                    <span key={i} className="mv-product-tag">{tag}</span>
-                  ))}
-                </div>
-                <div className="mv-product-actions">
-                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', textAlign: 'center', width: '100%' }}>
-                    Wholesale pricing locked
-                  </div>
-                  <div style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', textAlign: 'center', width: '100%', marginTop: '0.25rem' }}>
-                    Approved partners can view pricing and import this product.
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="mv-section-card" style={{ textAlign: 'center', padding: '2rem', marginTop: '1.5rem' }}>
-            <span className="mv-badge mv-badge-warning" style={{ fontSize: '0.875rem', padding: '0.5rem 1rem', display: 'inline-block', marginBottom: '1rem' }}>
-              Preview Mode — Wholesale pricing locked
-            </span>
-            <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
-              Approved partners can view wholesale pricing, profit estimates, and import products to their store.
-            </p>
-            <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-              <button className="mv-btn mv-btn-primary" onClick={() => window.location.href = "/app/status"}>
-                View Application Status
-              </button>
-              <button className="mv-btn mv-btn-secondary" onClick={() => window.location.href = "/app/application"}>
-                Edit Application
-              </button>
-            </div>
-          </div>
-        </div>
-      </s-page>
-    );
-  }
+  const statusMessage =
+    access === "APPROVED"
+      ? null
+      : access === "SUSPENDED"
+        ? "Your seller account is suspended. Wholesale pricing and importing are unavailable."
+        : access === "REJECTED"
+          ? "Your application was not approved. Wholesale pricing and importing are unavailable."
+          : "Your application is under review. Wholesale pricing and importing unlock after approval.";
 
   return (
     <s-page heading="Product Catalog">
       <div className="mv-container">
         <div className="mv-page-header">
-          <h2 className="mv-page-title">Product Catalog</h2>
+          <h2 className="mv-page-title">
+            {canViewWholesale ? "Product Catalog" : "Product Catalog Preview"}
+          </h2>
           <p className="mv-page-subtitle">
-            Premium bedding products from trusted suppliers. Import to your store and start selling today.
+            {canViewWholesale
+              ? "Wholesale products from MoonVella. Import to your store and start selling."
+              : "Browse MoonVella products. Wholesale pricing and import tools unlock after approval."}
           </p>
         </div>
+
+        {statusMessage && (
+          <div className="mv-section-card" style={{ marginBottom: "1.5rem" }}>
+            <span
+              className={`mv-badge ${
+                access === "SUSPENDED" || access === "REJECTED"
+                  ? "mv-badge-danger"
+                  : "mv-badge-warning"
+              }`}
+            >
+              {access}
+            </span>
+            <p className="mv-page-subtitle" style={{ marginTop: "0.75rem" }}>
+              {statusMessage}
+            </p>
+          </div>
+        )}
 
         <div className="mv-filter-row">
           <input
@@ -224,100 +161,198 @@ export default function CatalogPage() {
               onChange={(e) => setSelectedCategory(e.target.value)}
             >
               <option value="">All Categories</option>
-              <option value="Pillows">Pillows</option>
-              <option value="Duvets">Duvets</option>
-              <option value="Mattress Protectors">Mattress Protectors</option>
-              <option value="Pillow Protectors">Pillow Protectors</option>
-              <option value="Bundles">Bundles</option>
+              {categories.map((category) => (
+                <option key={category} value={category}>
+                  {category}
+                </option>
+              ))}
             </select>
           </div>
-          <div className="mv-filter-group">
-            <span className="mv-filter-label">Size</span>
-            <select
-              className="mv-filter-select"
-              value={selectedSize}
-              onChange={(e) => setSelectedSize(e.target.value)}
-            >
-              <option value="">All Sizes</option>
-              <option value="Small">Small</option>
-              <option value="Medium">Medium</option>
-              <option value="Large">Large</option>
-            </select>
-          </div>
-          <div className="mv-filter-group">
-            <span className="mv-filter-label">Feature</span>
-            <select
-              className="mv-filter-select"
-              value={selectedFeature}
-              onChange={(e) => setSelectedFeature(e.target.value)}
-            >
-              <option value="">All Features</option>
-              <option value="Bestseller">Bestseller</option>
-              <option value="New">New</option>
-              <option value="Popular">Popular</option>
-              <option value="Hypoallergenic">Hypoallergenic</option>
-            </select>
-          </div>
-          <div className="mv-filter-group">
-            <span className="mv-filter-label">Sort</span>
-            <select
-              className="mv-filter-select"
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value)}
-            >
-              <option value="name">Sort by Name</option>
-              <option value="price-low">Wholesale Cost (Low to High)</option>
-              <option value="price-high">Wholesale Cost (High to Low)</option>
-            </select>
-          </div>
+          {canViewWholesale && (
+            <div className="mv-filter-group">
+              <span className="mv-filter-label">Sort</span>
+              <select
+                className="mv-filter-select"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value)}
+              >
+                <option value="name">Sort by Name</option>
+                <option value="price-low">Wholesale (Low to High)</option>
+                <option value="price-high">Wholesale (High to Low)</option>
+              </select>
+            </div>
+          )}
         </div>
 
         <div className="mv-product-grid">
-          {sortedProducts.map((product) => (
+          {sorted.map((product) => (
             <div className="mv-product-card" key={product.id}>
               <div className="mv-product-image">
-                <span className="mv-product-placeholder">{product.name.substring(0, 2)}</span>
+                {product.image ? (
+                  <img
+                    src={product.image}
+                    alt={product.name}
+                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                  />
+                ) : (
+                  <span className="mv-product-placeholder">
+                    {product.name.substring(0, 2)}
+                  </span>
+                )}
               </div>
               <div className="mv-product-info">
                 <h4 className="mv-product-name">{product.name}</h4>
-                <p className="mv-product-sku">SKU: {product.sku}</p>
                 <span className="mv-product-category">{product.category}</span>
               </div>
+
               <div className="mv-product-details">
                 <div className="mv-product-detail-row">
-                  <span className="mv-product-detail-label">Wholesale</span>
-                  <span className="mv-product-detail-value">${product.wholesaleCost.toFixed(2)}</span>
+                  <span className="mv-product-detail-label">Category</span>
+                  <span className="mv-product-detail-value">{product.category}</span>
                 </div>
                 <div className="mv-product-detail-row">
-                  <span className="mv-product-detail-label">Retail</span>
-                  <span className="mv-product-detail-value">${product.suggestedRetail.toFixed(2)}</span>
+                  <span className="mv-product-detail-label">Availability</span>
+                  <span className="mv-product-detail-value">
+                    <span
+                      className={`mv-badge ${
+                        product.availability === "AVAILABLE"
+                          ? "mv-badge-instock"
+                          : "mv-badge-danger"
+                      }`}
+                    >
+                      {product.availability === "AVAILABLE" ? "Available" : "Unavailable"}
+                    </span>
+                  </span>
                 </div>
-                <div className="mv-product-detail-row">
-                  <span className="mv-product-detail-label">Profit</span>
-                  <span className="mv-product-detail-value">${product.estimatedProfit.toFixed(2)}</span>
-                </div>
-                <div className="mv-product-detail-row">
-                  <span className="mv-product-detail-label">Inventory</span>
-                  <span className="mv-product-detail-value">{product.inventory}</span>
-                </div>
+
+                {canViewWholesale && (
+                  <>
+                    <div className="mv-product-detail-row">
+                      <span className="mv-product-detail-label">Wholesale</span>
+                      <span className="mv-product-detail-value">
+                        {money(product.wholesalePrice)}
+                      </span>
+                    </div>
+                    <div className="mv-product-detail-row">
+                      <span className="mv-product-detail-label">Suggested retail</span>
+                      <span className="mv-product-detail-value">
+                        {money(product.suggestedRetailPrice)}
+                      </span>
+                    </div>
+                    <div className="mv-product-detail-row">
+                      <span className="mv-product-detail-label">Est. profit</span>
+                      <span className="mv-product-detail-value">
+                        {money(product.estimatedProfit)}
+                      </span>
+                    </div>
+                    <div className="mv-product-detail-row">
+                      <span className="mv-product-detail-label">Inventory</span>
+                      <span className="mv-product-detail-value">{product.inventory}</span>
+                    </div>
+                  </>
+                )}
               </div>
-              <div className="mv-product-tags">
-                {product.tags.map((tag, i) => (
-                  <span key={i} className="mv-product-tag">{tag}</span>
-                ))}
-              </div>
+
               <div className="mv-product-actions">
-                <button className="mv-import-btn" onClick={() => handleImport(product)}>
-                  Import to Store
-                </button>
+                {canImport ? (
+                  <fetcher.Form method="post">
+                    <input type="hidden" name="productId" value={product.id} />
+                    {canViewWholesale && (
+                      <details className="mv-import-options">
+                        <summary>Pricing options</summary>
+                        <label className="mv-import-field">
+                          <span>Markup %</span>
+                          <input
+                            type="number"
+                            name="markupPercent"
+                            min="0"
+                            step="1"
+                            placeholder="0"
+                          />
+                        </label>
+                        <label className="mv-import-field">
+                          <span>Custom wholesale ($)</span>
+                          <input
+                            type="number"
+                            name="customWholesalePrice"
+                            min="0"
+                            step="0.01"
+                            placeholder={(product.wholesalePrice / 100).toFixed(2)}
+                          />
+                        </label>
+                        <label className="mv-import-field">
+                          <span>Custom retail ($)</span>
+                          <input
+                            type="number"
+                            name="customRetailPrice"
+                            min="0"
+                            step="0.01"
+                            placeholder={(product.suggestedRetailPrice / 100).toFixed(2)}
+                          />
+                        </label>
+                      </details>
+                    )}
+                    <button
+                      type="submit"
+                      className="mv-import-btn"
+                      disabled={fetcher.state !== "idle"}
+                    >
+                      {fetcher.state !== "idle" ? "Importing..." : "Import to Store"}
+                    </button>
+                  </fetcher.Form>
+                ) : (
+                  <div
+                    style={{
+                      color: "var(--text-secondary)",
+                      fontSize: "0.75rem",
+                      textAlign: "center",
+                    }}
+                  >
+                    Wholesale pricing and import unlock after approval.
+                  </div>
+                )}
               </div>
             </div>
           ))}
         </div>
 
-        {sortedProducts.length === 0 && (
-          <div className="mv-section-card" style={{ textAlign: 'center', padding: '3rem' }}>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '1rem' }}>No products found matching your criteria.</p>
+        {sorted.length === 0 && (
+          <div className="mv-section-card" style={{ textAlign: "center", padding: "3rem" }}>
+            <p style={{ color: "var(--text-secondary)", fontSize: "1rem" }}>
+              No products found matching your criteria.
+            </p>
+          </div>
+        )}
+
+        {fetcher.data?.ok && (
+          <div className="mv-section-card" style={{ marginTop: "1rem" }}>
+            <p style={{ color: "#059669", fontSize: "0.875rem", margin: 0 }}>
+              {fetcher.data.updated
+                ? "Re-synced to your Shopify store — product, prices and inventory updated."
+                : "Imported to your Shopify store. View it under My Products."}
+            </p>
+            {fetcher.data.warnings?.length > 0 && (
+              <ul
+                style={{
+                  margin: "0.5rem 0 0",
+                  paddingLeft: "1.25rem",
+                  color: "var(--text-secondary)",
+                  fontSize: "0.8rem",
+                }}
+              >
+                {fetcher.data.warnings.map((warning, index) => (
+                  <li key={index}>{warning}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
+        {fetcher.data?.error && (
+          <div className="mv-section-card" style={{ marginTop: "1rem" }}>
+            <p style={{ color: "var(--danger-red)", fontSize: "0.875rem", margin: 0 }}>
+              {fetcher.data.error}
+            </p>
           </div>
         )}
       </div>

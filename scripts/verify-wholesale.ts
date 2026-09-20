@@ -1,0 +1,190 @@
+import { PrismaClient } from "@prisma/client";
+import {
+  getBillingSettings,
+  updateBillingSettings,
+  savePaymentMethodFromSetupIntent,
+  chargeWholesaleOrder,
+} from "../app/services/sellerBilling.server";
+import {
+  getQuotesForOrder,
+  selectQuote,
+  bookShipmentForOrder,
+  voidShipment,
+} from "../app/services/shipping.server";
+import { applyStripeEvent } from "../app/services/payments.server";
+
+const prisma = new PrismaClient();
+const SHOP = "wholesale-test.myshopify.com";
+let failures = 0;
+let total = 0;
+function check(name: string, pass: boolean, detail = "") {
+  total++;
+  if (!pass) failures++;
+  console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+}
+
+const actor = { actorId: "verify", actorName: "Verify" };
+
+async function cleanup() {
+  const seller = await prisma.seller.findUnique({ where: { shopDomain: SHOP } });
+  if (seller) {
+    const orders = await prisma.order.findMany({ where: { sellerId: seller.id }, select: { id: true } });
+    const ids = orders.map((o) => o.id);
+    await prisma.paymentEvent.deleteMany({ where: { payment: { sellerId: seller.id } } });
+    await prisma.paymentAttempt.deleteMany({ where: { payment: { sellerId: seller.id } } });
+    await prisma.wholesalePayment.deleteMany({ where: { sellerId: seller.id } });
+    await prisma.shippingQuote.deleteMany({ where: { orderId: { in: ids } } });
+    await prisma.shipmentItem.deleteMany({ where: { shipment: { orderId: { in: ids } } } });
+    await prisma.shipment.deleteMany({ where: { orderId: { in: ids } } });
+    await prisma.orderPackage.deleteMany({ where: { orderId: { in: ids } } });
+    await prisma.orderItem.deleteMany({ where: { orderId: { in: ids } } });
+    await prisma.fulfillmentRequest.deleteMany({ where: { orderId: { in: ids } } });
+    await prisma.order.deleteMany({ where: { sellerId: seller.id } });
+    await prisma.sellerPaymentMethod.deleteMany({ where: { sellerId: seller.id } });
+    await prisma.sellerBillingSettings.deleteMany({ where: { sellerId: seller.id } });
+    await prisma.seller.delete({ where: { id: seller.id } });
+  }
+  await prisma.integrationState.deleteMany({ where: { key: { in: ["eshipper", "shopify_fulfillment", "stripe"] } } });
+}
+
+let seq = 0;
+async function makeOrder(sellerId: string, total = 2598) {
+  seq++;
+  const order = await prisma.order.create({
+    data: {
+      sellerId,
+      shopifyOrderId: `ws-${seq}`,
+      shopifyOrderName: `#WS${seq}`,
+      shopifyOrderNumber: seq,
+      currency: "CAD",
+      customerName: "Retail Customer",
+      shippingAddress: JSON.stringify({ name: "Retail Customer", address1: "500 Queen St W", city: "Toronto", province: "ON", zip: "M5V 2T6", country: "CA", residential: true }),
+      subtotal: total,
+      totalTax: 0,
+      totalShipping: 0,
+      totalDiscounts: 0,
+      totalPrice: total,
+      moonvellaSubtotal: total,
+      moonvellaTax: 0,
+      moonvellaShipping: 0,
+      moonvellaDiscounts: 0,
+      moonvellaTotal: total,
+      paymentStatus: "PAID",
+      fulfillmentStatus: "PENDING",
+      shopifyCreatedAt: new Date(),
+      shopifyUpdatedAt: new Date(),
+      supplierReference: `${SHOP}#WS${seq}`,
+      items: { create: [{ name: "Hotel Pillow", sku: "MV-HP-001", quantity: 2, price: 4900, wholesalePrice: 1299, totalDiscount: 0, shopifyLineItemId: `li${seq}` }] },
+      packages: { create: [{ count: 1, length: 40, width: 30, height: 20, weight: 2.5, units: "cm_kg" }] },
+      wholesalePayment: { create: { sellerId, amount: total, currency: "CAD", provider: "stripe", status: "REQUIRES_PAYMENT", idempotencyKey: `ws:${seq}` } },
+      fulfillmentRequest: { create: {} },
+    },
+  });
+  return order;
+}
+
+async function main() {
+  await cleanup();
+  const seller = await prisma.seller.create({
+    data: {
+      shopDomain: SHOP,
+      storeName: "Wholesale Test Seller",
+      shopDomainFull: SHOP,
+      contactEmail: "ws@test.example",
+      status: "APPROVED",
+      approvedAt: new Date(),
+    },
+  });
+
+  const settings = await getBillingSettings(seller.id);
+  check("billing defaults to MANUAL", settings.mode === "MANUAL" && settings.autoPayEnabled === false);
+
+  const method = await savePaymentMethodFromSetupIntent(seller.id, "sim_seti_1");
+  check("payment method saved (tokenized, no raw details)", method.stripePaymentMethodId === "sim_pm_sim_seti_1" && method.last4 === "4242");
+
+  const order1 = await makeOrder(seller.id);
+
+  // Quotes
+  const quotes = await getQuotesForOrder(order1.id, actor);
+  check("quotes returned", quotes.length === 3, `${quotes.length}`);
+  const cheapest = [...quotes].sort((a, b) => a.totalAmount - b.totalAmount)[0];
+  const fastestKnown = quotes.filter((q) => q.transitDays !== null).sort((a, b) => (a.transitDays! - b.transitDays!))[0];
+  const unknown = quotes.find((q) => q.transitDays === null);
+  check("cheapest computed", cheapest.carrier === "UPS", cheapest.carrier);
+  check("fastest with known estimate is Purolator", fastestKnown.carrier === "Purolator", `${fastestKnown.carrier} ${fastestKnown.transitDays}d`);
+  check("unknown estimate present and excluded from fastest", !!unknown && unknown.transitDays === null, unknown?.carrier);
+
+  await selectQuote(order1.id, cheapest.id, actor);
+
+  // Booking blocked before payment
+  let blocked = false;
+  try {
+    await bookShipmentForOrder(order1.id, { quoteId: cheapest.id }, actor);
+  } catch (error) {
+    blocked = error instanceof Error && error.message.includes("not SUCCEEDED");
+  }
+  check("booking blocked before payment", blocked);
+
+  // Manual charge (simulated) then verified confirmation
+  const charge = await chargeWholesaleOrder(order1.id, { trigger: "MANUAL", actor });
+  check("manual charge accepted (processing)", charge.ok && charge.status === "PROCESSING", charge.status);
+  const payment = await prisma.wholesalePayment.findUnique({ where: { orderId: order1.id } });
+  await applyStripeEvent({
+    id: `evt_ws_${order1.id}`,
+    type: "payment_intent.succeeded",
+    data: { object: { id: payment!.providerPaymentIntentId, metadata: { orderId: order1.id } } },
+  });
+  const paidOrder = await prisma.order.findUnique({ where: { id: order1.id } });
+  check("order paid only after verified event", paidOrder?.wholesalePaymentStatus === "SUCCEEDED");
+
+  // Book + duplicate protection
+  const booked = await bookShipmentForOrder(order1.id, { quoteId: cheapest.id }, actor);
+  check("shipment booked with tracking", !!booked.shipment.trackingNumber, booked.shipment.trackingNumber ?? "");
+  const dup = await bookShipmentForOrder(order1.id, { quoteId: cheapest.id }, actor);
+  const shipCount = await prisma.shipment.count({ where: { orderId: order1.id } });
+  check("duplicate booking does not double-purchase", shipCount === 1 && dup.shipment.id === booked.shipment.id, `${shipCount} shipment(s)`);
+
+  // Expired quote
+  const expired = await prisma.shippingQuote.create({
+    data: { orderId: order1.id, carrier: "Test", serviceCode: "X", serviceName: "Expired", totalAmount: 100, expiresAt: new Date(Date.now() - 1000) },
+  });
+  let expiredBlocked = false;
+  try {
+    await selectQuote(order1.id, expired.id, actor);
+  } catch (error) {
+    expiredBlocked = error instanceof Error && error.message.includes("expired");
+  }
+  check("expired quote cannot be selected", expiredBlocked);
+
+  // Automatic payment limits
+  await updateBillingSettings(seller.id, { mode: "AUTOMATIC", autoPayEnabled: true, maxAmountPerOrder: 5000, maxShippingCharge: 100000 });
+  const order2 = await makeOrder(seller.id, 2598);
+  const autoOk = await chargeWholesaleOrder(order2.id, { trigger: "AUTOMATIC", actor });
+  check("automatic charge within limits allowed", autoOk.ok === true, autoOk.status);
+
+  const order3 = await makeOrder(seller.id, 900000);
+  const autoHeld = await chargeWholesaleOrder(order3.id, { trigger: "AUTOMATIC", actor });
+  check("automatic charge over limit held for review", autoHeld.heldForReview === true && autoHeld.ok === false, autoHeld.error ?? "");
+
+  // Auto payment disabled → refused
+  await updateBillingSettings(seller.id, { autoPayEnabled: false });
+  const order4 = await makeOrder(seller.id, 1000);
+  const autoOff = await chargeWholesaleOrder(order4.id, { trigger: "AUTOMATIC", actor });
+  check("automatic charge refused when disabled", autoOff.ok === false && /automatic/i.test(autoOff.error ?? ""), autoOff.error ?? "");
+
+  // Void
+  const voided = await voidShipment(booked.shipment.id, actor);
+  const voidedRow = await prisma.shipment.findUnique({ where: { id: booked.shipment.id } });
+  check("shipment void/cancel recorded", voided.cancelled === true && voidedRow?.status === "CANCELLED");
+
+  await cleanup();
+  console.log(`\n=== ${total - failures}/${total} checks passed ===`);
+  await prisma.$disconnect();
+  process.exit(failures ? 1 : 0);
+}
+
+main().catch(async (error) => {
+  console.error(error);
+  await prisma.$disconnect();
+  process.exit(1);
+});

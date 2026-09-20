@@ -19,6 +19,9 @@ database.sqlite
 # Local dev server log
 dev_server.log
 
+# Uploaded product images (local storage)
+/uploads
+
 
 
 

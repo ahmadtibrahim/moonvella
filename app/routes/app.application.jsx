@@ -1,11 +1,6 @@
 import React from "react";
-import { useFetcher } from "react-router";
+import { Link, useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
-import {
-  shopifyStoreProfile,
-  merchantContactProfile,
-  shopifySalesReview,
-} from "../data/moonvellaState";
 
 const PRODUCT_CATEGORIES = [
   "Bedding & Bath",
@@ -23,6 +18,83 @@ const CANADIAN_MARKETS = [
   "Atlantic Canada",
   "Northern / Remote",
 ];
+
+function safeParseArray(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function loader({ request }) {
+  const { authenticate } = await import("../shopify.server");
+  const { admin, session } = await authenticate.admin(request);
+  const { prisma } = await import("../db.server");
+
+  const profile = {
+    storeName: session.shop,
+    shopDomain: session.shop,
+    contactEmail: "",
+    country: "",
+    currency: "",
+    shopifyPlan: "",
+    storeUrl: "",
+  };
+
+  try {
+    const response = await admin.graphql(`#graphql
+      query ApplicationShopProfile {
+        shop {
+          name
+          myshopifyDomain
+          email
+          primaryDomain { url }
+          currencyCode
+          billingAddress { countryCodeV2 }
+          plan { displayName }
+        }
+      }
+    `);
+    const json = await response.json();
+    const shop = json?.data?.shop;
+    if (shop) {
+      profile.storeName = shop.name || profile.storeName;
+      profile.shopDomain = shop.myshopifyDomain || profile.shopDomain;
+      profile.contactEmail = shop.email || "";
+      profile.country = shop.billingAddress?.countryCodeV2 || "";
+      profile.currency = shop.currencyCode || "";
+      profile.shopifyPlan = shop.plan?.displayName || "";
+      profile.storeUrl = shop.primaryDomain?.url || "";
+    }
+  } catch {
+    // Best effort: fall back to the authenticated session shop identity.
+  }
+
+  const application = await prisma.merchantApplication.findUnique({
+    where: { shopDomain: session.shop },
+  });
+
+  return {
+    profile,
+    application: application
+      ? {
+          contactName: application.contactName,
+          phone: application.phone ?? "",
+          urgentPhone: application.urgentPhone ?? "",
+          email: application.email,
+          legalBusinessName: application.legalBusinessName,
+          sellerAddress: application.sellerAddress,
+          gstHstNumber: application.gstHstNumber ?? "",
+          productCategory: application.productCategory,
+          markets: safeParseArray(application.markets),
+          status: application.status,
+        }
+      : null,
+  };
+}
 
 function extractMarkets(formData) {
   let raw = formData.getAll("markets");
@@ -101,6 +173,23 @@ export async function action({ request }) {
 
   const { prisma } = await import("../db.server");
 
+  const existing = await prisma.merchantApplication.findUnique({
+    where: { shopDomain: shop },
+    select: { id: true, status: true },
+  });
+
+  // Editing contact details must not silently reset an approved or suspended
+  // seller back into review. Only brand-new, rejected or needs-info
+  // applications (re-)enter the pending queue.
+  let status = existing?.status ?? "PENDING";
+  if (
+    !existing ||
+    existing.status === "REJECTED" ||
+    existing.status === "NEEDS_INFO"
+  ) {
+    status = "PENDING";
+  }
+
   const data = {
     storeName,
     storeUrl,
@@ -116,45 +205,64 @@ export async function action({ request }) {
     gstHstNumber,
     productCategory,
     markets: JSON.stringify(markets),
-    status: "PENDING",
-    submittedAt: new Date(),
+    status,
   };
 
-  await prisma.merchantApplication.upsert({
+  const saved = await prisma.merchantApplication.upsert({
     where: { shopDomain: shop },
-    create: { shopDomain: shop, ...data },
+    create: { shopDomain: shop, ...data, submittedAt: new Date() },
     update: data,
+  });
+
+  const { recordAudit, AUDIT_ENTITY } = await import("../services/audit.server");
+  await recordAudit({
+    actorType: "MERCHANT",
+    actorId: shop,
+    actorName: storeName,
+    action: existing ? "application.updated" : "application.submitted",
+    entityType: AUDIT_ENTITY.APPLICATION,
+    entityId: saved.id,
+    afterData: { status: saved.status, productCategory, markets },
   });
 
   return { ok: true };
 }
 
 export default function ApplicationPage() {
+  const { profile, application } = useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
+  const navigate = useNavigate();
   const isSubmitting = fetcher.state !== "idle";
   const submitted = fetcher.data?.ok === true;
   const serverError = fetcher.data?.error;
+  const [intent, setIntent] = React.useState("submit");
 
   React.useEffect(() => {
     if (submitted) {
       shopify.toast.show(
-        "Application submitted. MoonVella will review your store before wholesale access is unlocked.",
+        "Application saved. MoonVella will review your store before wholesale access is unlocked.",
       );
+      if (intent === "save") {
+        navigate("/app/status");
+      }
     }
-  }, [submitted, shopify]);
+  }, [submitted, intent, shopify, navigate]);
 
-  const [formData, setFormData] = React.useState({
-    contactName: merchantContactProfile.contactName,
-    phone: merchantContactProfile.phone,
-    urgentPhone: merchantContactProfile.urgentPhone,
-    email: merchantContactProfile.email,
-    legalBusinessName: merchantContactProfile.legalBusinessName,
-    sellerAddress: merchantContactProfile.sellerAddress,
-    gstHstNumber: merchantContactProfile.gstHstNumber,
-    productCategory: "Bedding & Bath",
-    markets: ["Ontario", "Quebec"],
-  });
+  const [formData, setFormData] = React.useState(() => ({
+    contactName: application?.contactName ?? "",
+    phone: application?.phone ?? "",
+    urgentPhone: application?.urgentPhone ?? "",
+    email: application?.email ?? profile.contactEmail ?? "",
+    legalBusinessName: application?.legalBusinessName ?? "",
+    sellerAddress: application?.sellerAddress ?? "",
+    gstHstNumber: application?.gstHstNumber ?? "",
+    productCategory: application?.productCategory ?? "Bedding & Bath",
+    markets:
+      application?.markets && application.markets.length
+        ? application.markets
+        : ["Ontario"],
+  }));
 
   const [errors, setErrors] = React.useState({});
 
@@ -221,9 +329,9 @@ export default function ApplicationPage() {
             <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 2rem' }}>
               Application submitted. MoonVella will review your store before wholesale access is unlocked.
             </p>
-            <button className="mv-btn mv-btn-primary" onClick={() => window.location.href = "/app/status"}>
+            <Link to="/app/status" className="mv-btn mv-btn-primary">
               View Application Status
-            </button>
+            </Link>
           </div>
         </div>
       </s-page>
@@ -242,9 +350,10 @@ export default function ApplicationPage() {
 
         <form onSubmit={handleSubmit}>
           <div className="mv-section-card">
-            <h3 className="mv-settings-title">Shopify store detected</h3>
+            <h3 className="mv-settings-title">Store information from your Shopify shop</h3>
             <p className="mv-branding-message" style={{ marginBottom: '1.5rem' }}>
-              This information will be retrieved automatically from Shopify after installation.
+              Loaded from your connected Shopify shop. A field shows Unknown if the app does not
+              yet have permission for it.
             </p>
             <div className="mv-settings-grid">
               <div className="mv-settings-field">
@@ -252,7 +361,7 @@ export default function ApplicationPage() {
                 <input
                   type="text"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.storeName}
+                  value={profile.storeName}
                   disabled
                 />
               </div>
@@ -261,7 +370,7 @@ export default function ApplicationPage() {
                 <input
                   type="text"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.shopDomain}
+                  value={profile.shopDomain}
                   disabled
                 />
               </div>
@@ -270,7 +379,7 @@ export default function ApplicationPage() {
                 <input
                   type="email"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.contactEmail}
+                  value={profile.contactEmail}
                   disabled
                 />
               </div>
@@ -279,7 +388,7 @@ export default function ApplicationPage() {
                 <input
                   type="text"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.country}
+                  value={profile.country}
                   disabled
                 />
               </div>
@@ -288,7 +397,7 @@ export default function ApplicationPage() {
                 <input
                   type="text"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.currency}
+                  value={profile.currency}
                   disabled
                 />
               </div>
@@ -297,7 +406,7 @@ export default function ApplicationPage() {
                 <input
                   type="text"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.shopifyPlan}
+                  value={profile.shopifyPlan}
                   disabled
                 />
               </div>
@@ -306,7 +415,7 @@ export default function ApplicationPage() {
                 <input
                   type="url"
                   className="mv-settings-input"
-                  value={shopifyStoreProfile.storeUrl}
+                  value={profile.storeUrl}
                   disabled
                 />
               </div>
@@ -425,45 +534,23 @@ export default function ApplicationPage() {
           <div className="mv-section-card">
             <h3 className="mv-settings-title">Shopify sales review</h3>
             <p className="mv-branding-message" style={{ marginBottom: '1.5rem' }}>
-              MoonVella will review recent Shopify activity before approving wholesale access.
+              MoonVella reviews recent Shopify activity before approving wholesale access. These
+              analytics require reporting permissions on this shop.
             </p>
             <div className="mv-settings-grid" style={{ opacity: 0.7 }}>
-              <div className="mv-settings-field">
-                <span className="mv-settings-label">Last 3 months sales</span>
-                <input
-                  type="text"
-                  className="mv-settings-input"
-                  value={shopifySalesReview.lastThreeMonthsSales ? `$${shopifySalesReview.lastThreeMonthsSales.toLocaleString()}` : "Available after connection"}
-                  disabled
-                />
-              </div>
-              <div className="mv-settings-field">
-                <span className="mv-settings-label">Last 3 months orders</span>
-                <input
-                  type="text"
-                  className="mv-settings-input"
-                  value={shopifySalesReview.lastThreeMonthsOrders ? shopifySalesReview.lastThreeMonthsOrders.toLocaleString() : "Available after connection"}
-                  disabled
-                />
-              </div>
-              <div className="mv-settings-field">
-                <span className="mv-settings-label">Average order value</span>
-                <input
-                  type="text"
-                  className="mv-settings-input"
-                  value={shopifySalesReview.averageOrderValue ? `$${shopifySalesReview.averageOrderValue.toLocaleString()}` : "Available after connection"}
-                  disabled
-                />
-              </div>
-              <div className="mv-settings-field" style={{ gridColumn: '1 / -1' }}>
-                <span className="mv-settings-label">Main markets</span>
-                <input
-                  type="text"
-                  className="mv-settings-input"
-                  value={shopifySalesReview.mainMarkets.join(", ")}
-                  disabled
-                />
-              </div>
+              {["Last 90 days sales", "Paid order count", "Average order value", "Main markets"].map(
+                (label) => (
+                  <div className="mv-settings-field" key={label}>
+                    <span className="mv-settings-label">{label}</span>
+                    <input
+                      type="text"
+                      className="mv-settings-input"
+                      value="Collected during review"
+                      disabled
+                    />
+                  </div>
+                )
+              )}
             </div>
           </div>
 
@@ -473,8 +560,13 @@ export default function ApplicationPage() {
             </p>
           )}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '1rem', marginTop: '1.5rem' }}>
-            <button type="button" className="mv-btn mv-btn-secondary" onClick={() => window.location.href = "/app/status"}>
-              Save & Continue Later
+            <button
+              type="submit"
+              className="mv-btn mv-btn-secondary"
+              onClick={() => setIntent("save")}
+              disabled={isSubmitting}
+            >
+              Save &amp; Continue Later
             </button>
             <button type="submit" className="mv-btn mv-btn-primary" disabled={isSubmitting}>
               {isSubmitting ? "Submitting..." : "Submit Application"}

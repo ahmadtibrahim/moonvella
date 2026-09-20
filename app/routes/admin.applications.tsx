@@ -1,53 +1,81 @@
-import { Link, useLoaderData, Form, redirect } from "react-router";
+import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth } from "~/utils/ownerAuth.server";
+import {
+  requireOwnerRole,
+  assertSameOrigin,
+  getRequestMeta,
+} from "~/utils/ownerAuth.server";
 import { prisma } from "~/db.server";
+import {
+  approveApplication,
+  rejectApplication,
+  requestInformation,
+} from "~/services/application.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerAuth(request);
+  await requireOwnerRole(request, ["OWNER", "REVIEWER", "OPERATIONS", "READONLY"]);
 
-  const [pendingApplications, approvedCount, rejectedCount] = await Promise.all([
-    prisma.merchantApplication.findMany({
-      where: { status: "PENDING" },
-      orderBy: { submittedAt: "desc" },
-      select: {
-        id: true,
-        storeName: true,
-        shopDomain: true,
-        submittedAt: true,
-        contactName: true,
-        email: true,
-        productCategory: true,
-        country: true,
-      },
-    }),
-    prisma.merchantApplication.count({ where: { status: "APPROVED" } }),
-    prisma.merchantApplication.count({ where: { status: "REJECTED" } }),
-  ]);
+  const [pendingApplications, approvedCount, rejectedCount, needsInfoCount] =
+    await Promise.all([
+      prisma.merchantApplication.findMany({
+        where: { status: { in: ["PENDING", "NEEDS_INFO"] } },
+        orderBy: { submittedAt: "desc" },
+        select: {
+          id: true,
+          storeName: true,
+          shopDomain: true,
+          submittedAt: true,
+          contactName: true,
+          email: true,
+          productCategory: true,
+          country: true,
+          status: true,
+        },
+      }),
+      prisma.merchantApplication.count({ where: { status: "APPROVED" } }),
+      prisma.merchantApplication.count({ where: { status: "REJECTED" } }),
+      prisma.merchantApplication.count({ where: { status: "NEEDS_INFO" } }),
+    ]);
 
-  return { pendingApplications, approvedCount, rejectedCount };
+  return { pendingApplications, approvedCount, rejectedCount, needsInfoCount };
 }
 
 export async function action({ request }: ActionFunctionArgs) {
-  await requireOwnerAuth(request);
+  assertSameOrigin(request);
+  const user = await requireOwnerRole(request, ["OWNER", "REVIEWER"]);
+  const { ip, userAgent } = getRequestMeta(request);
+
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const applicationId = String(formData.get("applicationId") || "");
+  const reason = String(formData.get("reason") || "").trim();
 
   if (!applicationId) {
     return { error: "Missing application id." };
   }
 
-  if (intent === "approve") {
-    await prisma.merchantApplication.update({
-      where: { id: applicationId },
-      data: { status: "APPROVED", reviewedAt: new Date() },
-    });
-  } else if (intent === "reject") {
-    await prisma.merchantApplication.update({
-      where: { id: applicationId },
-      data: { status: "REJECTED", reviewedAt: new Date() },
-    });
+  const actor = {
+    actorType: "OWNER_USER" as const,
+    actorId: user.id,
+    actorName: user.name,
+    ipAddress: ip,
+    userAgent,
+  };
+
+  try {
+    if (intent === "approve") {
+      await approveApplication(applicationId, actor, reason || undefined);
+    } else if (intent === "reject") {
+      await rejectApplication(applicationId, actor, reason || "Not specified");
+    } else if (intent === "request_info") {
+      await requestInformation(applicationId, actor, reason || "Additional information required");
+    } else {
+      return { error: "Unknown action." };
+    }
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "The operation failed.",
+    };
   }
 
   return redirect("/admin/applications");
@@ -83,8 +111,9 @@ const btn = (color: string): React.CSSProperties => ({
 });
 
 export default function AdminApplications() {
-  const { pendingApplications, approvedCount, rejectedCount } =
+  const { pendingApplications, approvedCount, rejectedCount, needsInfoCount } =
     useLoaderData<typeof loader>();
+  const actionData = useActionData<typeof action>();
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -95,16 +124,32 @@ export default function AdminApplications() {
         Review pending merchant applications to onboard new sellers
       </p>
 
+      {actionData?.error ? (
+        <div
+          style={{
+            background: "#fef2f2",
+            border: "1px solid #fecaca",
+            color: "#991b1b",
+            padding: "0.75rem 1rem",
+            borderRadius: 8,
+            fontSize: "0.85rem",
+            marginBottom: "1rem",
+          }}
+        >
+          Operation failed: {actionData.error}
+        </div>
+      ) : null}
+
       <div
         style={{
           display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
           gap: "1rem",
           marginBottom: "2rem",
         }}
       >
         <div style={card}>
-          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Pending</div>
+          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Awaiting review</div>
           <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#b45309" }}>
             {pendingApplications.length}
           </div>
@@ -113,6 +158,12 @@ export default function AdminApplications() {
           <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Approved</div>
           <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#059669" }}>
             {approvedCount}
+          </div>
+        </div>
+        <div style={card}>
+          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Needs info</div>
+          <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#0369a1" }}>
+            {needsInfoCount}
           </div>
         </div>
         <div style={card}>
@@ -125,33 +176,71 @@ export default function AdminApplications() {
 
       <div style={card}>
         <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Pending Applications ({pendingApplications.length})
+          Applications needing action ({pendingApplications.length})
         </h2>
 
         {pendingApplications.length === 0 ? (
           <p style={{ color: "#64748b", fontSize: "0.875rem" }}>
-            No pending applications.
+            No applications awaiting review.
           </p>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
             {pendingApplications.map((app) => (
               <div key={app.id} style={row}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>{app.storeName}</div>
+                  <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                    {app.storeName}{" "}
+                    <span
+                      style={{
+                        fontSize: "0.6rem",
+                        fontWeight: 700,
+                        color: app.status === "NEEDS_INFO" ? "#0369a1" : "#b45309",
+                      }}
+                    >
+                      {app.status}
+                    </span>
+                  </div>
                   <div style={{ fontSize: "0.75rem", color: "#64748b" }}>{app.shopDomain}</div>
                   <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
                     {app.contactName} &middot; {app.email}
                     {app.country ? ` \u00b7 ${app.country}` : ""}
                   </div>
+                  <div style={{ marginTop: "0.5rem" }}>
+                    <Link
+                      to={`/admin/applications/${app.id}`}
+                      style={{ fontSize: "0.75rem", color: "#082a4a", fontWeight: 600 }}
+                    >
+                      Open full application &rarr;
+                    </Link>
+                  </div>
                 </div>
-                <Form method="post" style={{ display: "flex", gap: "0.5rem" }}>
+                <Form
+                  method="post"
+                  style={{ display: "flex", flexDirection: "column", gap: "0.5rem", width: 260 }}
+                >
                   <input type="hidden" name="applicationId" value={app.id} />
-                  <button type="submit" name="intent" value="approve" style={btn("#059669")}>
-                    Approve
-                  </button>
-                  <button type="submit" name="intent" value="reject" style={btn("#dc2626")}>
-                    Reject
-                  </button>
+                  <input
+                    type="text"
+                    name="reason"
+                    placeholder="Decision note (optional)"
+                    style={{
+                      padding: "0.4rem 0.6rem",
+                      border: "1px solid #cbd5e1",
+                      borderRadius: 6,
+                      fontSize: "0.75rem",
+                    }}
+                  />
+                  <div style={{ display: "flex", gap: "0.5rem" }}>
+                    <button type="submit" name="intent" value="approve" style={btn("#059669")}>
+                      Approve
+                    </button>
+                    <button type="submit" name="intent" value="reject" style={btn("#dc2626")}>
+                      Reject
+                    </button>
+                    <button type="submit" name="intent" value="request_info" style={btn("#0369a1")}>
+                      Request info
+                    </button>
+                  </div>
                 </Form>
               </div>
             ))}

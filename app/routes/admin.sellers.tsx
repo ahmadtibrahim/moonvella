@@ -1,10 +1,15 @@
 import { Link, useLoaderData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth } from "~/utils/ownerAuth.server";
+import {
+  requireOwnerRole,
+  assertSameOrigin,
+  getRequestMeta,
+} from "~/utils/ownerAuth.server";
 import { prisma } from "~/db.server";
+import { suspendSeller, reactivateSeller } from "~/services/application.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerAuth(request);
+  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
 
   const [sellers, pendingCount] = await Promise.all([
     prisma.seller.findMany({
@@ -14,6 +19,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         storeName: true,
         shopDomain: true,
         status: true,
+        suspensionReason: true,
         _count: { select: { orders: true } },
       },
     }),
@@ -24,25 +30,39 @@ export async function loader({ request }: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
-  await requireOwnerAuth(request);
+  assertSameOrigin(request);
+  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const { ip, userAgent } = getRequestMeta(request);
+
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "");
   const sellerId = String(formData.get("sellerId") || "");
+  const reason = String(formData.get("reason") || "").trim();
 
   if (!sellerId) {
     return { error: "Missing seller id." };
   }
 
-  if (intent === "suspend") {
-    await prisma.seller.update({
-      where: { id: sellerId },
-      data: { status: "SUSPENDED", suspendedAt: new Date() },
-    });
-  } else if (intent === "reactivate") {
-    await prisma.seller.update({
-      where: { id: sellerId },
-      data: { status: "APPROVED", suspendedAt: null, suspensionReason: null },
-    });
+  const actor = {
+    actorType: "OWNER_USER" as const,
+    actorId: user.id,
+    actorName: user.name,
+    ipAddress: ip,
+    userAgent,
+  };
+
+  try {
+    if (intent === "suspend") {
+      await suspendSeller(sellerId, actor, reason || "Suspended by owner");
+    } else if (intent === "reactivate") {
+      await reactivateSeller(sellerId, actor);
+    } else {
+      return { error: "Unknown action." };
+    }
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "The operation failed.",
+    };
   }
 
   return redirect("/admin/sellers");
@@ -129,12 +149,20 @@ export default function AdminSellers() {
               return (
                 <div key={seller.id} style={rowStyle}>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 600, fontSize: "0.9rem" }}>
+                    <Link
+                      to={`/admin/sellers/${seller.id}`}
+                      style={{ fontWeight: 600, fontSize: "0.9rem", color: "#082a4a" }}
+                    >
                       {seller.storeName}
-                    </div>
+                    </Link>
                     <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
                       {seller.shopDomain} &middot; {seller._count.orders} orders
                     </div>
+                    {seller.suspensionReason ? (
+                      <div style={{ fontSize: "0.7rem", color: "#dc2626" }}>
+                        {seller.suspensionReason}
+                      </div>
+                    ) : null}
                   </div>
                   <span
                     style={{
@@ -148,26 +176,43 @@ export default function AdminSellers() {
                   >
                     {seller.status}
                   </span>
-                  <Form method="post">
+                  <Form
+                    method="post"
+                    style={{ display: "flex", gap: "0.5rem", alignItems: "center" }}
+                  >
                     <input type="hidden" name="sellerId" value={seller.id} />
                     {isApproved ? (
-                      <button
-                        type="submit"
-                        name="intent"
-                        value="suspend"
-                        style={{
-                          padding: "0.5rem 1rem",
-                          border: "1px solid #dc2626",
-                          borderRadius: 6,
-                          background: "white",
-                          color: "#dc2626",
-                          fontSize: "0.75rem",
-                          fontWeight: 600,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Suspend
-                      </button>
+                      <>
+                        <input
+                          type="text"
+                          name="reason"
+                          placeholder="Reason"
+                          style={{
+                            padding: "0.4rem 0.6rem",
+                            border: "1px solid #cbd5e1",
+                            borderRadius: 6,
+                            fontSize: "0.75rem",
+                            width: 150,
+                          }}
+                        />
+                        <button
+                          type="submit"
+                          name="intent"
+                          value="suspend"
+                          style={{
+                            padding: "0.5rem 1rem",
+                            border: "1px solid #dc2626",
+                            borderRadius: 6,
+                            background: "white",
+                            color: "#dc2626",
+                            fontSize: "0.75rem",
+                            fontWeight: 600,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Suspend
+                        </button>
+                      </>
                     ) : (
                       <button
                         type="submit"

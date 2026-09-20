@@ -42,7 +42,6 @@ model OwnerUser {
   lastLoginAt   DateTime?
   sessions      OwnerSession[]
   reviewedApplications MerchantApplication[] @relation("ReviewedApplications")
-  auditLogs     AuditLog[] @relation("AuditLogs")
 }
 
 model OwnerSession {
@@ -86,13 +85,13 @@ model MerchantApplication {
   reviewedBy            OwnerUser?            @relation("ReviewedApplications", fields: [reviewedById], references: [id])
   rejectionReason       String?
   internalNotes         String?
+  businessStartDate     DateTime?
   createdAt             DateTime              @default(now())
   updatedAt             DateTime              @updatedAt
   shopifyStoreProfile   String?               @default("{}")
   shopifySalesReview    String?               @default("{}")
   merchantContact       String?               @default("{}")
   seller                Seller?
-  auditLogs             AuditLog[]
 
   @@index([status])
   @@index([shopDomain])
@@ -126,11 +125,17 @@ model Seller {
   suspensionReason      String?
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
+  installedAt           DateTime?
+  domainRegisteredAt    DateTime?
+  businessStartDate     DateTime?
   lastSyncAt            DateTime?
   syncStatus            SyncStatus    @default(NEVER)
   products              SellerProduct[]
   orders                Order[]
-  auditLogs             AuditLog[]
+  wholesalePayments     WholesalePayment[]
+  billingSettings       SellerBillingSettings?
+  paymentMethods        SellerPaymentMethod[]
+  bankAccounts          SellerBankAccount[]
   settings              SellerSettings?
 
   @@index([status])
@@ -176,13 +181,16 @@ model Product {
   wholesalePrice        Int
   suggestedRetailPrice  Int
   costPrice             Int?
+  currency              String            @default("CAD")
   images                String            @default("[]")
+  productImages         ProductImage[]
   categoryId            String?
   categoryRef           Category?         @relation(fields: [categoryId], references: [id])
   variants              ProductVariant[]
   sellerProducts        SellerProduct[]
   orderItems            OrderItem[]       @relation("OrderItemProduct")
   isActive              Boolean           @default(true)
+  isPublished           Boolean           @default(true)
   isArchived            Boolean           @default(false)
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
@@ -190,6 +198,18 @@ model Product {
   @@index([category])
   @@index([sku])
   @@index([isActive])
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  url       String
+  alt       String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
 }
 
 model Category {
@@ -216,12 +236,63 @@ model ProductVariant {
   suggestedRetailPrice Int
   costPrice         Int?
   inventory         Int       @default(0)
+  reserved          Int       @default(0)
+  lowStockThreshold Int       @default(5)
+  optionName        String?
+  optionValue       String?
+  variantImageUrl   String?
+  shipsSeparately   Boolean   @default(false)
+  packingInstructions String?
+  shippingDescription String?
+  declaredValueDefault Int?
   weight            Int?
   dimensions        String?
   isActive          Boolean   @default(true)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   orderItems        OrderItem[] @relation("OrderItemVariant")
+  sellerProductVariants SellerProductVariant[]
+  packages          VariantPackage[]
+}
+
+model PackagingPreset {
+  id            String   @id @default(cuid())
+  name          String   @unique
+  packageType   String   @default("carton")
+  length        Float
+  width         Float
+  height        Float
+  dimensionUnit String   @default("cm")
+  emptyWeight   Float?
+  weightUnit    String   @default("kg")
+  maxWeight     Float?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  packages      VariantPackage[]
+}
+
+model VariantPackage {
+  id             String          @id @default(cuid())
+  variantId      String
+  variant        ProductVariant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  label          String?
+  packageType    String          @default("carton")
+  presetId       String?
+  preset         PackagingPreset? @relation(fields: [presetId], references: [id])
+  length         Float
+  width          Float
+  height         Float
+  dimensionUnit  String          @default("cm")
+  grossWeight    Float
+  weightUnit     String          @default("kg")
+  unitsPerPackage Int            @default(1)
+  packagesPerUnit Int            @default(1)
+  sortOrder      Int             @default(0)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@index([variantId])
 }
 
 model SellerProduct {
@@ -233,16 +304,39 @@ model SellerProduct {
   shopifyProductId      String?
   shopifyVariantIds     String        @default("[]")
   importedAt            DateTime?
+  importStatus          SyncStatus    @default(NEVER)
+  lastImportError       String?
   isActive              Boolean       @default(true)
   customWholesalePrice  Int?
   customRetailPrice     Int?
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
   orderItems            OrderItem[]   @relation("OrderItemSellerProduct")
+  variantMappings       SellerProductVariant[]
 
   @@unique([sellerId, productId])
   @@index([sellerId])
   @@index([productId])
+}
+
+model SellerProductVariant {
+  id                     String         @id @default(cuid())
+  sellerProductId        String
+  sellerProduct          SellerProduct  @relation(fields: [sellerProductId], references: [id], onDelete: Cascade)
+  productVariantId       String
+  productVariant         ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  shopifyProductId       String
+  shopifyVariantId       String
+  shopifyInventoryItemId String?
+  shopifyLocationId      String?
+  syncStatus             SyncStatus     @default(NEVER)
+  syncedAt               DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  @@unique([sellerProductId, productVariantId])
+  @@unique([shopifyVariantId])
+  @@index([sellerProductId])
 }
 
 model Order {
@@ -276,9 +370,16 @@ model Order {
   processedAt           DateTime?
   cancelledAt           DateTime?
   cancelReason          String?
+  supplierReference     String?       @unique
+  shopifyFulfillmentOrderId String?
+  wholesalePaymentStatus WholesalePaymentStatus @default(REQUIRES_PAYMENT)
   items                 OrderItem[]
   refunds               Refund[]
   shipments             Shipment[]
+  wholesalePayment      WholesalePayment?
+  fulfillmentRequest    FulfillmentRequest?
+  shippingQuotes        ShippingQuote[]
+  packages              OrderPackage[]
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
 
@@ -360,9 +461,21 @@ model Shipment {
   trackingNumber        String?
   trackingUrl           String?
   carrier               String?
+  serviceName           String?
+  provider              String?
+  providerShipmentId    String?
+  labelUrl              String?
+  bookedCost            Int?
+  bookingIdempotencyKey String?       @unique
+  packageCount          Int?
   status                ShipmentStatus @default(PENDING)
+  labelCreatedAt        DateTime?
+  packedAt              DateTime?
+  handedToCarrierAt     DateTime?
   shippedAt             DateTime?
+  inTransitAt           DateTime?
   deliveredAt           DateTime?
+  exceptionAt           DateTime?
   items                 ShipmentItem[]
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
@@ -399,10 +512,6 @@ model AuditLog {
   ipAddress         String?
   userAgent         String?
   createdAt         DateTime    @default(now())
-
-  application       MerchantApplication? @relation(fields: [entityId], references: [id])
-  seller            Seller?           @relation(fields: [entityId], references: [id])
-  actor             OwnerUser?        @relation("AuditLogs", fields: [actorId], references: [id])
 
   @@index([entityType, entityId])
   @@index([actorId])
@@ -453,4 +562,241 @@ enum WebhookStatus {
   PROCESSING
   SUCCESS
   FAILED
+}
+
+enum WholesalePaymentStatus {
+  REQUIRES_PAYMENT
+  REQUIRES_ACTION
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  CANCELLED
+}
+
+enum FulfillmentRequestStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  CANCELLED
+  CLOSED
+}
+
+enum IntegrationStatus {
+  NOT_CONFIGURED
+  NEVER_SYNCED
+  HEALTHY
+  DELAYED
+  FAILED
+}
+
+enum BillingMode {
+  MANUAL
+  AUTOMATIC
+}
+
+enum PaymentMethodStatus {
+  ACTIVE
+  REMOVED
+  REQUIRES_ACTION
+}
+
+model WholesalePayment {
+  id                      String                 @id @default(cuid())
+  orderId                 String                 @unique
+  order                   Order                  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  sellerId                String
+  seller                  Seller                 @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  provider                String                 @default("stripe")
+  providerPaymentIntentId String?                @unique
+  providerChargeId        String?
+  clientSecret            String?
+  paymentMethodId         String?
+  billingMode             String?
+  subtotal                Int?
+  shippingAmount          Int?
+  taxAmount               Int?
+  amount                  Int
+  currency                String                 @default("CAD")
+  status                  WholesalePaymentStatus @default(REQUIRES_PAYMENT)
+  requiresAction          Boolean                @default(false)
+  failureMessage          String?
+  idempotencyKey          String                 @unique
+  authorizedAt            DateTime?
+  capturedAt              DateTime?
+  refundedAmount          Int                    @default(0)
+  paidAt                  DateTime?
+  createdAt               DateTime               @default(now())
+  updatedAt               DateTime               @updatedAt
+  events                  PaymentEvent[]
+  attempts                PaymentAttempt[]
+
+  @@index([sellerId])
+  @@index([status])
+}
+
+model PaymentAttempt {
+  id                      String           @id @default(cuid())
+  paymentId               String
+  payment                 WholesalePayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  provider                String           @default("stripe")
+  providerPaymentIntentId String?
+  status                  String
+  failureCode             String?
+  failureMessage          String?
+  requiresAction          Boolean          @default(false)
+  amount                  Int
+  createdAt               DateTime         @default(now())
+
+  @@index([paymentId])
+}
+
+model SellerBillingSettings {
+  id                      String      @id @default(cuid())
+  sellerId                String      @unique
+  seller                  Seller      @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  mode                    BillingMode @default(MANUAL)
+  autoPayEnabled          Boolean     @default(false)
+  maxAmountPerOrder       Int?
+  maxShippingCharge       Int?
+  preferredShippingPolicy String?
+  holdForReview           Boolean     @default(true)
+  autoBookShipment        Boolean     @default(false)
+  updatedAt               DateTime    @updatedAt
+  createdAt               DateTime    @default(now())
+}
+
+model SellerPaymentMethod {
+  id                       String              @id @default(cuid())
+  sellerId                 String
+  seller                   Seller              @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  provider                 String              @default("stripe")
+  stripeCustomerId         String?
+  stripePaymentMethodId    String?             @unique
+  brand                    String?
+  last4                    String?
+  expMonth                 Int?
+  expYear                  Int?
+  isDefault                Boolean             @default(false)
+  status                   PaymentMethodStatus @default(ACTIVE)
+  authorizationConsentAt   DateTime?
+  createdAt                DateTime            @default(now())
+  updatedAt                DateTime            @updatedAt
+
+  @@index([sellerId])
+}
+
+model SellerBankAccount {
+  id                   String   @id @default(cuid())
+  sellerId             String
+  seller               Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  provider             String   @default("plaid")
+  plaidItemId          String?
+  encryptedAccessToken String
+  institutionName      String?
+  accountName          String?
+  accountMask          String?
+  accountType          String?
+  accountSubtype       String?
+  status               String   @default("CONNECTED")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([sellerId])
+}
+
+model ShippingQuote {
+  id                String   @id @default(cuid())
+  orderId           String
+  order             Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  provider          String   @default("eshipper")
+  carrier           String
+  serviceCode       String
+  serviceName       String
+  totalAmount       Int
+  currency          String   @default("CAD")
+  transitDays       Int?
+  estimatedDelivery DateTime?
+  quotedAt          DateTime @default(now())
+  expiresAt         DateTime?
+  selected          Boolean  @default(false)
+  raw               String?
+  createdAt         DateTime @default(now())
+
+  @@index([orderId])
+}
+
+model OrderPackage {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  count     Int      @default(1)
+  length    Float
+  width     Float
+  height    Float
+  weight    Float
+  units     String   @default("cm_kg")
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
+
+model PaymentEvent {
+  id           String            @id @default(cuid())
+  provider     String            @default("stripe")
+  eventId      String            @unique
+  type         String
+  paymentId    String?
+  payment      WholesalePayment? @relation(fields: [paymentId], references: [id])
+  payload      String
+  status       String            @default("PROCESSED")
+  errorMessage String?
+  processedAt  DateTime?
+  createdAt    DateTime          @default(now())
+
+  @@index([paymentId])
+  @@index([type])
+}
+
+model FulfillmentRequest {
+  id                        String                   @id @default(cuid())
+  orderId                   String                   @unique
+  order                     Order                    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  shopifyFulfillmentOrderId String?
+  status                    FulfillmentRequestStatus @default(PENDING)
+  requestedAt               DateTime                 @default(now())
+  acceptedAt                DateTime?
+  rejectedAt                DateTime?
+  rejectReason              String?
+  closedAt                  DateTime?
+  updatedAt                 DateTime                 @updatedAt
+}
+
+model IntegrationState {
+  id            String            @id @default(cuid())
+  key           String            @unique
+  status        IntegrationStatus @default(NOT_CONFIGURED)
+  lastSuccessAt DateTime?
+  lastErrorAt   DateTime?
+  lastError     String?
+  detail        String?
+  updatedAt     DateTime          @updatedAt
+}
+
+model AnalyticsSnapshot {
+  id           String    @id @default(cuid())
+  shop         String
+  source       String
+  periodStart  DateTime?
+  periodEnd    DateTime?
+  coverage     String
+  metrics      String    @default("{}")
+  lastSyncAt   DateTime?
+  errorMessage String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([shop, source])
+  @@index([shop])
 }

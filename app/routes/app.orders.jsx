@@ -1,60 +1,84 @@
-import React from "react";
-import { StatusBadge } from "../components/StatusBadge";
-import { DataTable } from "../components/DataTable";
-import { dummyOrders } from "../data/moonvillaData";
-import { applicationStatus } from "../data/moonvellaState";
+import { Link, useLoaderData } from "react-router";
+import { requireSellerContext } from "../services/seller.server";
+import { prisma } from "../db.server";
 
-const isApproved = applicationStatus === "approved";
+export const loader = async ({ request }) => {
+  const context = await requireSellerContext(request);
 
-const orderStatuses = ["All", "Pending", "Processing", "Shipped", "Delivered", "Cancelled"];
+  let orders = [];
+  if (context.seller && context.canViewOrders) {
+    const rows = await prisma.order.findMany({
+      where: { sellerId: context.seller.id },
+      orderBy: { shopifyCreatedAt: "desc" },
+      take: 100,
+      select: {
+        id: true,
+        shopifyOrderName: true,
+        customerName: true,
+        moonvellaTotal: true,
+        currency: true,
+        paymentStatus: true,
+        fulfillmentStatus: true,
+        shopifyCreatedAt: true,
+        _count: { select: { items: true } },
+        shipments: {
+          select: { trackingNumber: true, trackingUrl: true, carrier: true, status: true },
+        },
+      },
+    });
+    orders = rows.map((o) => ({
+      id: o.id,
+      name: o.shopifyOrderName,
+      customer: o.customerName || "—",
+      items: o._count.items,
+      moonvellaTotal: o.moonvellaTotal,
+      currency: o.currency,
+      paymentStatus: o.paymentStatus,
+      fulfillmentStatus: o.fulfillmentStatus,
+      createdAt: o.shopifyCreatedAt,
+      shipments: o.shipments,
+    }));
+  }
+
+  return {
+    access: context.access,
+    canViewOrders: context.canViewOrders,
+    orders,
+  };
+};
+
+function money(cents, currency = "CAD") {
+  return `${(cents / 100).toFixed(2)} ${currency}`;
+}
 
 export default function OrdersPage() {
-  const [selectedStatus, setSelectedStatus] = React.useState("All");
-  const [searchQuery, setSearchQuery] = React.useState("");
+  const { access, canViewOrders, orders } = useLoaderData();
 
-  const orders = dummyOrders;
-
-  const filteredOrders = orders.filter((order) => {
-    if (selectedStatus !== "All" && order.fulfillmentStatus !== selectedStatus) {
-      return false;
-    }
-
-    if (searchQuery) {
-      const lower = searchQuery.toLowerCase();
-      return (
-        order.retailTotal.toString().includes(lower) ||
-        order.customer.toLowerCase().includes(lower) ||
-        order.retailer.toLowerCase().includes(lower)
-      );
-    }
-
-    return true;
-  });
-
-  if (!isApproved) {
+  if (!canViewOrders) {
     return (
       <s-page heading="Orders">
         <div className="mv-container">
           <div className="mv-page-header">
             <h2 className="mv-page-title">Orders</h2>
             <p className="mv-page-subtitle">
-              Manage and track all MoonVella orders. View order details, fulfillment status, and billing information.
+              MoonVella orders appear here after your store is approved and products are imported.
             </p>
           </div>
-
-          <div className="mv-section-card" style={{ textAlign: 'center', padding: '4rem 2rem' }}>
-            <div style={{ fontSize: '4rem', marginBottom: '1.5rem' }}>📋</div>
-            <h2 className="mv-page-title" style={{ marginBottom: '1rem' }}>Orders will appear here after approval</h2>
-            <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 2rem' }}>
-              Orders will appear here after approval and after MoonVella products are imported.
+          <div className="mv-section-card" style={{ textAlign: "center", padding: "4rem 2rem" }}>
+            <div style={{ fontSize: "4rem", marginBottom: "1.5rem" }}>📋</div>
+            <h2 className="mv-page-title" style={{ marginBottom: "1rem" }}>
+              Orders will appear here after approval
+            </h2>
+            <p className="mv-page-subtitle" style={{ maxWidth: "500px", margin: "0 auto 2rem" }}>
+              Current status: {access}.
             </p>
-            <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
-              <button className="mv-btn mv-btn-primary" onClick={() => window.location.href = "/app/status"}>
+            <div style={{ display: "flex", gap: "1rem", justifyContent: "center", flexWrap: "wrap" }}>
+              <Link className="mv-btn mv-btn-primary" to="/app/status">
                 View Application Status
-              </button>
-              <button className="mv-btn mv-btn-secondary" onClick={() => window.location.href = "/app/application"}>
+              </Link>
+              <Link className="mv-btn mv-btn-secondary" to="/app/application">
                 Edit Application
-              </button>
+              </Link>
             </div>
           </div>
         </div>
@@ -68,111 +92,55 @@ export default function OrdersPage() {
         <div className="mv-page-header">
           <h2 className="mv-page-title">Orders</h2>
           <p className="mv-page-subtitle">
-            Manage and track all MoonVella orders. View order details, fulfillment status, and billing information.
+            MoonVella product orders placed in your store, and their fulfillment and tracking.
           </p>
         </div>
 
-        <div className="mv-filter-row">
-          <div className="mv-tab-nav" role="tablist">
-            {orderStatuses.map((status) => (
-              <button
-                key={status}
-                role="tab"
-                aria-selected={selectedStatus === status}
-                className={`mv-tab-btn ${selectedStatus === status ? "active" : ""}`}
-                onClick={() => setSelectedStatus(status)}
-              >
-                {status}
-              </button>
-            ))}
+        {orders.length === 0 ? (
+          <div className="mv-section-card" style={{ textAlign: "center", padding: "3rem" }}>
+            <p className="mv-page-subtitle">
+              No MoonVella orders yet. Orders appear here once a customer buys an imported
+              MoonVella product.
+            </p>
           </div>
-          <input
-            type="text"
-            className="mv-search-input"
-            placeholder="Search orders, customers, or products..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-          />
-        </div>
-
-        <div className="mv-section-card">
-          <DataTable
-            columns={[
-              { key: "retailerOrder", label: "Retailer order #", type: "text" },
-              { key: "customer", label: "Customer", type: "text" },
-              { key: "items", label: "Items", type: "text" },
-              { key: "retailTotal", label: "Retail total", type: "text" },
-              { key: "moonvillaCost", label: "MoonVella cost", type: "text" },
-              { key: "paymentStatus", label: "Payment status", type: "badge" },
-              { key: "fulfillmentStatus", label: "Fulfillment status", type: "badge" },
-              { key: "tracking", label: "Tracking", type: "text" },
-              { key: "date", label: "Date", type: "text" },
-              { key: "actions", label: "Actions", type: "action" },
-            ]}
-            rows={filteredOrders}
-            selectable={false}
-          />
-        </div>
-
-        {filteredOrders.length > 0 && (
-          <div className="mv-dashboard-main">
-            <div className="mv-dashboard-content">
-              <div className="mv-section-card">
-                <h3 className="mv-section-title">Order #{filteredOrders[0]?.id || 1028}</h3>
-                <div className="mv-checklist" style={{ gap: '1rem' }}>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Customer:</span>
-                    <span>{filteredOrders[0]?.customer || "John Smith"}</span>
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Shipping:</span>
-                    <span>Shipping address placeholder</span>
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Items:</span>
-                    <span>{filteredOrders[0]?.items || 3} items</span>
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Retail total:</span>
-                    <span>${(filteredOrders[0]?.retailTotal || 149).toFixed(2)}</span>
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>MoonVella cost:</span>
-                    <span>${(filteredOrders[0]?.moonvillaCost || 92).toFixed(2)}</span>
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Payment:</span>
-                    <StatusBadge status={(filteredOrders[0]?.paymentStatus || "Paid").replace(" ", "")} />
-                  </div>
-                  <div className="mv-checklist-item" style={{ padding: '1rem', background: 'var(--background)' }}>
-                    <span style={{ fontWeight: '600', minWidth: '160px' }}>Fulfillment:</span>
-                    <StatusBadge status={(filteredOrders[0]?.fulfillmentStatus || "Processing").replace(" ", "")} />
-                  </div>
-                </div>
-              </div>
-            </div>
+        ) : (
+          <div className="mv-section-card">
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "#64748b", fontSize: "0.7rem" }}>
+                  <th style={{ padding: "0.5rem" }}>Order</th>
+                  <th style={{ padding: "0.5rem" }}>Customer</th>
+                  <th style={{ padding: "0.5rem" }}>Items</th>
+                  <th style={{ padding: "0.5rem" }}>MoonVella total</th>
+                  <th style={{ padding: "0.5rem" }}>Payment</th>
+                  <th style={{ padding: "0.5rem" }}>Fulfillment</th>
+                  <th style={{ padding: "0.5rem" }}>Tracking</th>
+                </tr>
+              </thead>
+              <tbody>
+                {orders.map((o) => (
+                  <tr key={o.id} style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <td style={{ padding: "0.5rem", fontWeight: 600 }}>{o.name}</td>
+                    <td style={{ padding: "0.5rem" }}>{o.customer}</td>
+                    <td style={{ padding: "0.5rem" }}>{o.items}</td>
+                    <td style={{ padding: "0.5rem" }}>
+                      {money(o.moonvellaTotal, o.currency)}
+                    </td>
+                    <td style={{ padding: "0.5rem" }}>{o.paymentStatus}</td>
+                    <td style={{ padding: "0.5rem" }}>{o.fulfillmentStatus}</td>
+                    <td style={{ padding: "0.5rem" }}>
+                      {o.shipments.length === 0
+                        ? "—"
+                        : o.shipments
+                            .map((s) => s.trackingNumber || s.status)
+                            .join(", ")}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
-
-        <div className="mv-section-card">
-          <h3 className="mv-section-title">Recent charges</h3>
-          <div className="mv-billing-table">
-            <div className="mv-billing-header">
-              <div className="mv-billing-col mv-col-sm">Order #</div>
-              <div className="mv-billing-col">Amount</div>
-              <div className="mv-billing-col mv-col-sm">Status</div>
-            </div>
-            {dummyOrders.slice(0, 5).map((order) => (
-              <div key={order.id} className="mv-billing-row">
-                <div className="mv-billing-col mv-col-sm">#{order.id}</div>
-                <div className="mv-billing-col">${order.retailTotal.toFixed(2)}</div>
-                <div className="mv-billing-col mv-col-sm">
-                  <StatusBadge status={order.paymentStatus.replace(" ", "")} />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
       </div>
     </s-page>
   );

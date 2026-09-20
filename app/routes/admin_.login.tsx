@@ -7,8 +7,15 @@ import {
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
-import { getOwnerUser, buildSessionCookie } from "~/utils/ownerAuth.server";
-import { authenticateOwner, createOwnerSession } from "~/services/ownerAuth.server";
+import { getOwnerUser, buildSessionCookie, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import {
+  authenticateOwner,
+  createOwnerSession,
+  isLoginThrottled,
+  recordFailedLogin,
+  clearLoginAttempts,
+} from "~/services/ownerAuth.server";
+import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const user = await getOwnerUser(request);
@@ -19,20 +26,53 @@ export async function loader({ request }: LoaderFunctionArgs) {
 }
 
 export async function action({ request }: ActionFunctionArgs) {
+  assertSameOrigin(request);
+
   const formData = await request.formData();
-  const email = String(formData.get("email") || "").trim();
+  const email = String(formData.get("email") || "").trim().toLowerCase();
   const password = String(formData.get("password") || "");
+  const { ip, userAgent } = getRequestMeta(request);
 
   if (!email || !password) {
     return { error: "Email and password are required." };
   }
 
+  const throttleKey = `${email}|${ip ?? "unknown"}`;
+  if (isLoginThrottled(throttleKey)) {
+    return {
+      error: "Too many failed sign-in attempts. Please wait a few minutes and try again.",
+    };
+  }
+
   const user = await authenticateOwner(email, password);
   if (!user) {
+    recordFailedLogin(throttleKey);
+    await recordAudit({
+      actorType: "SYSTEM",
+      actorId: email,
+      actorName: email,
+      action: "owner.login_failed",
+      entityType: AUDIT_ENTITY.OWNER_USER,
+      entityId: email,
+      ipAddress: ip,
+      userAgent,
+    });
     return { error: "Invalid email or password." };
   }
 
+  clearLoginAttempts(throttleKey);
   const token = await createOwnerSession(user.id);
+
+  await recordAudit({
+    actorType: "OWNER_USER",
+    actorId: user.id,
+    actorName: user.name,
+    action: "owner.login",
+    entityType: AUDIT_ENTITY.OWNER_USER,
+    entityId: user.id,
+    ipAddress: ip,
+    userAgent,
+  });
 
   return redirect("/admin", {
     headers: {

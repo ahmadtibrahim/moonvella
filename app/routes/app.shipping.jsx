@@ -1,13 +1,33 @@
-const canadianShippingZones = [
-  { name: "Ontario / GTA", province: "Ontario", supplierShippingCost: 9.99, transit: "1-3 days", freeShippingThreshold: 99, customerDisplay: "Show calculated rate", status: "Active" },
-  { name: "Ontario / Rest", province: "Ontario", supplierShippingCost: 14.99, transit: "2-4 days", freeShippingThreshold: 99, customerDisplay: "Show calculated rate", status: "Active" },
-  { name: "Quebec", province: "Quebec", supplierShippingCost: 12.99, transit: "2-4 days", freeShippingThreshold: 99, customerDisplay: "Show calculated rate", status: "Active" },
-  { name: "Western Canada", province: "BC, AB, SK, MB", supplierShippingCost: 16.99, transit: "3-5 days", freeShippingThreshold: 149, customerDisplay: "Show calculated rate", status: "Active" },
-  { name: "Atlantic Canada", province: "NB, NS, PE, NL", supplierShippingCost: 18.99, transit: "4-7 days", freeShippingThreshold: 149, customerDisplay: "Show calculated rate", status: "Active" },
-  { name: "Northern / Remote", province: "YT, NT, NU", supplierShippingCost: 24.99, transit: "5-10 days", freeShippingThreshold: 199, customerDisplay: "Custom quote", status: "Active" },
-];
+import { useLoaderData } from "react-router";
+import { prisma } from "../db.server";
+
+export const loader = async () => {
+  const zones = await prisma.shippingZone.findMany({
+    where: { isActive: true },
+    orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
+  });
+
+  return {
+    zones: zones.map((zone) => ({
+      id: zone.id,
+      name: zone.name,
+      province: zone.province,
+      supplierShippingCost: zone.supplierShippingCost,
+      transit: zone.transit,
+      freeShippingThreshold: zone.freeShippingThreshold,
+      customerDisplay: zone.customerDisplay,
+      status: zone.status,
+    })),
+  };
+};
+
+function money(cents) {
+  return `$${(Number(cents || 0) / 100).toFixed(2)}`;
+}
 
 export default function ShippingPage() {
+  const { zones } = useLoaderData();
+  const previewZones = zones.slice(0, 3);
 
   return (
     <s-page heading="Shipping">
@@ -15,58 +35,72 @@ export default function ShippingPage() {
         <div className="mv-page-header">
           <h2 className="mv-page-title">Shipping</h2>
           <p className="mv-page-subtitle">
-            Configure shipping rates, zones, and rules for MoonVella products in your store.
+            Shipping rates, zones, and rules for MoonVella products in your store.
           </p>
         </div>
 
         <div className="mv-section-card">
           <h3 className="mv-section-title">Shipping zones (Canada only)</h3>
-          <p className="mv-branding-message" style={{ marginBottom: '1rem', fontSize: '0.875rem' }}>
-            Shipping zones are available for preview. Editing unlocks after approval.
+          <p className="mv-branding-message" style={{ marginBottom: "1rem", fontSize: "0.875rem" }}>
+            Zones are managed by MoonVella and shown here for your store preview.
           </p>
-          <div style={{ opacity: 0.85 }}>
-            <table className="mv-table">
-              <thead>
-                <tr>
-                  <th>Zone / Province</th>
-                  <th>Supplier Shipping Cost (CAD)</th>
-                  <th>Transit Time</th>
-                  <th>Free Shipping Threshold (CAD)</th>
-                  <th>Customer Display</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {canadianShippingZones.map((zone) => (
-                  <tr key={zone.name}>
-                    <td>{zone.name}</td>
-                    <td>${zone.supplierShippingCost.toFixed(2)}</td>
-                    <td>{zone.transit}</td>
-                    <td>${zone.freeShippingThreshold}</td>
-                    <td>{zone.customerDisplay}</td>
-                    <td><span className="mv-badge mv-badge-instock">{zone.status}</span></td>
+
+          {zones.length === 0 ? (
+            <div style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.875rem" }}>
+              No shipping zones are configured yet. MoonVella will publish the Canadian zones before orders ship.
+            </div>
+          ) : (
+            <div className="mv-table-wrapper">
+              <table className="mv-table">
+                <thead>
+                  <tr>
+                    <th>Zone / Province</th>
+                    <th>Supplier Shipping Cost (CAD)</th>
+                    <th>Transit Time</th>
+                    <th>Free Shipping Threshold (CAD)</th>
+                    <th>Customer Display</th>
+                    <th>Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {zones.map((zone) => (
+                    <tr key={zone.id}>
+                      <td>
+                        {zone.name}
+                        <div style={{ fontSize: "0.75rem", color: "#94a3b8" }}>{zone.province}</div>
+                      </td>
+                      <td>{money(zone.supplierShippingCost)}</td>
+                      <td>{zone.transit}</td>
+                      <td>{zone.freeShippingThreshold > 0 ? money(zone.freeShippingThreshold) : "—"}</td>
+                      <td>{zone.customerDisplay}</td>
+                      <td>
+                        <span className={`mv-badge ${zone.status === "Active" ? "mv-badge-instock" : "mv-badge-pending"}`}>
+                          {zone.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         <div className="mv-dashboard-main">
           <div className="mv-dashboard-content">
             <div className="mv-section-card">
               <h3 className="mv-section-title">Display options</h3>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
                 <label className="mv-settings-checkbox">
-                  <input type="checkbox" checked disabled />
+                  <input type="checkbox" checked disabled readOnly />
                   <span>Show calculated shipping rate</span>
                 </label>
                 <label className="mv-settings-checkbox">
-                  <input type="checkbox" checked disabled />
-                  <span>Include shipping in product price</span>
+                  <input type="checkbox" disabled readOnly />
+                  <span>Include shipping in product price (not configurable)</span>
                 </label>
                 <label className="mv-settings-checkbox">
-                  <input type="checkbox" checked disabled />
+                  <input type="checkbox" checked disabled readOnly />
                   <span>Offer free shipping above threshold</span>
                 </label>
               </div>
@@ -74,20 +108,32 @@ export default function ShippingPage() {
 
             <div className="mv-section-card">
               <h3 className="mv-section-title">Customer checkout preview</h3>
-              <div className="mv-checkout-preview">
-                <div className="mv-checkout-row">
-                  <span className="mv-checkout-label">Standard Shipping (1–3 business days)</span>
-                  <span className="mv-checkout-value">$9.99</span>
+              {previewZones.length === 0 ? (
+                <p className="mv-branding-message" style={{ fontSize: "0.85rem" }}>
+                  A checkout preview appears once shipping zones are configured.
+                </p>
+              ) : (
+                <div className="mv-checkout-preview">
+                  {previewZones.map((zone) => (
+                    <div className="mv-checkout-row" key={zone.id}>
+                      <span className="mv-checkout-label">
+                        {zone.name} ({zone.transit})
+                      </span>
+                      <span className="mv-checkout-value">{money(zone.supplierShippingCost)}</span>
+                    </div>
+                  ))}
+                  {previewZones
+                    .filter((zone) => zone.freeShippingThreshold > 0)
+                    .map((zone) => (
+                      <div className="mv-checkout-row" key={`${zone.id}-free`}>
+                        <span className="mv-checkout-label">
+                          Free shipping ({zone.name}, orders over {money(zone.freeShippingThreshold)})
+                        </span>
+                        <span className="mv-checkout-value mv-free">Free</span>
+                      </div>
+                    ))}
                 </div>
-                <div className="mv-checkout-row">
-                  <span className="mv-checkout-label">Express Shipping (2–4 business days)</span>
-                  <span className="mv-checkout-value">$24.99</span>
-                </div>
-                <div className="mv-checkout-row">
-                  <span className="mv-checkout-label">Free Shipping (orders over $99)</span>
-                  <span className="mv-checkout-value mv-free">Free</span>
-                </div>
-              </div>
+              )}
             </div>
           </div>
 
