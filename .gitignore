@@ -16,6 +16,9 @@ database.sqlite
 .env
 .env.*
 
+# Local dev server log
+dev_server.log
+
 
 
 

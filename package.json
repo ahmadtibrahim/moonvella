@@ -17,6 +17,7 @@
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
+    "create-owner": "node scripts/create-owner.mjs",
     "typecheck": "react-router typegen && tsc --noEmit"
   },
   "type": "module",

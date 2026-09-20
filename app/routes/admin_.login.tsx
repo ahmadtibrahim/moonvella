@@ -1,0 +1,106 @@
+import "../styles/admin.css";
+import {
+  Form,
+  redirect,
+  useActionData,
+  useNavigation,
+  type ActionFunctionArgs,
+  type LoaderFunctionArgs,
+} from "react-router";
+import { getOwnerUser, buildSessionCookie } from "~/utils/ownerAuth.server";
+import { authenticateOwner, createOwnerSession } from "~/services/ownerAuth.server";
+
+export async function loader({ request }: LoaderFunctionArgs) {
+  const user = await getOwnerUser(request);
+  if (user) {
+    throw redirect("/admin");
+  }
+  return null;
+}
+
+export async function action({ request }: ActionFunctionArgs) {
+  const formData = await request.formData();
+  const email = String(formData.get("email") || "").trim();
+  const password = String(formData.get("password") || "");
+
+  if (!email || !password) {
+    return { error: "Email and password are required." };
+  }
+
+  const user = await authenticateOwner(email, password);
+  if (!user) {
+    return { error: "Invalid email or password." };
+  }
+
+  const token = await createOwnerSession(user.id);
+
+  return redirect("/admin", {
+    headers: {
+      "Set-Cookie": buildSessionCookie(token),
+    },
+  });
+}
+
+export default function AdminLogin() {
+  const actionData = useActionData<typeof action>();
+  const navigation = useNavigation();
+  const isSubmitting = navigation.state === "submitting";
+
+  return (
+    <div className="admin-login-page">
+      <div className="admin-login-card">
+        <div className="admin-login-header">
+          <div className="admin-login-logo">MoonVella</div>
+          <h1 className="admin-login-title">Admin Login</h1>
+          <p className="admin-login-subtitle">MoonVella Administration Panel</p>
+        </div>
+
+        <Form method="post" noValidate>
+          {actionData?.error ? (
+            <div className="admin-login-error">{actionData.error}</div>
+          ) : null}
+
+          <div className="admin-login-group">
+            <label className="admin-login-label" htmlFor="email">
+              Email
+            </label>
+            <input
+              className="admin-login-input"
+              type="email"
+              id="email"
+              name="email"
+              autoComplete="email"
+              required
+            />
+          </div>
+
+          <div className="admin-login-group">
+            <label className="admin-login-label" htmlFor="password">
+              Password
+            </label>
+            <input
+              className="admin-login-input"
+              type="password"
+              id="password"
+              name="password"
+              autoComplete="current-password"
+              required
+            />
+          </div>
+
+          <button
+            className="admin-login-button"
+            type="submit"
+            disabled={isSubmitting}
+          >
+            {isSubmitting ? "Signing in..." : "Sign In"}
+          </button>
+        </Form>
+
+        <p className="admin-login-footer">
+          MoonVella Administration Panel &bull; Private Access Only
+        </p>
+      </div>
+    </div>
+  );
+}
