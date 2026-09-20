@@ -1,4 +1,32 @@
-import { applicationStatus } from "../data/moonvellaState";
+import { useLoaderData } from "react-router";
+
+export const loader = async ({ request }) => {
+  const url = new URL(request.url);
+
+  if (!url.searchParams.get("shop")) {
+    return { status: null, submittedAt: null };
+  }
+
+  const { authenticate } = await import("../shopify.server");
+  const { session } = await authenticate.admin(request);
+  const { prisma } = await import("../db.server");
+
+  const application = await prisma.merchantApplication.findUnique({
+    where: { shopDomain: session.shop },
+    select: { status: true, submittedAt: true },
+  });
+
+  if (!application) {
+    return { status: null, submittedAt: null };
+  }
+
+  return {
+    status: application.status.toLowerCase(),
+    submittedAt: application.submittedAt
+      ? application.submittedAt.toISOString()
+      : null,
+  };
+};
 
 const getStageConfig = (stage) => {
   switch (stage) {
@@ -27,7 +55,16 @@ const getStatusConfig = (status) => {
 };
 
 export default function StatusPage() {
+  const { status, submittedAt } = useLoaderData();
+  const applicationStatus = status || "pending";
   const isApproved = applicationStatus === "approved";
+  const submittedLabel = submittedAt
+    ? `Submitted on ${new Date(submittedAt).toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      })}`
+    : "Not yet submitted";
 
   const dynamicReviewStages = [
     { id: "connected", label: "Shopify store connected", status: "completed" },
@@ -52,7 +89,7 @@ export default function StatusPage() {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem', marginBottom: '1.5rem' }}>
             <div>
               <h3 className="mv-page-title" style={{ fontSize: '1.5rem', marginBottom: '0.25rem' }}>MoonVella Partner Application</h3>
-              <p className="mv-page-subtitle">Submitted on January 15, 2025</p>
+              <p className="mv-page-subtitle">{submittedLabel}</p>
             </div>
             <span className={`mv-badge ${getStageConfig(applicationStatus).badge}`} style={{ fontSize: '0.875rem', padding: '0.5rem 1rem' }}>
               {getStageConfig(applicationStatus).label}

@@ -24,10 +24,125 @@ const CANADIAN_MARKETS = [
   "Northern / Remote",
 ];
 
+function extractMarkets(formData) {
+  let raw = formData.getAll("markets");
+  if (raw.length === 0) {
+    raw = formData.getAll("markets[]");
+  }
+  if (raw.length === 1) {
+    const value = String(raw[0]).trim();
+    if (value.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(value);
+        if (Array.isArray(parsed)) {
+          return parsed.map(String);
+        }
+      } catch {
+        // fall through and treat as a plain value
+      }
+    }
+  }
+  return raw.map(String).filter(Boolean);
+}
+
+export async function action({ request }) {
+  const { authenticate } = await import("../shopify.server");
+  const { admin, session } = await authenticate.admin(request);
+  const shop = session.shop;
+
+  const formData = await request.formData();
+
+  const contactName = String(formData.get("contactName") || "").trim();
+  const email = String(formData.get("email") || "").trim();
+  const legalBusinessName = String(formData.get("legalBusinessName") || "").trim();
+  const sellerAddress = String(formData.get("sellerAddress") || "").trim();
+
+  if (!contactName || !email || !legalBusinessName || !sellerAddress) {
+    return { ok: false, error: "Please complete all required fields." };
+  }
+
+  let storeName = shop;
+  let storeUrl = "";
+  let country = "";
+  let currency = "";
+  let shopifyPlan = "";
+
+  try {
+    const response = await admin.graphql(`#graphql
+      query ShopProfile {
+        shop {
+          name
+          myshopifyDomain
+          primaryDomain { url }
+          currencyCode
+          billingAddress { countryCodeV2 }
+          plan { displayName }
+        }
+      }
+    `);
+    const json = await response.json();
+    const shopData = json?.data?.shop;
+    if (shopData) {
+      storeName = shopData.name || storeName;
+      storeUrl = shopData.primaryDomain?.url || "";
+      country = shopData.billingAddress?.countryCodeV2 || "";
+      currency = shopData.currencyCode || "";
+      shopifyPlan = shopData.plan?.displayName || "";
+    }
+  } catch {
+    // Store profile is best-effort; fall back to the session shop domain.
+  }
+
+  const markets = extractMarkets(formData);
+  const productCategory = String(formData.get("productCategory") || "Other");
+  const phone = String(formData.get("phone") || "").trim() || null;
+  const urgentPhone = String(formData.get("urgentPhone") || "").trim() || null;
+  const gstHstNumber = String(formData.get("gstHstNumber") || "").trim() || null;
+
+  const { prisma } = await import("../db.server");
+
+  const data = {
+    storeName,
+    storeUrl,
+    country,
+    currency,
+    shopifyPlan,
+    contactName,
+    email,
+    phone,
+    urgentPhone,
+    legalBusinessName,
+    sellerAddress,
+    gstHstNumber,
+    productCategory,
+    markets: JSON.stringify(markets),
+    status: "PENDING",
+    submittedAt: new Date(),
+  };
+
+  await prisma.merchantApplication.upsert({
+    where: { shopDomain: shop },
+    create: { shopDomain: shop, ...data },
+    update: data,
+  });
+
+  return { ok: true };
+}
+
 export default function ApplicationPage() {
   const fetcher = useFetcher();
   const shopify = useAppBridge();
-  const isSubmitting = fetcher.state === "submitting";
+  const isSubmitting = fetcher.state !== "idle";
+  const submitted = fetcher.data?.ok === true;
+  const serverError = fetcher.data?.error;
+
+  React.useEffect(() => {
+    if (submitted) {
+      shopify.toast.show(
+        "Application submitted. MoonVella will review your store before wholesale access is unlocked.",
+      );
+    }
+  }, [submitted, shopify]);
 
   const [formData, setFormData] = React.useState({
     contactName: merchantContactProfile.contactName,
@@ -42,7 +157,6 @@ export default function ApplicationPage() {
   });
 
   const [errors, setErrors] = React.useState({});
-  const [submitted, setSubmitted] = React.useState(false);
 
   const handleChange = (field, value) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
@@ -83,9 +197,18 @@ export default function ApplicationPage() {
     e.preventDefault();
     if (!validate()) return;
 
-    fetcher.submit(formData, { method: "POST" });
-    setSubmitted(true);
-    shopify.toast.show("Application submitted. MoonVella will review your store before wholesale access is unlocked.");
+    const payload = new FormData();
+    payload.set("contactName", formData.contactName || "");
+    payload.set("phone", formData.phone || "");
+    payload.set("urgentPhone", formData.urgentPhone || "");
+    payload.set("email", formData.email || "");
+    payload.set("legalBusinessName", formData.legalBusinessName || "");
+    payload.set("sellerAddress", formData.sellerAddress || "");
+    payload.set("gstHstNumber", formData.gstHstNumber || "");
+    payload.set("productCategory", formData.productCategory || "Other");
+    (formData.markets || []).forEach((market) => payload.append("markets", market));
+
+    fetcher.submit(payload, { method: "POST" });
   };
 
   if (submitted) {
@@ -344,6 +467,11 @@ export default function ApplicationPage() {
             </div>
           </div>
 
+          {serverError && (
+            <p style={{ color: 'var(--danger-red)', fontSize: '0.875rem', marginTop: '0.5rem', textAlign: 'right' }}>
+              {serverError}
+            </p>
+          )}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '1rem', marginTop: '1.5rem' }}>
             <button type="button" className="mv-btn mv-btn-secondary" onClick={() => window.location.href = "/app/status"}>
               Save & Continue Later
