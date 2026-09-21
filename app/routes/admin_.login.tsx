@@ -4,6 +4,7 @@ import {
   redirect,
   useActionData,
   useNavigation,
+  useSearchParams,
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
@@ -38,7 +39,7 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   const throttleKey = `${email}|${ip ?? "unknown"}`;
-  if (isLoginThrottled(throttleKey)) {
+  if (await isLoginThrottled(throttleKey)) {
     return {
       error: "Too many failed sign-in attempts. Please wait a few minutes and try again.",
     };
@@ -46,7 +47,7 @@ export async function action({ request }: ActionFunctionArgs) {
 
   const user = await authenticateOwner(email, password);
   if (!user) {
-    recordFailedLogin(throttleKey);
+    await recordFailedLogin(throttleKey);
     await recordAudit({
       actorType: "SYSTEM",
       actorId: email,
@@ -60,7 +61,7 @@ export async function action({ request }: ActionFunctionArgs) {
     return { error: "Invalid email or password." };
   }
 
-  clearLoginAttempts(throttleKey);
+  await clearLoginAttempts(throttleKey);
   const token = await createOwnerSession(user.id);
 
   await recordAudit({
@@ -84,7 +85,12 @@ export async function action({ request }: ActionFunctionArgs) {
 export default function AdminLogin() {
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
+  const [searchParams] = useSearchParams();
   const isSubmitting = navigation.state === "submitting";
+  const notice =
+    searchParams.get("notice") === "password-changed"
+      ? "Password changed. All sessions were signed out — please sign in again."
+      : null;
 
   return (
     <div className="admin-login-page">
@@ -98,6 +104,24 @@ export default function AdminLogin() {
         <Form method="post" noValidate>
           {actionData?.error ? (
             <div className="admin-login-error">{actionData.error}</div>
+          ) : null}
+
+          {!actionData?.error && notice ? (
+            <div
+              className="admin-login-notice"
+              role="status"
+              style={{
+                background: "#eef7f0",
+                border: "1px solid #bfe3c8",
+                color: "#1c5c31",
+                borderRadius: 8,
+                padding: "0.75rem 0.9rem",
+                marginBottom: "1rem",
+                fontSize: "0.875rem",
+              }}
+            >
+              {notice}
+            </div>
           ) : null}
 
           <div className="admin-login-group">

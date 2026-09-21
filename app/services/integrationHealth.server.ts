@@ -8,7 +8,9 @@ export type IntegrationKey =
   | "product_import"
   | "stripe"
   | "eshipper"
+  | "vopay"
   | "plaid"
+  | "odoo"
   | "inventory_sync";
 
 const DEFAULTS: Record<IntegrationKey, { status: string; message: string }> = {
@@ -46,6 +48,16 @@ const DEFAULTS: Record<IntegrationKey, { status: string; message: string }> = {
     status: "NOT_CONFIGURED",
     message:
       "Plaid not configured. Set PLAID_CLIENT_ID/PLAID_SECRET with PLAID_ENV=sandbox for the seller bank-linking flow. Bank linking is separate from payment collection and never marks an invoice paid.",
+  },
+  vopay: {
+    status: "NOT_CONFIGURED",
+    message:
+      "VoPay not configured. Set VOPAY_ACCOUNT_ID/VOPAY_API_KEY/VOPAY_API_SECRET plus a VOPAY_BASE_URL that is explicitly a sandbox (VOPAY_ENV=production for live debits) to collect by Canadian PAD. Simulated mode records mandates and debits locally and moves no money meanwhile.",
+  },
+  odoo: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Odoo is not configured. Set ODOO_URL/ODOO_DATABASE/ODOO_USERNAME/ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
   },
   inventory_sync: {
     status: "NOT_CONFIGURED",
@@ -153,6 +165,16 @@ export async function checkIntegration(
             error: null,
           };
     }
+    case "vopay": {
+      const { vopayMode } = await import("./vopay.server");
+      return vopayMode() === "real"
+        ? { status: "HEALTHY", detail: "VoPay credentials and a confirmed base URL are set.", error: null }
+        : {
+            status: "NOT_CONFIGURED",
+            detail: "VoPay credentials not set. Simulated PAD mandates and debits are active; no money moves.",
+            error: null,
+          };
+    }
     case "plaid": {
       const { plaidConfigured } = await import("./plaid.server");
       return plaidConfigured()
@@ -162,6 +184,15 @@ export async function checkIntegration(
             detail: "Plaid credentials not set. Simulated bank linking is active.",
             error: null,
           };
+    }
+    case "odoo": {
+      const { describeOdooIntegration } = await import("./odoo.server");
+      const described = describeOdooIntegration();
+      return {
+        status: described.status === "OK" ? "HEALTHY" : described.status,
+        detail: described.message,
+        error: null,
+      };
     }
     case "inventory_sync": {
       const count = await prisma.product.count({ where: { isActive: true } });

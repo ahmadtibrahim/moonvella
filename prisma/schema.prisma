@@ -5,9 +5,14 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// Production runs on PostgreSQL. The SQLite datasource this replaced could not
+// be carried forward: its migrations are SQLite-flavoured SQL that PostgreSQL
+// rejects, so a fresh baseline was generated instead (see
+// prisma/migrations-sqlite-legacy/ for the retired history, kept for reference
+// only and never applied).
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {
@@ -799,4 +804,69 @@ model AnalyticsSnapshot {
 
   @@unique([shop, source])
   @@index([shop])
+}
+
+/// Durable failed-sign-in counter. Survives a container restart, unlike the
+/// in-memory map it replaces. Rows are pruned once they fall outside the window.
+model LoginAttempt {
+  id        String   @id @default(cuid())
+  key       String
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+}
+
+/// Idempotency ledger for externally-triggered work (Shopify webhooks, Odoo
+/// writes, payment debits, shipment creation). A row is claimed before the work
+/// is attempted, so a redelivered webhook or a retried request cannot create a
+/// second Odoo order, payment or label.
+/// Durable idempotency ledger.
+///
+/// Deliberately in the database rather than in process memory. The failure this
+/// exists to prevent — a retry turning into a second charge against a payer's
+/// bank account — most often follows a crash, a deploy, or a timeout. An
+/// in-memory guard is empty in precisely that moment, so it would protect only
+/// the cases that were already safe.
+model IdempotencyKey {
+  id          String    @id @default(cuid())
+  scope       String
+  key         String
+  /// SHA-256 of the request parameters. Same key + different parameters is a
+  /// conflict, not a replay, and must be reported rather than silently reused.
+  fingerprint String
+  status      String    @default("IN_PROGRESS")
+  /// The recorded outcome, replayed to the caller on a repeat call.
+  result      Json?
+  error       String?
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@unique([scope, key])
+  @@index([scope, status])
+  @@index([createdAt])
+}
+
+/// A Canadian Pre-Authorized Debit mandate.
+///
+/// Persisted so that the mandate state machine survives a restart. `CANCELLED`
+/// is terminal: a payer who revoked authorization must not be debitable because
+/// the process that knew about the revocation was recycled.
+model PadMandate {
+  id                String   @id @default(cuid())
+  sellerId          String
+  state             String
+  reference         String?
+  payerName         String
+  /// Last four digits only. Full account and transit numbers are never stored.
+  accountLast4      String?
+  institutionNumber String?
+  transitNumber     String?
+  accountType       String
+  /// True when produced without contacting the provider. Never debitable.
+  simulated         Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([sellerId])
+  @@index([state])
 }

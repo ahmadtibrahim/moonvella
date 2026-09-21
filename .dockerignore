@@ -1,3 +1,30 @@
-.cache
-build
+# Never ship secrets or local state into the image.
+.env
+.env.*
+!.env.example
+
+# Version control
+.git
+.gitignore
+
+# Build + dependency output (regenerated inside the builder stage)
 node_modules
+build
+.cache
+.react-router
+.shopify
+
+# Runtime state that must never be baked into an image
+uploads
+backups
+*.log
+dev_server.log
+prisma/dev.sqlite
+prisma/dev.sqlite-journal
+*.dump
+
+# Editor / agent scratch
+.cursor
+.gemini
+.mcp.json
+.vscode

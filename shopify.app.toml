@@ -1,7 +1,12 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "a2e6bdd412510b64ce32d28f2ca21e7e"
-application_url = "https://example.com"
+# Production URLs. The embedded merchant app is served from app.moonvella.com;
+# the owner panel lives on admin.moonvella.com and is deliberately NOT a
+# Shopify surface, so it appears in no Shopify configuration.
+# This file is prepared but NOT deployed — `shopify app deploy` is a go-live
+# step gated behind the Phase 15 checkpoint.
+application_url = "https://app.moonvella.com"
 embedded = true
 name = "MoonVella"
 
@@ -66,8 +71,12 @@ api_version = "2026-10"
 #   topics = [ "orders/create", "orders/updated", "orders/cancelled" ]
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://app.moonvella.com/api/auth" ]
 
 [build]
 include_config_on_deploy = true
-automatically_update_urls_on_dev = true
+# Set false deliberately. When true, running `shopify app dev` locally rewrites
+# the Partner Dashboard URLs to a temporary tunnel address — which would take
+# production down silently the next time anyone ran `npm run dev`. Production
+# URLs must only ever change through a reviewed deploy.
+automatically_update_urls_on_dev = false

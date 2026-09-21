@@ -1,7 +1,13 @@
-import { Form, Link, useActionData, useLoaderData, useNavigation } from "react-router";
+import { Form, Link, redirect, useActionData, useLoaderData, useNavigation } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import {
+  requireOwnerRole,
+  assertSameOrigin,
+  getRequestMeta,
+  buildSessionCookie,
+} from "~/utils/ownerAuth.server";
 import { hashPassword, verifyPassword } from "~/utils/auth.server";
+import { deleteAllOwnerSessions } from "~/services/ownerAuth.server";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 import {
@@ -75,6 +81,11 @@ export async function action({ request }: ActionFunctionArgs) {
     data: { passwordHash: await hashPassword(newPassword) },
   });
 
+  // A password change invalidates every existing session, including the one
+  // making this request. If a session was stolen, the new password locks the
+  // holder out instead of leaving them signed in.
+  await deleteAllOwnerSessions(user.id);
+
   await recordAudit({
     actorType: "OWNER_USER",
     actorId: user.id,
@@ -82,11 +93,14 @@ export async function action({ request }: ActionFunctionArgs) {
     action: "owner.password_changed",
     entityType: AUDIT_ENTITY.OWNER_USER,
     entityId: user.id,
+    afterData: { sessionsInvalidated: true },
     ipAddress: ip,
     userAgent,
   });
 
-  return { success: "Password updated successfully." };
+  throw redirect("/admin/login?notice=password-changed", {
+    headers: { "Set-Cookie": buildSessionCookie("", 0) },
+  });
 }
 
 const card: React.CSSProperties = {

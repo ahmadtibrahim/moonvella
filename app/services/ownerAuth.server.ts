@@ -1,29 +1,35 @@
 import { prisma } from "~/db.server";
 import { generateSessionToken, hashPassword, verifyPassword } from "~/utils/auth.server";
 
-// Login throttling. In-memory per process: adequate for the single-instance dev
-// server, and deliberately conservative so a restart does not lock anyone out
-// permanently. A durable store should replace this before multi-instance deploy.
+// Login throttling, backed by the database so a container restart cannot be
+// used to reset the counter. Nginx applies a second, coarser limit at the edge
+// (see the app/admin vhosts), so a flood is absorbed before it reaches here.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 8;
-const loginAttempts = new Map<string, number[]>();
 
-export function isLoginThrottled(key: string): boolean {
-  const now = Date.now();
-  const recent = (loginAttempts.get(key) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
-  loginAttempts.set(key, recent);
-  return recent.length >= LOGIN_MAX_ATTEMPTS;
+export async function isLoginThrottled(key: string): Promise<boolean> {
+  const since = new Date(Date.now() - LOGIN_WINDOW_MS);
+  const count = await prisma.loginAttempt.count({
+    where: { key, createdAt: { gte: since } },
+  });
+  return count >= LOGIN_MAX_ATTEMPTS;
 }
 
-export function recordFailedLogin(key: string): void {
-  const now = Date.now();
-  const recent = (loginAttempts.get(key) ?? []).filter((t) => now - t < LOGIN_WINDOW_MS);
-  recent.push(now);
-  loginAttempts.set(key, recent);
+export async function recordFailedLogin(key: string): Promise<void> {
+  await prisma.loginAttempt.create({ data: { key } });
 }
 
-export function clearLoginAttempts(key: string): void {
-  loginAttempts.delete(key);
+export async function clearLoginAttempts(key: string): Promise<void> {
+  await prisma.loginAttempt.deleteMany({ where: { key } });
+}
+
+/** Drop attempts that have fallen out of the window. Safe to call from cron. */
+export async function pruneLoginAttempts(): Promise<number> {
+  const cutoff = new Date(Date.now() - LOGIN_WINDOW_MS);
+  const { count } = await prisma.loginAttempt.deleteMany({
+    where: { createdAt: { lt: cutoff } },
+  });
+  return count;
 }
 
 export async function createOwnerSession(userId: string, expiresInDays = 30) {
