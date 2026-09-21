@@ -83,14 +83,37 @@ function surfaceForHost(host) {
  * onto the owner host by accident.
  */
 function surfaceForPath(pathname) {
-  if (pathname === "/admin" || pathname.startsWith("/admin/")) return "admin";
+  // `/admin.data` is React Router's single-fetch request for the `/admin` route
+  // itself — the data twin of the bare path, which carries no trailing slash.
+  // It is owner-panel traffic and has to be recognised as such, or the admin
+  // host answers its own client-side navigation with a 404. Every other data
+  // request keeps its slash (`/admin/users.data`, `/admin/login.data`), so the
+  // prefix test already covers those.
+  if (
+    pathname === "/admin" ||
+    pathname === "/admin.data" ||
+    pathname.startsWith("/admin/")
+  ) {
+    return "admin";
+  }
   return "public";
 }
 
-/** Assets and the probe must work on both hosts for either surface to render. */
+/**
+ * Assets and the probe must work on both hosts for either surface to render.
+ *
+ * `/__manifest` is React Router's lazy route discovery endpoint: the client asks
+ * for the manifest of the paths it is about to navigate to, on whichever host it
+ * is running on. The answer is route metadata from this one build — the same
+ * build whose JS bundle `/assets/` already serves on both hosts — so it carries
+ * nothing surface-specific. It is listed here rather than treated as a merchant
+ * path because without it the owner panel cannot navigate to any route that is
+ * not already in its initial bundle.
+ */
 function isHostAgnostic(pathname) {
   return (
     pathname === "/health" ||
+    pathname === "/__manifest" ||
     pathname === "/favicon.ico" ||
     pathname === "/robots.txt" ||
     pathname.startsWith("/assets/") ||
