@@ -184,6 +184,17 @@ const CHECKS = [
   // the longest, and it publishes a product of its own rather than depending on
   // anything an earlier suite leaves behind.
   { name: "product-system", kind: "ts", file: "scripts/verify-product-system.ts" },
+  // The editor's forms, over HTTP, against a running server. It proves the two
+  // interface promises that fail silently rather than loudly — that a category
+  // outside the offered list is honoured, and that inches typed into a carton
+  // are stored as centimetres — so it needs a session and is skipped without
+  // one. Bundled rather than run raw, because it imports a TypeScript module.
+  {
+    name: "editor-ui",
+    kind: "ts",
+    file: "scripts/verify-editor-ui.ts",
+    requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
+  },
 ];
 
 async function runAll() {
