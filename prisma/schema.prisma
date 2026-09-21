@@ -239,6 +239,7 @@ model Seller {
   paymentMethods        SellerPaymentMethod[]
   bankAccounts          SellerBankAccount[]
   settings              SellerSettings?
+  brandKit              SellerBrandKit?
 
   @@index([status])
   @@index([shopDomain])
@@ -274,18 +275,29 @@ model SellerSettings {
   updatedAt             DateTime @updatedAt
 }
 
+/// A product family. It is a description, not a thing that exists in a
+/// warehouse, and it is never the subject of an order line, an inventory count
+/// or a storefront listing.
+///
+/// The flat model this replaced carried `sku`, `wholesalePrice`,
+/// `suggestedRetailPrice` and `costPrice` on the product itself, which meant a
+/// family with three sizes could express only one price and one stock level.
+/// Those columns are gone: `sku` became the required and unique `productCode`
+/// below, and the three money columns moved down to ProductVariant, where the
+/// sellable unit lives. The migration copied every existing value into a
+/// generated Default variant before dropping them, so nothing was lost.
+///
+/// `images` (a JSON array of URLs) and the ProductImage table were retired the
+/// same way: both were a flat, per-product media list that could not express a
+/// variant-specific image or a file shared between variants. Their URLs were
+/// converted into MediaAsset rows with a shared assignment. See MediaAsset for
+/// the model that replaced them.
 model Product {
   id                    String            @id @default(cuid())
   name                  String
   description           String?
   category              String
-  sku                   String            @unique
-  wholesalePrice        Int
-  suggestedRetailPrice  Int
-  costPrice             Int?
   currency              String            @default("CAD")
-  images                String            @default("[]")
-  productImages         ProductImage[]
   categoryId            String?
   categoryRef           Category?         @relation(fields: [categoryId], references: [id])
   variants              ProductVariant[]
@@ -297,22 +309,48 @@ model Product {
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
+  /// The family code. Required, unique, normalized to upper case with internal
+  /// whitespace collapsed, and validated against a documented character set by
+  /// app/utils/productCode.ts.
+  ///
+  /// It is deliberately NOT a variant SKU and must never be exported as one:
+  /// it identifies the family, while each sellable unit has its own SKU on
+  /// ProductVariant. A future Shopify import maps it to a product metafield.
+  productCode      String  @unique
+  /// Bulleted feature list, one per line. Stored as written; the interface
+  /// renders it as a list.
+  features         String?
+  /// Materials and composition.
+  materials        String?
+  /// General care instructions for the family. A variant may add its own in a
+  /// care-guide document.
+  careInstructions String?
+
+  /// The editorial state. The merchant-facing flags above are kept consistent
+  /// with this by the publication gate, which is the only thing that sets
+  /// either to published.
+  status ProductStatus @default(DRAFT)
+
+  /// Who created and last changed the record. Nullable because rows migrated
+  /// from the flat model have no known author, and inventing one would be worse
+  /// than admitting the gap.
+  createdById String?
+  updatedById String?
+
+  mediaAssets      MediaAsset[]
+  externalMappings ExternalProductMapping[]
+
   @@index([category])
-  @@index([sku])
   @@index([isActive])
+  @@index([status])
 }
 
-model ProductImage {
-  id        String   @id @default(cuid())
-  productId String
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  url       String
-  alt       String?
-  sortOrder Int      @default(0)
-  createdAt DateTime @default(now())
-
-  @@index([productId])
-}
+// ProductImage was removed here. It was a flat list of {url, alt} rows hanging
+// off the product, with no way to say "this image is for the King variant" or
+// "this image is shared by all of them", and no notion of processing state,
+// approval or seller visibility. Its rows were converted to MediaAsset rows
+// with a shared assignment by the product/variant/media migration. The
+// replacement is MediaAsset + MediaAssetAssignment.
 
 model Category {
   id          String    @id @default(cuid())
@@ -340,21 +378,67 @@ model ProductVariant {
   inventory         Int       @default(0)
   reserved          Int       @default(0)
   lowStockThreshold Int       @default(5)
-  optionName        String?
-  optionValue       String?
   variantImageUrl   String?
   shipsSeparately   Boolean   @default(false)
   packingInstructions String?
   shippingDescription String?
   declaredValueDefault Int?
-  weight            Int?
-  dimensions        String?
+  /// Free-text dimensions from the flat model ("60x40x15"), retained verbatim
+  /// rather than parsed. The migration moved `weight` into the canonical
+  /// productWeightKg below, but a free-text string cannot be split into three
+  /// trustworthy numbers — guessing "60x40x15" is cm and not inches would be
+  /// inventing data. Kept so the value survives; the typed columns are what
+  /// anything new reads.
+  legacyDimensions  String?
   isActive          Boolean   @default(true)
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
   orderItems        OrderItem[] @relation("OrderItemVariant")
   sellerProductVariants SellerProductVariant[]
   packages          VariantPackage[]
+
+  /// Optional barcode/UPC. Unique when present — a barcode identifies exactly
+  /// one sellable unit — but nullable, because most variants will not have one
+  /// and PostgreSQL permits many NULLs in a unique index.
+  barcode String? @unique
+
+  /// Display order within the product. Also the order the seller's storefront
+  /// sees, so it is meaningful rather than cosmetic.
+  sortOrder Int @default(0)
+
+  /// The variant a single-variant product is sold as. Every product has exactly
+  /// one of these after migration; see the Default-variant rule in the
+  /// product/variant migration. It is a hint for the interface, not a
+  /// constraint on how many variants may exist.
+  isDefault Boolean @default(false)
+
+  currency String @default("CAD")
+
+  /// When false the variant is not stock-tracked and `inventory` is advisory.
+  trackInventory Boolean @default(true)
+  /// Placeholder for a future external inventory system. Never populated with
+  /// a credential.
+  externalInventoryRef String?
+
+  /// How many sellable units are in one package. Distinct from
+  /// VariantPackage.unitsPerPackage, which describes a shipping carton.
+  unitsPerPackage Int @default(1)
+
+  // --- unpacked product measurements -------------------------------------
+  // Canonical units are centimetres and kilograms, stored as exact decimals.
+  // The interface may display inches and pounds, but conversion is a display
+  // concern: these columns are what every calculation, snapshot and export
+  // reads, so a converted value can never quietly become the stored one.
+  productLengthCm Decimal? @db.Decimal(10, 2)
+  productWidthCm  Decimal? @db.Decimal(10, 2)
+  productHeightCm Decimal? @db.Decimal(10, 2)
+  productWeightKg Decimal? @db.Decimal(10, 3)
+
+  variantOptions    VariantOption[]
+  mediaAssignments  MediaAssetAssignment[]
+  externalMappings  ExternalVariantMapping[]
+
+  @@index([productId, sortOrder])
 }
 
 model PackagingPreset {
@@ -529,6 +613,44 @@ model OrderItem {
   createdAt             DateTime      @default(now())
   refundItems           RefundItem[]
   shipmentItems         ShipmentItem[]
+
+  // --- variant snapshot ---------------------------------------------------
+  //
+  // Everything below is a copy taken when the order was placed, not a live
+  // read. An order must keep showing what was actually sold even after the
+  // product is renamed, repriced, re-measured or archived, so nothing here is
+  // ever recalculated from the current catalogue. All of it is nullable
+  // because orders placed before variants existed have no variant to snapshot,
+  // and a legacy row must stay readable rather than be back-filled with values
+  // that would look like they were observed at the time.
+  //
+  // `name`, `sku`, `price` and `wholesalePrice` above are the original snapshot
+  // columns and keep their meaning: product name, the SKU charged, the price
+  // charged and the wholesale price charged.
+  productCode     String?
+  variantName     String?
+  /// The ordered option pairs as they stood at purchase, JSON-encoded. A string
+  /// rather than a relation for the same reason as the rest: the variant's
+  /// options may be renamed or deleted afterwards.
+  selectedOptions String?
+  /// What the seller intended to charge their customer, when known. Distinct
+  /// from `price`, which is what MoonVella charged the seller.
+  sellerRetailPrice Int?
+  currency          String?
+
+  /// Measurements as snapshotted, canonical cm/kg, same reasoning as above.
+  productLengthCm Decimal? @db.Decimal(10, 2)
+  productWidthCm  Decimal? @db.Decimal(10, 2)
+  productHeightCm Decimal? @db.Decimal(10, 2)
+  productWeightKg Decimal? @db.Decimal(10, 3)
+
+  /// The shipping carton actually used, resolved from the variant's first
+  /// package at order time.
+  packageLengthCm  Decimal? @db.Decimal(10, 2)
+  packageWidthCm   Decimal? @db.Decimal(10, 2)
+  packageHeightCm  Decimal? @db.Decimal(10, 2)
+  packagedWeightKg Decimal? @db.Decimal(10, 3)
+  unitsPerPackage  Int?
 }
 
 model Refund {
@@ -979,4 +1101,285 @@ model PadMandate {
 
   @@index([sellerId])
   @@index([state])
+}
+
+/* ========================================================================== */
+/* Product / variant / media                                                  */
+/* ========================================================================== */
+
+/// Lifecycle of a product family, independent of whether sellers can see it.
+///
+/// `isActive`/`isPublished`/`isArchived` predate this and are retained for the
+/// merchant-facing queries that already read them; `status` is the single
+/// editorial state the admin interface drives. The publication gate is what
+/// keeps the two consistent — nothing sets PUBLISHED without passing it.
+enum ProductStatus {
+  DRAFT
+  PENDING_APPROVAL
+  PUBLISHED
+  ARCHIVED
+}
+
+/// What an asset is for. Drives which tab it appears under and which subtype
+/// values are legal for it.
+enum MediaCategory {
+  WHITE_BACKGROUND_IMAGE
+  LIFESTYLE_IMAGE
+  PRODUCT_VIDEO
+  DOCUMENT
+  MARKETING_CREATIVE
+  EDITABLE_TEMPLATE
+}
+
+/// The finer classification within a category.
+///
+/// One enum across every category rather than one per category: the upload and
+/// approval paths are shared, so a single column keeps the "is this asset
+/// publishable" question answerable without a join per type. Values are grouped
+/// below by the category they belong to, and the pairing is validated in
+/// app/services/media.server.ts.
+enum MediaSubtype {
+  // WHITE_BACKGROUND_IMAGE
+  WHITE_BACKGROUND
+  // LIFESTYLE_IMAGE
+  LIFESTYLE
+  // PRODUCT_VIDEO
+  PRODUCT_DEMO
+  LIFESTYLE_VIDEO
+  SOCIAL_CLIP_VERTICAL // 9:16
+  SOCIAL_CLIP_SQUARE // 1:1
+  // DOCUMENT
+  CARE_GUIDE
+  SPECIFICATION_SHEET
+  WARRANTY
+  CERTIFICATION
+  PACKAGING_INSTRUCTIONS
+  MARKETING_PDF
+  OTHER_DOCUMENT
+  // MARKETING_CREATIVE / EDITABLE_TEMPLATE
+  SQUARE_POST // 1080 x 1080
+  STORY_REEL // 1080 x 1920
+  BANNER // 1600 x 600
+  LANDSCAPE_AD
+  SOCIAL_VIDEO
+  EDITABLE_TEMPLATE
+}
+
+/// Where an upload is in its lifecycle. A seller never sees anything that is
+/// not READY, whatever its approval state.
+enum ProcessingStatus {
+  UPLOADING
+  PROCESSING
+  READY
+  FAILED
+}
+
+/// Editorial approval, separate from processing. DRAFT is the initial state and
+/// is not a synonym for "not yet processed" — a DRAFT asset may be perfectly
+/// READY and simply not yet reviewed.
+enum ApprovalStatus {
+  DRAFT
+  APPROVED
+  REJECTED
+}
+
+/// The kinds of PDF a product can carry.
+enum DocumentType {
+  CARE_GUIDE
+  SPECIFICATION_SHEET
+  WARRANTY
+  CERTIFICATION
+  PACKAGING_INSTRUCTIONS
+  MARKETING_PDF
+  OTHER
+}
+
+/// One uploaded file, and every fact about it that is independent of which
+/// variants it is shown for.
+///
+/// Documents and marketing creatives are rows in THIS table, not tables of
+/// their own, which is why the document-only and marketing-only columns below
+/// are nullable. The alternative — three asset tables — would mean three upload
+/// paths, three approval paths and three implementations of the "which variants
+/// does this apply to" rule, and the directive is explicit that a file shared
+/// between variants is stored once. Type-specific fields are set only for the
+/// category that owns them; app/services/media.server.ts enforces the pairing
+/// so a DOCUMENT cannot carry a banner's dimensions.
+model MediaAsset {
+  id        String        @id @default(cuid())
+  productId String
+  product   Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  category  MediaCategory
+  subtype   MediaSubtype?
+  title     String
+  /// Required before publication. Enforced by the readiness checklist rather
+  /// than by a NOT NULL, because an asset is legitimately created before its
+  /// alt text is written.
+  altText   String?
+
+  /// What the uploader called it. Display only, never used to build a path.
+  originalFilename String
+  /// The opaque object key in the storage backend. Random, extension-less
+  /// enough to carry no meaning, and unique so two uploads cannot collide.
+  storageKey       String @unique
+  mimeType         String
+  fileSize         Int
+  /// sha256 of the stored bytes. Used for duplicate detection and integrity.
+  checksum         String
+
+  /// Where the asset came from, for rows migrated out of the old flat model
+  /// that stored a remote URL instead of a stored object. The bytes were never
+  /// in our storage, so the migration cannot import them; keeping the URL means
+  /// the original is still findable and the migration is not lossy. Null for
+  /// anything uploaded through the normal pipeline.
+  sourceUrl        String?
+
+  width           Int?
+  height          Int?
+  durationSeconds Int?
+  aspectRatio     String?
+
+  processingStatus ProcessingStatus @default(UPLOADING)
+  approvalStatus   ApprovalStatus   @default(DRAFT)
+  /// Seller visibility is a separate switch from approval on purpose: an
+  /// approved asset may still be held back from the Media Kit.
+  sellerVisible    Boolean          @default(false)
+
+  /// Video poster frame, stored as its own object.
+  posterStorageKey String?
+
+  // --- DOCUMENT only -------------------------------------------------------
+  documentType  DocumentType?
+  /// Human version label ("1.2"), not a sequence. History is preserved by
+  /// keeping the superseded row and pointing the replacement at it.
+  version       String?
+  effectiveDate DateTime?
+  language      String?
+  /// When set, this asset supersedes that one. The superseded row is never
+  /// deleted, so old versions stay traceable.
+  supersedesId  String?
+
+  // --- MARKETING_CREATIVE / EDITABLE_TEMPLATE only -------------------------
+  downloadAllowed Boolean @default(true)
+  instructions    String?
+  /// An approved external link for an editable template. Validated as https.
+  templateUrl     String?
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  supersedes  MediaAsset?  @relation("AssetSupersession", fields: [supersedesId], references: [id])
+  supersededBy MediaAsset[] @relation("AssetSupersession")
+  assignments MediaAssetAssignment[]
+
+  @@index([productId, category])
+  @@index([checksum])
+  @@index([approvalStatus])
+}
+
+/// Which variants an asset is shown for.
+///
+/// `variantId = null` means the asset is shared with every variant of the
+/// product. A non-null row means it applies to that one variant; assigning to
+/// several variants writes several rows pointing at the SAME asset, so the file
+/// is stored once however many variants use it.
+model MediaAssetAssignment {
+  id        String          @id @default(cuid())
+  assetId   String
+  asset     MediaAsset      @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  variantId String?
+  variant   ProductVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  sortOrder Int             @default(0)
+  /// The image actually used for this variant. A primary on a shared row is the
+  /// fallback used when the variant has no primary of its own; a primary on a
+  /// variant row overrides it.
+  isPrimary Boolean         @default(false)
+  createdAt DateTime        @default(now())
+
+  /// One row per (asset, scope). Re-assigning is idempotent.
+  @@unique([assetId, variantId])
+  @@index([variantId, sortOrder])
+}
+
+/// Ordered option name/value pairs on a variant — "Size: Queen", "Colour:
+/// White". Ordered because the interface shows them in the order entered, and
+/// because the SKU suggestion is built from them.
+///
+/// This replaces the single `optionName`/`optionValue` pair that the flat model
+/// used, which could express only one axis.
+model VariantOption {
+  id        String         @id @default(cuid())
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  name      String
+  value     String
+  sortOrder Int            @default(0)
+
+  @@unique([variantId, name])
+  @@index([variantId, sortOrder])
+}
+
+/// A merchant's copy of a MoonVella product in an external storefront.
+///
+/// Kept per shop rather than on the product, because the same product is
+/// imported by several merchants and each import has its own identity, status
+/// and failure history. `lastSyncError` is deliberately free text that must
+/// never be given a token or credential to quote — see the audit rules.
+model ExternalProductMapping {
+  id                String    @id @default(cuid())
+  productId         String
+  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  provider          String    @default("SHOPIFY")
+  shopDomain        String
+  externalProductId String?
+  importStatus      String    @default("NOT_IMPORTED")
+  lastSyncedAt      DateTime?
+  lastSyncError     String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([provider, shopDomain, productId])
+  @@index([shopDomain])
+}
+
+/// The variant-level counterpart of ExternalProductMapping. The Shopify variant
+/// id is the one the merchant's inventory is keyed on, so this row — not the
+/// product row — is what a future inventory sync reconciles against.
+model ExternalVariantMapping {
+  id                String         @id @default(cuid())
+  variantId         String
+  variant           ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  provider          String         @default("SHOPIFY")
+  shopDomain        String
+  externalProductId String?
+  externalVariantId String?
+  importStatus      String         @default("NOT_IMPORTED")
+  lastSyncedAt      DateTime?
+  lastSyncError     String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@unique([provider, shopDomain, variantId])
+  @@index([shopDomain])
+}
+
+/// Per-seller branding used when generating marketing material.
+///
+/// Nothing reads this yet. It exists now because the Marketing Pack generator
+/// has to be written against a shape, and retrofitting the seller's brand into
+/// generated assets after merchants have downloaded them is not possible.
+model SellerBrandKit {
+  id        String   @id @default(cuid())
+  sellerId  String   @unique
+  seller    Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  storeName String?
+  /// Object key of the seller's logo, in the same storage backend as media.
+  logoStorageKey String?
+  callToAction   String?
+  /// JSON object of named colours, e.g. {"primary":"#1B4D3E"}. A free-form map
+  /// because brands do not agree on a palette size.
+  brandColours   Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
