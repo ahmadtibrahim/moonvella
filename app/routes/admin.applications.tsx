@@ -1,10 +1,10 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import {
-  requireOwnerRole,
+  requirePermission,
   assertSameOrigin,
   getRequestMeta,
-} from "~/utils/ownerAuth.server";
+} from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import {
   approveApplication,
@@ -13,7 +13,7 @@ import {
 } from "~/services/application.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "REVIEWER", "OPERATIONS", "READONLY"]);
+  await requirePermission(request, "merchants.view");
 
   const [pendingApplications, approvedCount, rejectedCount, needsInfoCount] =
     await Promise.all([
@@ -42,7 +42,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
 export async function action({ request }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "REVIEWER"]);
+  const user = await requirePermission(request, "merchants.manage");
   const { ip, userAgent } = getRequestMeta(request);
 
   const formData = await request.formData();
@@ -55,7 +55,7 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   const actor = {
-    actorType: "OWNER_USER" as const,
+    actorType: "ADMIN_USER" as const,
     actorId: user.id,
     actorName: user.name,
     ipAddress: ip,

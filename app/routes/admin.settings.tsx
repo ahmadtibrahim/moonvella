@@ -1,15 +1,14 @@
-import { Form, Link, redirect, useActionData, useLoaderData, useNavigation } from "react-router";
+import { Form, Link, useActionData, useLoaderData, useNavigation, useSearchParams } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import {
-  requireOwnerRole,
+  requireAuth,
+  userCan,
   assertSameOrigin,
   getRequestMeta,
-  buildSessionCookie,
-} from "~/utils/ownerAuth.server";
-import { hashPassword, verifyPassword } from "~/utils/auth.server";
-import { deleteAllOwnerSessions } from "~/services/ownerAuth.server";
-import { prisma } from "~/db.server";
-import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
+  getSessionToken,
+} from "~/utils/adminAuth.server";
+import { permissionsFor } from "~/services/permissions";
+import { changeOwnPassword } from "~/services/adminUsers.server";
 import {
   listIntegrationStates,
   refreshIntegration,
@@ -19,15 +18,26 @@ import {
 } from "~/services/integrationHealth.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await requireOwnerRole(request, ["OWNER"]);
+  // Any signed-in user: everyone needs to be able to change their own password.
+  const user = await requireAuth(request);
+
+  // The integration panel is operational configuration, not account settings,
+  // so it is gated separately. Someone without the permission never receives the
+  // data — the section is absent from the payload, not merely hidden.
+  const canSeeIntegrations = userCan(user, "settings.general");
+
   return {
     user: {
       name: user.name,
       email: user.email,
       role: user.role,
+      isPrimaryOwner: user.isPrimaryOwner,
       lastLoginAt: user.lastLoginAt,
+      mustChangePassword: user.mustChangePassword,
     },
-    integrations: await listIntegrationStates(),
+    permissions: [...permissionsFor(user.role)].sort(),
+    canSeeIntegrations,
+    integrations: canSeeIntegrations ? await listIntegrationStates() : [],
   };
 }
 
@@ -37,23 +47,27 @@ function isIntegrationKey(value: string): value is IntegrationKey {
 
 export async function action({ request }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER"]);
+  const user = await requireAuth(request);
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "change_password");
   const { ip, userAgent } = getRequestMeta(request);
-  const actor = { actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
 
-  if (intent === "refresh_integration") {
+  if (intent === "refresh_integration" || intent === "clear_integration_error") {
+    if (!userCan(user, "settings.general")) {
+      throw new Response("Your role does not permit this.", { status: 403 });
+    }
+
     const key = String(formData.get("key") || "");
     if (!isIntegrationKey(key)) return { error: "Unknown integration." };
-    const state = await refreshIntegration(key, actor);
-    return { success: `${key} re-checked: ${state.status}.` };
-  }
 
-  if (intent === "clear_integration_error") {
-    const key = String(formData.get("key") || "");
-    if (!isIntegrationKey(key)) return { error: "Unknown integration." };
-    await clearIntegrationError(key, actor);
+    const auditActor = { actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
+
+    if (intent === "refresh_integration") {
+      const state = await refreshIntegration(key, auditActor);
+      return { success: `${key} re-checked: ${state.status}.` };
+    }
+
+    await clearIntegrationError(key, auditActor);
     return { success: `${key} error cleared.` };
   }
 
@@ -64,43 +78,21 @@ export async function action({ request }: ActionFunctionArgs) {
   if (!currentPassword || !newPassword) {
     return { error: "All password fields are required." };
   }
-  if (newPassword.length < 8) {
-    return { error: "New password must be at least 8 characters." };
-  }
   if (newPassword !== confirmPassword) {
     return { error: "New passwords do not match." };
   }
 
-  const dbUser = await prisma.ownerUser.findUnique({ where: { id: user.id } });
-  if (!dbUser || !(await verifyPassword(currentPassword, dbUser.passwordHash))) {
-    return { error: "Current password is incorrect." };
-  }
+  const result = await changeOwnPassword(
+    { id: user.id, name: user.name },
+    currentPassword,
+    newPassword,
+    getSessionToken(request),
+    { ip, userAgent }
+  );
 
-  await prisma.ownerUser.update({
-    where: { id: user.id },
-    data: { passwordHash: await hashPassword(newPassword) },
-  });
+  if (!result.ok) return { error: result.error };
 
-  // A password change invalidates every existing session, including the one
-  // making this request. If a session was stolen, the new password locks the
-  // holder out instead of leaving them signed in.
-  await deleteAllOwnerSessions(user.id);
-
-  await recordAudit({
-    actorType: "OWNER_USER",
-    actorId: user.id,
-    actorName: user.name,
-    action: "owner.password_changed",
-    entityType: AUDIT_ENTITY.OWNER_USER,
-    entityId: user.id,
-    afterData: { sessionsInvalidated: true },
-    ipAddress: ip,
-    userAgent,
-  });
-
-  throw redirect("/admin/login?notice=password-changed", {
-    headers: { "Set-Cookie": buildSessionCookie("", 0) },
-  });
+  return { success: result.message || "Password changed." };
 }
 
 const card: React.CSSProperties = {
@@ -146,10 +138,15 @@ function statusColor(status: string): string {
 }
 
 export default function AdminSettings() {
-  const { user, integrations } = useLoaderData<typeof loader>();
+  const { user, permissions, integrations, canSeeIntegrations } =
+    useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
+  const [searchParams] = useSearchParams();
   const isSubmitting = navigation.state === "submitting";
+
+  const forcedChange =
+    searchParams.get("notice") === "password-change-required" || user.mustChangePassword;
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -160,8 +157,27 @@ export default function AdminSettings() {
         Account and system configuration
       </p>
 
+      {forcedChange ? (
+        <div
+          role="alert"
+          style={{
+            background: "#fffbeb",
+            border: "1px solid #fcd34d",
+            color: "#92400e",
+            padding: "0.75rem 1rem",
+            borderRadius: 8,
+            fontSize: "0.85rem",
+            marginBottom: "1rem",
+          }}
+        >
+          Your password was reset by an owner. Choose a new one below before
+          continuing.
+        </div>
+      ) : null}
+
       {actionData && "error" in actionData && actionData.error ? (
         <div
+          role="alert"
           style={{
             background: "#fef2f2",
             border: "1px solid #fecaca",
@@ -177,6 +193,7 @@ export default function AdminSettings() {
       ) : null}
       {actionData && "success" in actionData && actionData.success ? (
         <div
+          role="status"
           style={{
             background: "#f0fdf4",
             border: "1px solid #bbf7d0",
@@ -191,61 +208,63 @@ export default function AdminSettings() {
         </div>
       ) : null}
 
-      <div style={card}>
-        <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Integration health
-        </h2>
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-          {integrations.map((i) => (
-            <div
-              key={i.key}
-              style={{
-                display: "grid",
-                gridTemplateColumns: "190px 110px 1fr auto",
-                gap: "0.75rem",
-                alignItems: "center",
-                padding: "0.6rem 0.75rem",
-                border: "1px solid #e2e8f0",
-                borderRadius: 8,
-                fontSize: "0.8rem",
-              }}
-            >
-              <span style={{ fontWeight: 600, color: "#1e293b" }}>{i.key}</span>
-              <span style={{ fontWeight: 600, color: statusColor(i.status) }}>{i.status}</span>
-              <span style={{ color: "#64748b" }}>
-                <span>{i.detail}</span>
-                <span style={{ display: "block", fontSize: "0.68rem", color: "#94a3b8", marginTop: "0.15rem" }}>
-                  {i.lastSuccessAt ? `Last success: ${new Date(i.lastSuccessAt).toLocaleString()}` : "No successful check yet"}
-                  {i.lastErrorAt ? ` · Last error: ${new Date(i.lastErrorAt).toLocaleString()}` : ""}
-                  {i.lastError ? ` · ${i.lastError}` : ""}
+      {canSeeIntegrations ? (
+        <div style={card}>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
+            Integration health
+          </h2>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+            {integrations.map((i) => (
+              <div
+                key={i.key}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "190px 110px 1fr auto",
+                  gap: "0.75rem",
+                  alignItems: "center",
+                  padding: "0.6rem 0.75rem",
+                  border: "1px solid #e2e8f0",
+                  borderRadius: 8,
+                  fontSize: "0.8rem",
+                }}
+              >
+                <span style={{ fontWeight: 600, color: "#1e293b" }}>{i.key}</span>
+                <span style={{ fontWeight: 600, color: statusColor(i.status) }}>{i.status}</span>
+                <span style={{ color: "#64748b" }}>
+                  <span>{i.detail}</span>
+                  <span style={{ display: "block", fontSize: "0.68rem", color: "#94a3b8", marginTop: "0.15rem" }}>
+                    {i.lastSuccessAt ? `Last success: ${new Date(i.lastSuccessAt).toLocaleString()}` : "No successful check yet"}
+                    {i.lastErrorAt ? ` · Last error: ${new Date(i.lastErrorAt).toLocaleString()}` : ""}
+                    {i.lastError ? ` · ${i.lastError}` : ""}
+                  </span>
                 </span>
-              </span>
-              <span style={{ display: "flex", gap: "0.35rem" }}>
-                <Form method="post">
-                  <input type="hidden" name="intent" value="refresh_integration" />
-                  <input type="hidden" name="key" value={i.key} />
-                  <button type="submit" style={smallButton} disabled={isSubmitting}>
-                    Re-check
-                  </button>
-                </Form>
-                {i.lastError || i.lastErrorAt ? (
+                <span style={{ display: "flex", gap: "0.35rem" }}>
                   <Form method="post">
-                    <input type="hidden" name="intent" value="clear_integration_error" />
+                    <input type="hidden" name="intent" value="refresh_integration" />
                     <input type="hidden" name="key" value={i.key} />
                     <button type="submit" style={smallButton} disabled={isSubmitting}>
-                      Clear error
+                      Re-check
                     </button>
                   </Form>
-                ) : null}
-              </span>
-            </div>
-          ))}
+                  {i.lastError || i.lastErrorAt ? (
+                    <Form method="post">
+                      <input type="hidden" name="intent" value="clear_integration_error" />
+                      <input type="hidden" name="key" value={i.key} />
+                      <button type="submit" style={smallButton} disabled={isSubmitting}>
+                        Clear error
+                      </button>
+                    </Form>
+                  ) : null}
+                </span>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       <div style={card}>
         <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1.5rem" }}>
-          Owner Account
+          Your Account
         </h2>
 
         <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
@@ -268,9 +287,43 @@ export default function AdminSettings() {
           <div>
             <div style={{ fontWeight: 600, color: "#1e293b" }}>{user.name}</div>
             <div style={{ fontSize: "0.85rem", color: "#64748b" }}>{user.email}</div>
-            <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>Role: {user.role}</div>
+            <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>
+              Role: {user.role}
+              {user.isPrimaryOwner ? " (primary owner — cannot be disabled or demoted)" : ""}
+            </div>
+            {user.lastLoginAt ? (
+              <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>
+                Last sign-in: {new Date(user.lastLoginAt).toLocaleString()}
+              </div>
+            ) : null}
           </div>
         </div>
+
+        {/* Listing the effective permissions rather than only the role name lets
+            someone confirm what they can do without asking, and makes an
+            unexpected role change visible immediately. */}
+        <details style={{ marginBottom: "1.5rem" }}>
+          <summary style={{ cursor: "pointer", fontSize: "0.8rem", color: "#64748b", fontWeight: 600 }}>
+            What your role permits ({permissions.length})
+          </summary>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem", marginTop: "0.75rem" }}>
+            {permissions.map((p) => (
+              <code
+                key={p}
+                style={{
+                  background: "#f1f5f9",
+                  border: "1px solid #e2e8f0",
+                  borderRadius: 4,
+                  padding: "0.15rem 0.4rem",
+                  fontSize: "0.7rem",
+                  color: "#334155",
+                }}
+              >
+                {p}
+              </code>
+            ))}
+          </div>
+        </details>
 
         <Form method="post">
           <input type="hidden" name="intent" value="change_password" />
@@ -288,6 +341,10 @@ export default function AdminSettings() {
               <input style={input} id="confirmPassword" name="confirmPassword" type="password" autoComplete="new-password" />
             </div>
           </div>
+          <p style={{ fontSize: "0.7rem", color: "#94a3b8", marginTop: "0.5rem" }}>
+            At least 12 characters, including a letter and a number. Changing your
+            password signs out your other sessions.
+          </p>
 
           <button
             type="submit"

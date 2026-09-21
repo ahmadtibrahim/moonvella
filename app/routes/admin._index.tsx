@@ -1,11 +1,11 @@
 import { Link, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole } from "~/utils/ownerAuth.server";
+import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { listIntegrationStates } from "~/services/integrationHealth.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
+  await requirePermission(request, "dashboard.view");
 
   const [
     totalSellers,

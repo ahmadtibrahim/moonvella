@@ -55,7 +55,7 @@ const EXPECTED_SUBTOTAL = WHOLESALE * QTY; // 2598
 const EXPECTED_SHIPPING = Math.round((ORDER_SHIPPING * RETAIL * QTY) / ORDER_SUBTOTAL); // 1361
 const EXPECTED_TOTAL = EXPECTED_SUBTOTAL - LINE_DISCOUNT + LINE_TAX + EXPECTED_SHIPPING; // 4253
 
-const actor = { actorId: "e2e-verify", actorName: "E2E Verify", actorType: "OWNER_USER" as const };
+const actor = { actorId: "e2e-verify", actorName: "E2E Verify", actorType: "ADMIN_USER" as const };
 
 let failures = 0;
 let total = 0;
@@ -120,10 +120,6 @@ async function cleanup() {
     select: { id: true },
   });
   const orderIds = orders.map((o) => o.id);
-  const shipments = orderIds.length
-    ? await prisma.shipment.findMany({ where: { orderId: { in: orderIds } }, select: { id: true } })
-    : [];
-  const shipmentIds = shipments.map((s) => s.id);
   const payments = await prisma.wholesalePayment.findMany({
     where: { seller: { shopDomain: SHOP } },
     select: { id: true },
@@ -164,21 +160,18 @@ async function cleanup() {
   if (application?.id) {
     await prisma.merchantApplication.deleteMany({ where: { id: application.id } });
   }
-  await prisma.ownerUser.deleteMany({ where: { email: OWNER_EMAIL } });
+  await prisma.adminUser.deleteMany({ where: { email: OWNER_EMAIL } });
   await prisma.webhookEvent.deleteMany({ where: { shopDomain: SHOP } });
   if (product?.id) {
     await prisma.product.deleteMany({ where: { id: product.id } });
   }
 
-  const entityIds = [application?.id, sellerId, product?.id, ...orderIds, ...shipmentIds, ...paymentIds].filter(
-    (v): v is string => !!v
-  );
-  if (entityIds.length) {
-    await prisma.auditLog.deleteMany({ where: { entityId: { in: entityIds } } });
-  }
-  await prisma.auditLog.deleteMany({
-    where: { entityId: { in: ["shopify_orders", "stripe", "shopify_fulfillment"] } },
-  });
+  // Audit rows are deliberately NOT deleted, and could not be: the AuditLog
+  // table is append-only at the database level, enforced by the trigger
+  // AuditLog_append_only, which raises restrict_violation on any DELETE or
+  // UPDATE. This harness therefore leaves its audit rows behind. That is the
+  // intended behaviour of the table, not a leak: the rows carry the test
+  // entity ids and are attributable to this run.
   await prisma.integrationState.deleteMany({
     where: { key: { in: ["shopify_orders", "stripe", "shopify_fulfillment"] } },
   });
@@ -186,7 +179,7 @@ async function cleanup() {
 
 async function main() {
   // ---- (a) application approval -------------------------------------------
-  const owner = await prisma.ownerUser.create({
+  const owner = await prisma.adminUser.create({
     data: { email: OWNER_EMAIL, passwordHash: "e2e-not-a-real-hash", name: "E2E Owner", role: "OWNER", isActive: true },
   });
   const application = await prisma.merchantApplication.create({
@@ -205,7 +198,7 @@ async function main() {
   });
 
   const approved = await approveApplication(application.id, {
-    actorType: "OWNER_USER",
+    actorType: "ADMIN_USER",
     actorId: owner.id,
     actorName: "E2E Owner",
   });

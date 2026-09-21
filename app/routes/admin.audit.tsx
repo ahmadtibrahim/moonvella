@@ -1,11 +1,11 @@
 import { Link, Form, useLoaderData } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 import type { Prisma } from "@prisma/client";
-import { requireOwnerRole } from "~/utils/ownerAuth.server";
+import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "READONLY", "REVIEWER"]);
+  await requirePermission(request, "audit.view");
 
   const url = new URL(request.url);
   const actor = url.searchParams.get("actor")?.trim() || "";

@@ -1,28 +1,62 @@
 import "../styles/admin.css";
 import { Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth } from "~/utils/ownerAuth.server";
+import { requireAuth, userCan } from "~/utils/adminAuth.server";
+import { can, type Permission } from "~/services/permissions";
+import type { AdminRole } from "@prisma/client";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await requireOwnerAuth(request);
-  return { user: { name: user.name, email: user.email, role: user.role } };
+  const user = await requireAuth(request);
+  return {
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      isPrimaryOwner: user.isPrimaryOwner,
+    },
+  };
 }
 
-const NAV_ITEMS = [
-  { href: "/admin", label: "Dashboard", icon: "D" },
-  { href: "/admin/applications", label: "Applications", icon: "A" },
-  { href: "/admin/sellers", label: "Sellers", icon: "S" },
-  { href: "/admin/rankings", label: "Rankings", icon: "R" },
-  { href: "/admin/products", label: "Products", icon: "P" },
-  { href: "/admin/orders", label: "Orders", icon: "O" },
-  { href: "/admin/shipping", label: "Shipping", icon: "H" },
+/**
+ * Navigation, gated per entry.
+ *
+ * Hiding a link is presentation, not authorisation — every one of these routes
+ * enforces its own permission in its loader and would return 403 if reached
+ * directly. The gate here exists so an OPERATIONS user is not shown a door that
+ * only ever opens onto an error.
+ */
+const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permission }[] = [
+  { href: "/admin", label: "Dashboard", icon: "D", permission: "dashboard.view" },
+  { href: "/admin/applications", label: "Applications", icon: "A", permission: "merchants.view" },
+  { href: "/admin/sellers", label: "Sellers", icon: "S", permission: "merchants.view" },
+  { href: "/admin/rankings", label: "Rankings", icon: "R", permission: "reports.view" },
+  { href: "/admin/products", label: "Products", icon: "P", permission: "products.view" },
+  { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view" },
+  { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view" },
+  { href: "/admin/users", label: "Users", icon: "U", permission: "users.view" },
+  // Settings has no permission gate: every signed-in user needs it to change
+  // their own password. The sections inside it are gated individually.
   { href: "/admin/settings", label: "Settings", icon: "G" },
-  { href: "/admin/audit", label: "Audit Log", icon: "L" },
+  { href: "/admin/audit", label: "Audit Log", icon: "L", permission: "audit.view" },
 ];
+
+const ROLE_LABEL: Record<AdminRole, string> = {
+  OWNER: "Owner",
+  ADMIN: "Administrator",
+  OPERATIONS: "Operations",
+  CATALOG: "Catalog",
+  SUPPORT: "Support",
+  VIEWER: "Viewer",
+};
 
 export default function AdminLayout() {
   const { user } = useLoaderData<typeof loader>();
   const location = useLocation();
+
+  const visible = NAV_ITEMS.filter(
+    (item) => !item.permission || can(user.role, item.permission)
+  );
 
   return (
     <div style={{ display: "flex", minHeight: "100vh", background: "#f6f8fb" }}>
@@ -63,9 +97,9 @@ export default function AdminLayout() {
           </div>
         </div>
 
-        <nav style={{ flex: 1 }}>
+        <nav style={{ flex: 1, overflowY: "auto" }}>
           <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            {NAV_ITEMS.map((item) => {
+            {visible.map((item) => {
               const isActive =
                 location.pathname === item.href ||
                 location.pathname.startsWith(item.href + "/");
@@ -130,16 +164,27 @@ export default function AdminLayout() {
                 fontSize: "0.875rem",
               }}
             >
-              {user?.name?.charAt(0)?.toUpperCase() || "O"}
+              {user?.name?.charAt(0)?.toUpperCase() || "?"}
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 500, color: "white", fontSize: "0.8rem" }}>
-                {user?.name || "Owner"}
+              <div
+                style={{
+                  fontWeight: 500,
+                  color: "white",
+                  fontSize: "0.8rem",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {user?.name || "User"}
               </div>
               <div style={{ fontSize: "0.625rem", color: "rgba(255,255,255,0.4)" }}>
-                {user?.role || "OWNER"}
+                {user?.isPrimaryOwner ? "Primary Owner" : ROLE_LABEL[user?.role as AdminRole] || user?.role}
               </div>
             </div>
+            {/* Logout is a POST: a link would be a state change a cross-site
+                image tag could trigger. */}
             <form method="post" action="/admin/logout" style={{ margin: 0 }}>
               <button
                 type="submit"
@@ -168,6 +213,26 @@ export default function AdminLayout() {
           minHeight: "100vh",
         }}
       >
+        {/* Required by the controlled-testing phase: this panel is connected to
+            Shopify development stores only. The banner is a reminder, not a
+            control — the real protection is that no production credential is
+            configured and the Odoo connector is not enabled. */}
+        <div
+          role="status"
+          style={{
+            background: "#fffbeb",
+            border: "1px solid #fcd34d",
+            color: "#92400e",
+            borderRadius: 8,
+            padding: "0.6rem 0.9rem",
+            marginBottom: "1.5rem",
+            fontSize: "0.8rem",
+            fontWeight: 600,
+            letterSpacing: "0.01em",
+          }}
+        >
+          TEST MODE — NO REAL PAYMENT OR FULFILLMENT
+        </div>
         <Outlet />
       </main>
     </div>

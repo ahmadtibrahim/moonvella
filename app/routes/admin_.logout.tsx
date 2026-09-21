@@ -1,34 +1,46 @@
+import { redirect, type ActionFunctionArgs } from "react-router";
 import {
-  redirect,
-  type ActionFunctionArgs,
-} from "react-router";
-import { prisma } from "~/db.server";
-import {
-  getSessionToken,
-  buildSessionCookie,
-  getOwnerUser,
+  assertSameOrigin,
+  clearSessionCookie,
   getRequestMeta,
-} from "~/utils/ownerAuth.server";
-import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
+  getSessionToken,
+  getCurrentUser,
+} from "~/utils/adminAuth.server";
+import { revokeSessionByToken } from "~/services/adminAuth.server";
+import { recordAudit, SECURITY_ACTION, AUDIT_ENTITY } from "~/services/audit.server";
 
+/**
+ * Sign out.
+ *
+ * POST only, with the same origin guard the other mutating routes use. An
+ * unguarded GET sign-out is a real, if minor, nuisance: any page on the
+ * internet can embed a link or an image pointing at it, and the owner finds
+ * themselves signed out with no explanation.
+ *
+ * No permission guard: signing out is never something a role should be able to
+ * lose. It also has to work for a session that is already invalid — which is
+ * precisely the state someone is in when they most want to clear the cookie.
+ */
 export async function action({ request }: ActionFunctionArgs) {
+  assertSameOrigin(request);
+
   const token = getSessionToken(request);
-  // Resolve the user before the session row is removed, so the audit record can
-  // name who signed out. Never records the session token itself.
-  const user = await getOwnerUser(request);
+  // Resolve the user before the session row is removed, so the audit entry can
+  // name who signed out. The token itself is never recorded.
+  const user = await getCurrentUser(request);
   const { ip, userAgent } = getRequestMeta(request);
 
   if (token) {
-    await prisma.ownerSession.deleteMany({ where: { token } });
+    await revokeSessionByToken(token);
   }
 
   if (user) {
     await recordAudit({
-      actorType: "OWNER_USER",
+      actorType: "ADMIN_USER",
       actorId: user.id,
       actorName: user.name,
-      action: "owner.logout",
-      entityType: AUDIT_ENTITY.OWNER_USER,
+      action: SECURITY_ACTION.LOGOUT,
+      entityType: AUDIT_ENTITY.ADMIN_USER,
       entityId: user.id,
       ipAddress: ip,
       userAgent,
@@ -36,7 +48,7 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   return redirect("/admin/login", {
-    headers: { "Set-Cookie": buildSessionCookie("", 0) },
+    headers: { "Set-Cookie": clearSessionCookie() },
   });
 }
 

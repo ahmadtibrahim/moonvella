@@ -84,7 +84,7 @@ export async function approveApplication(
 
     await recordAudit(
       {
-        actorType: actor.actorType ?? "OWNER_USER",
+        actorType: actor.actorType ?? "ADMIN_USER",
         actorId: actor.actorId,
         actorName: actor.actorName,
         action: "application.approved",
@@ -140,7 +140,7 @@ export async function rejectApplication(
 
     await recordAudit(
       {
-        actorType: actor.actorType ?? "OWNER_USER",
+        actorType: actor.actorType ?? "ADMIN_USER",
         actorId: actor.actorId,
         actorName: actor.actorName,
         action: "application.rejected",
@@ -178,7 +178,7 @@ export async function requestInformation(
 
     await recordAudit(
       {
-        actorType: actor.actorType ?? "OWNER_USER",
+        actorType: actor.actorType ?? "ADMIN_USER",
         actorId: actor.actorId,
         actorName: actor.actorName,
         action: "application.information_requested",
@@ -222,7 +222,7 @@ export async function suspendSeller(
 
     await recordAudit(
       {
-        actorType: actor.actorType ?? "OWNER_USER",
+        actorType: actor.actorType ?? "ADMIN_USER",
         actorId: actor.actorId,
         actorName: actor.actorName,
         action: "seller.suspended",
@@ -266,7 +266,7 @@ export async function reactivateSeller(sellerId: string, actor: ActorInput) {
 
     await recordAudit(
       {
-        actorType: actor.actorType ?? "OWNER_USER",
+        actorType: actor.actorType ?? "ADMIN_USER",
         actorId: actor.actorId,
         actorName: actor.actorName,
         action: "seller.reactivated",

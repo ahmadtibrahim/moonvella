@@ -103,7 +103,7 @@ export async function getQuotesForOrder(orderId: string, actor: Actor) {
   );
 
   await recordAudit({
-    actorType: "OWNER_USER",
+    actorType: "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.quotes_requested",
@@ -128,7 +128,7 @@ export async function selectQuote(orderId: string, quoteId: string, actor: Actor
     prisma.shippingQuote.update({ where: { id: quoteId }, data: { selected: true } }),
   ]);
   await recordAudit({
-    actorType: "OWNER_USER",
+    actorType: "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.quote_selected",
@@ -254,7 +254,7 @@ export async function bookShipmentForOrder(
     });
 
     await recordAudit({
-      actorType: "OWNER_USER",
+      actorType: "ADMIN_USER",
       actorId: actor.actorId,
       actorName: actor.actorName,
       action: "shipping.booked",
@@ -362,7 +362,7 @@ export async function voidShipment(shipmentId: string, actor: Actor) {
     data: { status: "CANCELLED" },
   });
   await recordAudit({
-    actorType: "OWNER_USER",
+    actorType: "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.cancelled",

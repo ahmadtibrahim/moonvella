@@ -20,7 +20,7 @@
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
     "vite": "vite",
-    "create-owner": "node scripts/create-owner.mjs",
+    "create-admin": "node scripts/create-admin.mjs",
     "seed-catalog": "node scripts/seed-catalog.mjs",
     "verify:phase1": "node scripts/verify-phase1.mjs",
     "verify:phase5": "node scripts/verify-phase5.mjs",

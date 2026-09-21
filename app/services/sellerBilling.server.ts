@@ -415,7 +415,7 @@ export async function chargeWholesaleOrder(
       data: { billingMode: opts.trigger, paymentMethodId: method.id, status: "PROCESSING" },
     });
     await recordAudit({
-      actorType: "OWNER_USER",
+      actorType: "ADMIN_USER",
       actorId: opts.actor.actorId,
       actorName: opts.actor.actorName,
       action: "payment.charge_succeeded",
@@ -460,7 +460,7 @@ export async function chargeWholesaleOrder(
       },
     });
     await recordAudit({
-      actorType: "OWNER_USER",
+      actorType: "ADMIN_USER",
       actorId: opts.actor.actorId,
       actorName: opts.actor.actorName,
       action: "payment.charge_succeeded",
@@ -481,7 +481,7 @@ export async function chargeWholesaleOrder(
     });
     await prisma.wholesalePayment.update({ where: { id: payment.id }, data: { status: "FAILED", failureMessage: message } });
     await recordAudit({
-      actorType: "OWNER_USER",
+      actorType: "ADMIN_USER",
       actorId: opts.actor.actorId,
       actorName: opts.actor.actorName,
       action: "payment.failed",

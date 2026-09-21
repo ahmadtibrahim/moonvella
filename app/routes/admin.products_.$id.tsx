@@ -1,6 +1,6 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import {
   getProduct,
   updateProduct,
@@ -16,7 +16,7 @@ import { saveProductImage } from "~/services/storage.server";
 import { listPresets, saveVariantPackages, copyVariantPackaging } from "~/services/packaging.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "READONLY", "REVIEWER"]);
+  await requirePermission(request, "products.view");
   const product = await getProduct(String(params.id));
   if (!product) {
     throw new Response("Product not found", { status: 404 });
@@ -27,10 +27,10 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
 export async function action({ request, params }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const user = await requirePermission(request, "products.manage");
   const { ip, userAgent } = getRequestMeta(request);
   const actor = {
-    actorType: "OWNER_USER" as const,
+    actorType: "ADMIN_USER" as const,
     actorId: user.id,
     actorName: user.name,
     ipAddress: ip,

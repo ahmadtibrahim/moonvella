@@ -24,7 +24,7 @@ export interface PackingAllocation {
 }
 
 interface Actor {
-  actorType?: "OWNER_USER" | "SYSTEM";
+  actorType?: "ADMIN_USER" | "SYSTEM";
   actorId: string;
   actorName?: string | null;
   ipAddress?: string | null;
@@ -69,7 +69,7 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
   await prisma.order.update({ where: { id: orderId }, data: { fulfillmentStatus: "SHIPPED" } });
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipment.created",
@@ -122,7 +122,7 @@ export async function advanceShipment(
   }
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: `shipment.${event}`,
@@ -187,7 +187,7 @@ export async function createPackingShipment(
   });
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipment.packing_created",
@@ -210,7 +210,7 @@ export async function markShipmentPacked(shipmentId: string, actor: Actor) {
     data: { packedAt: before.packedAt ?? new Date() },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipment.packed",
@@ -244,7 +244,7 @@ export async function markOrderReadyToShip(orderId: string, actor: Actor) {
   ]);
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipment.ready_to_ship",
@@ -283,7 +283,7 @@ export async function addOrderPackage(orderId: string, input: OrderPackageInput,
     },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "order.package_added",
@@ -301,7 +301,7 @@ export async function removeOrderPackage(orderId: string, packageId: string, act
   if (!before || before.orderId !== orderId) throw new Error("Package not found for this order.");
   await prisma.orderPackage.delete({ where: { id: packageId } });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "order.package_removed",
@@ -323,7 +323,7 @@ export async function deletePackingShipment(shipmentId: string, actor: Actor) {
   }
   await prisma.shipment.delete({ where: { id: shipmentId } });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipment.packing_deleted",

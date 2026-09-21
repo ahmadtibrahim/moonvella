@@ -1,6 +1,6 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { createOrReuseWholesalePayment, applyStripeEvent, stripeMode } from "~/services/payments.server";
 import { chargeWholesaleOrder, getBillingSettings } from "~/services/sellerBilling.server";
@@ -23,7 +23,7 @@ import {
 import { getIntegrationState } from "~/services/integrationHealth.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
+  await requirePermission(request, "orders.view");
   const order = await prisma.order.findUnique({
     where: { id: String(params.id) },
     include: {
@@ -74,9 +74,9 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
 export async function action({ request, params }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const user = await requirePermission(request, "orders.manage");
   const { ip, userAgent } = getRequestMeta(request);
-  const actor = { actorType: "OWNER_USER" as const, actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
+  const actor = { actorType: "ADMIN_USER" as const, actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
   const orderId = String(params.id);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");

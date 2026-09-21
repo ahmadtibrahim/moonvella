@@ -1,5 +1,5 @@
 import type { LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole } from "~/utils/ownerAuth.server";
+import { requirePermission } from "~/utils/adminAuth.server";
 import {
   computeRankings,
   resolvePeriod,
@@ -8,7 +8,7 @@ import {
 } from "~/services/rankings.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
+  await requirePermission(request, "reports.view");
   const url = new URL(request.url);
   const { from, to } = resolvePeriod(url.searchParams);
 

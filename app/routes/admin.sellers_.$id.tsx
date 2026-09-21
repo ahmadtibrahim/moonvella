@@ -1,12 +1,12 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { getSellerDetail } from "~/services/seller.server";
 import { suspendSeller, reactivateSeller } from "~/services/application.server";
 import { getShopAnalytics } from "~/services/analytics.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "REVIEWER", "READONLY"]);
+  await requirePermission(request, "merchants.view");
   const id = String(params.id);
 
   const detail = await getSellerDetail(id);
@@ -29,7 +29,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
 export async function action({ request, params }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const user = await requirePermission(request, "merchants.manage");
   const { ip, userAgent } = getRequestMeta(request);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
@@ -37,7 +37,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const id = String(params.id);
 
   const actor = {
-    actorType: "OWNER_USER" as const,
+    actorType: "ADMIN_USER" as const,
     actorId: user.id,
     actorName: user.name,
     ipAddress: ip,

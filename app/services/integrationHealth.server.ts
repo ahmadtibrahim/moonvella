@@ -229,7 +229,7 @@ export async function clearIntegrationError(key: IntegrationKey, actor?: Integra
   });
   await recordAudit(
     {
-      actorType: actor ? "OWNER_USER" : "SYSTEM",
+      actorType: actor ? "ADMIN_USER" : "SYSTEM",
       actorId: actor?.actorId ?? "system",
       actorName: actor?.actorName ?? "System",
       action: "integration.error_cleared",
@@ -282,7 +282,7 @@ export async function setIntegrationState(
 
   if (changed) {
     await recordAudit({
-      actorType: actor ? "OWNER_USER" : "SYSTEM",
+      actorType: actor ? "ADMIN_USER" : "SYSTEM",
       actorId: actor?.actorId ?? "system",
       actorName: actor?.actorName ?? "System",
       action: "integration.state_changed",

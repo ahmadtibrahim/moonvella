@@ -243,6 +243,31 @@ const server = http.createServer(async (req, res) => {
     return html(res, 503, "Service restarting");
   }
 
+  /**
+   * Response headers for the owner panel, applied here rather than per route.
+   *
+   * The requirement is that authenticated pages are never stored by a cache and
+   * never indexed. Expressing that as a rule about the *host* rather than about
+   * any particular route means a route added next year cannot forget it, and
+   * that the guarantee does not depend on how the auth wrapper happens to be
+   * composed on each page.
+   *
+   * `no-store` rather than `no-cache`: no-cache permits storing the response and
+   * revalidating it, which still leaves a copy of an admin page on disk. The
+   * one exception is `/assets/`, whose filenames are content hashes — those are
+   * identical for every user and contain no data, so caching them is free.
+   */
+  if (hostSurface === "admin") {
+    if (!pathname.startsWith("/assets/")) {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+    }
+    // Belt and braces with the CSP: a staff panel has no business in a search
+    // index, and a leaked invitation URL in a search result would be a real
+    // disclosure.
+    res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+  }
+
   const pathSurface = surfaceForPath(pathname);
 
   if (!isHostAgnostic(pathname)) {

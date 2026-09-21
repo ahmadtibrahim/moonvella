@@ -68,6 +68,14 @@ COPY --from=builder /app/app ./app
 COPY --from=builder /app/server.js ./server.js
 COPY --from=builder /app/package.json ./package.json
 
+# The primary-owner bootstrap script, and only that one. The rest of scripts/
+# holds verification harnesses that have no business in a production image:
+# they create test sellers and orders. This one is needed inside the container
+# because it has to reach Prisma and the credentials it carries never leave the
+# host. It is run by an operator with shell access; nothing invokes it
+# automatically.
+COPY --from=builder /app/scripts/create-admin.mjs ./scripts/create-admin.mjs
+
 RUN mkdir -p /app/uploads && chown -R 10001:10001 /app /app/uploads
 
 USER 10001:10001

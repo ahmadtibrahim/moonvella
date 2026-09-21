@@ -1,6 +1,6 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import {
   approveApplication,
@@ -10,7 +10,7 @@ import {
 import { getShopAnalytics } from "~/services/analytics.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "REVIEWER", "OPERATIONS", "READONLY"]);
+  await requirePermission(request, "merchants.view");
   const id = String(params.id);
 
   const application = await prisma.merchantApplication.findUnique({
@@ -40,7 +40,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
 export async function action({ request, params }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "REVIEWER"]);
+  const user = await requirePermission(request, "merchants.manage");
   const { ip, userAgent } = getRequestMeta(request);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
@@ -48,7 +48,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const id = String(params.id);
 
   const actor = {
-    actorType: "OWNER_USER" as const,
+    actorType: "ADMIN_USER" as const,
     actorId: user.id,
     actorName: user.name,
     ipAddress: ip,

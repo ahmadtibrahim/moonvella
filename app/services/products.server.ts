@@ -158,7 +158,7 @@ export async function createProduct(input: ProductInput, actor: Actor) {
   const product = await prisma.product.create({ data });
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.created",
@@ -193,7 +193,7 @@ export async function updateProduct(id: string, input: ProductInput, actor: Acto
   const product = await prisma.product.update({ where: { id }, data });
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.updated",
@@ -214,7 +214,7 @@ export async function setArchived(id: string, archived: boolean, actor: Actor) {
     data: { isArchived: archived, isActive: !archived },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: archived ? "product.archived" : "product.restored",
@@ -246,7 +246,7 @@ export async function deleteProduct(id: string, actor: Actor) {
   await prisma.product.delete({ where: { id } });
 
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.deleted",
@@ -264,7 +264,7 @@ export async function setPublished(id: string, published: boolean, actor: Actor)
     data: { isPublished: published },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: published ? "product.published" : "product.unpublished",
@@ -293,7 +293,7 @@ export async function addVariant(productId: string, input: VariantInput, actor: 
   };
   const variant = await prisma.productVariant.create({ data });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.variant_added",
@@ -325,7 +325,7 @@ export async function updateVariant(variantId: string, input: VariantInput, acto
     },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.variant_updated",
@@ -344,7 +344,7 @@ export async function deleteVariant(variantId: string, actor: Actor) {
   if (!before) throw new Error("Variant not found.");
   await prisma.productVariant.delete({ where: { id: variantId } });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.variant_deleted",
@@ -362,7 +362,7 @@ export async function addImage(productId: string, url: string, alt: string | nul
     data: { productId, url, alt, sortOrder: count },
   });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.image_added",
@@ -380,7 +380,7 @@ export async function deleteImage(imageId: string, actor: Actor) {
   if (!image) throw new Error("Image not found.");
   await prisma.productImage.delete({ where: { id: imageId } });
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.image_deleted",
@@ -422,7 +422,7 @@ export async function reorderImages(productId: string, orderedIds: string[], act
   }
   await persistImageOrder(next);
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.images_reordered",
@@ -442,7 +442,7 @@ export async function setMainImage(imageId: string, actor: Actor) {
   const next = [image.id, ...existing.filter((id) => id !== image.id)];
   await persistImageOrder(next);
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "product.image_set_main",
@@ -465,7 +465,7 @@ export async function moveImage(imageId: string, direction: "up" | "down", actor
     [order[index], order[target]] = [order[target], order[index]];
     await persistImageOrder(order);
     await recordAudit({
-      actorType: actor.actorType ?? "OWNER_USER",
+      actorType: actor.actorType ?? "ADMIN_USER",
       actorId: actor.actorId,
       actorName: actor.actorName,
       action: "product.image_reordered",

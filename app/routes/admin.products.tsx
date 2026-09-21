@@ -1,6 +1,6 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import {
   listProducts,
   createProduct,
@@ -13,7 +13,7 @@ import {
 const STATUSES = ["ALL", "PUBLISHED", "UNPUBLISHED", "ARCHIVED"] as const;
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerRole(request, ["OWNER", "OPERATIONS", "READONLY", "REVIEWER"]);
+  await requirePermission(request, "products.view");
   const url = new URL(request.url);
   const statusParam = url.searchParams.get("status") || "ALL";
   const status = (STATUSES.includes(statusParam as (typeof STATUSES)[number])
@@ -37,10 +37,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
 export async function action({ request }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const user = await requirePermission(request, "products.manage");
   const { ip, userAgent } = getRequestMeta(request);
   const actor = {
-    actorType: "OWNER_USER" as const,
+    actorType: "ADMIN_USER" as const,
     actorId: user.id,
     actorName: user.name,
     ipAddress: ip,

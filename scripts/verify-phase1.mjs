@@ -43,8 +43,8 @@ async function post(path, cookie, data) {
 }
 
 async function createOwner(email, password, role, isActive = true) {
-  const passwordHash = await bcrypt.hash(password, 10);
-  return prisma.ownerUser.upsert({
+  const passwordHash = await bcrypt.hash(password, 12);
+  return prisma.adminUser.upsert({
     where: { email },
     create: { email, passwordHash, name: `Test ${role}`, role, isActive },
     update: { passwordHash, role, isActive },
@@ -52,29 +52,19 @@ async function createOwner(email, password, role, isActive = true) {
 }
 
 async function cleanup() {
-  const entityIds = await testEntityIds();
-  if (entityIds.length) {
-    await prisma.auditLog.deleteMany({ where: { entityId: { in: entityIds } } });
-  }
+  // Audit rows are deliberately NOT deleted, and could not be: the AuditLog
+  // table is append-only at the database level, enforced by the trigger
+  // AuditLog_append_only, which raises restrict_violation on any DELETE or
+  // UPDATE. A harness that removed its own audit trail would be exercising
+  // exactly the capability the trail exists to deny. This run therefore leaves
+  // its audit rows behind; everything else it creates is removed.
   await prisma.seller.deleteMany({ where: { shopDomain: { in: [TEST_SHOP, TEST_SHOP_2] } } });
   await prisma.merchantApplication.deleteMany({
     where: { shopDomain: { in: [TEST_SHOP, TEST_SHOP_2] } },
   });
-  await prisma.ownerUser.deleteMany({
+  await prisma.adminUser.deleteMany({
     where: { email: { in: ["phase1-readonly@example.com", "phase1-inactive@example.com"] } },
   });
-}
-
-async function testEntityIds() {
-  const apps = await prisma.merchantApplication.findMany({
-    where: { shopDomain: { in: [TEST_SHOP, TEST_SHOP_2] } },
-    select: { id: true },
-  });
-  const sellers = await prisma.seller.findMany({
-    where: { shopDomain: { in: [TEST_SHOP, TEST_SHOP_2] } },
-    select: { id: true },
-  });
-  return [...apps.map((a) => a.id), ...sellers.map((s) => s.id)];
 }
 
 async function main() {
@@ -151,8 +141,8 @@ async function main() {
   const sellerReactivated = await prisma.seller.findUnique({ where: { id: sellerAfter.id } });
   check("reactivate: seller APPROVED", sellerReactivated?.status === "APPROVED", sellerReactivated?.status);
 
-  // 6. READONLY cannot approve
-  await createOwner("phase1-readonly@example.com", "readonly123", "READONLY");
+  // 6. VIEWER cannot approve
+  await createOwner("phase1-readonly@example.com", "readonly123", "VIEWER");
   const readonlyLogin = await login("phase1-readonly@example.com", "readonly123");
   const application2 = await prisma.merchantApplication.create({
     data: {
@@ -172,8 +162,8 @@ async function main() {
     applicationId: application2.id,
   });
   const app2After = await prisma.merchantApplication.findUnique({ where: { id: application2.id } });
-  check("READONLY approve blocked (403)", readonlyApprove.status === 403, `status ${readonlyApprove.status}`);
-  check("READONLY approve had no effect", app2After?.status === "PENDING", app2After?.status);
+  check("VIEWER approve blocked (403)", readonlyApprove.status === 403, `status ${readonlyApprove.status}`);
+  check("VIEWER approve had no effect", app2After?.status === "PENDING", app2After?.status);
 
   // 7. Inactive owner cannot log in
   await createOwner("phase1-inactive@example.com", "inactive123", "OWNER", false);

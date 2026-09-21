@@ -36,7 +36,7 @@ async function auditTransition(
   extra: Record<string, unknown> = {}
 ) {
   await recordAudit({
-    actorType: actor.actorType ?? "OWNER_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action,

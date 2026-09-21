@@ -119,11 +119,11 @@ interface RawTotalsRow {
 }
 
 const SORT_EXPRESSIONS: Record<RankingSortKey, Prisma.Sql> = {
-  netRetail: Prisma.sql`(COALESCE(st.retailSales, 0) - COALESCE(rf.refunds, 0))`,
-  retailSales: Prisma.sql`COALESCE(st.retailSales, 0)`,
-  wholesaleRevenue: Prisma.sql`COALESCE(st.wholesaleRevenue, 0)`,
-  paidOrders: Prisma.sql`COALESCE(st.paidOrders, 0)`,
-  unitsSold: Prisma.sql`COALESCE(st.unitsSold, 0)`,
+  netRetail: Prisma.sql`(COALESCE(st."retailSales", 0) - COALESCE(rf.refunds, 0))`,
+  retailSales: Prisma.sql`COALESCE(st."retailSales", 0)`,
+  wholesaleRevenue: Prisma.sql`COALESCE(st."wholesaleRevenue", 0)`,
+  paidOrders: Prisma.sql`COALESCE(st."paidOrders", 0)`,
+  unitsSold: Prisma.sql`COALESCE(st."unitsSold", 0)`,
   refunds: Prisma.sql`COALESCE(rf.refunds, 0)`,
 };
 
@@ -139,46 +139,53 @@ export async function computeRankings(
   const pageSize = options.all ? 0 : Math.max(1, options.pageSize ?? DEFAULT_PAGE_SIZE);
   const page = options.all ? 1 : Math.max(1, options.page ?? 1);
 
+  // Every camelCase identifier below is double-quoted, and it has to be.
+  // PostgreSQL folds an unquoted identifier to lower case, so `o.sellerId` is
+  // read as `o.sellerid` and the query dies with 42703 ("column does not
+  // exist"). Prisma creates these columns quoted and camelCase, so the quotes
+  // are not optional here — the same applies to the aliases, because Prisma
+  // returns the result-set column names verbatim and the mapping code below
+  // reads `row.sellerId`, not `row.sellerid`.
   const qualifyingOrderWhere = Prisma.sql`
     o.currency = ${currency}
-    AND o.shopifyCreatedAt >= ${from}
-    AND o.shopifyCreatedAt <= ${to}
-    AND o.cancelledAt IS NULL
-    AND o.paymentStatus IN ('PAID', 'PARTIALLY_REFUNDED')
-    AND UPPER(o.shopifyOrderName) NOT LIKE 'TEST%'
-    AND s.shopDomain NOT LIKE '%test.myshopify.com'
+    AND o."shopifyCreatedAt" >= ${from}
+    AND o."shopifyCreatedAt" <= ${to}
+    AND o."cancelledAt" IS NULL
+    AND o."paymentStatus" IN ('PAID', 'PARTIALLY_REFUNDED')
+    AND UPPER(o."shopifyOrderName") NOT LIKE 'TEST%'
+    AND s."shopDomain" NOT LIKE '%test.myshopify.com'
   `;
 
   const statsSubquery = Prisma.sql`
     SELECT
-      o.sellerId AS sellerId,
-      SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.price * oi.quantity ELSE 0 END) AS retailSales,
-      SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.wholesalePrice * oi.quantity ELSE 0 END) AS wholesaleRevenue,
-      SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.quantity ELSE 0 END) AS unitsSold,
-      COUNT(DISTINCT CASE WHEN oi.isMoonvellaProduct = 1 THEN o.id END) AS paidOrders
+      o."sellerId" AS "sellerId",
+      SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi.price * oi.quantity ELSE 0 END) AS "retailSales",
+      SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi."wholesalePrice" * oi.quantity ELSE 0 END) AS "wholesaleRevenue",
+      SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi.quantity ELSE 0 END) AS "unitsSold",
+      COUNT(DISTINCT CASE WHEN oi."isMoonvellaProduct" THEN o.id END) AS "paidOrders"
     FROM "Order" o
-    JOIN "OrderItem" oi ON oi.orderId = o.id
-    JOIN "Seller" s ON s.id = o.sellerId
+    JOIN "OrderItem" oi ON oi."orderId" = o.id
+    JOIN "Seller" s ON s.id = o."sellerId"
     WHERE ${qualifyingOrderWhere}
       AND s.status IN ('APPROVED', 'SUSPENDED')
-    GROUP BY o.sellerId
+    GROUP BY o."sellerId"
   `;
 
   const refundsSubquery = Prisma.sql`
-    SELECT o.sellerId AS sellerId, SUM(r.amount) AS refunds
+    SELECT o."sellerId" AS "sellerId", SUM(r.amount) AS refunds
     FROM "Refund" r
-    JOIN "Order" o ON o.id = r.orderId
-    JOIN "Seller" s ON s.id = o.sellerId
-    WHERE r.processedAt >= ${from}
-      AND r.processedAt <= ${to}
+    JOIN "Order" o ON o.id = r."orderId"
+    JOIN "Seller" s ON s.id = o."sellerId"
+    WHERE r."processedAt" >= ${from}
+      AND r."processedAt" <= ${to}
       AND o.currency = ${currency}
       AND s.status IN ('APPROVED', 'SUSPENDED')
-    GROUP BY o.sellerId
+    GROUP BY o."sellerId"
   `;
 
   const like = `%${search.toLowerCase()}%`;
   const searchClause = search
-    ? Prisma.sql`AND (LOWER(s.storeName) LIKE ${like} OR LOWER(s.shopDomain) LIKE ${like})`
+    ? Prisma.sql`AND (LOWER(s."storeName") LIKE ${like} OR LOWER(s."shopDomain") LIKE ${like})`
     : Prisma.empty;
   const limitClause =
     pageSize > 0
@@ -188,21 +195,21 @@ export async function computeRankings(
 
   const rowsQuery = Prisma.sql`
     SELECT
-      s.id AS sellerId,
-      s.storeName AS storeName,
-      s.shopDomain AS shopDomain,
+      s.id AS "sellerId",
+      s."storeName" AS "storeName",
+      s."shopDomain" AS "shopDomain",
       s.status AS status,
-      COALESCE(st.retailSales, 0) AS retailSales,
-      COALESCE(st.wholesaleRevenue, 0) AS wholesaleRevenue,
-      COALESCE(st.paidOrders, 0) AS paidOrders,
-      COALESCE(st.unitsSold, 0) AS unitsSold,
+      COALESCE(st."retailSales", 0) AS "retailSales",
+      COALESCE(st."wholesaleRevenue", 0) AS "wholesaleRevenue",
+      COALESCE(st."paidOrders", 0) AS "paidOrders",
+      COALESCE(st."unitsSold", 0) AS "unitsSold",
       COALESCE(rf.refunds, 0) AS refunds
     FROM "Seller" s
-    LEFT JOIN (${statsSubquery}) st ON st.sellerId = s.id
-    LEFT JOIN (${refundsSubquery}) rf ON rf.sellerId = s.id
+    LEFT JOIN (${statsSubquery}) st ON st."sellerId" = s.id
+    LEFT JOIN (${refundsSubquery}) rf ON rf."sellerId" = s.id
     WHERE s.status IN ('APPROVED', 'SUSPENDED')
       ${searchClause}
-    ORDER BY ${SORT_EXPRESSIONS[sortKey]} ${dirSql}, s.storeName ASC
+    ORDER BY ${SORT_EXPRESSIONS[sortKey]} ${dirSql}, s."storeName" ASC
     ${limitClause}
   `;
 
@@ -215,14 +222,14 @@ export async function computeRankings(
 
   const totalsQuery = Prisma.sql`
     SELECT
-      COALESCE(SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.price * oi.quantity ELSE 0 END), 0) AS retailSales,
-      COALESCE(SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.wholesalePrice * oi.quantity ELSE 0 END), 0) AS wholesaleRevenue,
-      COALESCE(SUM(CASE WHEN oi.isMoonvellaProduct = 1 THEN oi.quantity ELSE 0 END), 0) AS unitsSold,
-      COUNT(DISTINCT CASE WHEN oi.isMoonvellaProduct = 1 THEN o.id END) AS paidOrders,
-      COUNT(DISTINCT CASE WHEN oi.isMoonvellaProduct = 1 THEN o.sellerId END) AS sellers
+      COALESCE(SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi.price * oi.quantity ELSE 0 END), 0) AS "retailSales",
+      COALESCE(SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi."wholesalePrice" * oi.quantity ELSE 0 END), 0) AS "wholesaleRevenue",
+      COALESCE(SUM(CASE WHEN oi."isMoonvellaProduct" THEN oi.quantity ELSE 0 END), 0) AS "unitsSold",
+      COUNT(DISTINCT CASE WHEN oi."isMoonvellaProduct" THEN o.id END) AS "paidOrders",
+      COUNT(DISTINCT CASE WHEN oi."isMoonvellaProduct" THEN o."sellerId" END) AS sellers
     FROM "Order" o
-    JOIN "OrderItem" oi ON oi.orderId = o.id
-    JOIN "Seller" s ON s.id = o.sellerId
+    JOIN "OrderItem" oi ON oi."orderId" = o.id
+    JOIN "Seller" s ON s.id = o."sellerId"
     WHERE ${qualifyingOrderWhere}
       AND s.status IN ('APPROVED', 'SUSPENDED')
   `;
@@ -230,10 +237,10 @@ export async function computeRankings(
   const refundsTotalQuery = Prisma.sql`
     SELECT COALESCE(SUM(r.amount), 0) AS refunds
     FROM "Refund" r
-    JOIN "Order" o ON o.id = r.orderId
-    JOIN "Seller" s ON s.id = o.sellerId
-    WHERE r.processedAt >= ${from}
-      AND r.processedAt <= ${to}
+    JOIN "Order" o ON o.id = r."orderId"
+    JOIN "Seller" s ON s.id = o."sellerId"
+    WHERE r."processedAt" >= ${from}
+      AND r."processedAt" <= ${to}
       AND o.currency = ${currency}
       AND s.status IN ('APPROVED', 'SUSPENDED')
   `;
@@ -241,14 +248,14 @@ export async function computeRankings(
   const droppedCurrenciesQuery = Prisma.sql`
     SELECT o.currency AS currency, COUNT(*) AS count
     FROM "Order" o
-    JOIN "Seller" s ON s.id = o.sellerId
+    JOIN "Seller" s ON s.id = o."sellerId"
     WHERE o.currency != ${currency}
-      AND o.shopifyCreatedAt >= ${from}
-      AND o.shopifyCreatedAt <= ${to}
-      AND o.cancelledAt IS NULL
-      AND o.paymentStatus IN ('PAID', 'PARTIALLY_REFUNDED')
-      AND UPPER(o.shopifyOrderName) NOT LIKE 'TEST%'
-      AND s.shopDomain NOT LIKE '%test.myshopify.com'
+      AND o."shopifyCreatedAt" >= ${from}
+      AND o."shopifyCreatedAt" <= ${to}
+      AND o."cancelledAt" IS NULL
+      AND o."paymentStatus" IN ('PAID', 'PARTIALLY_REFUNDED')
+      AND UPPER(o."shopifyOrderName") NOT LIKE 'TEST%'
+      AND s."shopDomain" NOT LIKE '%test.myshopify.com'
     GROUP BY o.currency
   `;
 

@@ -1,6 +1,6 @@
 import { Link, Form, useLoaderData, useActionData, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requireOwnerAuth, requireOwnerRole, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
 
@@ -9,7 +9,7 @@ const STATUSES = ["PENDING", "SHIPPED", "DELIVERED", "EXCEPTION", "CANCELLED"];
 const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = ["packed", "handed_to_carrier", "shipped", "in_transit", "delivered", "exception"];
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requireOwnerAuth(request);
+  await requirePermission(request, "shipping.view");
   const url = new URL(request.url);
   const status = url.searchParams.get("status") || "";
   const where = STATUSES.includes(status) ? { status: status as never } : {};
@@ -44,9 +44,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
 export async function action({ request }: ActionFunctionArgs) {
   assertSameOrigin(request);
-  const user = await requireOwnerRole(request, ["OWNER", "OPERATIONS"]);
+  const user = await requirePermission(request, "shipping.manage");
   const { ip, userAgent } = getRequestMeta(request);
-  const actor = { actorType: "OWNER_USER" as const, actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
+  const actor = { actorType: "ADMIN_USER" as const, actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
 

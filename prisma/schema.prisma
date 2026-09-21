@@ -35,35 +35,132 @@ model Session {
   refreshTokenExpires DateTime?
 }
 
-model OwnerUser {
-  id            String    @id @default(cuid())
-  email         String    @unique
-  passwordHash  String
-  name          String
-  role          OwnerRole @default(OWNER)
-  isActive      Boolean   @default(true)
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
-  lastLoginAt   DateTime?
-  sessions      OwnerSession[]
+/// An administrative identity for the owner panel.
+///
+/// This was called OwnerUser while the panel had exactly one account. It now
+/// holds every staff member, and an OPERATIONS or VIEWER user is not an owner,
+/// so the name follows the job. The rename cost nothing at the moment it was
+/// made: the table held zero rows.
+model AdminUser {
+  id                 String    @id @default(cuid())
+  /// Always stored trimmed and lower-cased, and sign-in normalises the same
+  /// way, so "A@B.com" and "a@b.com" can never become two accounts.
+  email              String    @unique
+  name               String
+  /// Null until an invitation is accepted. A pending invitee therefore holds no
+  /// credential at all, rather than a placeholder that could be guessed.
+  passwordHash       String?
+  role               AdminRole @default(VIEWER)
+  isActive           Boolean   @default(true)
+
+  /// The primary owner. At most one row may carry this flag: the migration
+  /// creates a partial unique index on it, so the invariant is enforced by the
+  /// database and not only by the application code that happens to respect it.
+  isPrimaryOwner     Boolean   @default(false)
+
+  /// Set when the invited person proves control of the address by accepting.
+  /// Distinguishes a proven address from one an operator merely typed in.
+  emailVerifiedAt    DateTime?
+  /// Forces a password change at next sign-in. Used for recovery, not by the
+  /// ordinary invitation flow.
+  mustChangePassword Boolean   @default(false)
+
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  lastLoginAt        DateTime?
+
+  /// Durable per-account failure tally, surfaced in the user list. LoginAttempt
+  /// remains the source of truth for throttling; this is the visible counter.
+  failedLoginCount   Int       @default(0)
+  lockedUntil        DateTime?
+
+  /// Who created the account. Null for the primary owner, who is created by the
+  /// CLI and has no creator.
+  createdById        String?
+  createdBy          AdminUser? @relation("CreatedUsers", fields: [createdById], references: [id], onDelete: SetNull)
+  createdUsers       AdminUser[] @relation("CreatedUsers")
+
+  sessions           AdminSession[]
+  invitationsSent    AdminInvitation[] @relation("InvitedBy")
   reviewedApplications MerchantApplication[] @relation("ReviewedApplications")
+
+  @@index([isActive])
+  @@index([role])
 }
 
-model OwnerSession {
-  id           String     @id @default(cuid())
+/// A signed-in session.
+///
+/// The token itself is NOT stored — only its SHA-256 digest. A copy of this
+/// table (a backup, a replica, a query that reads one row) therefore yields no
+/// usable credential, because the digest cannot be replayed as a cookie. The
+/// raw token exists only in the client's cookie and in the request that set it.
+///
+/// SHA-256 is the right choice here rather than bcrypt: the token is 256 bits
+/// of CSPRNG output, not a human-chosen password, so there is no dictionary to
+/// attack and no work factor worth adding. The hash is verified on every
+/// authenticated request, where a slow KDF would be a self-inflicted denial of
+/// service.
+model AdminSession {
+  id           String    @id @default(cuid())
   userId       String
-  user         OwnerUser  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  token        String     @unique
+  user         AdminUser @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// SHA-256 of the session token, hex-encoded. Never the token itself.
+  tokenHash    String    @unique
   expiresAt    DateTime
-  createdAt    DateTime   @default(now())
-  lastAccessAt DateTime   @default(now())
+  createdAt    DateTime  @default(now())
+  lastAccessAt DateTime  @default(now())
+  /// Captured at sign-in, for the session list and audit correlation.
+  ipAddress    String?
+  userAgent    String?
+
+  @@index([userId])
+  @@index([expiresAt])
 }
 
-enum OwnerRole {
+enum AdminRole {
   OWNER
+  ADMIN
   OPERATIONS
-  REVIEWER
-  READONLY
+  CATALOG
+  SUPPORT
+  VIEWER
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  CANCELLED
+}
+
+/// An invitation to create a staff account.
+///
+/// Only the SHA-256 digest of the token is stored, for the same reason as
+/// AdminSession: the digest cannot be turned back into a working link. The
+/// token appears exactly once, in the URL handed to the invited person, and is
+/// unrecoverable from this table afterwards — which is why the owner is offered
+/// a one-time copy of the link rather than a "resend existing link" button.
+model AdminInvitation {
+  id          String           @id @default(cuid())
+  /// Normalised exactly as AdminUser.email is.
+  email       String
+  name        String
+  /// The role this invitation grants. Held here and never read from the
+  /// acceptance request, so an invitee cannot turn a CATALOG invitation into an
+  /// OWNER account by editing the form they submit.
+  role        AdminRole
+  tokenHash   String           @unique
+  status      InvitationStatus @default(PENDING)
+  /// 24 hours from creation, checked on redemption and not only on display.
+  expiresAt   DateTime
+  createdAt   DateTime         @default(now())
+  acceptedAt  DateTime?
+  cancelledAt DateTime?
+
+  invitedById String
+  invitedBy   AdminUser @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([email])
+  @@index([status, expiresAt])
 }
 
 model MerchantApplication {
@@ -87,7 +184,7 @@ model MerchantApplication {
   submittedAt           DateTime?
   reviewedAt            DateTime?
   reviewedById          String?
-  reviewedBy            OwnerUser?            @relation("ReviewedApplications", fields: [reviewedById], references: [id])
+  reviewedBy            AdminUser?            @relation("ReviewedApplications", fields: [reviewedById], references: [id])
   rejectionReason       String?
   internalNotes         String?
   businessStartDate     DateTime?
@@ -504,6 +601,19 @@ model ShipmentItem {
   createdAt       DateTime    @default(now())
 }
 
+/// The append-only security and activity log.
+///
+/// Append-only is enforced in the database, not by convention: a migration
+/// installs a trigger that raises on UPDATE and DELETE against this table. That
+/// matters because the application connects as the role that owns the schema,
+/// so revoking UPDATE/DELETE from it would be meaningless — the owner can grant
+/// the privilege straight back. A trigger applies to every role, including the
+/// owner and including a future careless migration.
+///
+/// Security events use `action` values prefixed "security.". The acting user is
+/// actorId; the subject of the action, where there is one, is entityId with
+/// entityType "AdminUser". Nothing here may hold a secret, a password, a hash,
+/// a session token or an invitation token — see recordAudit() callers.
 model AuditLog {
   id                String      @id @default(cuid())
   actorType         ActorType
@@ -524,7 +634,7 @@ model AuditLog {
 }
 
 enum ActorType {
-  OWNER_USER
+  ADMIN_USER
   SYSTEM
   MERCHANT
   WEBHOOK

@@ -8,18 +8,40 @@ import {
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
 } from "react-router";
-import { getOwnerUser, buildSessionCookie, assertSameOrigin, getRequestMeta } from "~/utils/ownerAuth.server";
 import {
-  authenticateOwner,
-  createOwnerSession,
-  isLoginThrottled,
-  recordFailedLogin,
+  buildSessionCookie,
+  assertSameOrigin,
+  getRequestMeta,
+  getSessionToken,
+  getCurrentUser,
+} from "~/utils/adminAuth.server";
+// Client-safe: the component re-validates `next` during render.
+import { safeRedirectPath } from "~/utils/safeRedirect";
+import {
+  authenticate,
   clearLoginAttempts,
-} from "~/services/ownerAuth.server";
-import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
+  createSession,
+  isLoginThrottled,
+  markLoginFailure,
+  markLoginSuccess,
+  recordFailedLogin,
+  revokeSessionByToken,
+} from "~/services/adminAuth.server";
+import { recordAudit, SECURITY_ACTION, AUDIT_ENTITY } from "~/services/audit.server";
+
+/**
+ * One message for every failure.
+ *
+ * Wrong password, no such account, disabled account and throttled account all
+ * produce the same sentence. That is not politeness — a distinct message for
+ * "no such user" turns this form into an account-enumeration oracle, and the
+ * only thing the person in front of it legitimately needs to know is that the
+ * credentials did not work.
+ */
+const GENERIC_FAILURE = "Invalid email or password.";
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  const user = await getOwnerUser(request);
+  const user = await getCurrentUser(request);
   if (user) {
     throw redirect("/admin");
   }
@@ -32,53 +54,86 @@ export async function action({ request }: ActionFunctionArgs) {
   const formData = await request.formData();
   const email = String(formData.get("email") || "").trim().toLowerCase();
   const password = String(formData.get("password") || "");
+  const nextParam = safeRedirectPath(String(formData.get("next") || ""));
   const { ip, userAgent } = getRequestMeta(request);
 
   if (!email || !password) {
     return { error: "Email and password are required." };
   }
 
-  const throttleKey = `${email}|${ip ?? "unknown"}`;
-  if (await isLoginThrottled(throttleKey)) {
-    return {
-      error: "Too many failed sign-in attempts. Please wait a few minutes and try again.",
-    };
-  }
-
-  const user = await authenticateOwner(email, password);
-  if (!user) {
-    await recordFailedLogin(throttleKey);
+  // Throttle before touching the password, so a flood costs one indexed count
+  // rather than a bcrypt comparison per request.
+  if (await isLoginThrottled(email, ip)) {
     await recordAudit({
       actorType: "SYSTEM",
       actorId: email,
-      actorName: email,
-      action: "owner.login_failed",
-      entityType: AUDIT_ENTITY.OWNER_USER,
+      actorName: null,
+      action: SECURITY_ACTION.LOGIN_THROTTLED,
+      entityType: AUDIT_ENTITY.ADMIN_USER,
       entityId: email,
       ipAddress: ip,
       userAgent,
     });
-    return { error: "Invalid email or password." };
+    return { error: GENERIC_FAILURE };
   }
 
-  await clearLoginAttempts(throttleKey);
-  const token = await createOwnerSession(user.id);
+  const user = await authenticate(email, password);
+
+  if (!user) {
+    // Recorded whether or not the account exists, so the throttle behaves
+    // identically for real and imaginary addresses and cannot be used to probe.
+    await recordFailedLogin(email, ip);
+    await markLoginFailure(email);
+
+    await recordAudit({
+      actorType: "SYSTEM",
+      actorId: email,
+      actorName: null,
+      action: SECURITY_ACTION.LOGIN_FAILED,
+      entityType: AUDIT_ENTITY.ADMIN_USER,
+      entityId: email,
+      ipAddress: ip,
+      userAgent,
+    });
+
+    return { error: GENERIC_FAILURE };
+  }
+
+  await clearLoginAttempts(email, ip);
+  await markLoginSuccess(user.id);
+
+  /**
+   * Rotate. Whatever session cookie arrived is discarded and a new token is
+   * minted, so a session identifier that was valid before authentication does
+   * not remain valid after it. That is the whole of session-fixation defence
+   * and it costs one delete.
+   */
+  const presented = getSessionToken(request);
+  if (presented) {
+    await revokeSessionByToken(presented);
+  }
+
+  const token = await createSession(user.id, { ip, userAgent });
 
   await recordAudit({
-    actorType: "OWNER_USER",
+    actorType: "ADMIN_USER",
     actorId: user.id,
     actorName: user.name,
-    action: "owner.login",
-    entityType: AUDIT_ENTITY.OWNER_USER,
+    action: SECURITY_ACTION.LOGIN,
+    entityType: AUDIT_ENTITY.ADMIN_USER,
     entityId: user.id,
     ipAddress: ip,
     userAgent,
   });
 
-  return redirect("/admin", {
-    headers: {
-      "Set-Cookie": buildSessionCookie(token),
-    },
+  // A password reset issued by an owner takes precedence over wherever the user
+  // was heading.
+  const destination = user.mustChangePassword
+    ? "/admin/settings?notice=password-change-required"
+    : nextParam || "/admin";
+
+  return redirect(destination, {
+    headers: { "Set-Cookie": buildSessionCookie(token) },
   });
 }
 
@@ -87,10 +142,15 @@ export default function AdminLogin() {
   const navigation = useNavigation();
   const [searchParams] = useSearchParams();
   const isSubmitting = navigation.state === "submitting";
+
   const notice =
     searchParams.get("notice") === "password-changed"
-      ? "Password changed. All sessions were signed out — please sign in again."
-      : null;
+      ? "Password changed. Other sessions were signed out — please sign in again."
+      : searchParams.get("notice") === "invitation-accepted"
+        ? "Your account is ready. Sign in with the password you just chose."
+        : null;
+
+  const next = safeRedirectPath(searchParams.get("next"));
 
   return (
     <div className="admin-login-page">
@@ -102,8 +162,15 @@ export default function AdminLogin() {
         </div>
 
         <Form method="post" noValidate>
+          {/* Carried through the form rather than left in the query string, so
+              the destination cannot be swapped by editing the URL a submitted
+              form points at. Re-validated server-side on the way back. */}
+          {next ? <input type="hidden" name="next" value={next} /> : null}
+
           {actionData?.error ? (
-            <div className="admin-login-error">{actionData.error}</div>
+            <div className="admin-login-error" role="alert">
+              {actionData.error}
+            </div>
           ) : null}
 
           {!actionData?.error && notice ? (
@@ -135,6 +202,7 @@ export default function AdminLogin() {
               name="email"
               autoComplete="email"
               required
+              autoFocus
             />
           </div>
 
@@ -163,6 +231,9 @@ export default function AdminLogin() {
 
         <p className="admin-login-footer">
           MoonVella Administration Panel &bull; Private Access Only
+        </p>
+        <p className="admin-login-footer" style={{ marginTop: "0.5rem" }}>
+          Accounts are created by invitation. There is no self-registration.
         </p>
       </div>
     </div>
