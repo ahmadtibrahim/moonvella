@@ -4,7 +4,22 @@ import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adm
 import { permissionsFor } from "~/services/permissions";
 import { createProduct } from "~/services/products.server";
 import { PRODUCT_CODE_HELP, suggestProductCode } from "~/utils/productCode";
-import { card, input, label, btn, sectionTitle, sectionNote, Field, INK, MUTED, helpText } from "~/components/product/ui";
+import {
+  card,
+  input,
+  label,
+  btn,
+  sectionTitle,
+  sectionNote,
+  Field,
+  CATEGORY_OPTIONS,
+  CURRENCY_OPTIONS,
+  CatalogueField,
+  catalogueValue,
+  INK,
+  MUTED,
+  helpText,
+} from "~/components/product/ui";
 
 /**
  * Creating a product.
@@ -46,9 +61,9 @@ export async function action({ request }: ActionFunctionArgs) {
       {
         name: String(form.get("name") || ""),
         productCode: String(form.get("productCode") || ""),
-        category: String(form.get("category") || ""),
+        category: catalogueValue(form, "category"),
         description: String(form.get("description") || "") || null,
-        currency: String(form.get("currency") || "CAD"),
+        currency: catalogueValue(form, "currency") || "CAD",
       },
       actor
     );
@@ -62,9 +77,9 @@ export async function action({ request }: ActionFunctionArgs) {
       values: {
         name: String(form.get("name") || ""),
         productCode: String(form.get("productCode") || ""),
-        category: String(form.get("category") || ""),
+        category: catalogueValue(form, "category"),
         description: String(form.get("description") || ""),
-        currency: String(form.get("currency") || "CAD"),
+        currency: catalogueValue(form, "currency") || "CAD",
       },
     };
   }
@@ -130,27 +145,27 @@ export default function AdminProductNew() {
           </div>
 
           <div>
-            <Field id="new-category" label="Category">
-              <input
-                style={input}
-                id="new-category"
-                name="category"
-                required
-                defaultValue={actionData?.values.category ?? ""}
-                placeholder="Bedding"
-              />
-            </Field>
+            <CatalogueField
+              id="new-category"
+              label="Category"
+              name="category"
+              options={CATEGORY_OPTIONS}
+              value={actionData?.values.category ?? ""}
+              hint="Or type a new one below — anything you type there is used instead."
+              placeholder="e.g. Bedding"
+            />
           </div>
 
           <div>
-            <Field id="new-currency" label="Currency">
-              <input
-                style={input}
-                id="new-currency"
-                name="currency"
-                defaultValue={actionData?.values.currency ?? "CAD"}
-              />
-            </Field>
+            <CatalogueField
+              id="new-currency"
+              label="Currency"
+              name="currency"
+              options={CURRENCY_OPTIONS}
+              value={actionData?.values.currency ?? "CAD"}
+              hint="Prices on every variant are in this currency."
+              placeholder="e.g. NZD"
+            />
           </div>
 
           <div style={{ gridColumn: "1 / -1" }}>

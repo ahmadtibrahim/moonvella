@@ -28,7 +28,7 @@ import {
 import { publicationReadiness } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import { listPresets, saveVariantPackages, copyVariantPackaging } from "~/services/packaging.server";
-import { card, INK, MUTED } from "~/components/product/ui";
+import { card, INK, MUTED, catalogueValue } from "~/components/product/ui";
 import DetailsTab from "~/components/product/DetailsTab";
 import VariantsTab from "~/components/product/VariantsTab";
 import MediaTab from "~/components/product/MediaTab";
@@ -142,12 +142,12 @@ export async function action({ request, params }: ActionFunctionArgs) {
           {
             name: text("name"),
             productCode: text("productCode"),
-            category: text("category"),
+            category: catalogueValue(form, "category"),
             description: optional("description"),
             features: optional("features"),
             materials: optional("materials"),
             careInstructions: optional("careInstructions"),
-            currency: text("currency") || "CAD",
+            currency: catalogueValue(form, "currency") || "CAD",
           },
           actor
         );
@@ -159,12 +159,12 @@ export async function action({ request, params }: ActionFunctionArgs) {
           {
             name: text("name"),
             productCode: text("productCode"),
-            category: text("category"),
+            category: catalogueValue(form, "category"),
             description: optional("description"),
             features: optional("features"),
             materials: optional("materials"),
             careInstructions: optional("careInstructions"),
-            currency: text("currency") || "CAD",
+            currency: catalogueValue(form, "currency") || "CAD",
             status: "PENDING_APPROVAL",
           },
           actor
@@ -344,9 +344,11 @@ export async function action({ request, params }: ActionFunctionArgs) {
           length,
           width: String(form.getAll("pkg_width")[i] ?? ""),
           height: String(form.getAll("pkg_height")[i] ?? ""),
-          dimensionUnit: String(form.getAll("pkg_dimUnit")[i] ?? "cm"),
+          // The form defaults to inches and pounds; the service converts to the
+          // canonical centimetres and kilograms before anything is stored.
+          dimensionUnit: String(form.getAll("pkg_dimUnit")[i] ?? "in"),
           grossWeight: String(form.getAll("pkg_weight")[i] ?? ""),
-          weightUnit: String(form.getAll("pkg_weightUnit")[i] ?? "kg"),
+          weightUnit: String(form.getAll("pkg_weightUnit")[i] ?? "lb"),
           unitsPerPackage: String(form.getAll("pkg_unitsPerPackage")[i] ?? "1"),
           packagesPerUnit: String(form.getAll("pkg_packagesPerUnit")[i] ?? "1"),
         }));

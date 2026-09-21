@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Form, Link, useSearchParams } from "react-router";
 import {
   card,
@@ -212,6 +213,13 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
         A file is stored once and attached where it applies. An image attached to the whole
         product is shared, and every variant shows it without a second copy of the file.
       </p>
+      <p style={{ ...helpText, marginBottom: "0.85rem" }}>
+        Coverage and publication are two different questions, and the tiles below answer only the
+        first: does every variant have a picture? Attaching a file to one variant leaves the rest
+        showing a placeholder, and those pictures are not what publication counts. Publication
+        asks whether the product has an approved, seller-visible image, and whether every such
+        image has alt text — questions the readiness strip at the top of this page answers.
+      </p>
 
       {product.variants.length === 0 ? (
         <EmptyState>
@@ -281,6 +289,14 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
 function UploadPanel({ product }: { product: Product }) {
   const [params] = useSearchParams();
   const scope = params.get("scope") ?? "shared";
+  /**
+   * Alt text is required of an image and meaningless for a video or a
+   * template, and this one form uploads all three — so the field asks for it
+   * only when the category being chosen is one that needs it, rather than
+   * blocking a video upload over a description nobody will read.
+   */
+  const [category, setCategory] = useState("WHITE_BACKGROUND_IMAGE");
+  const altRequired = IMAGE_CATEGORIES.includes(category);
 
   return (
     <div style={card}>
@@ -308,7 +324,13 @@ function UploadPanel({ product }: { product: Product }) {
           </div>
 
           <Field id="m-category" label="Category">
-            <select style={input} id="m-category" name="category" defaultValue="WHITE_BACKGROUND_IMAGE">
+            <select
+              style={input}
+              id="m-category"
+              name="category"
+              value={category}
+              onChange={(event) => setCategory(event.target.value)}
+            >
               {Object.entries(CATEGORY_LABELS).map(([value, text]) => (
                 <option key={value} value={value}>
                   {text}
@@ -342,10 +364,14 @@ function UploadPanel({ product }: { product: Product }) {
 
           <Field
             id="m-alt"
-            label="Alt text"
-            hint="Required before an image can be published. Describe what the picture shows."
+            label={altRequired ? "Alt text *" : "Alt text"}
+            hint={
+              altRequired
+                ? "Required before an image can be published. Describe what the picture shows."
+                : "Used where the asset is described. Not required for video or templates."
+            }
           >
-            <input style={input} id="m-alt" name="altText" />
+            <input style={input} id="m-alt" name="altText" required={altRequired} />
           </Field>
         </div>
 
@@ -692,14 +718,20 @@ function AssetEditor({
 
               <Field
                 id={`a-alt-${asset.id}`}
-                label="Alt text"
+                label={IMAGE_CATEGORIES.includes(asset.category) ? "Alt text *" : "Alt text"}
                 hint={
                   IMAGE_CATEGORIES.includes(asset.category)
                     ? "Required before publication."
                     : "Used where the asset is described."
                 }
               >
-                <input style={input} id={`a-alt-${asset.id}`} name="altText" defaultValue={asset.altText ?? ""} />
+                <input
+                  style={input}
+                  id={`a-alt-${asset.id}`}
+                  name="altText"
+                  required={IMAGE_CATEGORIES.includes(asset.category)}
+                  defaultValue={asset.altText ?? ""}
+                />
               </Field>
 
               <Field id={`a-subtype-${asset.id}`} label="Subtype">

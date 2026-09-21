@@ -20,32 +20,33 @@ export const card: CSSProperties = {
   background: "white",
   border: `1px solid ${LINE}`,
   borderRadius: 12,
-  padding: "1.5rem",
+  padding: "2rem",
   marginBottom: "1.5rem",
 };
 
 export const input: CSSProperties = {
   width: "100%",
-  padding: "0.5rem",
+  padding: "0.55rem",
   border: "1px solid #cbd5e1",
   borderRadius: 6,
-  fontSize: "0.85rem",
+  fontSize: "0.9rem",
   boxSizing: "border-box",
   fontFamily: "inherit",
 };
 
 export const label: CSSProperties = {
   display: "block",
-  fontSize: "0.72rem",
-  color: MUTED,
-  marginBottom: "0.25rem",
+  fontSize: "0.78rem",
+  fontWeight: 600,
+  color: "#334155",
+  marginBottom: "0.3rem",
 };
 
 export const helpText: CSSProperties = {
-  fontSize: "0.7rem",
-  color: FAINT,
-  marginTop: "0.2rem",
-  lineHeight: 1.4,
+  fontSize: "0.76rem",
+  color: MUTED,
+  marginTop: "0.25rem",
+  lineHeight: 1.45,
 };
 
 export function btn(color: string, options: { solid?: boolean } = {}): CSSProperties {
@@ -71,7 +72,7 @@ export const sectionTitle: CSSProperties = {
 };
 
 export const sectionNote: CSSProperties = {
-  fontSize: "0.75rem",
+  fontSize: "0.8rem",
   color: MUTED,
   marginBottom: "1rem",
   lineHeight: 1.5,
@@ -102,6 +103,96 @@ export function Field({
       {hint ? <div style={helpText}>{hint}</div> : null}
     </div>
   );
+}
+
+/**
+ * The values a merchant is offered before they are invited to invent one.
+ *
+ * These are suggestions, not an enum: the column is free text, and a catalog
+ * that has to be redeployed before somebody can sell "Pet Supplies" is a worse
+ * catalog. What the list buys is that the *common* answers agree with each
+ * other — one "Clothing", not "Clothing", "clothing" and "Apparel" — because
+ * filtering and the seller-facing categories only work if the words match.
+ */
+export const CATEGORY_OPTIONS = [
+  "Clothing",
+  "Accessories",
+  "Home & Garden",
+  "Sports",
+  "Electronics",
+  "Other",
+];
+
+export const CURRENCY_OPTIONS = ["CAD", "USD", "EUR", "GBP", "AUD", "CHF"];
+
+/**
+ * A catalogue value: a list of the usual answers, and a box for a new one.
+ *
+ * The box wins whenever it has anything in it. That rule is the whole design —
+ * it is what lets both controls stay named, submit together, and behave
+ * predictably with no JavaScript at all (see `catalogueValue` for the other
+ * half of it). "I typed something here" reads as a deliberate override; a blank
+ * box reads as "the list is right".
+ *
+ * The product's *current* value is added to the list when it is not already in
+ * it, so editing a product categorised before this list existed shows that
+ * category rather than silently resetting it to whatever is first.
+ */
+export function CatalogueField({
+  id,
+  label: text,
+  name,
+  options,
+  value,
+  disabled,
+  hint,
+  placeholder,
+}: {
+  id: string;
+  label: string;
+  name: string;
+  options: string[];
+  value: string | null | undefined;
+  disabled?: boolean;
+  hint?: ReactNode;
+  placeholder?: string;
+}) {
+  const current = (value ?? "").trim();
+  return (
+    <Field id={id} label={text} hint={hint}>
+      <select style={input} id={id} name={name} disabled={disabled} defaultValue={current}>
+        {current === "" ? <option value="">Choose…</option> : null}
+        {current !== "" && !options.includes(current) ? (
+          <option value={current}>{current}</option>
+        ) : null}
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
+      <input
+        style={{ ...input, marginTop: "0.3rem" }}
+        id={`${id}-new`}
+        name={`${name}_new`}
+        disabled={disabled}
+        placeholder={placeholder}
+        aria-label={`New ${text.toLowerCase()} — overrides the list above`}
+      />
+    </Field>
+  );
+}
+
+/**
+ * Reads a `CatalogueField` back out of a submitted form.
+ *
+ * Shares the field's one rule so the two routes that use it cannot drift apart:
+ * the free-text box if it holds anything, otherwise the list.
+ */
+export function catalogueValue(form: FormData, name: string): string {
+  const typed = String(form.get(`${name}_new`) ?? "").trim();
+  if (typed) return typed;
+  return String(form.get(name) ?? "").trim();
 }
 
 export function StatusChip({ status }: { status: string }) {

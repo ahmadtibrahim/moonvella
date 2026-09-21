@@ -156,7 +156,9 @@ export default function AdminProducts() {
           </h1>
           <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1.5rem" }}>
             MoonVella supplier catalog. A product is a family; each sellable size or
-            colour underneath it is a variant with its own SKU and price.
+            colour underneath it is a variant with its own SKU and price. The Media
+            column counts the files attached to the product — it is not a count of
+            variants with pictures, which is shown on the product&rsquo;s Media tab.
           </p>
         </div>
         <Link to="/admin/products/new" style={{ ...btn("#082a4a"), textDecoration: "none", padding: "0.6rem 1.1rem", fontSize: "0.8rem" }}>

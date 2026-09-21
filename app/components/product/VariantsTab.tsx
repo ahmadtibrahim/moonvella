@@ -401,11 +401,11 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                   <select
                     style={input}
                     name="pkg_dimUnit"
-                    defaultValue={row?.dimensionUnit ?? "cm"}
+                    defaultValue={row?.dimensionUnit ?? "in"}
                     aria-label={`Carton ${index + 1} dimension unit`}
                   >
-                    <option value="cm">cm</option>
                     <option value="in">in</option>
+                    <option value="cm">cm</option>
                   </select>
                 </td>
                 <td style={{ padding: "0.2rem" }}>
@@ -421,11 +421,11 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                   <select
                     style={input}
                     name="pkg_weightUnit"
-                    defaultValue={row?.weightUnit ?? "kg"}
+                    defaultValue={row?.weightUnit ?? "lb"}
                     aria-label={`Carton ${index + 1} weight unit`}
                   >
-                    <option value="kg">kg</option>
                     <option value="lb">lb</option>
+                    <option value="kg">kg</option>
                   </select>
                 </td>
                 <td style={{ padding: "0.2rem" }}>

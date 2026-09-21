@@ -6,6 +6,9 @@ import {
   card,
   input,
   btn,
+  CATEGORY_OPTIONS,
+  CURRENCY_OPTIONS,
+  CatalogueField,
   sectionTitle,
   sectionNote,
   Field,
@@ -129,26 +132,27 @@ export default function DetailsTab({
               />
             </Field>
 
-            <Field id="d-category" label="Category">
-              <input
-                style={input}
-                id="d-category"
-                name="category"
-                required
-                disabled={disabled}
-                defaultValue={product.category}
-              />
-            </Field>
+            <CatalogueField
+              id="d-category"
+              label="Category"
+              name="category"
+              options={CATEGORY_OPTIONS}
+              value={product.category}
+              disabled={disabled}
+              hint="Or type a new one below — anything you type there is used instead."
+              placeholder="e.g. Bedding"
+            />
 
-            <Field id="d-currency" label="Currency">
-              <input
-                style={input}
-                id="d-currency"
-                name="currency"
-                disabled={disabled}
-                defaultValue={product.currency}
-              />
-            </Field>
+            <CatalogueField
+              id="d-currency"
+              label="Currency"
+              name="currency"
+              options={CURRENCY_OPTIONS}
+              value={product.currency}
+              disabled={disabled}
+              hint="Prices on every variant are in this currency."
+              placeholder="e.g. NZD"
+            />
 
             <div />
 
