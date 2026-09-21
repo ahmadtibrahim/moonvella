@@ -89,13 +89,13 @@ function promptHidden(prompt) {
         switch (ch) {
           case "\r":
           case "\n":
-          case "": // Ctrl-D
+          case "\u0004": // Ctrl-D
             finish(value);
             return;
-          case "": // Ctrl-C
+          case "\u0003": // Ctrl-C
             finish(null, new Error("Cancelled."));
             return;
-          case "": // Backspace
+          case "\u007f": // Backspace (DEL)
           case "\b":
             value = value.slice(0, -1);
             break;

@@ -63,9 +63,19 @@ interface ImportableProduct {
   name: string;
   description: string | null;
   category: string;
-  images: string;
   variants: ImportableVariant[];
-  productImages: { url: string; alt: string | null }[];
+  mediaAssets: ImportableMediaAsset[];
+}
+
+/**
+ * The subset of a MediaAsset the Shopify export cares about. storageKey is
+ * carried so a future deployment with a public origin can address the file;
+ * sourceUrl is what can be sent today.
+ */
+interface ImportableMediaAsset {
+  storageKey: string;
+  sourceUrl: string | null;
+  altText: string | null;
 }
 
 interface SellerLike {
@@ -154,30 +164,22 @@ const INVENTORY_SET = `#graphql
 const LOCATIONS_QUERY = `#graphql
   query MoonVellaLocations { locations(first: 1) { nodes { id } } }`;
 
-export function parseImages(raw: string | null): string[] {
-  if (!raw) return [];
-  try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
 /**
- * Preferred image source is the ProductImage relation; the legacy Product.images
- * JSON column is only used when no ProductImage rows exist. Duplicates removed.
+ * Shopify fetches media by URL, so an asset can only be exported when it has an
+ * absolute one. `sourceUrl` holds the URL a legacy asset came from, which is
+ * exactly what Shopify needs. An asset uploaded through the new pipeline has no
+ * sourceUrl: it is addressed by a storage key and this deployment has no public
+ * origin configured for it, so inventing one would send Shopify a broken link.
+ * Such assets are skipped here and wait for the storage origin to exist.
+ *
+ * Duplicates are removed because Shopify rejects the same originalSource twice.
  */
 export function collectProductImages(product: {
-  productImages?: { url: string; alt?: string | null }[];
-  images?: string | null;
+  mediaAssets?: ImportableMediaAsset[];
 }): { url: string; alt: string | null }[] {
-  const rows = (product.productImages ?? [])
-    .filter((image) => typeof image.url === "string" && image.url.length > 0)
-    .map((image) => ({ url: image.url, alt: image.alt ?? null }));
-  const sources = rows.length
-    ? rows
-    : parseImages(product.images ?? null).map((url) => ({ url, alt: null }));
+  const sources = (product.mediaAssets ?? [])
+    .filter((asset) => typeof asset.sourceUrl === "string" && asset.sourceUrl.trim().length > 0)
+    .map((asset) => ({ url: asset.sourceUrl!.trim(), alt: asset.altText ?? null }));
 
   const seen = new Set<string>();
   const result: { url: string; alt: string | null }[] = [];
@@ -323,14 +325,36 @@ function variantPriceInput(variant: ImportableVariant, opts: ResolvedPricing) {
   };
 }
 
+/**
+ * Writes the record of what was imported, in the seller's own store.
+ *
+ * Two levels, and both are needed:
+ *
+ *   • SellerProduct / SellerProductVariant answer "what does this merchant have,
+ *     and what did it sell for there?" — that is commercial state, per seller.
+ *
+ *   • ExternalProductMapping / ExternalVariantMapping answer "which Shopify
+ *     object is this MoonVella product?" — that is identity, and it is written
+ *     inside the same transaction as the commercial record so the two cannot
+ *     disagree. A mapping that exists without its SellerProduct would point at
+ *     a store object nobody owns; a SellerProduct without its mapping could
+ *     never be resynced.
+ *
+ * The external tables carry no prices. A merchant's pricing is theirs and lives
+ * in SellerProduct; these rows are identifiers only, which is also why they are
+ * safe to keep if a merchant's commercial terms are ever reset.
+ */
 function persistMappings(
-  sellerId: string,
+  seller: { id: string; shopDomain: string },
   product: ImportableProduct,
   shopifyProductId: string,
   locationId: string | null,
   resolved: { local: ImportableVariant; shopifyVariant: ShopifyVariant | null }[],
   opts: ResolvedPricing
 ) {
+  const sellerId = seller.id;
+  const provider = "SHOPIFY";
+  const shopDomain = seller.shopDomain;
   const shopifyVariantIds = resolved
     .filter((item) => item.shopifyVariant)
     .map((item) => item.shopifyVariant!.id);
@@ -392,12 +416,54 @@ function persistMappings(
           syncedAt: new Date(),
         },
       });
+      // The identity row for this variant, in the same transaction as the
+      // commercial one above.
+      await tx.externalVariantMapping.upsert({
+        where: {
+          provider_shopDomain_variantId: { provider, shopDomain, variantId: item.local.id },
+        },
+        create: {
+          provider,
+          shopDomain,
+          variantId: item.local.id,
+          externalProductId: shopifyProductId,
+          externalVariantId: shopifyVariant.id,
+          importStatus: "IMPORTED",
+          lastSyncedAt: new Date(),
+        },
+        update: {
+          externalProductId: shopifyProductId,
+          externalVariantId: shopifyVariant.id,
+          importStatus: "IMPORTED",
+          lastSyncedAt: new Date(),
+          lastSyncError: null,
+        },
+      });
+
       mappings.push({
         productVariantId: item.local.id,
         shopifyVariantId: shopifyVariant.id,
         inventoryItemId,
       });
     }
+
+    await tx.externalProductMapping.upsert({
+      where: { provider_shopDomain_productId: { provider, shopDomain, productId: product.id } },
+      create: {
+        provider,
+        shopDomain,
+        productId: product.id,
+        externalProductId: shopifyProductId,
+        importStatus: mappings.length === resolved.length ? "IMPORTED" : "PARTIAL",
+        lastSyncedAt: new Date(),
+      },
+      update: {
+        externalProductId: shopifyProductId,
+        importStatus: mappings.length === resolved.length ? "IMPORTED" : "PARTIAL",
+        lastSyncedAt: new Date(),
+        lastSyncError: null,
+      },
+    });
 
     return { sellerProduct, mappings };
   });
@@ -466,7 +532,7 @@ async function createNewProduct(
   }));
 
   const result = await persistMappings(
-    seller.id,
+    seller,
     product,
     shopifyProductId,
     locationId,
@@ -621,7 +687,7 @@ async function resyncExistingProduct(
   }
 
   const result = await persistMappings(
-    seller.id,
+    seller,
     product,
     shopifyProductId,
     locationId,
@@ -677,7 +743,17 @@ export async function importProductForSeller(
     where: { id: productId },
     include: {
       variants: { where: { isActive: true }, orderBy: { sku: "asc" } },
-      productImages: { orderBy: { sortOrder: "asc" } },
+      // Only approved, seller-visible images may leave for a merchant store,
+      // which is the same gate the seller catalog applies.
+      mediaAssets: {
+        where: {
+          approvalStatus: "APPROVED",
+          sellerVisible: true,
+          category: { in: ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"] },
+        },
+        orderBy: { createdAt: "asc" },
+        select: { storageKey: true, sourceUrl: true, altText: true },
+      },
     },
   });
   if (!product || product.isArchived) return { ok: false, error: "Product not available." };

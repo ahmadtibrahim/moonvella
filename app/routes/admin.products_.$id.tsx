@@ -1,30 +1,107 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
+import { permissionsFor } from "~/services/permissions";
 import {
   getProduct,
   updateProduct,
+  setPublished,
+  setArchived,
+  duplicateProduct,
   addVariant,
   updateVariant,
   deleteVariant,
-  addImage,
-  deleteImage,
-  setMainImage,
-  moveImage,
+  setDefaultVariant,
 } from "~/services/products.server";
-import { saveProductImage } from "~/services/storage.server";
+import {
+  listProductMedia,
+  uploadMedia,
+  attachMediaToVariants,
+  updateMedia,
+  setMediaApproval,
+  deleteMedia,
+  detachMedia,
+  setPrimaryAssignment,
+  reorderAssignment,
+  supersedeDocument,
+} from "~/services/media.server";
+import { publicationReadiness } from "~/services/publication.server";
+import { previewMarketingPack } from "~/services/marketingPack.server";
 import { listPresets, saveVariantPackages, copyVariantPackaging } from "~/services/packaging.server";
+import { card, INK, MUTED } from "~/components/product/ui";
+import DetailsTab from "~/components/product/DetailsTab";
+import VariantsTab from "~/components/product/VariantsTab";
+import MediaTab from "~/components/product/MediaTab";
+import DocumentsTab from "~/components/product/DocumentsTab";
+import MarketingTab from "~/components/product/MarketingTab";
+
+export const TABS = ["details", "variants", "media", "documents", "marketing"] as const;
+export type TabKey = (typeof TABS)[number];
+
+const TAB_LABELS: Record<TabKey, string> = {
+  details: "Product Details",
+  variants: "Variants",
+  media: "Media",
+  documents: "Documents",
+  marketing: "Marketing Kit",
+};
+
+function readTab(value: string | null | undefined): TabKey {
+  return TABS.includes(value as TabKey) ? (value as TabKey) : "details";
+}
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requirePermission(request, "products.view");
-  const product = await getProduct(String(params.id));
+  const user = await requirePermission(request, "products.view");
+  const productId = String(params.id);
+  const product = await getProduct(productId);
   if (!product) {
     throw new Response("Product not found", { status: 404 });
   }
-  const presets = await listPresets();
-  return { product, presets };
+
+  const url = new URL(request.url);
+  const [presets, media, readiness, pack] = await Promise.all([
+    listPresets(),
+    listProductMedia(productId),
+    publicationReadiness(productId),
+    // Describes the seller's pack without opening any of its files, so the
+    // Marketing tab can show what will be handed over rather than describe it.
+    previewMarketingPack(productId),
+  ]);
+
+  const held = permissionsFor(user.role);
+
+  return {
+    product,
+    presets,
+    media,
+    readiness,
+    pack,
+    tab: readTab(url.searchParams.get("tab")),
+    /**
+     * "Preview seller view" is a navigation rather than a client-side toggle, so
+     * the preview is a URL someone can send to a colleague and reload.
+     */
+    preview: url.searchParams.get("preview") === "1",
+    /**
+     * What this person may do, resolved from their role. Used to decide which
+     * controls are drawn — never as the control itself, which is the check in
+     * the action and in the service behind it.
+     */
+    can: {
+      manage: held.has("products.manage"),
+      cost: held.has("products.cost.edit"),
+    },
+  };
 }
 
+/**
+ * Every write in the editor arrives here.
+ *
+ * One action for five tabs rather than five routes: the tabs share a product,
+ * and a single action means one authorisation check, one actor, and one place
+ * where an unknown intent is refused. A form that invents an intent it was not
+ * given fails loudly instead of silently doing nothing.
+ */
 export async function action({ request, params }: ActionFunctionArgs) {
   assertSameOrigin(request);
   const user = await requirePermission(request, "products.manage");
@@ -35,443 +112,418 @@ export async function action({ request, params }: ActionFunctionArgs) {
     actorName: user.name,
     ipAddress: ip,
     userAgent,
+    permissions: [...permissionsFor(user.role)],
   };
+
   const productId = String(params.id);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
+  const tab = readTab(String(form.get("tab") || ""));
+
+  const text = (name: string) => String(form.get(name) || "");
+  const optional = (name: string) => {
+    const value = String(form.get(name) ?? "").trim();
+    return value === "" ? null : value;
+  };
+  const variantScope = () =>
+    form
+      .getAll("scopeVariantIds")
+      .map(String)
+      .filter(Boolean);
 
   try {
-    if (intent === "update") {
-      await updateProduct(
-        productId,
-        {
-          name: String(form.get("name") || ""),
-          sku: String(form.get("sku") || ""),
-          category: String(form.get("category") || ""),
-          description: String(form.get("description") || ""),
-          wholesalePrice: Number(form.get("wholesalePrice")),
-          suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
-          costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          currency: String(form.get("currency") || "CAD"),
-        },
-        actor
-      );
-    } else if (intent === "add_variant") {
-      await addVariant(
-        productId,
-        {
-          name: String(form.get("name") || ""),
-          sku: String(form.get("sku") || ""),
-          wholesalePrice: Number(form.get("wholesalePrice")),
-          suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
-          costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          inventory: Number(form.get("inventory")),
-          weight: form.get("weight") ? Number(form.get("weight")) : null,
-        },
-        actor
-      );
-    } else if (intent === "update_variant") {
-      await updateVariant(
-        String(form.get("variantId")),
-        {
-          name: String(form.get("name") || ""),
-          sku: String(form.get("sku") || ""),
-          wholesalePrice: Number(form.get("wholesalePrice")),
-          suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
-          costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          inventory: Number(form.get("inventory")),
-          weight: form.get("weight") ? Number(form.get("weight")) : null,
-        },
-        actor
-      );
-    } else if (intent === "delete_variant") {
-      await deleteVariant(String(form.get("variantId")), actor);
-    } else if (intent === "set_main_image") {
-      await setMainImage(String(form.get("imageId")), actor);
-    } else if (intent === "move_image_up") {
-      await moveImage(String(form.get("imageId")), "up", actor);
-    } else if (intent === "move_image_down") {
-      await moveImage(String(form.get("imageId")), "down", actor);
-    } else if (intent === "add_image_file") {
-      const file = form.get("image");
-      if (!(file instanceof File) || file.size === 0) {
-        throw new Error("Choose an image file to upload.");
+    switch (intent) {
+      /* ---------------------------------------------------------------- */
+      /* Product details                                                   */
+      /* ---------------------------------------------------------------- */
+      case "update_details":
+        await updateProduct(
+          productId,
+          {
+            name: text("name"),
+            productCode: text("productCode"),
+            category: text("category"),
+            description: optional("description"),
+            features: optional("features"),
+            materials: optional("materials"),
+            careInstructions: optional("careInstructions"),
+            currency: text("currency") || "CAD",
+          },
+          actor
+        );
+        break;
+
+      case "submit_for_approval":
+        await updateProduct(
+          productId,
+          {
+            name: text("name"),
+            productCode: text("productCode"),
+            category: text("category"),
+            description: optional("description"),
+            features: optional("features"),
+            materials: optional("materials"),
+            careInstructions: optional("careInstructions"),
+            currency: text("currency") || "CAD",
+            status: "PENDING_APPROVAL",
+          },
+          actor
+        );
+        break;
+
+      case "publish":
+        await setPublished(productId, true, actor);
+        break;
+      case "unpublish":
+        await setPublished(productId, false, actor);
+        break;
+      case "archive":
+        await setArchived(productId, true, actor);
+        break;
+      case "restore":
+        await setArchived(productId, false, actor);
+        break;
+      case "duplicate": {
+        const copy = await duplicateProduct(productId, actor);
+        return redirect(`/admin/products/${copy.id}?tab=details`);
       }
-      const stored = await saveProductImage(file);
-      await addImage(productId, stored.url, String(form.get("alt") || "") || null, actor);
-    } else if (intent === "add_image_url") {
-      const url = String(form.get("imageUrl") || "").trim();
-      if (!/^https?:\/\//.test(url)) throw new Error("Enter a valid http(s) image URL.");
-      await addImage(productId, url, String(form.get("alt") || "") || null, actor);
-    } else if (intent === "delete_image") {
-      await deleteImage(String(form.get("imageId")), actor);
-    } else if (intent === "save_packaging") {
-      const variantId = String(form.get("variantId"));
-      const lengths = form.getAll("pkg_length").map(String);
-      const widths = form.getAll("pkg_width").map(String);
-      const heights = form.getAll("pkg_height").map(String);
-      const dimUnits = form.getAll("pkg_dimUnit").map(String);
-      const weights = form.getAll("pkg_weight").map(String);
-      const weightUnits = form.getAll("pkg_weightUnit").map(String);
-      const unitsPerPackage = form.getAll("pkg_unitsPerPackage").map(String);
-      const packagesPerUnit = form.getAll("pkg_packagesPerUnit").map(String);
-      const labels = form.getAll("pkg_label").map(String);
-      const types = form.getAll("pkg_packageType").map(String);
-      const presetIds = form.getAll("pkg_presetId").map(String);
-      const rows = lengths.map((l, i) => ({
-        label: labels[i],
-        packageType: types[i],
-        presetId: presetIds[i] || null,
-        length: l,
-        width: widths[i],
-        height: heights[i],
-        dimensionUnit: dimUnits[i],
-        grossWeight: weights[i],
-        weightUnit: weightUnits[i],
-        unitsPerPackage: unitsPerPackage[i],
-        packagesPerUnit: packagesPerUnit[i],
-      }));
-      await saveVariantPackages(variantId, rows);
-    } else if (intent === "copy_packaging") {
-      await copyVariantPackaging(String(form.get("fromVariantId")), String(form.get("toVariantId")));
-    } else {
-      throw new Error("Unknown action.");
+
+      /* ---------------------------------------------------------------- */
+      /* Variants                                                          */
+      /* ---------------------------------------------------------------- */
+      case "add_variant":
+      case "update_variant": {
+        const variantInput = {
+          name: text("name"),
+          sku: text("sku"),
+          barcode: optional("barcode"),
+          wholesalePrice: Number(form.get("wholesalePrice")),
+          suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
+          // Absent means "not supplied" rather than zero, so a caller without
+          // cost permission does not accidentally zero the figure.
+          costPrice: form.has("costPrice") ? (optional("costPrice") as never) : undefined,
+          inventory: Number(form.get("inventory") || 0),
+          unitsPerPackage: Number(form.get("unitsPerPackage") || 1),
+          productLengthCm: optional("productLengthCm"),
+          productWidthCm: optional("productWidthCm"),
+          productHeightCm: optional("productHeightCm"),
+          productWeightKg: optional("productWeightKg"),
+          options: form
+            .getAll("optionName")
+            .map((name, index) => ({
+              name: String(name),
+              value: String(form.getAll("optionValue")[index] ?? ""),
+            }))
+            .filter((option) => option.name.trim() && option.value.trim()),
+        };
+
+        if (intent === "add_variant") {
+          await addVariant(productId, variantInput, actor);
+        } else {
+          await updateVariant(text("variantId"), variantInput, actor);
+        }
+        break;
+      }
+
+      case "delete_variant":
+        await deleteVariant(text("variantId"), actor);
+        break;
+      case "set_default_variant":
+        await setDefaultVariant(text("variantId"), actor);
+        break;
+
+      /* ---------------------------------------------------------------- */
+      /* Media, documents and marketing share one set of writes            */
+      /* ---------------------------------------------------------------- */
+      case "media_upload": {
+        const file = form.get("file");
+        if (!(file instanceof File) || file.size === 0) {
+          throw new Error("Choose a file to upload.");
+        }
+        await uploadMedia(
+          productId,
+          file,
+          {
+            category: text("category") as never,
+            subtype: optional("subtype"),
+            title: optional("title"),
+            altText: optional("altText"),
+            variantIds: variantScope(),
+            documentType: optional("documentType"),
+            version: optional("version"),
+            effectiveDate: optional("effectiveDate"),
+            language: optional("language"),
+            downloadAllowed: form.get("downloadAllowed") !== "false",
+            instructions: optional("instructions"),
+            templateUrl: optional("templateUrl"),
+          },
+          actor
+        );
+        break;
+      }
+
+      case "document_supersede": {
+        const file = form.get("file");
+        if (!(file instanceof File) || file.size === 0) {
+          throw new Error("Choose the replacement file.");
+        }
+        await supersedeDocument(
+          text("assetId"),
+          file,
+          {
+            category: "DOCUMENT",
+            subtype: optional("subtype"),
+            title: optional("title"),
+            altText: optional("altText"),
+            variantIds: variantScope(),
+            documentType: optional("documentType"),
+            version: optional("version"),
+            effectiveDate: optional("effectiveDate"),
+            language: optional("language"),
+          },
+          actor
+        );
+        break;
+      }
+
+      case "media_update":
+        await updateMedia(
+          text("assetId"),
+          {
+            title: text("title"),
+            altText: optional("altText"),
+            category: form.has("category") ? (text("category") as never) : undefined,
+            subtype: form.has("subtype") ? (optional("subtype") as never) : undefined,
+            sellerVisible: form.has("sellerVisible") ? form.get("sellerVisible") === "true" : undefined,
+            documentType: form.has("documentType") ? (optional("documentType") as never) : undefined,
+            version: form.has("version") ? optional("version") : undefined,
+            effectiveDate: form.has("effectiveDate") ? optional("effectiveDate") : undefined,
+            language: form.has("language") ? optional("language") : undefined,
+            downloadAllowed: form.has("downloadAllowed") ? form.get("downloadAllowed") === "true" : undefined,
+            instructions: form.has("instructions") ? optional("instructions") : undefined,
+            templateUrl: form.has("templateUrl") ? optional("templateUrl") : undefined,
+          },
+          actor
+        );
+        break;
+
+      case "media_attach":
+        await attachMediaToVariants(text("assetId"), variantScope(), actor);
+        break;
+      case "media_approve":
+        await setMediaApproval(text("assetId"), "APPROVED", actor);
+        break;
+      case "media_reject":
+        await setMediaApproval(text("assetId"), "REJECTED", actor);
+        break;
+      case "media_delete":
+        await deleteMedia(text("assetId"), actor);
+        break;
+      case "media_detach":
+        await detachMedia(text("assignmentId"), actor);
+        break;
+      case "media_primary":
+        await setPrimaryAssignment(text("assignmentId"), actor);
+        break;
+      case "media_move_up":
+        await reorderAssignment(text("assignmentId"), "up", actor);
+        break;
+      case "media_move_down":
+        await reorderAssignment(text("assignmentId"), "down", actor);
+        break;
+
+      /* ---------------------------------------------------------------- */
+      /* Shipping and packaging — a separate feature, kept working          */
+      /* ---------------------------------------------------------------- */
+      case "save_packaging": {
+        const lengths = form.getAll("pkg_length").map(String);
+        const rows = lengths.map((length, i) => ({
+          label: String(form.getAll("pkg_label")[i] ?? ""),
+          packageType: String(form.getAll("pkg_packageType")[i] ?? "carton"),
+          presetId: String(form.getAll("pkg_presetId")[i] ?? "") || null,
+          length,
+          width: String(form.getAll("pkg_width")[i] ?? ""),
+          height: String(form.getAll("pkg_height")[i] ?? ""),
+          dimensionUnit: String(form.getAll("pkg_dimUnit")[i] ?? "cm"),
+          grossWeight: String(form.getAll("pkg_weight")[i] ?? ""),
+          weightUnit: String(form.getAll("pkg_weightUnit")[i] ?? "kg"),
+          unitsPerPackage: String(form.getAll("pkg_unitsPerPackage")[i] ?? "1"),
+          packagesPerUnit: String(form.getAll("pkg_packagesPerUnit")[i] ?? "1"),
+        }));
+        await saveVariantPackages(text("variantId"), rows);
+        break;
+      }
+
+      case "copy_packaging":
+        await copyVariantPackaging(text("fromVariantId"), text("toVariantId"));
+        break;
+
+      default:
+        throw new Error("Unknown action.");
     }
   } catch (error) {
-    return { error: error instanceof Error ? error.message : "Operation failed." };
+    return {
+      error: error instanceof Error ? error.message : "Operation failed.",
+      tab,
+    };
   }
 
-  return redirect(`/admin/products/${productId}`);
+  // Back to the tab the form was on, so a save does not move the reader.
+  return redirect(`/admin/products/${productId}?tab=${tab}`);
 }
 
-const card: React.CSSProperties = {
-  background: "white",
-  border: "1px solid #e2e8f0",
-  borderRadius: 12,
-  padding: "1.5rem",
-  marginBottom: "1.5rem",
-};
-const input: React.CSSProperties = {
-  width: "100%",
-  padding: "0.5rem",
-  border: "1px solid #cbd5e1",
-  borderRadius: 6,
-  fontSize: "0.85rem",
-  boxSizing: "border-box",
-};
-const label: React.CSSProperties = { display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" };
-const btn = (color: string): React.CSSProperties => ({
-  padding: "0.4rem 0.75rem",
-  border: `1px solid ${color}`,
-  borderRadius: 6,
-  background: "white",
-  color,
-  fontSize: "0.72rem",
-  fontWeight: 600,
-  cursor: "pointer",
-});
-
 export default function AdminProductDetail() {
-  const { product, presets } = useLoaderData<typeof loader>();
+  const { product, presets, media, readiness, pack, tab, can, preview } =
+    useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
+  const href = (key: TabKey) => `/admin/products/${product.id}?tab=${key}`;
+
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+    <div style={{ maxWidth: 1180, margin: "0 auto" }}>
       <p style={{ fontSize: "0.75rem", marginBottom: "0.5rem" }}>
-        <Link to="/admin/products" style={{ color: "#082a4a" }}>
+        <Link to="/admin/products" style={{ color: INK }}>
           &larr; All products
         </Link>
       </p>
-      <h1 style={{ fontSize: "1.6rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-        {product.name}
-      </h1>
-      <p style={{ color: "#64748b", fontSize: "0.8rem", marginBottom: "1.5rem" }}>
-        {product.sku} &middot; {product.isArchived ? "Archived" : product.isPublished ? "Published" : "Unpublished"}
-      </p>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "1rem" }}>
+        <div>
+          <h1 style={{ fontSize: "1.6rem", fontWeight: 700, color: INK, marginBottom: "0.25rem" }}>
+            {product.name}
+          </h1>
+          <p style={{ color: MUTED, fontSize: "0.8rem", marginBottom: 0 }}>
+            <code>{product.productCode}</code> &middot; {product.variants.length} variant
+            {product.variants.length === 1 ? "" : "s"} &middot; {media.length} media asset
+            {media.length === 1 ? "" : "s"}
+          </p>
+        </div>
+      </div>
+
+      {/* Publication state is shown on every tab, because "is this live?" is
+          the question a merchant has most often and the answer must not depend
+          on which tab they happen to be looking at. */}
+      <ReadinessStrip readiness={readiness} status={product.status} />
 
       {actionData?.error ? (
-        <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
+        <div
+          role="alert"
+          style={{
+            ...card,
+            background: "#fef2f2",
+            borderColor: "#fecaca",
+            color: "#991b1b",
+            fontSize: "0.85rem",
+            whiteSpace: "pre-wrap",
+          }}
+        >
           {actionData.error}
         </div>
       ) : null}
 
-      <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Product details
-        </h2>
-        <Form method="post" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.75rem" }}>
-          <input type="hidden" name="intent" value="update" />
-          <div>
-            <label style={label} htmlFor="edit-name">Title</label>
-            <input style={input} id="edit-name" name="name" defaultValue={product.name} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-sku">SKU</label>
-            <input style={input} id="edit-sku" name="sku" defaultValue={product.sku} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-category">Category</label>
-            <input style={input} id="edit-category" name="category" defaultValue={product.category} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-wholesalePrice">Wholesale price (CAD)</label>
-            <input style={input} id="edit-wholesalePrice" name="wholesalePrice" type="number" min="0" step="0.01" defaultValue={(product.wholesalePrice / 100).toFixed(2)} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-suggestedRetailPrice">Suggested retail price (CAD)</label>
-            <input style={input} id="edit-suggestedRetailPrice" name="suggestedRetailPrice" type="number" min="0" step="0.01" defaultValue={(product.suggestedRetailPrice / 100).toFixed(2)} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-costPrice">Internal acquisition cost (CAD, owner-only)</label>
-            <input style={input} id="edit-costPrice" name="costPrice" type="number" min="0" step="0.01" defaultValue={product.costPrice != null ? (product.costPrice / 100).toFixed(2) : ""} />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-currency">Currency</label>
-            <input style={input} id="edit-currency" name="currency" defaultValue={product.currency} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <label style={label} htmlFor="edit-description">Description</label>
-            <textarea style={input} id="edit-description" name="description" rows={2} defaultValue={product.description ?? ""} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <button type="submit" style={btn("#082a4a")}>Save details</button>
-          </div>
-        </Form>
-      </div>
-
-      <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Variants ({product.variants.length})
-        </h2>
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "1rem" }}>
-          {product.variants.map((v) => (
-            <Form
-              key={v.id}
-              method="post"
+      <nav
+        aria-label="Product sections"
+        style={{ display: "flex", gap: "0.25rem", borderBottom: "1px solid #e2e8f0", marginBottom: "1.25rem", flexWrap: "wrap" }}
+      >
+        {TABS.map((key) => {
+          const active = key === tab;
+          return (
+            <Link
+              key={key}
+              to={href(key)}
+              aria-current={active ? "page" : undefined}
               style={{
-                display: "grid",
-                gridTemplateColumns: "1.2fr 1fr 80px 80px 80px 70px 70px 70px",
-                gap: "0.4rem",
-                alignItems: "center",
+                padding: "0.55rem 0.9rem",
+                fontSize: "0.82rem",
+                fontWeight: active ? 700 : 500,
+                color: active ? INK : MUTED,
+                textDecoration: "none",
+                borderBottom: active ? `2px solid ${INK}` : "2px solid transparent",
+                marginBottom: -1,
               }}
             >
-              <input type="hidden" name="intent" value="update_variant" />
-              <input type="hidden" name="variantId" value={v.id} />
-              <input style={input} name="name" defaultValue={v.name} title="Name" />
-              <input style={input} name="sku" defaultValue={v.sku} title="SKU" />
-              <input style={input} name="wholesalePrice" type="number" step="0.01" defaultValue={(v.wholesalePrice / 100).toFixed(2)} title="Wholesale" />
-              <input style={input} name="suggestedRetailPrice" type="number" step="0.01" defaultValue={(v.suggestedRetailPrice / 100).toFixed(2)} title="Suggested retail" />
-              <input style={input} name="costPrice" type="number" step="0.01" defaultValue={v.costPrice != null ? (v.costPrice / 100).toFixed(2) : ""} title="Cost" />
-              <input style={input} name="weight" type="number" step="1" defaultValue={v.weight ?? ""} title="Weight" />
-              <input style={input} name="inventory" type="number" defaultValue={v.inventory} title="Inventory" />
-              <button type="submit" style={btn("#0369a1")}>Save</button>
-            </Form>
-          ))}
-        </div>
-        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-          {product.variants.map((v) => (
-            <Form key={`del-${v.id}`} method="post">
-              <input type="hidden" name="intent" value="delete_variant" />
-              <input type="hidden" name="variantId" value={v.id} />
-              <button type="submit" style={btn("#dc2626")}>
-                Delete {v.name}
-              </button>
-            </Form>
-          ))}
-        </div>
-
-        <h3 style={{ fontSize: "0.85rem", fontWeight: 600, marginTop: "1.25rem", marginBottom: "0.5rem" }}>
-          Add variant
-        </h3>
-        <Form method="post" style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr 1fr 1fr 1fr 1fr", gap: "0.4rem" }}>
-          <input type="hidden" name="intent" value="add_variant" />
-          <input style={input} name="name" placeholder="Name" required />
-          <input style={input} name="sku" placeholder="SKU" required />
-          <input style={input} name="wholesalePrice" type="number" placeholder="Wholesale" required />
-          <input style={input} name="suggestedRetailPrice" type="number" placeholder="Retail" required />
-          <input style={input} name="costPrice" type="number" placeholder="Cost" />
-          <input style={input} name="weight" type="number" placeholder="Weight" />
-          <input style={input} name="inventory" type="number" placeholder="Inventory" required />
-          <div style={{ gridColumn: "1 / -1" }}>
-            <button type="submit" style={btn("#059669")}>Add variant</button>
-          </div>
-        </Form>
-      </div>
-
-      <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
-          Shipping &amp; Packaging
-        </h2>
-        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "1rem" }}>
-          Enter the outside dimensions and total weight of the package as it will be handed to the carrier. This is the
-          default packaging used for quoting; it does not replace the actual measured packing of a multi-item order.
-          Presets assist entry but never override measured values.
-        </p>
-        {product.variants.map((v) => {
-          const blanks = Math.max(0, 2 - v.packages.length);
-          const rows = [...v.packages, ...Array.from({ length: blanks }).map(() => null)];
-          return (
-            <div key={v.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.75rem", marginBottom: "0.75rem" }}>
-              <div style={{ fontWeight: 600, fontSize: "0.85rem", marginBottom: "0.5rem" }}>
-                {v.name} ({v.sku}) —{" "}
-                {v.packages.length === 0 ? (
-                  <span style={{ color: "#b45309" }}>Packaging incomplete</span>
-                ) : (
-                  `${v.packages.length} package row(s)`
-                )}
-              </div>
-              <Form method="post">
-                <input type="hidden" name="intent" value="save_packaging" />
-                <input type="hidden" name="variantId" value={v.id} />
-                {rows.map((pkg, i) => (
-                  <div key={i} style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem", marginBottom: "0.35rem", alignItems: "center" }}>
-                    <input style={{ ...input, width: 110 }} name="pkg_label" placeholder="Label" defaultValue={pkg?.label ?? ""} />
-                    <select style={{ ...input, width: 90 }} name="pkg_packageType" defaultValue={pkg?.packageType ?? "carton"}>
-                      <option value="carton">Carton</option>
-                      <option value="mailer">Mailer</option>
-                      <option value="envelope">Envelope</option>
-                      <option value="custom">Custom</option>
-                    </select>
-                    <input style={{ ...input, width: 60 }} name="pkg_length" type="number" step="0.01" placeholder="L" defaultValue={pkg?.length ?? ""} />
-                    <input style={{ ...input, width: 60 }} name="pkg_width" type="number" step="0.01" placeholder="W" defaultValue={pkg?.width ?? ""} />
-                    <input style={{ ...input, width: 60 }} name="pkg_height" type="number" step="0.01" placeholder="H" defaultValue={pkg?.height ?? ""} />
-                    <select style={{ ...input, width: 60 }} name="pkg_dimUnit" defaultValue={pkg?.dimensionUnit ?? "cm"}>
-                      <option value="cm">cm</option>
-                      <option value="in">in</option>
-                    </select>
-                    <input style={{ ...input, width: 70 }} name="pkg_weight" type="number" step="0.001" placeholder="kg" defaultValue={pkg?.grossWeight ?? ""} />
-                    <select style={{ ...input, width: 60 }} name="pkg_weightUnit" defaultValue={pkg?.weightUnit ?? "kg"}>
-                      <option value="kg">kg</option>
-                      <option value="lb">lb</option>
-                    </select>
-                    <input style={{ ...input, width: 60 }} name="pkg_unitsPerPackage" type="number" title="Units of product per package" defaultValue={pkg?.unitsPerPackage ?? 1} />
-                    <input style={{ ...input, width: 60 }} name="pkg_packagesPerUnit" type="number" title="Packages per sellable unit" defaultValue={pkg?.packagesPerUnit ?? 1} />
-                    <select style={{ ...input, width: 120 }} name="pkg_presetId" defaultValue={pkg?.presetId ?? ""}>
-                      <option value="">Preset…</option>
-                      {presets.map((pr) => (
-                        <option key={pr.id} value={pr.id}>{pr.name}</option>
-                      ))}
-                    </select>
-                  </div>
-                ))}
-                <div style={{ fontSize: "0.66rem", color: "#94a3b8", marginBottom: "0.4rem" }}>
-                  Columns: Label · Type · L · W · H · dim unit · gross weight · weight unit · units/package · packages/unit · preset
-                </div>
-                <button type="submit" style={btn("#082a4a")}>Save packaging</button>
-              </Form>
-              {product.variants.length > 1 && (
-                <Form method="post" style={{ marginTop: "0.4rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
-                  <input type="hidden" name="intent" value="copy_packaging" />
-                  <input type="hidden" name="toVariantId" value={v.id} />
-                  <span style={{ fontSize: "0.7rem", color: "#64748b" }}>Copy packaging from</span>
-                  <select style={{ ...input, width: 160 }} name="fromVariantId">
-                    {product.variants.filter((o) => o.id !== v.id).map((o) => (
-                      <option key={o.id} value={o.id}>{o.name}</option>
-                    ))}
-                  </select>
-                  <button type="submit" style={btn("#64748b")}>Copy</button>
-                </Form>
-              )}
-            </div>
+              {TAB_LABELS[key]}
+            </Link>
           );
         })}
+      </nav>
+
+      {tab === "details" ? (
+        <DetailsTab
+          product={product}
+          media={media}
+          readiness={readiness}
+          canManage={can.manage}
+          preview={preview}
+        />
+      ) : null}
+      {tab === "variants" ? (
+        <VariantsTab product={product} presets={presets} canEditCost={can.cost} />
+      ) : null}
+      {tab === "media" ? <MediaTab product={product} media={media} /> : null}
+      {tab === "documents" ? <DocumentsTab product={product} media={media} /> : null}
+      {tab === "marketing" ? <MarketingTab product={product} media={media} pack={pack} /> : null}
+
+      {/* A hidden form carrying the current tab, so every control that needs to
+          post the tab back can copy it from one place. */}
+      <Form method="post" id="tab-context" style={{ display: "none" }}>
+        <input type="hidden" name="tab" value={tab} />
+      </Form>
+    </div>
+  );
+}
+
+/**
+ * The publication state, and — when it is not publishable — why not.
+ *
+ * The reasons are listed rather than counted: "4 problems" tells a merchant
+ * nothing they can act on, and each line links to the tab that resolves it.
+ */
+function ReadinessStrip({
+  readiness,
+  status,
+}: {
+  readiness: { ready: boolean; checks: { key: string; label: string; ok: boolean; detail: string; tab: TabKey }[]; blockers: { key: string; label: string; detail: string; tab: TabKey }[] };
+  status: string;
+}) {
+  const published = status === "PUBLISHED";
+  const tone = published
+    ? { bg: "#ecfdf5", border: "#a7f3d0", fg: "#065f46" }
+    : readiness.ready
+      ? { bg: "#f0f9ff", border: "#bae6fd", fg: "#075985" }
+      : { bg: "#fffbeb", border: "#fde68a", fg: "#92400e" };
+
+  return (
+    <div
+      style={{
+        background: tone.bg,
+        border: `1px solid ${tone.border}`,
+        color: tone.fg,
+        borderRadius: 10,
+        padding: "0.75rem 1rem",
+        margin: "1rem 0 1.25rem",
+        fontSize: "0.8rem",
+      }}
+    >
+      <div style={{ fontWeight: 700, marginBottom: readiness.blockers.length ? "0.4rem" : 0 }}>
+        {published
+          ? "Published to sellers."
+          : readiness.ready
+            ? "Ready to publish."
+            : `Not ready to publish — ${readiness.blockers.length} item${readiness.blockers.length === 1 ? "" : "s"} outstanding.`}
       </div>
-
-      <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Images ({product.productImages.length})
-        </h2>
-        {product.productImages.length > 0 && (
-          <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginBottom: "1rem" }}>
-            {product.productImages.map((img, index) => (
-              <div key={img.id} style={{ width: 140 }}>
-                <div style={{ position: "relative" }}>
-                  <img
-                    src={img.url}
-                    alt={img.alt || product.name}
-                    style={{ width: 140, height: 140, objectFit: "cover", borderRadius: 8, border: "1px solid #e2e8f0" }}
-                  />
-                  {index === 0 ? (
-                    <span
-                      style={{
-                        position: "absolute",
-                        top: 6,
-                        left: 6,
-                        background: "#082a4a",
-                        color: "white",
-                        fontSize: "0.6rem",
-                        fontWeight: 700,
-                        padding: "0.15rem 0.4rem",
-                        borderRadius: 4,
-                      }}
-                    >
-                      Main
-                    </span>
-                  ) : null}
-                </div>
-                <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
-                  {index > 0 ? (
-                    <Form method="post">
-                      <input type="hidden" name="intent" value="set_main_image" />
-                      <input type="hidden" name="imageId" value={img.id} />
-                      <button type="submit" style={btn("#082a4a")}>Set main</button>
-                    </Form>
-                  ) : null}
-                  {index > 0 ? (
-                    <Form method="post">
-                      <input type="hidden" name="intent" value="move_image_up" />
-                      <input type="hidden" name="imageId" value={img.id} />
-                      <button type="submit" style={btn("#64748b")} title="Move earlier">
-                        &uarr;
-                      </button>
-                    </Form>
-                  ) : null}
-                  {index < product.productImages.length - 1 ? (
-                    <Form method="post">
-                      <input type="hidden" name="intent" value="move_image_down" />
-                      <input type="hidden" name="imageId" value={img.id} />
-                      <button type="submit" style={btn("#64748b")} title="Move later">
-                        &darr;
-                      </button>
-                    </Form>
-                  ) : null}
-                  <Form method="post">
-                    <input type="hidden" name="intent" value="delete_image" />
-                    <input type="hidden" name="imageId" value={img.id} />
-                    <button type="submit" style={btn("#dc2626")}>Remove</button>
-                  </Form>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <Form method="post" encType="multipart/form-data" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", flexWrap: "wrap" }}>
-          <input type="hidden" name="intent" value="add_image_file" />
-          <div>
-            <label style={label} htmlFor="img-file">Upload image (PNG/JPEG/WEBP/GIF, max 5MB)</label>
-            <input type="file" id="img-file" name="image" accept="image/png,image/jpeg,image/webp,image/gif" />
-          </div>
-          <div>
-            <label style={label} htmlFor="img-alt">Alt text</label>
-            <input style={input} id="img-alt" name="alt" />
-          </div>
-          <button type="submit" style={btn("#082a4a")}>Upload image</button>
-        </Form>
-
-        <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", marginTop: "0.75rem", flexWrap: "wrap" }}>
-          <input type="hidden" name="intent" value="add_image_url" />
-          <div>
-            <label style={label} htmlFor="img-url">Or image URL</label>
-            <input style={input} id="img-url" name="imageUrl" placeholder="https://..." />
-          </div>
-          <div>
-            <label style={label} htmlFor="img-url-alt">Alt text</label>
-            <input style={input} id="img-url-alt" name="alt" />
-          </div>
-          <button type="submit" style={btn("#082a4a")}>Add URL</button>
-        </Form>
-      </div>
+      {!published && readiness.blockers.length ? (
+        <ul style={{ margin: 0, paddingLeft: "1.1rem", lineHeight: 1.6 }}>
+          {readiness.blockers.map((blocker) => (
+            <li key={blocker.key}>
+              <a href={`?tab=${blocker.tab}`} style={{ color: "inherit", fontWeight: 600 }}>
+                {blocker.label}
+              </a>{" "}
+              — {blocker.detail}
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }

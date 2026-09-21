@@ -249,8 +249,9 @@ SELECT gen_random_uuid()::text, v."id", BTRIM(v."optionName"), BTRIM(v."optionVa
 --     aborting the whole migration on a cast error. checksum is a marker, not a
 --     hash: these files were never hashed by the old code and there is nothing
 --     to recompute from. processingStatus is READY because nothing is
---     processing them; approvalStatus is DRAFT and sellerVisible is false, so
---     none of them can reach a seller until someone approves them.
+--     processing them; approvalStatus and sellerVisible are set here to the
+--     strict default and then corrected in 5i, which knows the owning product's
+--     publication state.
 --
 --     The asset id is derived from (product, array position) rather than drawn
 --     at random, so the assignment statement below can address exactly the rows
@@ -266,7 +267,7 @@ SELECT
   'WHITE_BACKGROUND_IMAGE',
   p."name",
   COALESCE(NULLIF(regexp_replace(u.url, '^.*/', ''), ''), 'legacy-image'),
-  'legacy/mvlimg-' || md5(p."id" || ':' || (u.ord - 1)::text),
+  'legacy-mvlimg-' || md5(p."id" || ':' || (u.ord - 1)::text),
   'image/jpeg',
   0,
   'legacy-unverified',
@@ -303,7 +304,7 @@ SELECT
   COALESCE(NULLIF(BTRIM(pi."alt"), ''), p."name"),
   NULLIF(BTRIM(pi."alt"), ''),
   COALESCE(NULLIF(regexp_replace(pi."url", '^.*/', ''), ''), 'legacy-image'),
-  'legacy/' || pi."id",
+  'legacy-' || pi."id",
   'image/jpeg',
   0,
   'legacy-unverified',
@@ -381,6 +382,32 @@ WITH ranked AS (
 UPDATE "MediaAssetAssignment" a
    SET "sortOrder" = r."rn", "isPrimary" = (r."rn" = 0)
   FROM ranked r WHERE a."id" = r."id";
+
+-- 5i. Publication state and media visibility are DERIVED from the old flags,
+--     never reset to the column default.
+--
+--     "status" was added with DEFAULT 'DRAFT', which is the correct default for
+--     a new product and the wrong answer for every existing one: left alone it
+--     would unpublish the entire catalogue at the moment of migration. The old
+--     flags are the authority, so translate them. isActive is folded into
+--     PUBLISHED because PUBLISHED means "for sale" here and a published but
+--     inactive product is not for sale; it keeps its own meaning elsewhere.
+UPDATE "Product" SET "status" = CASE
+  WHEN "isArchived" THEN 'ARCHIVED'::"ProductStatus"
+  WHEN "isPublished" AND "isActive" THEN 'PUBLISHED'::"ProductStatus"
+  ELSE 'DRAFT'::"ProductStatus"
+END;
+
+--     Media that sat on an already-published product was already visible to
+--     sellers, so it is grandfathered as APPROVED and seller-visible. Media on
+--     anything else stays DRAFT, because it was never visible and the approval
+--     gate is exactly what should now apply to it. Without this, every legacy
+--     image would be hidden the day the migration ran, and the merchant would
+--     have to re-approve a catalogue that was live the day before.
+UPDATE "MediaAsset" m
+   SET "approvalStatus" = 'APPROVED', "sellerVisible" = true
+  FROM "Product" p
+ WHERE p."id" = m."productId" AND p."status" = 'PUBLISHED';
 
 -- ---------------------------------------------------------------------------
 -- 6. Constraints — only now that every row has been through the backfill.

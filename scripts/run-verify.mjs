@@ -7,9 +7,15 @@
  * `--packages=external`), executed with node, and the temp file is removed.
  * The child exit code is always propagated.
  *
+ * It is also the runner for the repository's other TypeScript scripts — notably
+ * `seed-test-product.ts` — because there is no tsx here and bundling is the
+ * only way to run one. Those are named explicitly rather than listed in CHECKS:
+ * CHECKS is what `--all` runs, and seeding is not a check.
+ *
  * Usage:
  *   node scripts/run-verify.mjs scripts/verify-rankings.ts
  *   node scripts/run-verify.mjs scripts/verify-packaging.ts --seed-packaging
+ *   node scripts/run-verify.mjs scripts/seed-test-product.ts
  *   node scripts/run-verify.mjs --all
  */
 import { spawnSync } from "node:child_process";
@@ -104,14 +110,12 @@ async function seedPackagingFixture() {
   const { PrismaClient } = await import("@prisma/client");
   const prisma = new PrismaClient();
   const suffix = Date.now().toString(36);
+  // Prices belong to the variant; the family carries only its name and code.
   const product = await prisma.product.create({
     data: {
       name: "Verify Packaging Fixture",
-      sku: `VERIFY-PKG-${suffix}`,
+      productCode: `VERIFY-PKG-${suffix}`,
       category: "Verification",
-      wholesalePrice: 1299,
-      suggestedRetailPrice: 4900,
-      isPublished: false,
     },
   });
   const variant = await prisma.productVariant.create({
@@ -122,6 +126,7 @@ async function seedPackagingFixture() {
       wholesalePrice: 1299,
       suggestedRetailPrice: 4900,
       inventory: 10,
+      isDefault: true,
     },
   });
   await prisma.variantPackage.create({
@@ -175,6 +180,10 @@ const CHECKS = [
   { name: "packaging", kind: "ts", file: "scripts/verify-packaging.ts", packaging: true },
   { name: "plaid", kind: "ts", file: "scripts/verify-plaid.ts" },
   { name: "e2e", kind: "ts", file: "scripts/verify-e2e.ts" },
+  // The product/variant/media/document/marketing system. Last because it is
+  // the longest, and it publishes a product of its own rather than depending on
+  // anything an earlier suite leaves behind.
+  { name: "product-system", kind: "ts", file: "scripts/verify-product-system.ts" },
 ];
 
 async function runAll() {

@@ -1,5 +1,8 @@
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcryptjs";
+// Imported rather than written out: a renamed cookie must not leave this suite
+// asserting a string that no longer exists.
+import { ADMIN_SESSION_COOKIE } from "../app/utils/adminAuth.server";
 
 const prisma = new PrismaClient();
 const BASE = process.env.APP_BASE || "http://localhost:61784";
@@ -92,7 +95,11 @@ async function main() {
 
   // 1. Login
   const ownerLogin = await login(OWNER_EMAIL, OWNER_PASSWORD);
-  check("owner login returns redirect + cookie", ownerLogin.status === 302 && ownerLogin.cookie.includes("owner_session"), `status ${ownerLogin.status}`);
+  check(
+    "owner login returns redirect + cookie",
+    ownerLogin.status === 302 && ownerLogin.cookie.includes(ADMIN_SESSION_COOKIE),
+    `status ${ownerLogin.status}, cookie ${ownerLogin.cookie.includes(ADMIN_SESSION_COOKIE) ? "issued" : "absent"}`
+  );
 
   // 2. Approve
   const approveRes = await post("/admin/applications", ownerLogin.cookie, {

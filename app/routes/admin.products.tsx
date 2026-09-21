@@ -3,14 +3,29 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import {
   listProducts,
-  createProduct,
   setArchived,
   setPublished,
   deleteProduct,
+  duplicateProduct,
   type ProductListFilters,
 } from "~/services/products.server";
+import { permissionsFor } from "~/services/permissions";
 
-const STATUSES = ["ALL", "PUBLISHED", "UNPUBLISHED", "ARCHIVED"] as const;
+const STATUSES = ["ALL", "DRAFT", "PENDING_APPROVAL", "PUBLISHED", "ARCHIVED"] as const;
+
+const STATUS_LABELS: Record<string, string> = {
+  DRAFT: "Draft",
+  PENDING_APPROVAL: "Pending approval",
+  PUBLISHED: "Published",
+  ARCHIVED: "Archived",
+};
+
+const STATUS_COLOURS: Record<string, string> = {
+  DRAFT: "#64748b",
+  PENDING_APPROVAL: "#b45309",
+  PUBLISHED: "#059669",
+  ARCHIVED: "#94a3b8",
+};
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "products.view");
@@ -45,6 +60,10 @@ export async function action({ request }: ActionFunctionArgs) {
     actorName: user.name,
     ipAddress: ip,
     userAgent,
+    // Resolved from the role rather than trusted from the request, so the
+    // service layer's cost check is answering to the policy and not to a
+    // field an attacker could set.
+    permissions: [...permissionsFor(user.role)],
   };
 
   const form = await request.formData();
@@ -52,22 +71,13 @@ export async function action({ request }: ActionFunctionArgs) {
   const productId = String(form.get("productId") || "");
 
   try {
-    if (intent === "create") {
-      const product = await createProduct(
-        {
-          name: String(form.get("name") || ""),
-          sku: String(form.get("sku") || ""),
-          category: String(form.get("category") || ""),
-          description: String(form.get("description") || ""),
-          wholesalePrice: Number(form.get("wholesalePrice")),
-          suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
-          costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          currency: String(form.get("currency") || "CAD"),
-          isPublished: true,
-        },
-        actor
-      );
-      return redirect(`/admin/products/${product.id}`);
+    // Creating a product now means setting up a family and then giving it at
+    // least one sellable variant, which needs the tabbed editor rather than one
+    // line of form fields. The list only routes there; /admin/products/new
+    // performs the create.
+    if (intent === "duplicate") {
+      const copy = await duplicateProduct(productId, actor);
+      return redirect(`/admin/products/${copy.id}`);
     }
     if (intent === "archive") {
       await setArchived(productId, true, actor);
@@ -139,71 +149,26 @@ export default function AdminProducts() {
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-        Products
-      </h1>
-      <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1.5rem" }}>
-        MoonVella supplier catalog. The merchant catalog reads these same records.
-      </p>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "1rem" }}>
+        <div>
+          <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
+            Products
+          </h1>
+          <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1.5rem" }}>
+            MoonVella supplier catalog. A product is a family; each sellable size or
+            colour underneath it is a variant with its own SKU and price.
+          </p>
+        </div>
+        <Link to="/admin/products/new" style={{ ...btn("#082a4a"), textDecoration: "none", padding: "0.6rem 1.1rem", fontSize: "0.8rem" }}>
+          New product
+        </Link>
+      </div>
 
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
           {actionData.error}
         </div>
       ) : null}
-
-      <div style={card}>
-        <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-          Add product
-        </h2>
-        <Form method="post" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.75rem" }}>
-          <input type="hidden" name="intent" value="create" />
-          <div>
-            <label style={label} htmlFor="prod-name">Title</label>
-            <input style={input} id="prod-name" name="name" required />
-          </div>
-          <div>
-            <label style={label} htmlFor="prod-sku">SKU</label>
-            <input style={input} id="prod-sku" name="sku" required />
-          </div>
-          <div>
-            <label style={label} htmlFor="prod-category">Category</label>
-            <input style={input} id="prod-category" name="category" required />
-          </div>
-          <div>
-            <label style={label} htmlFor="prod-wholesalePrice">Wholesale price (CAD)</label>
-            <input style={input} id="prod-wholesalePrice" name="wholesalePrice" type="number" min="0" step="0.01" placeholder="25.00" required />
-          </div>
-          <div>
-            <label style={label} htmlFor="prod-suggestedRetailPrice">Suggested retail price (CAD)</label>
-            <input style={input} id="prod-suggestedRetailPrice" name="suggestedRetailPrice" type="number" min="0" step="0.01" placeholder="49.00" required />
-          </div>
-          <div>
-            <label style={label} htmlFor="prod-costPrice">Internal acquisition cost (CAD, owner-only)</label>
-            <input style={input} id="prod-costPrice" name="costPrice" type="number" min="0" step="0.01" placeholder="12.00" />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <label style={label} htmlFor="prod-description">Description</label>
-            <textarea style={input} id="prod-description" name="description" rows={2} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <button
-              type="submit"
-              style={{
-                padding: "0.6rem 1.2rem",
-                background: "#082a4a",
-                color: "white",
-                border: "none",
-                borderRadius: 6,
-                fontWeight: 600,
-                cursor: "pointer",
-              }}
-            >
-              Create product
-            </button>
-          </div>
-        </Form>
-      </div>
 
       <div style={card}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "1rem" }}>
@@ -218,7 +183,7 @@ export default function AdminProducts() {
         <Form method="get" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
           <div>
             <label style={label} htmlFor="product-filter-q">Search</label>
-            <input id="product-filter-q" style={{ ...input, width: 220 }} name="q" defaultValue={data.filters.q} placeholder="Name or SKU" />
+            <input id="product-filter-q" style={{ ...input, width: 220 }} name="q" defaultValue={data.filters.q} placeholder="Name, code or variant SKU" />
           </div>
           <div>
             <label style={label} htmlFor="product-filter-category">Category</label>
@@ -235,9 +200,11 @@ export default function AdminProducts() {
             <label style={label} htmlFor="product-filter-status">Status</label>
             <select id="product-filter-status" style={{ ...input, width: 150 }} name="status" defaultValue={data.filters.status}>
               <option value="ALL">All</option>
-              <option value="PUBLISHED">Published</option>
-              <option value="UNPUBLISHED">Unpublished</option>
-              <option value="ARCHIVED">Archived</option>
+              {STATUSES.filter((s) => s !== "ALL").map((s) => (
+                <option key={s} value={s}>
+                  {STATUS_LABELS[s]}
+                </option>
+              ))}
             </select>
           </div>
           <button type="submit" style={btn("#082a4a")}>
@@ -256,10 +223,10 @@ export default function AdminProducts() {
           <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
             <div style={gridCols}>
               <span style={gridHead}>Product</span>
-              <span style={gridHead}>SKU</span>
-              <span style={gridHead}>Wholesale</span>
+              <span style={gridHead}>Code</span>
+              <span style={gridHead}>Category</span>
               <span style={gridHead}>Variants</span>
-              <span style={gridHead}>Images</span>
+              <span style={gridHead}>Media</span>
               <span style={gridHead}>Status</span>
               <span style={gridHead}>Actions</span>
             </div>
@@ -278,18 +245,33 @@ export default function AdminProducts() {
                 <Link to={`/admin/products/${p.id}`} style={{ fontWeight: 600, color: "#082a4a" }}>
                   {p.name}
                 </Link>
-                <span style={{ color: "#64748b" }}>{p.sku}</span>
-                <span>{money(p.wholesalePrice, p.currency)}</span>
-                <span style={{ color: "#64748b" }}>{p._count.variants}</span>
-                <span style={{ color: "#64748b" }}>{p._count.productImages}</span>
-                <span style={{ color: p.isArchived ? "#64748b" : p.isPublished ? "#059669" : "#b45309" }}>
-                  {p.isArchived ? "Archived" : p.isPublished ? "Published" : "Unpublished"}
+                <span style={{ color: "#64748b", fontFamily: "ui-monospace, monospace", fontSize: "0.78rem" }}>
+                  {p.productCode}
+                </span>
+                <span style={{ color: "#64748b" }}>{p.category}</span>
+                <span style={{ color: p._count.variants === 0 ? "#b45309" : "#64748b" }}>
+                  {p._count.variants === 0 ? "none yet" : p._count.variants}
+                </span>
+                <span style={{ color: "#64748b" }}>{p._count.mediaAssets}</span>
+                <span style={{ color: STATUS_COLOURS[p.status] ?? "#64748b", fontWeight: 600 }}>
+                  {STATUS_LABELS[p.status] ?? p.status}
                 </span>
                 <Form method="post" style={{ display: "flex", gap: "0.35rem", flexWrap: "wrap" }}>
                   <input type="hidden" name="productId" value={p.id} />
                   <input type="hidden" name="returnTo" value={returnTo} />
-                  <button type="submit" name="intent" value={p.isPublished ? "unpublish" : "publish"} style={btn("#0369a1")}>
-                    {p.isPublished ? "Unpublish" : "Publish"}
+                  <button
+                    type="submit"
+                    name="intent"
+                    value={p.status === "PUBLISHED" ? "unpublish" : "publish"}
+                    style={btn("#0369a1")}
+                  >
+                    {p.status === "PUBLISHED" ? "Unpublish" : "Publish"}
+                  </button>
+                  <Link to={`/admin/products/${p.id}`} style={{ ...btn("#64748b"), textDecoration: "none" }}>
+                    Edit
+                  </Link>
+                  <button type="submit" name="intent" value="duplicate" style={btn("#64748b")}>
+                    Duplicate
                   </button>
                   <button type="submit" name="intent" value={p.isArchived ? "restore" : "archive"} style={btn(p.isArchived ? "#059669" : "#dc2626")}>
                     {p.isArchived ? "Restore" : "Archive"}

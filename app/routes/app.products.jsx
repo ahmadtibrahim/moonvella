@@ -20,32 +20,70 @@ export const loader = async ({ request }) => {
         lastImportError: true,
         customRetailPrice: true,
         customWholesalePrice: true,
+        // Prices and SKUs live on the sellable variant now, not on the family.
+        // A family is a name and a code; the thing with a price is the variant.
         product: {
           select: {
             name: true,
-            sku: true,
+            productCode: true,
             category: true,
-            images: true,
-            wholesalePrice: true,
-            suggestedRetailPrice: true,
+            variants: {
+              where: { isActive: true },
+              orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
+              select: {
+                sku: true,
+                wholesalePrice: true,
+                suggestedRetailPrice: true,
+                isDefault: true,
+              },
+            },
           },
+        },
+        variantMappings: {
+          select: { productVariant: { select: { sku: true } } },
         },
       },
     });
-    imported = rows.map((row) => ({
-      id: row.id,
-      productId: row.productId,
-      name: row.product.name,
-      sku: row.product.sku,
-      category: row.product.category,
-      shopifyProductId: row.shopifyProductId,
-      importedAt: row.importedAt,
-      importStatus: row.importStatus,
-      lastImportError: row.lastImportError,
-      retailPrice: row.customRetailPrice ?? row.product.suggestedRetailPrice,
-      moonvillaCost: row.customWholesalePrice ?? row.product.wholesalePrice,
-      isActive: row.isActive,
-    }));
+    imported = rows.map((row) => {
+      const variants = row.product.variants;
+      // What the seller actually imported, when the import recorded it. Mappings
+      // are written by the Shopify export path, so an older row may have none.
+      const mapped = row.variantMappings
+        .map((mapping) => mapping.productVariant.sku)
+        .filter(Boolean);
+
+      // A single SKU column is only honest when the row *is* one sellable item.
+      // For a family with several variants the Product Code identifies the row
+      // instead, and the count is shown so the row does not imply it is one.
+      const singleSku = mapped.length === 1 ? mapped[0] : null;
+      const sku = singleSku ?? (variants.length === 1 ? variants[0].sku : row.product.productCode);
+      const extraVariants = singleSku
+        ? 0
+        : Math.max(0, (mapped.length || variants.length) - 1);
+
+      // Family-level prices are the cheapest active variant's — the entry price
+      // a seller can actually pay — matching the catalogue page.
+      const cheapest = variants.reduce(
+        (best, variant) => (!best || variant.wholesalePrice < best.wholesalePrice ? variant : best),
+        null
+      );
+
+      return {
+        id: row.id,
+        productId: row.productId,
+        name: row.product.name,
+        sku,
+        extraVariants,
+        category: row.product.category,
+        shopifyProductId: row.shopifyProductId,
+        importedAt: row.importedAt,
+        importStatus: row.importStatus,
+        lastImportError: row.lastImportError,
+        retailPrice: row.customRetailPrice ?? cheapest?.suggestedRetailPrice ?? 0,
+        moonvillaCost: row.customWholesalePrice ?? cheapest?.wholesalePrice ?? 0,
+        isActive: row.isActive,
+      };
+    });
   }
 
   return {
@@ -199,7 +237,18 @@ export default function ProductsPage() {
                 {imported.map((p) => (
                   <tr key={p.id} style={{ borderTop: "1px solid #f1f5f9" }}>
                     <td style={{ padding: "0.5rem", fontWeight: 600 }}>{p.name}</td>
-                    <td style={{ padding: "0.5rem", color: "#64748b" }}>{p.sku}</td>
+                    <td style={{ padding: "0.5rem", color: "#64748b" }}>
+                      {p.sku}
+                      {p.extraVariants > 0 ? (
+                        <span
+                          title={`This family contains ${p.extraVariants + 1} sellable variants.`}
+                          style={{ color: "#94a3b8" }}
+                        >
+                          {" "}
+                          +{p.extraVariants}
+                        </span>
+                      ) : null}
+                    </td>
                     <td style={{ padding: "0.5rem" }}>{money(p.retailPrice)}</td>
                     <td style={{ padding: "0.5rem" }}>{money(p.moonvillaCost)}</td>
                     <td style={{ padding: "0.5rem" }}>

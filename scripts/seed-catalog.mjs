@@ -98,17 +98,16 @@ const CATALOG = [
 
 async function main() {
   for (const product of CATALOG) {
+    // The family carries the name and the code. Prices, weight and stock are
+    // properties of a sellable variant and are written below, not here: a
+    // product-level price is what a multi-size family cannot express.
     const record = await prisma.product.upsert({
-      where: { sku: product.sku },
+      where: { productCode: product.sku },
       create: {
         name: product.name,
-        sku: product.sku,
+        productCode: product.sku,
         category: product.category,
         description: product.description,
-        wholesalePrice: product.wholesale,
-        suggestedRetailPrice: product.retail,
-        costPrice: Math.round(product.wholesale * 0.6),
-        images: "[]",
         isActive: true,
         isArchived: false,
       },
@@ -116,18 +115,20 @@ async function main() {
         name: product.name,
         category: product.category,
         description: product.description,
-        wholesalePrice: product.wholesale,
-        suggestedRetailPrice: product.retail,
         isActive: true,
         isArchived: false,
       },
     });
 
-    for (const variant of product.variants) {
+    for (const [index, variant] of product.variants.entries()) {
       const variantSku = `${product.sku}-${variant.name
         .replace(/[^A-Za-z0-9]+/g, "")
         .toUpperCase()
         .slice(0, 8)}`;
+      // Seed data states weight in grams, which is how a supplier quotes it.
+      // The canonical column is kilograms, so the conversion happens here and
+      // the stored value is what everything downstream reads.
+      const weightKg = (variant.weight / 1000).toFixed(3);
       await prisma.productVariant.upsert({
         where: { sku: variantSku },
         create: {
@@ -138,7 +139,11 @@ async function main() {
           suggestedRetailPrice: product.retail,
           costPrice: Math.round(product.wholesale * 0.6),
           inventory: variant.inventory,
-          weight: variant.weight,
+          productWeightKg: weightKg,
+          sortOrder: index,
+          // The first variant is the one a single-variant family sells as, and
+          // the one the catalogue shows first.
+          isDefault: index === 0,
           isActive: true,
         },
         update: {
@@ -147,7 +152,8 @@ async function main() {
           wholesalePrice: product.wholesale,
           suggestedRetailPrice: product.retail,
           inventory: variant.inventory,
-          weight: variant.weight,
+          productWeightKg: weightKg,
+          sortOrder: index,
           isActive: true,
         },
       });

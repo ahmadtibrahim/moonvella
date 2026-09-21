@@ -254,6 +254,20 @@ export default function CatalogPage() {
               </div>
 
               <div className="mv-product-actions">
+                {/* The marketing kit. Approved sellers only, and the route
+                    behind the link re-checks that rather than trusting the
+                    link: the archive is built from approved, seller-visible
+                    records and must never be reachable by URL alone. */}
+                {canViewWholesale ? (
+                  <a
+                    className="mv-import-btn"
+                    style={{ display: "block", textAlign: "center", marginBottom: "0.4rem" }}
+                    href={`/app/marketing-pack?productId=${encodeURIComponent(product.id)}`}
+                  >
+                    Download marketing pack
+                  </a>
+                ) : null}
+
                 {canImport ? (
                   <fetcher.Form method="post">
                     <input type="hidden" name="productId" value={product.id} />

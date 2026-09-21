@@ -11,7 +11,8 @@
  */
 import { PrismaClient } from "@prisma/client";
 import { approveApplication } from "../app/services/application.server";
-import { createProduct, addVariant } from "../app/services/products.server";
+import { createProduct, addVariant, updateVariant } from "../app/services/products.server";
+import { permissionsFor } from "../app/services/permissions";
 import { saveVariantPackages, validateVariantPackaging } from "../app/services/packaging.server";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import {
@@ -39,7 +40,10 @@ const prisma = new PrismaClient();
 const suffix = Date.now().toString(36);
 const SHOP = `e2e-${suffix}.myshopify.com`;
 const OWNER_EMAIL = `e2e-owner-${suffix}@example.com`;
-const PRODUCT_SKU = `E2E-${suffix}`;
+// Upper case because that is what the product code is normalised to on the way
+// in: asserting against the raw suffix would compare a code to the request that
+// produced it rather than to what was stored.
+const PRODUCT_SKU = `E2E-${suffix.toUpperCase()}`;
 const SHOPIFY_VARIANT_ID = String(Date.now());
 const SHOPIFY_PRODUCT_ID = String(Date.now() + 1);
 const ORDER_ID = 800000 + (Date.now() % 100000);
@@ -55,7 +59,15 @@ const EXPECTED_SUBTOTAL = WHOLESALE * QTY; // 2598
 const EXPECTED_SHIPPING = Math.round((ORDER_SHIPPING * RETAIL * QTY) / ORDER_SUBTOTAL); // 1361
 const EXPECTED_TOTAL = EXPECTED_SUBTOTAL - LINE_DISCOUNT + LINE_TAX + EXPECTED_SHIPPING; // 4253
 
-const actor = { actorId: "e2e-verify", actorName: "E2E Verify", actorType: "ADMIN_USER" as const };
+// The full OWNER grant, because the script exercises the whole catalogue path
+// including acquisition cost. Passing a role's real permission set here is also
+// what makes the cost check below a genuine test rather than a bypass.
+const actor = {
+  actorId: "e2e-verify",
+  actorName: "E2E Verify",
+  actorType: "ADMIN_USER" as const,
+  permissions: [...permissionsFor("OWNER")],
+};
 
 let failures = 0;
 let total = 0;
@@ -125,7 +137,7 @@ async function cleanup() {
     select: { id: true },
   });
   const paymentIds = payments.map((p) => p.id);
-  const product = await prisma.product.findUnique({ where: { sku: PRODUCT_SKU }, select: { id: true } });
+  const product = await prisma.product.findUnique({ where: { productCode: PRODUCT_SKU }, select: { id: true } });
   const application = await prisma.merchantApplication.findUnique({
     where: { shopDomain: SHOP },
     select: { id: true },
@@ -223,12 +235,12 @@ async function main() {
   const product = await createProduct(
     {
       name: "E2E Verify Product",
+      // The family carries a code, not a price: 1299 and 4900 are the
+      // variant's, and asserting them on the parent would be asserting a
+      // column that no longer exists.
+      productCode: PRODUCT_SKU,
       description: "Created by verify-e2e",
       category: "Bedding",
-      sku: PRODUCT_SKU,
-      wholesalePrice: WHOLESALE / 100,
-      suggestedRetailPrice: RETAIL / 100,
-      costPrice: 8,
     },
     actor
   );
@@ -241,7 +253,8 @@ async function main() {
       suggestedRetailPrice: RETAIL / 100,
       costPrice: 8,
       inventory: 50,
-      weight: 900,
+      // 900 g, expressed in the canonical unit the column now uses.
+      productWeightKg: "0.9",
     },
     actor
   );
@@ -263,11 +276,55 @@ async function main() {
   const productRow = await prisma.product.findUnique({ where: { id: product.id } });
   const variantRow = await prisma.productVariant.findUnique({ where: { id: variant.id } });
   const packaging = await validateVariantPackaging(variant.id);
-  check("product persisted with expected price", productRow?.wholesalePrice === WHOLESALE, String(productRow?.wholesalePrice));
+  check("product persisted with expected code", productRow?.productCode === PRODUCT_SKU, String(productRow?.productCode));
   check("variant persisted", variantRow?.sku === `${PRODUCT_SKU}-STD`, variantRow?.sku);
+  // Money now lives on the sellable variant, in integer cents.
+  check("variant persisted with expected price", variantRow?.wholesalePrice === WHOLESALE, String(variantRow?.wholesalePrice));
+  // 900 g in, 0.9 kg stored — the canonical unit, not a float.
+  check("variant weight converted to kilograms", variantRow?.productWeightKg?.toString() === "0.9", String(variantRow?.productWeightKg));
   check("variant packaging persisted + complete", packaging.complete && packaging.packageCount === 1, JSON.stringify(packaging.missing));
   check("audit row for product.created", (await auditCount("product.created", product.id)) >= 1);
   check("audit row for product.variant_added", (await auditCount("product.variant_added", product.id)) >= 1);
+
+  // ---- (b2) acquisition cost is gated by the service, not by the form ------
+  // CATALOG holds products.manage, so it can edit the catalogue — including
+  // prices — but not the margin. The gate lives in the service precisely so it
+  // covers callers that never render a form.
+  const catalogActor = {
+    actorId: "e2e-catalog",
+    actorName: "E2E Catalog",
+    actorType: "ADMIN_USER" as const,
+    permissions: [...permissionsFor("CATALOG")],
+  };
+  const variantInput = {
+    name: "Standard",
+    sku: `${PRODUCT_SKU}-STD`,
+    wholesalePrice: WHOLESALE / 100,
+    suggestedRetailPrice: RETAIL / 100,
+    inventory: 50,
+  };
+
+  let costChangeRefused = false;
+  try {
+    await updateVariant(variant.id, { ...variantInput, costPrice: 99 }, catalogActor);
+  } catch {
+    costChangeRefused = true;
+  }
+  check("CATALOG cannot change acquisition cost", costChangeRefused);
+
+  // Re-sending the form without touching cost must be allowed and must leave
+  // the stored figure alone, or every ordinary edit would erase the margin.
+  let catalogEditAllowed = false;
+  try {
+    await updateVariant(variant.id, variantInput, catalogActor);
+    catalogEditAllowed = true;
+  } catch (error) {
+    check("CATALOG may still edit the rest of the variant", false, String(error));
+  }
+  const afterCatalogEdit = await prisma.productVariant.findUnique({ where: { id: variant.id } });
+  check("CATALOG may still edit the rest of the variant", catalogEditAllowed);
+  check("cost survived a CATALOG edit untouched", afterCatalogEdit?.costPrice === 800, String(afterCatalogEdit?.costPrice));
+  check("CATALOG's own field was written", afterCatalogEdit?.wholesalePrice === WHOLESALE, String(afterCatalogEdit?.wholesalePrice));
 
   // ---- (c) order webhook intake -------------------------------------------
   const sellerProduct = await prisma.sellerProduct.create({
@@ -308,6 +365,109 @@ async function main() {
   const webhook = await prisma.webhookEvent.findFirst({ where: { shopDomain: SHOP, topic: "ORDERS_CREATE" } });
   check("WebhookEvent recorded SUCCESS", webhook?.status === "SUCCESS", webhook?.status ?? "null");
   if (!order) throw new Error("Order was not created; cannot continue.");
+
+  // ---- (c2) the order line is a snapshot, not a live read ------------------
+  const snapshot = order.items[0];
+  check("order line recorded the variant name", snapshot?.variantName === "Standard", String(snapshot?.variantName));
+  check("order line recorded the family code", snapshot?.productCode === PRODUCT_SKU, String(snapshot?.productCode));
+  check("order line recorded the product id", snapshot?.productId === product.id, String(snapshot?.productId));
+  check(
+    "order line recorded the weight in kilograms",
+    snapshot?.productWeightKg?.toString() === "0.9",
+    String(snapshot?.productWeightKg)
+  );
+  check(
+    "order line recorded the carton used",
+    snapshot?.packageLengthCm?.toString() === "40" &&
+      snapshot?.packageWidthCm?.toString() === "30" &&
+      snapshot?.packageHeightCm?.toString() === "20" &&
+      snapshot?.packagedWeightKg?.toString() === "2.5",
+    `${snapshot?.packageLengthCm}x${snapshot?.packageWidthCm}x${snapshot?.packageHeightCm} @ ${snapshot?.packagedWeightKg}`
+  );
+  check("order line recorded units per package", snapshot?.unitsPerPackage === 1, String(snapshot?.unitsPerPackage));
+  check("order line with no options stores no options", snapshot?.selectedOptions === null, String(snapshot?.selectedOptions));
+
+  // The point of the snapshot: editing the catalogue afterwards must not
+  // rewrite what the customer bought. The variant is renamed, re-weighed,
+  // re-packed and repriced, and the order line has to be unmoved.
+  await updateVariant(
+    variant.id,
+    {
+      name: "Renamed After Purchase",
+      sku: `${PRODUCT_SKU}-STD`,
+      wholesalePrice: WHOLESALE / 100 + 5,
+      suggestedRetailPrice: RETAIL / 100,
+      inventory: 50,
+      productWeightKg: "2.5",
+    },
+    actor
+  );
+  await saveVariantPackages(variant.id, [
+    {
+      label: "Bigger carton",
+      packageType: "carton",
+      length: 60,
+      width: 50,
+      height: 40,
+      dimensionUnit: "cm",
+      grossWeight: 9,
+      weightUnit: "kg",
+      unitsPerPackage: 2,
+      packagesPerUnit: 1,
+    },
+  ]);
+  const afterEdit = await prisma.orderItem.findUnique({ where: { id: snapshot.id } });
+  check(
+    "order line survives a later variant rename",
+    afterEdit?.variantName === "Standard",
+    String(afterEdit?.variantName)
+  );
+  check(
+    "order line survives a later re-measure",
+    afterEdit?.productWeightKg?.toString() === "0.9" &&
+      afterEdit?.packageLengthCm?.toString() === "40" &&
+      afterEdit?.unitsPerPackage === 1,
+    `${afterEdit?.productWeightKg} / ${afterEdit?.packageLengthCm} / ${afterEdit?.unitsPerPackage}`
+  );
+  check(
+    "order line keeps the price it was placed at",
+    afterEdit?.wholesalePrice === WHOLESALE,
+    String(afterEdit?.wholesalePrice)
+  );
+  const liveVariant = await prisma.productVariant.findUnique({ where: { id: variant.id } });
+  check(
+    "the catalogue did move, so the check above is not vacuous",
+    liveVariant?.name === "Renamed After Purchase" && liveVariant?.productWeightKg?.toString() === "2.5",
+    `${liveVariant?.name} / ${liveVariant?.productWeightKg}`
+  );
+
+  // Put the variant back so later sections see the shape they expect.
+  await updateVariant(
+    variant.id,
+    {
+      name: "Standard",
+      sku: `${PRODUCT_SKU}-STD`,
+      wholesalePrice: WHOLESALE / 100,
+      suggestedRetailPrice: RETAIL / 100,
+      inventory: 50,
+      productWeightKg: "0.9",
+    },
+    actor
+  );
+  await saveVariantPackages(variant.id, [
+    {
+      label: "Carton",
+      packageType: "carton",
+      length: 40,
+      width: 30,
+      height: 20,
+      dimensionUnit: "cm",
+      grossWeight: 2.5,
+      weightUnit: "kg",
+      unitsPerPackage: 1,
+      packagesPerUnit: 1,
+    },
+  ]);
 
   // ---- (d) fulfillment request transitions --------------------------------
   const pending = await getFulfillmentRequest(order.id);

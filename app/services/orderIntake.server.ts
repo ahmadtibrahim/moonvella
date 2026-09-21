@@ -2,6 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
+import { toCm, toKg } from "./packaging.server";
 
 interface TaxLine {
   price?: string | null;
@@ -75,7 +76,41 @@ interface OrderPayload {
 interface VariantMapping {
   productVariantId: string;
   sellerProductId: string;
-  productVariant: { name: string; sku: string; wholesalePrice: number };
+  productVariant: VariantSnapshotSource;
+}
+
+/**
+ * Everything the order line copies out of the variant at intake.
+ *
+ * These are read once, at the moment the order arrives, and written as literal
+ * values onto the OrderItem. Nothing downstream re-reads the variant, which is
+ * the whole point: renaming a colour, repricing a size or archiving a product
+ * must not rewrite what a customer was told they bought last month.
+ */
+interface VariantSnapshotSource {
+  productId: string;
+  name: string;
+  sku: string;
+  wholesalePrice: number;
+  suggestedRetailPrice: number;
+  productLengthCm: unknown;
+  productWidthCm: unknown;
+  productHeightCm: unknown;
+  productWeightKg: unknown;
+  unitsPerPackage: number;
+  currency: string;
+  variantOptions: { name: string; value: string }[];
+  product: { productCode: string } | null;
+  packages: {
+    length: number;
+    width: number;
+    height: number;
+    dimensionUnit: string;
+    grossWeight: number;
+    weightUnit: string;
+    unitsPerPackage: number;
+    sortOrder: number;
+  }[];
 }
 
 export interface IntakeResult {
@@ -99,6 +134,24 @@ interface BuiltItem {
   shopifyLineItemId: string;
   variantId: string;
   sellerProductId: string;
+  /* --- variant snapshot, copied at intake ---------------------------------- */
+  productId: string;
+  productCode: string | null;
+  variantName: string;
+  /** Ordered options as JSON. A string, because the variant's own rows may change. */
+  selectedOptions: string | null;
+  /** What the seller was told to charge. Shopify's line price is what was charged. */
+  sellerRetailPrice: number | null;
+  currency: string | null;
+  productLengthCm: string | null;
+  productWidthCm: string | null;
+  productHeightCm: string | null;
+  productWeightKg: string | null;
+  packageLengthCm: string | null;
+  packageWidthCm: string | null;
+  packageHeightCm: string | null;
+  packagedWeightKg: string | null;
+  unitsPerPackage: number | null;
 }
 
 interface BuiltItems {
@@ -126,6 +179,67 @@ function sumDiscounts(li: LineItem): number {
 }
 
 /**
+ * A Decimal column takes a string, and should.
+ *
+ * Prisma will accept a JavaScript number here and convert it, but that routes
+ * an exact decimal through binary floating point first: 0.1 kg becomes
+ * 0.1000000000000000055511151231257827 before it is rounded back to three
+ * places. Passing the value's own decimal string through keeps the stored
+ * number equal to the number that was entered.
+ */
+function decimal(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null;
+  const text = String(value);
+  return Number.isFinite(Number(text)) ? text : null;
+}
+
+/**
+ * The carton actually used, resolved from the variant's first package.
+ *
+ * Packaging is stored per variant and a variant may have several cartons; the
+ * first is the one the shipping feature quotes from, so it is the one an order
+ * should record. A package measured in inches is converted rather than copied,
+ * because the snapshot columns are canonical cm/kg and a mixed-unit column
+ * would be unreadable a year from now.
+ *
+ * The conversion itself is `packaging.server`'s, imported rather than repeated:
+ * one unit conversion, in one place, is the only way the quote and the order
+ * line can be guaranteed to agree.
+ */
+function snapshotFor(variant: VariantSnapshotSource, chargedRetailCents: number) {
+  const packages = [...variant.packages].sort((a, b) => a.sortOrder - b.sortOrder);
+  const carton = packages[0] ?? null;
+  const options = variant.variantOptions
+    .filter((option) => option.name.trim() && option.value.trim())
+    .map((option) => ({ name: option.name, value: option.value }));
+
+  return {
+    productId: variant.productId,
+    // The family code, so an archived-and-reissued product can still be
+    // recognised on an old order without joining back to a row that may have
+    // been renamed.
+    productCode: variant.product?.productCode ?? null,
+    variantName: variant.name,
+    selectedOptions: options.length ? JSON.stringify(options) : null,
+    // What the seller was told to charge, as distinct from the price that was
+    // charged. Kept only when the two differ in a way worth explaining: if
+    // Shopify charged the catalogue price, recording it again adds nothing.
+    sellerRetailPrice:
+      variant.suggestedRetailPrice !== chargedRetailCents ? variant.suggestedRetailPrice : null,
+    currency: variant.currency || null,
+    productLengthCm: decimal(variant.productLengthCm),
+    productWidthCm: decimal(variant.productWidthCm),
+    productHeightCm: decimal(variant.productHeightCm),
+    productWeightKg: decimal(variant.productWeightKg),
+    packageLengthCm: carton ? toCm(carton.length, carton.dimensionUnit).toFixed(2) : null,
+    packageWidthCm: carton ? toCm(carton.width, carton.dimensionUnit).toFixed(2) : null,
+    packageHeightCm: carton ? toCm(carton.height, carton.dimensionUnit).toFixed(2) : null,
+    packagedWeightKg: carton ? toKg(carton.grossWeight, carton.weightUnit).toFixed(3) : null,
+    unitsPerPackage: carton?.unitsPerPackage ?? null,
+  };
+}
+
+/**
  * Keep only line items mapped to a persisted MoonVella variant. Unrelated
  * products stay out of the supplier workflow.
  */
@@ -138,17 +252,18 @@ function buildItems(items: LineItem[], byVariant: Map<string, VariantMapping>): 
 
   const rows = moonvellaItems.map((li) => {
     const mapping = byVariant.get(String(li.variant_id))!;
+    const variant = mapping.productVariant;
     const quantity = Number(li.quantity) || 0;
     const retailUnit = cents(li.price);
-    const wholesaleUnit = mapping.productVariant.wholesalePrice;
+    const wholesaleUnit = variant.wholesalePrice;
     const lineDiscount = sumDiscounts(li);
     retailTotal += retailUnit * quantity;
     moonvellaSubtotal += wholesaleUnit * quantity;
     lineDiscountTotal += lineDiscount;
     lineTaxTotal += sumTaxes(li);
     return {
-      name: li.title || mapping.productVariant.name,
-      sku: li.sku || mapping.productVariant.sku,
+      name: li.title || variant.name,
+      sku: li.sku || variant.sku,
       quantity,
       price: retailUnit,
       wholesalePrice: wholesaleUnit,
@@ -156,6 +271,7 @@ function buildItems(items: LineItem[], byVariant: Map<string, VariantMapping>): 
       shopifyLineItemId: String(li.id ?? ""),
       variantId: mapping.productVariantId,
       sellerProductId: mapping.sellerProductId,
+      ...snapshotFor(variant, retailUnit),
     };
   });
 
@@ -371,7 +487,20 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
         sellerProduct: { sellerId: seller.id },
         shopifyVariantId: { in: variantIds },
       },
-      include: { productVariant: true, sellerProduct: true },
+      // Read once, at intake, and copied onto the order line. The relations are
+      // included because the snapshot needs the option pairs, the family code
+      // and the carton — all of which can change later, which is exactly why
+      // the copy exists.
+      include: {
+        productVariant: {
+          include: {
+            variantOptions: { orderBy: { sortOrder: "asc" } },
+            product: { select: { productCode: true } },
+            packages: { orderBy: { sortOrder: "asc" } },
+          },
+        },
+        sellerProduct: true,
+      },
     });
     const byVariant = new Map<string, VariantMapping>();
     for (const mapping of mappings) {

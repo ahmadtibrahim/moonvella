@@ -6,6 +6,7 @@ export const AUDIT_ENTITY = {
   APPLICATION: "MerchantApplication",
   SELLER: "Seller",
   PRODUCT: "Product",
+  MEDIA: "MediaAsset",
   SELLER_PRODUCT: "SellerProduct",
   ORDER: "Order",
   SHIPMENT: "Shipment",

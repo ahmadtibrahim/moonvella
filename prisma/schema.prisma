@@ -309,9 +309,12 @@ model Product {
   createdAt             DateTime          @default(now())
   updatedAt             DateTime          @updatedAt
 
-  /// The family code. Required, unique, normalized to upper case with internal
-  /// whitespace collapsed, and validated against a documented character set by
-  /// app/utils/productCode.ts.
+  /// The family code. Required, unique, trimmed and upper-cased, and validated
+  /// against a documented character set by app/utils/productCode.ts.
+  ///
+  /// Whitespace is rejected rather than stripped. Collapsing it silently would
+  /// let two distinct codes become one row with no explanation shown to the
+  /// person who typed it.
   ///
   /// It is deliberately NOT a variant SKU and must never be exported as one:
   /// it identifies the family, while each sellable unit has its own SKU on
@@ -633,8 +636,11 @@ model OrderItem {
   /// rather than a relation for the same reason as the rest: the variant's
   /// options may be renamed or deleted afterwards.
   selectedOptions String?
-  /// What the seller intended to charge their customer, when known. Distinct
-  /// from `price`, which is what MoonVella charged the seller.
+  /// The seller's own list price for this variant at the time, recorded only
+  /// when it differed from what was actually charged. `price` remains what the
+  /// customer paid; this is the intended figure, kept so a discounted line can
+  /// still explain itself. `wholesalePrice` is what MoonVella charged the
+  /// seller, which is a different party and a different number.
   sellerRetailPrice Int?
   currency          String?
 
