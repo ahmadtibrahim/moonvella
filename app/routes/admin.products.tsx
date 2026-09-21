@@ -252,7 +252,10 @@ export default function AdminProducts() {
                 <span style={{ color: p._count.variants === 0 ? "#b45309" : "#64748b" }}>
                   {p._count.variants === 0 ? "none yet" : p._count.variants}
                 </span>
-                <span style={{ color: "#64748b" }}>{p._count.mediaAssets}</span>
+                <span style={{ color: "#64748b" }}>
+                  {p._count.mediaAssets}{" "}
+                  <span style={{ fontSize: "0.7rem" }}>(media assets for publication)</span>
+                </span>
                 <span style={{ color: STATUS_COLOURS[p.status] ?? "#64748b", fontWeight: 600 }}>
                   {STATUS_LABELS[p.status] ?? p.status}
                 </span>

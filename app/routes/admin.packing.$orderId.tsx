@@ -33,7 +33,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     for (const si of s.items) packedByItem[si.orderItemId] = (packedByItem[si.orderItemId] || 0) + si.quantity;
   }
 
-  const variantPackaging: Record<string, { label: string | null; length: number; width: number; height: number; weight: number; count: number }[]> = {};
+  const variantPackaging: Record<string, { label: string | null; length: number; width: number; height: number; weight: number; dimensionUnit: string; weightUnit: string; count: number }[]> = {};
   await Promise.all(
     order.items.map(async (item) => {
       if (!item.variantId) return;
@@ -44,6 +44,8 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
         width: Number(toCm(r.width, r.dimensionUnit).toFixed(2)),
         height: Number(toCm(r.height, r.dimensionUnit).toFixed(2)),
         weight: Number(toKg(r.grossWeight, r.weightUnit).toFixed(3)),
+        dimensionUnit: r.dimensionUnit,
+        weightUnit: r.weightUnit,
         count: item.quantity * r.packagesPerUnit,
       }));
     })
@@ -233,7 +235,7 @@ export default function AdminPacking() {
                   <td style={{ padding: "0.4rem" }}>
                     {i.variantPackaging.length > 0 ? (
                       <span style={{ fontSize: "0.7rem", color: "#64748b" }}>
-                        {i.variantPackaging.map((p) => `${p.count}× ${p.length}×${p.width}×${p.height}cm ${p.weight}kg`).join("; ")}
+                        {i.variantPackaging.map((p) => `${p.count}× ${p.length.toFixed(2)}×${p.width.toFixed(2)}×${p.height.toFixed(2)} ${p.dimensionUnit}${p.count > 1 ? " set" : ""} ${p.weight.toFixed(3)}${p.weightUnit}`).join("; ")}
                       </span>
                     ) : (
                       <span style={{ fontSize: "0.7rem", color: "#94a3b8" }}>no variant packaging</span>

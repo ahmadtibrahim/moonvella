@@ -339,12 +339,12 @@ export default function ApplicationPage() {
   }
 
   return (
-    <s-page heading="Apply to sell MoonVella bedding">
+    <s-page heading="Apply to access MoonVella">
       <div className="mv-container">
         <div className="mv-page-header">
-          <h2 className="mv-page-title">Apply to sell MoonVella bedding</h2>
+          <h2 className="mv-page-title">Apply to access MoonVella</h2>
           <p className="mv-page-subtitle">
-            We review each Shopify store before unlocking wholesale pricing and product import tools.
+            Submit your business details to access MoonVella's wholesale catalog and seller tools.
           </p>
         </div>
 

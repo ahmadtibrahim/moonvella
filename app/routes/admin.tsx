@@ -102,7 +102,7 @@ export default function AdminLayout() {
             {visible.map((item) => {
               const isActive =
                 location.pathname === item.href ||
-                location.pathname.startsWith(item.href + "/");
+                (item.href !== "/admin" && location.pathname.startsWith(item.href + "/"));
               return (
                 <li key={item.href} style={{ marginBottom: "0.25rem" }}>
                   <a

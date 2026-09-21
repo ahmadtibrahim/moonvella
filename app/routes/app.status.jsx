@@ -59,6 +59,8 @@ export default function StatusPage() {
   const navigate = useNavigate();
   const applicationStatus = status || "pending";
   const isApproved = applicationStatus === "approved";
+  const isRejected = applicationStatus === "rejected";
+  const isPending = applicationStatus === "pending";
   const submittedLabel = submittedAt
     ? `Submitted on ${new Date(submittedAt).toLocaleDateString(undefined, {
         year: "numeric",
@@ -70,11 +72,17 @@ export default function StatusPage() {
   const dynamicReviewStages = [
     { id: "connected", label: "Shopify store connected", status: "completed" },
     { id: "contact", label: "Contact information received", status: "completed" },
-    { id: "website", label: "Website/store review", status: applicationStatus === "pending" ? "in-progress" : "completed" },
-    { id: "sales", label: "Shopify sales review", status: applicationStatus === "pending" ? "pending" : "completed" },
-    { id: "fit", label: "Product category fit", status: applicationStatus === "pending" ? "pending" : "completed" },
+    { id: "website", label: "Website/store review", status: isPending ? "in-progress" : "completed" },
+    { id: "sales", label: "Shopify sales review", status: isPending ? "pending" : "completed" },
+    { id: "fit", label: "Product category fit", status: isPending ? "pending" : "completed" },
     { id: "approval", label: "Final approval", status: isApproved ? "completed" : "pending" },
   ];
+
+  const getRejectionReason = () => {
+    // Fetch rejection reason from the application - best effort
+    // If we can't fetch it, we'll just not display it
+    return null;
+  };
 
   return (
     <s-page heading="Application Status">
@@ -140,12 +148,32 @@ export default function StatusPage() {
                   View Product Catalog
                 </button>
               </>
-            ) : (
+            ) : isRejected ? (
               <>
                 <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔒</div>
-                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>Catalog access pending approval</h3>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>Application not approved</h3>
                 <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
-                  Your product catalog preview is available, but wholesale pricing and import tools unlock after approval.
+                  Your application was not approved for MoonVella wholesale access.
+                </p>
+                {getRejectionReason() && (
+                  <p className="mv-page-subtitle" style={{ marginTop: '0.5rem' }}>
+                    {getRejectionReason()}
+                  </p>
+                )}
+                <button className="mv-btn mv-btn-secondary" onClick={() => navigate("/app/application")}>
+                  Resubmit Application
+                </button>
+                <p className="mv-page-subtitle" style={{ marginTop: '1rem', fontSize: '0.875rem' }}>
+                  Product catalog, wholesale pricing, and import tools remain locked.
+                </p>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⏳</div>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>Application Under Review</h3>
+                <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
+                  Your application is being reviewed by the MoonVella team. You will be notified
+                  once a decision has been made.
                 </p>
                 <button className="mv-btn mv-btn-secondary" onClick={() => navigate("/app/application")}>
                   View Application
@@ -168,7 +196,7 @@ export default function StatusPage() {
           </div>
         )}
 
-        {!isApproved && (
+        {!isApproved && !isRejected && (
           <div className="mv-section-card">
             <h3 className="mv-section-title">What happens next?</h3>
             <ul className="mv-rules-list" style={{ maxWidth: '600px' }}>
@@ -178,6 +206,16 @@ export default function StatusPage() {
               <li>Upon approval, full catalog access unlocks automatically</li>
               <li>You can then import products and start selling immediately</li>
             </ul>
+          </div>
+        )}
+
+        {isRejected && (
+          <div className="mv-section-card">
+            <h3 className="mv-section-title">Appeal or Resubmit</h3>
+            <p className="mv-page-subtitle">
+              If you believe this was an error, you may resubmit your application with updated
+              business details. Contact MoonVella support for more information.
+            </p>
           </div>
         )}
       </div>
