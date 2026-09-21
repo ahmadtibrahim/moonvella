@@ -74,6 +74,30 @@ async function post(path: string, cookie: string, data: Record<string, string>) 
 }
 
 /**
+ * A POST that can repeat a field. `Record<string, string>` cannot express the
+ * list fields, and a form with two boxes named `features` is the whole point of
+ * them — a helper that silently sent only the last value would make every check
+ * about ordering pass for the wrong reason.
+ */
+async function postMulti(path: string, cookie: string, data: [string, string][]) {
+  return fetch(`${BASE}${path}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Origin: BASE,
+      Cookie: cookie,
+    },
+    body: new URLSearchParams(data),
+  });
+}
+
+/** How many controls in this page submit under one name. */
+function countNamed(html: string, name: string): number {
+  return (html.match(new RegExp(`name="${name}"`, "g")) ?? []).length;
+}
+
+/**
  * The attributes of the tag carrying this id, for asserting on the markup a
  * browser would actually receive rather than on the source that produced it.
  */
@@ -117,6 +141,10 @@ async function main() {
       // editor must show rather than reset.
       category: "Bedding",
       currency: "CAD",
+      // Two stored lines, so the editor has to draw two boxes rather than one
+      // textarea: that is the whole of the owner's request, in one assertion.
+      features: "Keeps cool for up to 8 hours\nMachine-washable cover",
+      materials: "Organic cotton",
       variants: {
         create: [
           {
@@ -308,6 +336,87 @@ async function main() {
     );
 
     /* ------------------------------------------------------------------ */
+    /* Features and materials: a list, not a paragraph                      */
+    /* ------------------------------------------------------------------ */
+    const boxes = countNamed(details.html, "features");
+    check(
+      "Each stored feature gets its own box",
+      boxes === 2,
+      `${boxes} box(es) for two stored lines`
+    );
+    check(
+      "And its own remove control, with a way to add a third",
+      /Remove features 1/.test(details.html) && /Add another/.test(details.html),
+      "a list that cannot grow is a textarea with extra steps"
+    );
+    check(
+      "Materials are drawn the same way",
+      countNamed(details.html, "materials") === 1 && /Add material/.test(details.html)
+    );
+
+    await postMulti(`/admin/products/${product.id}`, cookie, [
+      ["intent", "update_details"],
+      ["tab", "details"],
+      ["name", "Verify Editor UI"],
+      ["productCode", CODE],
+      ["category", "Clothing"],
+      ["category_new", ""],
+      ["currency", "CAD"],
+      ["currency_new", ""],
+      ["description", "Written by verify-editor-ui."],
+      ["features", "Cool for eight hours"],
+      ["features", "Washable cover"],
+      ["materials", "Organic cotton"],
+    ]);
+    const afterTwoBoxes = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "Two boxes are stored as two lines, in the order they were filled in",
+      afterTwoBoxes?.features === "Cool for eight hours\nWashable cover",
+      JSON.stringify(afterTwoBoxes?.features)
+    );
+
+    // Somebody pasting a whole list into the first box should get a list, not
+    // one very long feature.
+    await postMulti(`/admin/products/${product.id}`, cookie, [
+      ["intent", "update_details"],
+      ["tab", "details"],
+      ["name", "Verify Editor UI"],
+      ["productCode", CODE],
+      ["category", "Clothing"],
+      ["category_new", ""],
+      ["currency", "CAD"],
+      ["currency_new", ""],
+      ["features", "Cool for eight hours\nWashable cover\nNo chemical coolants"],
+      ["materials", "Organic cotton"],
+    ]);
+    const afterPaste = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "A pasted list splits on its own line breaks",
+      afterPaste?.features === "Cool for eight hours\nWashable cover\nNo chemical coolants",
+      JSON.stringify(afterPaste?.features)
+    );
+
+    await postMulti(`/admin/products/${product.id}`, cookie, [
+      ["intent", "update_details"],
+      ["tab", "details"],
+      ["name", "Verify Editor UI"],
+      ["productCode", CODE],
+      ["category", "Clothing"],
+      ["category_new", ""],
+      ["currency", "CAD"],
+      ["currency_new", ""],
+      ["features", "Only this one"],
+      ["features", "   "],
+      ["materials", "   "],
+    ]);
+    const afterBlank = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "An empty box adds nothing, so a blank row cannot become a blank feature",
+      afterBlank?.features === "Only this one" && afterBlank?.materials === null,
+      `${JSON.stringify(afterBlank?.features)} / ${JSON.stringify(afterBlank?.materials)}`
+    );
+
+    /* ------------------------------------------------------------------ */
     /* The catalogue list                                                    */
     /* ------------------------------------------------------------------ */
     const list = await get("/admin/products", cookie);
@@ -315,6 +424,72 @@ async function main() {
       "The list says what its media column counts",
       /variants with pictures/.test(list.html) && list.html.includes(CODE)
     );
+
+    /* ------------------------------------------------------------------ */
+    /* Delete, and the reason it stopped working                             */
+    /* ------------------------------------------------------------------ */
+    /**
+     * Delete failed for the owner while its neighbours worked. The action was
+     * fine — it was the browser dialog in front of it: once Chrome is told to
+     * "prevent this page from creating additional dialogs", every later
+     * `confirm()` returns false without being shown, so the button is dead and
+     * nothing on the page explains why. The guard is therefore about the page:
+     * a Delete that depends on `confirm()` will pass every server-side check
+     * and still be broken.
+     */
+    check(
+      "Delete does not depend on a browser dialog",
+      !list.html.includes("confirm("),
+      "a suppressed confirm() is a dead button that reports nothing"
+    );
+    check(
+      "Delete is a button in the row that cannot submit until it is armed",
+      (() => {
+        // The arming press is client-side, so the server's HTML holds the first
+        // state: a `type="button"` that submits nothing. If it came back as a
+        // submit button, a stray Enter would delete a product.
+        const at = list.html.indexOf(">Delete</button>");
+        if (at === -1) return false;
+        const tag = list.html.slice(list.html.lastIndexOf("<button", at), at);
+        return /type="button"/.test(tag);
+      })(),
+      "the second press is the one that deletes"
+    );
+
+    const doomed = await prisma.product.create({
+      data: {
+        name: "Verify Delete Me",
+        productCode: `${CODE}-DEL`,
+        category: "Clothing",
+        currency: "CAD",
+        variants: {
+          create: [{ name: "One size", sku: `${CODE}-DEL-1`, wholesalePrice: 100, suggestedRetailPrice: 200, isDefault: true }],
+        },
+      },
+      include: { variants: true },
+    });
+    const deleteRes = await post("/admin/products", cookie, {
+      intent: "delete",
+      productId: doomed.id,
+      returnTo: "/admin/products",
+    });
+    const gone = await prisma.product.findUnique({ where: { id: doomed.id } });
+    check(
+      "Deleting a product actually deletes it",
+      deleteRes.status === 302 && gone === null,
+      `HTTP ${deleteRes.status}, ${gone ? "still there" : "row gone"}`
+    );
+
+    // And the page says so, rather than silently re-rendering an identical list.
+    const afterDelete = await get("/admin/products?done=delete", cookie);
+    check(
+      "And the list says what happened",
+      /Deleted\./.test(afterDelete.html)
+    );
+
+    await prisma.variantPackage.deleteMany({ where: { variantId: doomed.variants[0].id } });
+    await prisma.productVariant.deleteMany({ where: { productId: doomed.id } });
+    await prisma.product.deleteMany({ where: { id: doomed.id } });
   } finally {
     // Audit rows are append-only at the database level and are deliberately
     // left behind; everything else this suite made goes.

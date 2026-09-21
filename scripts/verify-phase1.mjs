@@ -126,7 +126,7 @@ async function main() {
   check("approve twice: single seller record", sellerCount === 1, `${sellerCount} seller(s)`);
 
   // 4. Suspend
-  await post("/admin/sellers", ownerLogin.cookie, {
+  await post("/admin/stores", ownerLogin.cookie, {
     intent: "suspend",
     sellerId: sellerAfter.id,
     reason: "Phase 1 test suspend",
@@ -141,7 +141,7 @@ async function main() {
   check("suspend: audit event written", !!suspendAudit);
 
   // 5. Reactivate
-  await post("/admin/sellers", ownerLogin.cookie, {
+  await post("/admin/stores", ownerLogin.cookie, {
     intent: "reactivate",
     sellerId: sellerAfter.id,
   });

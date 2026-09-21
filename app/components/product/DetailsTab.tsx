@@ -9,6 +9,8 @@ import {
   CATEGORY_OPTIONS,
   CURRENCY_OPTIONS,
   CatalogueField,
+  ListField,
+  listLines,
   sectionTitle,
   sectionNote,
   Field,
@@ -174,29 +176,28 @@ export default function DetailsTab({
             </div>
 
             <div style={{ gridColumn: "1 / -1" }}>
-              <Field id="d-features" label="Features" hint="One per line.">
-                <textarea
-                  style={input}
-                  id="d-features"
-                  name="features"
-                  rows={3}
-                  disabled={disabled}
-                  defaultValue={product.features ?? ""}
-                />
-              </Field>
+              <ListField
+                id="d-features"
+                label="Features"
+                name="features"
+                values={listLines(product.features)}
+                disabled={disabled}
+                hint="One feature per box — what a seller reads on the product card. Add another for each one."
+                placeholder="e.g. Keeps cool for up to 8 hours"
+              />
             </div>
 
             <div style={{ gridColumn: "1 / -1" }}>
-              <Field id="d-materials" label="Materials">
-                <textarea
-                  style={input}
-                  id="d-materials"
-                  name="materials"
-                  rows={2}
-                  disabled={disabled}
-                  defaultValue={product.materials ?? ""}
-                />
-              </Field>
+              <ListField
+                id="d-materials"
+                label="Materials"
+                name="materials"
+                values={listLines(product.materials)}
+                disabled={disabled}
+                hint="What it is made of, one per box."
+                placeholder="e.g. 100% organic cotton"
+                addLabel="Add material"
+              />
             </div>
 
             <div style={{ gridColumn: "1 / -1" }}>

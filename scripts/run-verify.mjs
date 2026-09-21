@@ -195,6 +195,17 @@ const CHECKS = [
     file: "scripts/verify-editor-ui.ts",
     requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
   },
+  // The Stores roster and a store's own page, over HTTP. Checks two different
+  // things and is worth running for both: that Deactivate and Activate change
+  // the seller's status rather than only returning a redirect, and that the
+  // balances and invoices — which are drawn, not read, until Odoo is connected
+  // — say so on the page instead of looking like a ledger.
+  {
+    name: "stores-ui",
+    kind: "ts",
+    file: "scripts/verify-stores-ui.ts",
+    requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
+  },
 ];
 
 async function runAll() {

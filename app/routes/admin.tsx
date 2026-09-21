@@ -29,7 +29,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permission }[] = [
   { href: "/admin", label: "Dashboard", icon: "D", permission: "dashboard.view" },
   { href: "/admin/applications", label: "Applications", icon: "A", permission: "merchants.view" },
-  { href: "/admin/sellers", label: "Sellers", icon: "S", permission: "merchants.view" },
+  { href: "/admin/stores", label: "Stores", icon: "S", permission: "merchants.view" },
   { href: "/admin/rankings", label: "Rankings", icon: "R", permission: "reports.view" },
   { href: "/admin/products", label: "Products", icon: "P", permission: "products.view" },
   { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view" },

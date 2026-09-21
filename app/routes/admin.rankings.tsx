@@ -155,7 +155,7 @@ export default function AdminRankings() {
               data.rows.map((r) => (
                 <tr key={r.sellerId} style={{ borderBottom: "1px solid #f1f5f9" }}>
                   <td style={{ padding: "0.5rem", fontSize: "0.82rem" }}>
-                    <Link to={`/admin/sellers/${r.sellerId}`} style={{ fontWeight: 600, color: "#082a4a" }}>
+                    <Link to={`/admin/stores/${r.sellerId}`} style={{ fontWeight: 600, color: "#082a4a" }}>
                       {r.storeName}
                     </Link>
                     <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>{r.shopDomain}</div>

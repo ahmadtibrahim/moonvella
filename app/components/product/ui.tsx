@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { Form } from "react-router";
 
@@ -193,6 +193,124 @@ export function catalogueValue(form: FormData, name: string): string {
   const typed = String(form.get(`${name}_new`) ?? "").trim();
   if (typed) return typed;
   return String(form.get(name) ?? "").trim();
+}
+
+/**
+ * A list that grows one box at a time: Features, Materials, and anything else
+ * that is a handful of short lines rather than a paragraph.
+ *
+ * A textarea with "one per line" written underneath asks the writer to hold a
+ * format in their head and shows them nothing about the shape of the answer;
+ * five boxes show that five things go here and that a sixth is one press away.
+ * The entries are still stored one per line, so nothing that already reads
+ * these fields — the seller catalog, the marketing pack — has to change.
+ *
+ * Every box submits under the same name, so the action reads them as an array
+ * and `listValue` puts them back together.
+ */
+export function ListField({
+  id,
+  label: text,
+  name,
+  values,
+  disabled,
+  hint,
+  placeholder,
+  addLabel = "Add another",
+}: {
+  id: string;
+  label: string;
+  name: string;
+  /** The stored lines, already split. An empty list still shows one box. */
+  values: string[];
+  disabled?: boolean;
+  hint?: ReactNode;
+  placeholder?: string;
+  addLabel?: string;
+}) {
+  const [rows, setRows] = useState(() =>
+    (values.length ? values : [""]).map((value, index) => ({ key: index, value }))
+  );
+  // Keys only have to be unique among the rows on screen, and this counter is
+  // what stops React reusing the wrong box when one in the middle is removed.
+  const nextKey = useRef(rows.length);
+
+  const add = () => {
+    nextKey.current += 1;
+    setRows((current) => [...current, { key: nextKey.current, value: "" }]);
+  };
+  const remove = (key: number) => setRows((current) => current.filter((row) => row.key !== key));
+  const change = (key: number, value: string) =>
+    setRows((current) => current.map((row) => (row.key === key ? { ...row, value } : row)));
+
+  return (
+    <Field id={id} label={text} hint={hint}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+        {rows.map((row, index) => (
+          <div key={row.key} style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
+            <input
+              style={input}
+              id={index === 0 ? id : `${id}-${index}`}
+              name={name}
+              value={row.value}
+              disabled={disabled}
+              placeholder={index === 0 ? placeholder : undefined}
+              onChange={(event) => change(row.key, event.target.value)}
+              aria-label={`${text} ${index + 1}`}
+            />
+            <button
+              type="button"
+              onClick={() => remove(row.key)}
+              disabled={disabled || rows.length === 1}
+              aria-label={`Remove ${text.toLowerCase()} ${index + 1}`}
+              style={{
+                ...btn("#64748b"),
+                padding: "0.35rem 0.55rem",
+                // A one-row list has nothing to remove; the control is present
+                // so the shape does not jump when a second row appears.
+                opacity: rows.length === 1 ? 0.35 : 1,
+                cursor: rows.length === 1 ? "not-allowed" : "pointer",
+              }}
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        onClick={add}
+        disabled={disabled}
+        style={{ ...btn(INK), marginTop: "0.4rem" }}
+      >
+        + {addLabel}
+      </button>
+    </Field>
+  );
+}
+
+/**
+ * Reads a `ListField` back out of a submitted form, in the format the column
+ * has always used: one entry per line, blank lines dropped.
+ *
+ * A pasted paragraph splits on its own newlines rather than becoming one very
+ * long feature, so the boxes are a convenience and never a trap.
+ */
+export function listValue(form: FormData, name: string): string | null {
+  const lines = form
+    .getAll(name)
+    .flatMap((value) => String(value).split("\n"))
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length ? lines.join("\n") : null;
+}
+
+/** The other half: a stored column back into the rows `ListField` draws. */
+export function listLines(stored: string | null | undefined): string[] {
+  return (stored ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 export function StatusChip({ status }: { status: string }) {

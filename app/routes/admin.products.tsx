@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
@@ -27,6 +28,22 @@ const STATUS_COLOURS: Record<string, string> = {
   ARCHIVED: "#94a3b8",
 };
 
+/**
+ * What to say after an action, so a press that worked does not look like a
+ * press that did nothing.
+ *
+ * A redirect back to the same list is invisible: the row's status changes, but
+ * only if the reader happens to remember what it said before. Each action
+ * therefore names itself in the URL and the list says it back in words.
+ */
+const DONE_MESSAGES: Record<string, string> = {
+  publish: "Published to sellers.",
+  unpublish: "Withdrawn from sellers. Existing orders are unaffected.",
+  archive: "Archived. Sellers no longer see it.",
+  restore: "Restored as a draft, so it has to pass the publication checks again before sellers see it.",
+  delete: "Deleted.",
+};
+
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "products.view");
   const url = new URL(request.url);
@@ -40,8 +57,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
     status,
     page: Number(url.searchParams.get("page") || 1),
   });
+  const done = url.searchParams.get("done") || "";
   return {
     ...result,
+    done: DONE_MESSAGES[done] ?? "",
     filters: {
       q: url.searchParams.get("q") || "",
       category: url.searchParams.get("category") || "",
@@ -95,7 +114,8 @@ export async function action({ request }: ActionFunctionArgs) {
   }
 
   const returnTo = String(form.get("returnTo") || "");
-  return redirect(returnTo.startsWith("/admin/products") ? returnTo : "/admin/products");
+  const base = returnTo.startsWith("/admin/products") ? returnTo : "/admin/products";
+  return redirect(`${base}${base.includes("?") ? "&" : "?"}done=${intent}`);
 }
 
 const card: React.CSSProperties = {
@@ -169,6 +189,15 @@ export default function AdminProducts() {
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
           {actionData.error}
+        </div>
+      ) : null}
+
+      {data.done ? (
+        <div
+          role="status"
+          style={{ ...card, background: "#f0fdf4", borderColor: "#bbf7d0", color: "#065f46", fontSize: "0.85rem", marginBottom: "1rem" }}
+        >
+          {data.done}
         </div>
       ) : null}
 
@@ -281,19 +310,7 @@ export default function AdminProducts() {
                   <button type="submit" name="intent" value={p.isArchived ? "restore" : "archive"} style={btn(p.isArchived ? "#059669" : "#dc2626")}>
                     {p.isArchived ? "Restore" : "Archive"}
                   </button>
-                  <button
-                    type="submit"
-                    name="intent"
-                    value="delete"
-                    style={btn("#7f1d1d")}
-                    onClick={(event) => {
-                      if (!confirm(`Permanently delete "${p.name}"? This cannot be undone. Products referenced by orders must be archived instead.`)) {
-                        event.preventDefault();
-                      }
-                    }}
-                  >
-                    Delete
-                  </button>
+                  <ArmedDelete name={p.name} />
                 </Form>
               </div>
             ))}
@@ -319,15 +336,57 @@ export default function AdminProducts() {
   );
 }
 
-function btn(color: string): React.CSSProperties {
+function btn(color: string, solid = false): React.CSSProperties {
   return {
     padding: "0.35rem 0.6rem",
     border: `1px solid ${color}`,
     borderRadius: 6,
-    background: "white",
-    color,
+    background: solid ? color : "white",
+    color: solid ? "white" : color,
     fontSize: "0.68rem",
     fontWeight: 600,
     cursor: "pointer",
   };
+}
+
+/**
+ * Delete, asked twice — and never through a browser dialog.
+ *
+ * This button used to open a `confirm()` box. Chrome offers "Prevent this page
+ * from creating additional dialogs" the second or third time a page asks, and
+ * once that is ticked every later `confirm()` returns false *without ever
+ * appearing* — so Delete stops working while its confirm-free neighbours carry
+ * on, and the page offers no reason why. That is exactly the report this
+ * replaced. The question is asked inside the row instead, which nothing can
+ * switch off.
+ *
+ * It submits the row's own form rather than a nested one: a form inside a form
+ * is invalid HTML, and the inner one would swallow the productId the action
+ * needs to know what to delete.
+ */
+function ArmedDelete({ name }: { name: string }) {
+  const [armed, setArmed] = useState(false);
+
+  if (!armed) {
+    return (
+      <button type="button" style={btn("#7f1d1d")} onClick={() => setArmed(true)}>
+        Delete
+      </button>
+    );
+  }
+
+  return (
+    <>
+      {/* Announced as well as shown, so the second press is never a surprise. */}
+      <span role="status" style={{ fontSize: "0.68rem", color: "#7f1d1d", maxWidth: 170 }}>
+        Delete &ldquo;{name}&rdquo; for good? Products on orders must be archived instead.
+      </span>
+      <button type="submit" name="intent" value="delete" style={btn("#7f1d1d", true)}>
+        Yes, delete
+      </button>
+      <button type="button" style={btn("#64748b")} onClick={() => setArmed(false)}>
+        Cancel
+      </button>
+    </>
+  );
 }

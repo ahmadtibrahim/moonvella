@@ -249,7 +249,7 @@ export default function AdminApplications() {
       </div>
 
       <p style={{ marginTop: "1.5rem", fontSize: "0.75rem" }}>
-        <Link to="/admin/sellers" style={{ color: "#082a4a", fontWeight: 500 }}>
+        <Link to="/admin/stores" style={{ color: "#082a4a", fontWeight: 500 }}>
           Manage sellers &rarr;
         </Link>
       </p>

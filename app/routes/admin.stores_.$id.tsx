@@ -4,6 +4,13 @@ import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adm
 import { getSellerDetail } from "~/services/seller.server";
 import { suspendSeller, reactivateSeller } from "~/services/application.server";
 import { getShopAnalytics } from "~/services/analytics.server";
+import {
+  AccountingPreviewNotice,
+  BalancesPanel,
+  CommunicationsPanel,
+  LedgerPanel,
+  UninvoicedPanel,
+} from "~/components/store/accounting";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   await requirePermission(request, "merchants.view");
@@ -11,13 +18,17 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const detail = await getSellerDetail(id);
   if (!detail) {
-    throw new Response("Seller not found", { status: 404 });
+    throw new Response("Store not found", { status: 404 });
   }
 
-  const analyticsDays = new URL(request.url).searchParams.get("analytics") === "90" ? 90 : 30;
+  const url = new URL(request.url);
+  const analyticsDays = url.searchParams.get("analytics") === "90" ? 90 : 30;
   const analytics = await getShopAnalytics(detail.seller.shopDomain, analyticsDays);
 
+  const done = url.searchParams.get("done") || "";
+
   return {
+    done: DONE_MESSAGES[done] ?? "",
     seller: detail.seller,
     application: detail.seller.application,
     orderCount: detail.orderCount,
@@ -56,8 +67,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
     return { error: error instanceof Error ? error.message : "The operation failed." };
   }
 
-  return redirect(`/admin/sellers/${id}`);
+  return redirect(`/admin/stores/${id}?done=${intent}`);
 }
+
+const DONE_MESSAGES: Record<string, string> = {
+  suspend: "Store deactivated. It keeps its history and its orders are unaffected.",
+  reactivate: "Store activated. It can sign in and order again.",
+};
 
 const card: React.CSSProperties = {
   background: "white",
@@ -145,8 +161,8 @@ function statusStyle(status: string): React.CSSProperties {
   };
 }
 
-export default function AdminSellerDetail() {
-  const { seller, application, orderCount, wholesaleRevenue, history, analytics } =
+export default function AdminStoreDetail() {
+  const { seller, application, orderCount, wholesaleRevenue, history, analytics, done } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const isApproved = seller.status === "APPROVED";
@@ -156,8 +172,8 @@ export default function AdminSellerDetail() {
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
       <p style={{ fontSize: "0.75rem", marginBottom: "0.5rem" }}>
-        <Link to="/admin/sellers" style={{ color: "#082a4a" }}>
-          &larr; All sellers
+        <Link to="/admin/stores" style={{ color: "#082a4a" }}>
+          &larr; All stores
         </Link>
       </p>
       <h1 style={{ fontSize: "1.6rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
@@ -170,6 +186,15 @@ export default function AdminSellerDetail() {
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
           {actionData.error}
+        </div>
+      ) : null}
+
+      {done ? (
+        <div
+          role="status"
+          style={{ ...card, background: "#f0fdf4", borderColor: "#bbf7d0", color: "#065f46", fontSize: "0.85rem" }}
+        >
+          {done}
         </div>
       ) : null}
 
@@ -200,9 +225,25 @@ export default function AdminSellerDetail() {
         </div>
       </div>
 
+      {/*
+        The account comes before the paperwork. The question that brings someone
+        to a store's page is almost always about money — what is owed, what has
+        been paid, what was said about it — and the profile, the application and
+        the connection settings are answers to questions asked less often.
+      */}
+      <AccountingPreviewNotice currency={seller.currency ?? "CAD"} />
+      <BalancesPanel
+        currency={seller.currency ?? "CAD"}
+        liveOrders={orderCount}
+        liveRevenue={wholesaleRevenue}
+      />
+      <LedgerPanel currency={seller.currency ?? "CAD"} />
+      <UninvoicedPanel currency={seller.currency ?? "CAD"} />
+      <CommunicationsPanel />
+
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.75rem" }}>
-          Seller profile
+          Store profile
         </h2>
         <div style={rowStyle}>
           <span style={keyStyle}>Store name</span>
@@ -343,7 +384,7 @@ export default function AdminSellerDetail() {
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.75rem" }}>
-          Seller settings
+          Store settings
         </h2>
         {seller.settings ? (
           <>
@@ -373,7 +414,7 @@ export default function AdminSellerDetail() {
             </div>
           </>
         ) : (
-          <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No seller settings saved yet.</p>
+          <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No store settings saved yet.</p>
         )}
 
         <h3 style={{ fontSize: "0.85rem", fontWeight: 600, color: "#082a4a", margin: "1rem 0 0.5rem" }}>
@@ -545,9 +586,15 @@ export default function AdminSellerDetail() {
       </div>
 
       <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.75rem" }}>
-          Seller actions
+        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
+          Store controls
         </h2>
+        <p style={{ fontSize: "0.78rem", color: "#64748b", marginBottom: "0.85rem", lineHeight: 1.5 }}>
+          Deactivating refuses the store&rsquo;s orders and signs it out; it keeps every record it
+          has. Activating reverses it. Blocking — refusing a store while leaving its account
+          intact — is drawn but not yet available: it needs a status the database does not have,
+          and a Block button that quietly deactivated would be a worse answer than none.
+        </p>
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           {isApproved ? (
             <>
@@ -556,7 +603,7 @@ export default function AdminSellerDetail() {
                   htmlFor="suspension-reason"
                   style={{ display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" }}
                 >
-                  Suspension reason
+                  Reason for deactivating
                 </label>
                 <input
                   id="suspension-reason"
@@ -565,20 +612,28 @@ export default function AdminSellerDetail() {
                 />
               </div>
               <button type="submit" name="intent" value="suspend" style={btn("#dc2626")}>
-                Suspend seller
+                Deactivate store
               </button>
             </>
           ) : (
             <button type="submit" name="intent" value="reactivate" style={btn("#059669")}>
-              Reactivate seller
+              {seller.status === "SUSPENDED" ? "Activate store" : "Activate this store"}
             </button>
           )}
+          <button
+            type="button"
+            disabled
+            style={{ ...btn("#cbd5e1"), color: "#cbd5e1", cursor: "not-allowed" }}
+            title="Blocking needs a status the database does not have yet."
+          >
+            Block store
+          </button>
         </Form>
       </div>
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.75rem" }}>
-          Seller &amp; application history
+          Store &amp; application history
         </h2>
         {history.length === 0 ? (
           <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No decisions recorded yet.</p>

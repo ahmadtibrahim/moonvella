@@ -28,7 +28,7 @@ import {
 import { publicationReadiness } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import { listPresets, saveVariantPackages, copyVariantPackaging } from "~/services/packaging.server";
-import { card, INK, MUTED, catalogueValue } from "~/components/product/ui";
+import { card, INK, MUTED, catalogueValue, listValue } from "~/components/product/ui";
 import DetailsTab from "~/components/product/DetailsTab";
 import VariantsTab from "~/components/product/VariantsTab";
 import MediaTab from "~/components/product/MediaTab";
@@ -144,8 +144,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
             productCode: text("productCode"),
             category: catalogueValue(form, "category"),
             description: optional("description"),
-            features: optional("features"),
-            materials: optional("materials"),
+            features: listValue(form, "features"),
+            materials: listValue(form, "materials"),
             careInstructions: optional("careInstructions"),
             currency: catalogueValue(form, "currency") || "CAD",
           },
@@ -161,8 +161,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
             productCode: text("productCode"),
             category: catalogueValue(form, "category"),
             description: optional("description"),
-            features: optional("features"),
-            materials: optional("materials"),
+            features: listValue(form, "features"),
+            materials: listValue(form, "materials"),
             careInstructions: optional("careInstructions"),
             currency: catalogueValue(form, "currency") || "CAD",
             status: "PENDING_APPROVAL",
