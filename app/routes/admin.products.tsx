@@ -62,7 +62,7 @@ export async function action({ request }: ActionFunctionArgs) {
           wholesalePrice: Number(form.get("wholesalePrice")),
           suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
           costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          currency: String(form.get("currency") || "CAD"),
+          currency: String(form.get("currency") || "") || String(form.get("currency_new") || "CAD"),
           isPublished: true,
         },
         actor
@@ -282,6 +282,7 @@ export default function AdminProducts() {
                 <span>{money(p.wholesalePrice, p.currency)}</span>
                 <span style={{ color: "#64748b" }}>{p._count.variants}</span>
                 <span style={{ color: "#64748b" }}>{p._count.productImages}</span>
+                <span style={{ color: "#64748b", fontSize: "0.7rem" }}>(product images for publication)</span>
                 <span style={{ color: p.isArchived ? "#64748b" : p.isPublished ? "#059669" : "#b45309" }}>
                   {p.isArchived ? "Archived" : p.isPublished ? "Published" : "Unpublished"}
                 </span>

@@ -42,17 +42,18 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   try {
     if (intent === "update") {
+      const category = String(form.get("category") || "") || String(form.get("category_new") || "");
       await updateProduct(
         productId,
         {
           name: String(form.get("name") || ""),
           sku: String(form.get("sku") || ""),
-          category: String(form.get("category") || ""),
+          category: category,
           description: String(form.get("description") || ""),
           wholesalePrice: Number(form.get("wholesalePrice")),
           suggestedRetailPrice: Number(form.get("suggestedRetailPrice")),
           costPrice: form.get("costPrice") ? Number(form.get("costPrice")) : null,
-          currency: String(form.get("currency") || "CAD"),
+          currency: String(form.get("currency") || "") || String(form.get("currency_new") || "CAD"),
         },
         actor
       );
@@ -148,18 +149,19 @@ const card: React.CSSProperties = {
   background: "white",
   border: "1px solid #e2e8f0",
   borderRadius: 12,
-  padding: "1.5rem",
-  marginBottom: "1.5rem",
+  padding: "2rem",
+  marginBottom: "2rem",
 };
 const input: React.CSSProperties = {
   width: "100%",
-  padding: "0.5rem",
+  padding: "0.6rem",
   border: "1px solid #cbd5e1",
   borderRadius: 6,
-  fontSize: "0.85rem",
+  fontSize: "0.9rem",
   boxSizing: "border-box",
+  fontFamily: "system-ui, -apple-system, sans-serif",
 };
-const label: React.CSSProperties = { display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" };
+const label: React.CSSProperties = { display: "block", fontSize: "0.8rem", color: "#334155", marginBottom: "0.35rem" };
 const btn = (color: string): React.CSSProperties => ({
   padding: "0.4rem 0.75rem",
   border: `1px solid ${color}`,
@@ -201,42 +203,62 @@ export default function AdminProductDetail() {
         </h2>
         <Form method="post" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.75rem" }}>
           <input type="hidden" name="intent" value="update" />
-          <div>
-            <label style={label} htmlFor="edit-name">Title</label>
-            <input style={input} id="edit-name" name="name" defaultValue={product.name} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-sku">SKU</label>
-            <input style={input} id="edit-sku" name="sku" defaultValue={product.sku} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-category">Category</label>
-            <input style={input} id="edit-category" name="category" defaultValue={product.category} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-wholesalePrice">Wholesale price (CAD)</label>
-            <input style={input} id="edit-wholesalePrice" name="wholesalePrice" type="number" min="0" step="0.01" defaultValue={(product.wholesalePrice / 100).toFixed(2)} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-suggestedRetailPrice">Suggested retail price (CAD)</label>
-            <input style={input} id="edit-suggestedRetailPrice" name="suggestedRetailPrice" type="number" min="0" step="0.01" defaultValue={(product.suggestedRetailPrice / 100).toFixed(2)} required />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-costPrice">Internal acquisition cost (CAD, owner-only)</label>
-            <input style={input} id="edit-costPrice" name="costPrice" type="number" min="0" step="0.01" defaultValue={product.costPrice != null ? (product.costPrice / 100).toFixed(2) : ""} />
-          </div>
-          <div>
-            <label style={label} htmlFor="edit-currency">Currency</label>
-            <input style={input} id="edit-currency" name="currency" defaultValue={product.currency} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <label style={label} htmlFor="edit-description">Description</label>
-            <textarea style={input} id="edit-description" name="description" rows={2} defaultValue={product.description ?? ""} />
-          </div>
-          <div style={{ gridColumn: "1 / -1" }}>
-            <button type="submit" style={btn("#082a4a")}>Save details</button>
-          </div>
-        </Form>
+<div>
+              <label style={label} htmlFor="edit-name">Title</label>
+              <input style={input} id="edit-name" name="name" defaultValue={product.name} required />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-sku">SKU</label>
+              <input style={input} id="edit-sku" name="sku" defaultValue={product.sku} required />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-category">Category</label>
+              <select style={input} id="edit-category" name="category">
+                <option value="">Select category…</option>
+                <option value="Clothing">Clothing</option>
+                <option value="Accessories">Accessories</option>
+                <option value="Home & Garden">Home & Garden</option>
+                <option value="Sports">Sports</option>
+                <option value="Electronics">Electronics</option>
+                <option value="Other">Other</option>
+              </select>
+              <small style={{ fontSize: "0.65rem", color: "#64748b" }}>Or enter a new category</small>
+              <input style={input} id="edit-category-new" name="category_new" type="hidden" />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-wholesalePrice">Wholesale price (CAD)</label>
+              <input style={input} id="edit-wholesalePrice" name="wholesalePrice" type="number" min="0" step="0.01" defaultValue={(product.wholesalePrice / 100).toFixed(2)} required />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-suggestedRetailPrice">Suggested retail price (CAD)</label>
+              <input style={input} id="edit-suggestedRetailPrice" name="suggestedRetailPrice" type="number" min="0" step="0.01" defaultValue={(product.suggestedRetailPrice / 100).toFixed(2)} required />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-costPrice">Internal acquisition cost (CAD, owner-only)</label>
+              <input style={input} id="edit-costPrice" name="costPrice" type="number" min="0" step="0.01" defaultValue={product.costPrice != null ? (product.costPrice / 100).toFixed(2) : ""} />
+            </div>
+            <div>
+              <label style={label} htmlFor="edit-currency">Currency</label>
+              <select style={input} id="edit-currency" name="currency">
+                <option value="">Select currency…</option>
+                <option value="CAD">CAD</option>
+                <option value="USD">USD</option>
+                <option value="EUR">EUR</option>
+                <option value="GBP">GBP</option>
+                <option value="AUD">AUD</option>
+                <option value="CHF">CHF</option>
+              </select>
+              <small style={{ fontSize: "0.65rem", color: "#64748b" }}>Or enter a custom currency</small>
+              <input style={input} id="edit-currency-new" name="currency_new" type="hidden" />
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <label style={label} htmlFor="edit-description">Description</label>
+              <textarea style={input} id="edit-description" name="description" rows={2} defaultValue={product.description ?? ""} />
+            </div>
+            <div style={{ gridColumn: "1 / -1" }}>
+              <button type="submit" style={btn("#082a4a")}>Save details</button>
+            </div>
+          </Form>
       </div>
 
       <div style={card}>
@@ -335,14 +357,14 @@ export default function AdminProductDetail() {
                     <input style={{ ...input, width: 60 }} name="pkg_length" type="number" step="0.01" placeholder="L" defaultValue={pkg?.length ?? ""} />
                     <input style={{ ...input, width: 60 }} name="pkg_width" type="number" step="0.01" placeholder="W" defaultValue={pkg?.width ?? ""} />
                     <input style={{ ...input, width: 60 }} name="pkg_height" type="number" step="0.01" placeholder="H" defaultValue={pkg?.height ?? ""} />
-                    <select style={{ ...input, width: 60 }} name="pkg_dimUnit" defaultValue={pkg?.dimensionUnit ?? "cm"}>
+                    <select style={{ ...input, width: 60 }} name="pkg_dimUnit" defaultValue={pkg?.dimensionUnit ?? "in"}>
                       <option value="cm">cm</option>
-                      <option value="in">in</option>
+                      <option value="in" selected>in</option>
                     </select>
-                    <input style={{ ...input, width: 70 }} name="pkg_weight" type="number" step="0.001" placeholder="kg" defaultValue={pkg?.grossWeight ?? ""} />
-                    <select style={{ ...input, width: 60 }} name="pkg_weightUnit" defaultValue={pkg?.weightUnit ?? "kg"}>
+                    <input style={{ ...input, width: 70 }} name="pkg_weight" type="number" step="0.001" placeholder="lb" defaultValue={pkg?.grossWeight ?? ""} />
+                    <select style={{ ...input, width: 60 }} name="pkg_weightUnit" defaultValue={pkg?.weightUnit ?? "lb"}>
                       <option value="kg">kg</option>
-                      <option value="lb">lb</option>
+                      <option value="lb" selected>lb</option>
                     </select>
                     <input style={{ ...input, width: 60 }} name="pkg_unitsPerPackage" type="number" title="Units of product per package" defaultValue={pkg?.unitsPerPackage ?? 1} />
                     <input style={{ ...input, width: 60 }} name="pkg_packagesPerUnit" type="number" title="Packages per sellable unit" defaultValue={pkg?.packagesPerUnit ?? 1} />
@@ -354,7 +376,7 @@ export default function AdminProductDetail() {
                     </select>
                   </div>
                 ))}
-                <div style={{ fontSize: "0.66rem", color: "#94a3b8", marginBottom: "0.4rem" }}>
+                <div style={{ fontSize: "0.78rem", color: "#64748b", marginBottom: "0.5rem" }}>
                   Columns: Label · Type · L · W · H · dim unit · gross weight · weight unit · units/package · packages/unit · preset
                 </div>
                 <button type="submit" style={btn("#082a4a")}>Save packaging</button>
@@ -381,6 +403,9 @@ export default function AdminProductDetail() {
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
           Images ({product.productImages.length})
         </h2>
+        <p style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: "0.5rem" }}>
+          Variant images (per-variant pictures) are separate from product images needed for publication.
+        </p>
         {product.productImages.length > 0 && (
           <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap", marginBottom: "1rem" }}>
             {product.productImages.map((img, index) => (
@@ -452,10 +477,10 @@ export default function AdminProductDetail() {
             <label style={label} htmlFor="img-file">Upload image (PNG/JPEG/WEBP/GIF, max 5MB)</label>
             <input type="file" id="img-file" name="image" accept="image/png,image/jpeg,image/webp,image/gif" />
           </div>
-          <div>
-            <label style={label} htmlFor="img-alt">Alt text</label>
-            <input style={input} id="img-alt" name="alt" />
-          </div>
+<div>
+              <label style={label} htmlFor="img-alt">Alt text <span style={{ color: "#ef4444", fontWeight: 600 }}>*</span></label>
+              <input style={input} id="img-alt" name="alt" required />
+            </div>
           <button type="submit" style={btn("#082a4a")}>Upload image</button>
         </Form>
 
@@ -465,10 +490,10 @@ export default function AdminProductDetail() {
             <label style={label} htmlFor="img-url">Or image URL</label>
             <input style={input} id="img-url" name="imageUrl" placeholder="https://..." />
           </div>
-          <div>
-            <label style={label} htmlFor="img-url-alt">Alt text</label>
-            <input style={input} id="img-url-alt" name="alt" />
-          </div>
+<div>
+              <label style={label} htmlFor="img-url-alt">Alt text <span style={{ color: "#ef4444", fontWeight: 600 }}>*</span></label>
+              <input style={input} id="img-url-alt" name="alt" required />
+            </div>
           <button type="submit" style={btn("#082a4a")}>Add URL</button>
         </Form>
       </div>
