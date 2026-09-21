@@ -1,4 +1,10 @@
-import type { MediaCategory, ApprovalStatus, Prisma } from "@prisma/client";
+import type {
+  MediaCategory,
+  MediaSubtype,
+  DocumentType,
+  ApprovalStatus,
+  Prisma,
+} from "@prisma/client";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import type { CatalogActor } from "./products.server";
@@ -220,7 +226,16 @@ export interface UploadMediaInput {
  * at an object that does not exist. The reverse failure — an object with no row
  * — is possible if the insert fails, and is the one worth having: it is
  * invisible, harmless, and reclaimable, whereas a row with no object is a
- * broken image in a seller's catalogue.
+ * broken image in a seller's catalogue. Reclaimable is not the same as
+ * reclaimed, though, so the write below removes the object it just stored if
+ * the row cannot be written. Nothing points at those bytes either way, and
+ * leaving them would mean the only record of a rejected upload is a file on
+ * disk that no screen will ever show anyone.
+ *
+ * The category and document type are checked here, before anything is written.
+ * `updateMedia` has always done this; the upload path did not, so a value that
+ * is not on the enum travelled all the way to the database and came back as a
+ * raw driver error — after the file had been stored.
  */
 export async function uploadMedia(
   productId: string,
@@ -228,6 +243,10 @@ export async function uploadMedia(
   input: UploadMediaInput,
   actor: CatalogActor
 ): Promise<MediaAssetView> {
+  if (!MEDIA_CATEGORIES.includes(input.category)) throw new Error("Unknown media category.");
+  const subtype = normalizeSubtype(input.category, input.subtype);
+  const documentType = normalizeDocumentType(input.documentType);
+
   const product = await prisma.product.findUnique({
     where: { id: productId },
     select: { id: true, name: true, variants: { select: { id: true } } },
@@ -252,44 +271,54 @@ export async function uploadMedia(
     );
   }
 
-  const asset = await prisma.$transaction(async (tx) => {
-    const created = await tx.mediaAsset.create({
-      data: {
-        productId,
-        category: input.category,
-        subtype: (input.subtype ?? null) as never,
-        title: (input.title || "").trim() || stored.originalFilename,
-        altText: (input.altText || "").trim() || null,
-        originalFilename: stored.originalFilename,
-        storageKey: stored.key,
-        mimeType: stored.mimeType,
-        fileSize: stored.size,
-        checksum: stored.checksum,
-        width: stored.width,
-        height: stored.height,
-        durationSeconds: stored.durationSeconds,
-        aspectRatio: aspectRatioOf(stored.width, stored.height),
-        // A video whose length could not be measured stays PROCESSING rather
-        // than being called READY on the strength of an assumption.
-        processingStatus:
-          stored.kind === "video" && stored.durationSeconds === null ? "PROCESSING" : "READY",
-        approvalStatus: "DRAFT",
-        sellerVisible: false,
-        documentType: (input.documentType ?? null) as never,
-        version: (input.version || "").trim() || null,
-        effectiveDate: parseDate(input.effectiveDate),
-        language: (input.language || "").trim() || null,
-        downloadAllowed: input.downloadAllowed ?? true,
-        instructions: (input.instructions || "").trim() || null,
-        templateUrl: validateTemplateUrl(input.templateUrl),
-        createdById: actor.actorId,
-      },
-      select: { id: true },
-    });
+  let asset: string;
+  try {
+    asset = await prisma.$transaction(async (tx) => {
+      const created = await tx.mediaAsset.create({
+        data: {
+          productId,
+          category: input.category,
+          subtype,
+          title: (input.title || "").trim() || stored.originalFilename,
+          altText: (input.altText || "").trim() || null,
+          originalFilename: stored.originalFilename,
+          storageKey: stored.key,
+          mimeType: stored.mimeType,
+          fileSize: stored.size,
+          checksum: stored.checksum,
+          width: stored.width,
+          height: stored.height,
+          durationSeconds: stored.durationSeconds,
+          aspectRatio: aspectRatioOf(stored.width, stored.height),
+          // A video whose length could not be measured stays PROCESSING rather
+          // than being called READY on the strength of an assumption.
+          processingStatus:
+            stored.kind === "video" && stored.durationSeconds === null ? "PROCESSING" : "READY",
+          approvalStatus: "DRAFT",
+          sellerVisible: false,
+          documentType,
+          version: (input.version || "").trim() || null,
+          effectiveDate: parseDate(input.effectiveDate),
+          language: (input.language || "").trim() || null,
+          downloadAllowed: input.downloadAllowed ?? true,
+          instructions: (input.instructions || "").trim() || null,
+          templateUrl: validateTemplateUrl(input.templateUrl),
+          createdById: actor.actorId,
+        },
+        select: { id: true },
+      });
 
-    await attach(tx, created.id, productId, variantIds);
-    return created.id;
-  });
+      await attach(tx, created.id, productId, variantIds);
+      return created.id;
+    });
+  } catch (error) {
+    // The row was not written, so nothing references the bytes just stored.
+    // They are removed rather than left on disk for nobody to see. The delete
+    // is best-effort: whether it succeeds or not, the original error is the
+    // one the uploader needs to see.
+    await deleteObject(stored.key).catch(() => undefined);
+    throw error;
+  }
 
   await recordAudit({
     actorType: actor.actorType ?? "ADMIN_USER",
@@ -454,6 +483,80 @@ const MEDIA_CATEGORIES: MediaCategory[] = [
   "EDITABLE_TEMPLATE",
 ];
 
+/**
+ * The subtypes that belong to each category — the whole enum, partitioned.
+ *
+ * The Media tab has carried this same table for as long as it has offered the
+ * choice, but only in the browser. A form field is not a boundary: the value
+ * arrives here from whatever posted it, and until it is checked against the
+ * category it was sent with, the two can disagree and the disagreement is
+ * written down. This is the copy that decides.
+ */
+const SUBTYPES_BY_CATEGORY: Record<MediaCategory, readonly string[]> = {
+  WHITE_BACKGROUND_IMAGE: ["WHITE_BACKGROUND"],
+  LIFESTYLE_IMAGE: ["LIFESTYLE"],
+  PRODUCT_VIDEO: ["PRODUCT_DEMO", "LIFESTYLE_VIDEO", "SOCIAL_CLIP_VERTICAL", "SOCIAL_CLIP_SQUARE"],
+  DOCUMENT: [
+    "CARE_GUIDE",
+    "SPECIFICATION_SHEET",
+    "WARRANTY",
+    "CERTIFICATION",
+    "PACKAGING_INSTRUCTIONS",
+    "MARKETING_PDF",
+    "OTHER_DOCUMENT",
+  ],
+  MARKETING_CREATIVE: ["SQUARE_POST", "STORY_REEL", "BANNER", "LANDSCAPE_AD", "SOCIAL_VIDEO"],
+  EDITABLE_TEMPLATE: ["EDITABLE_TEMPLATE"],
+};
+
+/**
+ * The document kinds a DOCUMENT asset may carry.
+ *
+ * A blank value is not an error: a file may be uploaded before anyone has
+ * decided what to call it, and the Documents tab is where that gets settled.
+ * Anything else has to name a real kind, because the value goes to a database
+ * enum that will reject it — and by then the file is already stored.
+ *
+ * `MediaSubtype` and `DocumentType` share seven near-identical names and
+ * disagree about one of them — a document's "other" is OTHER here and
+ * OTHER_DOCUMENT there — so a caller can be forgiven for sending the wrong
+ * one. It cannot be forgiven silently, which is what this catches.
+ */
+const DOCUMENT_TYPES = [
+  "CARE_GUIDE",
+  "SPECIFICATION_SHEET",
+  "WARRANTY",
+  "CERTIFICATION",
+  "PACKAGING_INSTRUCTIONS",
+  "MARKETING_PDF",
+  "OTHER",
+] as const;
+
+function normalizeDocumentType(value: string | null | undefined): DocumentType | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return null;
+  if (!(DOCUMENT_TYPES as readonly string[]).includes(trimmed)) {
+    throw new Error(
+      "Unknown document type. A document is a care guide, a specification sheet, a warranty, a certification, packaging instructions, a marketing PDF, or other."
+    );
+  }
+  // Checked against the list above, which is the enum spelled out. The cast
+  // records that, rather than pretending the check happened elsewhere.
+  return trimmed as DocumentType;
+}
+
+function normalizeSubtype(
+  category: MediaCategory,
+  value: string | null | undefined
+): MediaSubtype | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed) return null;
+  if (!SUBTYPES_BY_CATEGORY[category].includes(trimmed)) {
+    throw new Error("That subtype does not belong to the media category it was sent with.");
+  }
+  return trimmed as MediaSubtype;
+}
+
 export async function updateMedia(
   assetId: string,
   input: UpdateMediaInput,
@@ -465,6 +568,16 @@ export async function updateMedia(
   const category = input.category ?? before.category;
   if (!MEDIA_CATEGORIES.includes(category)) throw new Error("Unknown media category.");
 
+  // A subtype already on the row was checked when it was written; one arriving
+  // with this edit is checked against the category the row will end up with,
+  // which is the category it was sent with when that is part of the edit.
+  const subtype =
+    input.subtype === undefined ? before.subtype : normalizeSubtype(category, input.subtype);
+  const documentType =
+    input.documentType === undefined
+      ? before.documentType
+      : normalizeDocumentType(input.documentType);
+
   const asset = await prisma.mediaAsset.update({
     where: { id: assetId },
     data: {
@@ -472,10 +585,9 @@ export async function updateMedia(
       altText:
         input.altText === undefined ? before.altText : String(input.altText ?? "").trim() || null,
       category,
-      subtype: input.subtype === undefined ? before.subtype : ((input.subtype ?? null) as never),
+      subtype,
       sellerVisible: input.sellerVisible ?? before.sellerVisible,
-      documentType:
-        input.documentType === undefined ? before.documentType : ((input.documentType ?? null) as never),
+      documentType,
       version: input.version === undefined ? before.version : String(input.version ?? "").trim() || null,
       effectiveDate: input.effectiveDate === undefined ? before.effectiveDate : parseDate(input.effectiveDate),
       language:

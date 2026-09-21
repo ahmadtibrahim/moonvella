@@ -98,8 +98,18 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
       // Without this, a browser is free to treat the stored bytes as whatever
       // it sniffs them to be, which is how an uploaded file becomes a script.
       "X-Content-Type-Options": "nosniff",
-      // Never render a stored file as a document; it is an image or a download.
-      "Content-Disposition": "inline",
+      // Images and video are served inline — they are inert containers, and
+      // inline is what lets a thumbnail or a preview play from this URL.
+      //
+      // A PDF is not. It is the one type on the allowlist that a browser hands
+      // to a renderer capable of running code embedded in the file, and the
+      // directive for this system says plainly that embedded PDF content is
+      // not to be executed. We cannot control what the reader does with a
+      // script inside a PDF it is asked to display, so we do not ask it to
+      // display one: a document is downloaded and opened by the person who
+      // wanted it, in whatever they trust. The application itself never parses
+      // a PDF beyond its signature either.
+      "Content-Disposition": contentTypeForKey(key) === "application/pdf" ? "attachment" : "inline",
     },
   });
 }
