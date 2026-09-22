@@ -23,6 +23,8 @@
  * Usage, inside the app image:
  *   node scripts/run-verify.mjs scripts/verify-stores-ui.ts
  */
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import { ADMIN_SESSION_COOKIE } from "~/utils/adminAuth.server";
 
@@ -65,6 +67,45 @@ async function post(path: string, cookie: string, data: Record<string, string>) 
     headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: BASE, Cookie: cookie },
     body: new URLSearchParams(data),
   });
+}
+
+/**
+ * What a reader sees, with the serialized loader data taken out.
+ *
+ * The route data JSON is full of the words being asserted — every status, every
+ * reason, the string "undefined" — and it is in the page whether or not the
+ * page renders any of it. An assertion about the screen has to be run against
+ * the screen.
+ */
+function rendered(html: string): string {
+  return html.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<[^>]*>/g, " ");
+}
+
+/**
+ * The client bundle the operator's browser downloads.
+ *
+ * Block asks its question in the browser: the modal is not rendered until the
+ * button is clicked, so no GET of the page can contain it, and asserting the
+ * wording against the HTML would only ever prove the HTML lacks it. The wording
+ * has to be checked where it actually lives, which is in the built JavaScript
+ * this image serves — the artifact the operator runs.
+ *
+ * Returns "" if there is no build to read, which fails the checks that use it
+ * rather than skipping them.
+ */
+function clientBundleText(): string {
+  const dir = resolve(process.cwd(), "build/client/assets");
+  if (!existsSync(dir)) return "";
+  let text = "";
+  const walk = (at: string) => {
+    for (const entry of readdirSync(at, { withFileTypes: true })) {
+      const full = join(at, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith(".js")) text += readFileSync(full, "utf8");
+    }
+  };
+  walk(dir);
+  return text;
 }
 
 async function main() {
@@ -181,27 +222,28 @@ async function main() {
     /* ------------------------------------------------------------------ */
     check(
       "An active store is offered Deactivate and Block",
-      /Deactivate store/.test(detail.html) && /Block store/.test(detail.html)
+      /Deactivate store/.test(detail.html) && />Block<\/button>/.test(detail.html)
     );
 
     // A page of arithmetic is a page where a missing currency or a null column
-    // reaches the reader as "NaN CAD". Rendered text only — the serialized
-    // route data is full of the word "undefined" and means nothing by it.
-    const renderedText = detail.html.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<[^>]*>/g, " ");
+    // reaches the reader as "NaN CAD".
+    const renderedText = rendered(detail.html);
     check(
       "No figure reaches the page as NaN or undefined",
       !/\bNaN\b/.test(renderedText) && !/\bundefined\b/.test(renderedText),
       (renderedText.match(/\b(NaN|undefined)\b/) ?? ["", ""])[0]
     );
     check(
-      "Block is present but disabled, rather than pretending to work",
+      "Block is offered on an active store, and it opens a question rather than acting",
       (() => {
-        const at = detail.html.indexOf("Block store");
+        const at = detail.html.indexOf(">Block<");
         if (at === -1) return false;
         const tag = detail.html.slice(detail.html.lastIndexOf("<button", at), at);
-        return /\bdisabled\b/.test(tag);
+        // type="button", so a stray Enter cannot block a store; the modal's
+        // confirm is a separate submit.
+        return /type="button"/.test(tag) && !/\bdisabled\b/.test(tag);
       })(),
-      "there is no BLOCKED status to write to"
+      "an approved store is one a block can affect"
     );
 
     const deactivated = await post("/admin/stores", cookie, {
@@ -243,6 +285,118 @@ async function main() {
       activated.status === 302 && afterReactivate?.status === "APPROVED",
       `HTTP ${activated.status}, status ${afterReactivate?.status}`
     );
+
+    /* ------------------------------------------------------------------ */
+    /* Block, which is a different answer from Deactivate                   */
+    /* ------------------------------------------------------------------ */
+    /**
+     * The modal lives in the browser, not in the HTML. Clicking Block sets
+     * client state and only then renders the question, so a GET of the page
+     * cannot contain it — the same trap the Delete fix fell into. What the
+     * browser will actually show is therefore asserted against the shipped
+     * client bundle, which is the artifact the operator runs.
+     */
+    const bundleText = clientBundleText();
+    check(
+      "The confirmation the operator reads is the one the owner specified",
+      bundleText.includes("Block this seller?") &&
+        bundleText.includes(
+          "They will lose access to pricing, imports, and order sync, but history will remain."
+        ),
+      bundleText ? `${bundleText.length} bytes of client JavaScript read` : "no client bundle to read"
+    );
+    check(
+      "And the excuse that blocking was not possible is gone from what ships",
+      !bundleText.includes("Blocking needs a status") && !detail.html.includes("Blocking needs a status"),
+      "a disabled control explained by a missing status has no business in a build that has one"
+    );
+
+    const blocked = await post("/admin/stores", cookie, {
+      intent: "block",
+      sellerId: seller.id,
+      reason: "Verify stores UI",
+    });
+    const afterBlock = await prisma.seller.findUnique({ where: { id: seller.id } });
+    check(
+      "Blocking a store blocks it, and records why",
+      blocked.status === 302 &&
+        afterBlock?.status === "BLOCKED" &&
+        afterBlock?.blockReason === "Verify stores UI" &&
+        afterBlock?.blockedAt instanceof Date,
+      `HTTP ${blocked.status}, status ${afterBlock?.status}, reason ${afterBlock?.blockReason}`
+    );
+    check(
+      "And the page says what the block did and did not take",
+      (blocked.headers.get("location") ?? "").includes("done=block")
+    );
+
+    const blockedPage = await get(`/admin/stores/${seller.id}?done=block`, cookie);
+    check(
+      "The confirmation is shown on the page it returns to",
+      /Store blocked\./.test(blockedPage.html) && /MoonVella has kept all of them/.test(blockedPage.html)
+    );
+    check(
+      "A blocked store is offered the way back, and not a second way to block it",
+      />Unblock<\/button>/.test(blockedPage.html) &&
+        !/>Block<\/button>/.test(blockedPage.html) &&
+        !/Deactivate store/.test(blockedPage.html)
+    );
+    // Read off the page, not the loader data: the reason is in the serialized
+    // payload either way, so asserting against the raw HTML would pass on a
+    // page that never drew it.
+    const blockedText = rendered(blockedPage.html);
+    check(
+      "Its block date and reason are on the page MoonVella staff work from",
+      /Blocked/.test(blockedText) &&
+        // The separator and the lower-case "stores" together can only come from
+        // the block reason being drawn beside its label. The store's own name is
+        // "Verify Stores UI", which this cannot match by accident.
+        /·\s*Verify stores UI/.test(blockedText),
+      "the operator should not have to open the database to learn why"
+    );
+
+    const unblocked = await post("/admin/stores", cookie, {
+      intent: "unblock",
+      sellerId: seller.id,
+    });
+    const afterUnblock = await prisma.seller.findUnique({ where: { id: seller.id } });
+    check(
+      "Unblocking returns the store to the status it held before the block",
+      unblocked.status === 302 &&
+        afterUnblock?.status === "APPROVED" &&
+        afterUnblock?.blockedAt === null &&
+        afterUnblock?.blockReason === null,
+      `HTTP ${unblocked.status}, status ${afterUnblock?.status}`
+    );
+
+    /* ------------------------------------------------------------------ */
+    /* Where a block would mean nothing                                     */
+    /* ------------------------------------------------------------------ */
+    const rejected = await prisma.seller.create({
+      data: {
+        shopDomain: `verify-rejected-${Date.now()}.myshopify.com`,
+        shopDomainFull: `verify-rejected-${Date.now()}.myshopify.com`,
+        storeName: "Verify Rejected Store",
+        contactEmail: "verify@example.com",
+        currency: "CAD",
+        status: "REJECTED",
+      },
+    });
+    try {
+      const rejectedPage = await get(`/admin/stores/${rejected.id}`, cookie);
+      check(
+        "A rejected store's Block is disabled, with the reason, rather than absent",
+        (() => {
+          const at = rejectedPage.html.indexOf(">Block<");
+          if (at === -1) return false;
+          const tag = rejectedPage.html.slice(rejectedPage.html.lastIndexOf("<button", at), at);
+          return /\bdisabled\b/.test(tag) && /no access left to block/.test(rejectedPage.html);
+        })(),
+        "a control that vanishes when you look for it teaches nothing"
+      );
+    } finally {
+      await prisma.seller.deleteMany({ where: { id: rejected.id } });
+    }
 
     /* ------------------------------------------------------------------ */
     /* The section it replaced                                              */

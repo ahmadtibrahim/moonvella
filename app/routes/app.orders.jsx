@@ -1,5 +1,5 @@
 import { Link, useLoaderData } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
 import { prisma } from "../db.server";
 
 export const loader = async ({ request }) => {
@@ -44,6 +44,7 @@ export const loader = async ({ request }) => {
     access: context.access,
     canViewOrders: context.canViewOrders,
     orders,
+    blockedMessage: BLOCKED_MESSAGE,
   };
 };
 
@@ -52,7 +53,8 @@ function money(cents, currency = "CAD") {
 }
 
 export default function OrdersPage() {
-  const { access, canViewOrders, orders } = useLoaderData();
+  const { access, canViewOrders, orders, blockedMessage } = useLoaderData();
+  const isBlocked = access === "BLOCKED";
 
   if (!canViewOrders) {
     return (
@@ -67,10 +69,16 @@ export default function OrdersPage() {
           <div className="mv-section-card" style={{ textAlign: "center", padding: "4rem 2rem" }}>
             <div style={{ fontSize: "4rem", marginBottom: "1.5rem" }}>📋</div>
             <h2 className="mv-page-title" style={{ marginBottom: "1rem" }}>
-              Orders will appear here after approval
+              {isBlocked ? "Orders are unavailable" : "Orders will appear here after approval"}
             </h2>
-            <p className="mv-page-subtitle" style={{ maxWidth: "500px", margin: "0 auto 2rem" }}>
-              Current status: {access}.
+            {/* A blocked store is told what happened to its access, not that it
+                should wait for a review that has already been decided. */}
+            <p
+              className="mv-page-subtitle"
+              style={{ maxWidth: "500px", margin: "0 auto 2rem" }}
+              role={isBlocked ? "alert" : undefined}
+            >
+              {isBlocked ? blockedMessage : `Current status: ${access}.`}
             </p>
             <div style={{ display: "flex", gap: "1rem", justifyContent: "center", flexWrap: "wrap" }}>
               <Link className="mv-btn mv-btn-primary" to="/app/status">

@@ -146,6 +146,18 @@ export async function computeRankings(
   // are not optional here — the same applies to the aliases, because Prisma
   // returns the result-set column names verbatim and the mapping code below
   // reads `row.sellerId`, not `row.sellerid`.
+  /**
+   * WHICH SELLERS COUNT, AND WHY BLOCKED IS ON THE LIST.
+   *
+   * These three statuses are the ones whose orders are real. A seller that was
+   * never approved has no orders to count; a blocked one has plenty, and they
+   * are orders MoonVella accepted, fulfilled and invoiced. Excluding them would
+   * not punish the seller — it would quietly shrink MoonVella's reported
+   * wholesale revenue the moment an administrative action was taken, which is
+   * a number the business makes decisions from. Blocking stops a store from
+   * doing new business; it does not unmake what it already did, and the totals
+   * query below is not even broken down by seller.
+   */
   const qualifyingOrderWhere = Prisma.sql`
     o.currency = ${currency}
     AND o."shopifyCreatedAt" >= ${from}
@@ -167,7 +179,7 @@ export async function computeRankings(
     JOIN "OrderItem" oi ON oi."orderId" = o.id
     JOIN "Seller" s ON s.id = o."sellerId"
     WHERE ${qualifyingOrderWhere}
-      AND s.status IN ('APPROVED', 'SUSPENDED')
+      AND s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
     GROUP BY o."sellerId"
   `;
 
@@ -179,7 +191,7 @@ export async function computeRankings(
     WHERE r."processedAt" >= ${from}
       AND r."processedAt" <= ${to}
       AND o.currency = ${currency}
-      AND s.status IN ('APPROVED', 'SUSPENDED')
+      AND s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
     GROUP BY o."sellerId"
   `;
 
@@ -207,7 +219,7 @@ export async function computeRankings(
     FROM "Seller" s
     LEFT JOIN (${statsSubquery}) st ON st."sellerId" = s.id
     LEFT JOIN (${refundsSubquery}) rf ON rf."sellerId" = s.id
-    WHERE s.status IN ('APPROVED', 'SUSPENDED')
+    WHERE s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
       ${searchClause}
     ORDER BY ${SORT_EXPRESSIONS[sortKey]} ${dirSql}, s."storeName" ASC
     ${limitClause}
@@ -216,7 +228,7 @@ export async function computeRankings(
   const countQuery = Prisma.sql`
     SELECT COUNT(*) AS count
     FROM "Seller" s
-    WHERE s.status IN ('APPROVED', 'SUSPENDED')
+    WHERE s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
       ${searchClause}
   `;
 
@@ -231,7 +243,7 @@ export async function computeRankings(
     JOIN "OrderItem" oi ON oi."orderId" = o.id
     JOIN "Seller" s ON s.id = o."sellerId"
     WHERE ${qualifyingOrderWhere}
-      AND s.status IN ('APPROVED', 'SUSPENDED')
+      AND s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
   `;
 
   const refundsTotalQuery = Prisma.sql`
@@ -242,7 +254,7 @@ export async function computeRankings(
     WHERE r."processedAt" >= ${from}
       AND r."processedAt" <= ${to}
       AND o.currency = ${currency}
-      AND s.status IN ('APPROVED', 'SUSPENDED')
+      AND s.status IN ('APPROVED', 'SUSPENDED', 'BLOCKED')
   `;
 
   const droppedCurrenciesQuery = Prisma.sql`

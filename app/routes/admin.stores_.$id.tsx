@@ -2,7 +2,13 @@ import { Link, useLoaderData, useActionData, Form, redirect } from "react-router
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { getSellerDetail } from "~/services/seller.server";
-import { suspendSeller, reactivateSeller } from "~/services/application.server";
+import {
+  blockSeller,
+  reactivateSeller,
+  suspendSeller,
+  unblockSeller,
+} from "~/services/application.server";
+import { BlockControl } from "~/components/store/BlockControl";
 import { getShopAnalytics } from "~/services/analytics.server";
 import {
   AccountingPreviewNotice,
@@ -60,6 +66,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await suspendSeller(id, actor, reason || "Suspended by owner");
     } else if (intent === "reactivate") {
       await reactivateSeller(id, actor);
+    } else if (intent === "block") {
+      await blockSeller(id, actor, reason || "Blocked by owner");
+    } else if (intent === "unblock") {
+      await unblockSeller(id, actor);
     } else {
       return { error: "Unknown action." };
     }
@@ -73,6 +83,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
 const DONE_MESSAGES: Record<string, string> = {
   suspend: "Store deactivated. It keeps its history and its orders are unaffected.",
   reactivate: "Store activated. It can sign in and order again.",
+  block:
+    "Store blocked. It has lost pricing, imports, order sync and its order history; MoonVella has kept all of them.",
+  unblock: "Block lifted. The store is back to the status it held before it was blocked.",
 };
 
 const card: React.CSSProperties = {
@@ -148,6 +161,7 @@ function statusStyle(status: string): React.CSSProperties {
     NEEDS_INFO: { bg: "#dbeafe", color: "#1d4ed8" },
     REJECTED: { bg: "#fee2e2", color: "#dc2626" },
     SUSPENDED: { bg: "#fee2e2", color: "#dc2626" },
+    BLOCKED: { bg: "#7f1d1d", color: "#fef2f2" },
     UNINSTALLED: { bg: "#f1f5f9", color: "#64748b" },
   };
   const s = map[status] ?? map.UNINSTALLED;
@@ -166,6 +180,7 @@ export default function AdminStoreDetail() {
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const isApproved = seller.status === "APPROVED";
+  const isBlocked = seller.status === "BLOCKED";
   const badge = coverageBadge(analytics.coverage);
   const guidance = permissionGuidance(analytics.coverage, analytics.grantedScopes);
 
@@ -301,6 +316,19 @@ export default function AdminStoreDetail() {
             <span>
               {fmtDate(seller.suspendedAt)}
               {seller.suspensionReason ? ` · ${seller.suspensionReason}` : ""}
+            </span>
+          </div>
+        ) : null}
+        {/* Shown even when the block has been lifted is NOT the behaviour here:
+            unblocking clears both columns, so this row exists only while the
+            store is actually blocked. The history of both events is in the
+            audit log below, which is append-only. */}
+        {seller.blockedAt ? (
+          <div style={rowStyle}>
+            <span style={keyStyle}>Blocked</span>
+            <span>
+              {fmtDate(seller.blockedAt)}
+              {seller.blockReason ? ` · ${seller.blockReason}` : ""}
             </span>
           </div>
         ) : null}
@@ -590,10 +618,11 @@ export default function AdminStoreDetail() {
           Store controls
         </h2>
         <p style={{ fontSize: "0.78rem", color: "#64748b", marginBottom: "0.85rem", lineHeight: 1.5 }}>
-          Deactivating refuses the store&rsquo;s orders and signs it out; it keeps every record it
-          has. Activating reverses it. Blocking — refusing a store while leaving its account
-          intact — is drawn but not yet available: it needs a status the database does not have,
-          and a Block button that quietly deactivated would be a worse answer than none.
+          Deactivating pauses the store and signs it out; it keeps read access to what it already
+          sold, and Activating reverses it. Blocking refuses the store outright: no wholesale
+          pricing, no imports, no new orders, no product sync, and no order history either. Every
+          record it has stays here, with MoonVella. Unblocking returns it to the status it held
+          before it was blocked.
         </p>
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           {isApproved ? (
@@ -615,19 +644,14 @@ export default function AdminStoreDetail() {
                 Deactivate store
               </button>
             </>
-          ) : (
+          ) : isBlocked ? null : (
             <button type="submit" name="intent" value="reactivate" style={btn("#059669")}>
               {seller.status === "SUSPENDED" ? "Activate store" : "Activate this store"}
             </button>
           )}
-          <button
-            type="button"
-            disabled
-            style={{ ...btn("#cbd5e1"), color: "#cbd5e1", cursor: "not-allowed" }}
-            title="Blocking needs a status the database does not have yet."
-          >
-            Block store
-          </button>
+          {/* The reason box above belongs to Deactivate and is only drawn for an
+              approved store, so the modal asks for its own. */}
+          <BlockControl sellerId={seller.id} status={seller.status} />
         </Form>
       </div>
 

@@ -8,7 +8,16 @@ export type SellerAccess =
   | "NEEDS_INFO"
   | "REJECTED"
   | "APPROVED"
-  | "SUSPENDED";
+  | "SUSPENDED"
+  | "BLOCKED";
+
+/**
+ * What a blocked store is told. One string, in one place, because it is a
+ * promise about what has happened to their account and it appears on more than
+ * one screen — two copies of it would eventually disagree.
+ */
+export const BLOCKED_MESSAGE =
+  "Your MoonVella partner access has been blocked. Contact MoonVella support.";
 
 export interface SellerContext {
   shop: string;
@@ -45,12 +54,45 @@ function accessFromStatus(status: string): SellerAccess {
       return "REJECTED";
     case "SUSPENDED":
       return "SUSPENDED";
+    case "BLOCKED":
+      return "BLOCKED";
+    // An uninstalled app is a store that has gone, not one that was refused:
+    // it is mapped to the recoverable state so reinstalling does not lose a
+    // seller their order history.
     case "UNINSTALLED":
       return "SUSPENDED";
     default:
       return "NONE";
   }
 }
+
+/**
+ * What each state may do, written out rather than derived.
+ *
+ * This used to be two booleans — `approved` and `suspended` — with the four
+ * flags built from them. That works while there are two refusals. Block is a
+ * third, and it differs from suspension in exactly the way a two-variable
+ * expression cannot express: both refuse pricing and imports, but a suspended
+ * store keeps read access to what it already sold, so a deactivation does not
+ * look like data loss, while a blocked one sees nothing at all. Written as a
+ * table, each row can be read on its own and an eighth status cannot inherit a
+ * permission by falling through the wrong branch.
+ */
+const ACCESS_RULES: Record<
+  SellerAccess,
+  { wholesale: boolean; import: boolean; orders: boolean; newBusiness: boolean }
+> = {
+  NONE: { wholesale: false, import: false, orders: false, newBusiness: false },
+  PENDING: { wholesale: false, import: false, orders: false, newBusiness: false },
+  NEEDS_INFO: { wholesale: false, import: false, orders: false, newBusiness: false },
+  REJECTED: { wholesale: false, import: false, orders: false, newBusiness: false },
+  APPROVED: { wholesale: true, import: true, orders: true, newBusiness: true },
+  // Recoverable. History stays readable.
+  SUSPENDED: { wholesale: false, import: false, orders: true, newBusiness: false },
+  // Not recoverable in the sense suspension is. The history still exists and
+  // MoonVella staff can still see it; the store cannot.
+  BLOCKED: { wholesale: false, import: false, orders: false, newBusiness: false },
+};
 
 export async function resolveSellerContext(shop: string): Promise<SellerContext> {
   const application = await prisma.merchantApplication.findUnique({
@@ -70,18 +112,17 @@ export async function resolveSellerContext(shop: string): Promise<SellerContext>
       ? accessFromStatus(application.status)
       : "NONE";
 
-  const approved = access === "APPROVED";
-  const suspended = access === "SUSPENDED";
+  const rules = ACCESS_RULES[access];
 
   return {
     shop,
     application: application ?? null,
     seller: seller ?? null,
     access,
-    canViewWholesale: approved,
-    canImport: approved,
-    canViewOrders: approved || suspended,
-    canStartNewBusiness: approved,
+    canViewWholesale: rules.wholesale,
+    canImport: rules.import,
+    canViewOrders: rules.orders,
+    canStartNewBusiness: rules.newBusiness,
   };
 }
 

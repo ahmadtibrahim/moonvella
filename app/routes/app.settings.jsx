@@ -1,5 +1,5 @@
 import { useLoaderData, useActionData, useNavigation, Link, Form } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
 import { prisma } from "../db.server";
 import { recordAudit, AUDIT_ENTITY } from "../services/audit.server";
 
@@ -64,7 +64,15 @@ export const action = async ({ request }) => {
   const context = await requireSellerContext(request);
   if (!context.seller) return { error: "No seller account." };
   if (!context.canStartNewBusiness) {
-    return { error: `Settings require an approved seller account (current status: ${context.access}).` };
+    // Settings is where product sync is switched on, so a blocked store being
+    // told to wait for approval would be doubly wrong: it is not pending, and
+    // what it is asking for is the thing that was blocked.
+    return {
+      error:
+        context.access === "BLOCKED"
+          ? BLOCKED_MESSAGE
+          : `Settings require an approved seller account (current status: ${context.access}).`,
+    };
   }
 
   const form = await request.formData();

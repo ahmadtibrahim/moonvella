@@ -6,7 +6,13 @@ import {
   getRequestMeta,
 } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
-import { suspendSeller, reactivateSeller } from "~/services/application.server";
+import {
+  blockSeller,
+  reactivateSeller,
+  suspendSeller,
+  unblockSeller,
+} from "~/services/application.server";
+import { BlockControl } from "~/components/store/BlockControl";
 import {
   AccountingPreviewNotice,
   MiniBalance,
@@ -38,6 +44,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
         shopDomain: true,
         status: true,
         suspensionReason: true,
+        blockReason: true,
         currency: true,
         _count: { select: { orders: true } },
       },
@@ -52,25 +59,28 @@ export async function loader({ request }: LoaderFunctionArgs) {
 const DONE_MESSAGES: Record<string, string> = {
   suspend: "Store deactivated. It keeps its history and its orders are unaffected.",
   reactivate: "Store activated. It can sign in and order again.",
+  block:
+    "Store blocked. It has lost pricing, imports, order sync and its order history; MoonVella has kept all of them.",
+  unblock: "Block lifted. The store is back to the status it held before it was blocked.",
 };
 
 /**
- * The three controls the owner asked for, and where each one stands.
+ * The four controls the owner asked for.
  *
  * Deactivate and Activate are wired to the suspension the application review
  * already uses, so a store switched off here is switched off everywhere.
  *
- * Block is drawn and disabled. Blocking means refusing a store while leaving
- * its account intact — a stronger, separate state from suspension — and the
- * database has no such status: `SellerStatus` is PENDING, APPROVED, NEEDS_INFO,
- * REJECTED, SUSPENDED, UNINSTALLED. Shipping a button that quietly wrote
- * SUSPENDED would be a lie about what had happened, and one the owner would
- * only discover from a store that kept ordering. It becomes a real control the
- * day the status exists.
+ * Block is the harder refusal and now a real status of its own. A suspended
+ * store keeps read access to what it already sold, so a deactivation does not
+ * look like data loss; a blocked one sees nothing — no pricing, no imports, no
+ * new orders, no product sync, and no order history either. MoonVella keeps
+ * all of it. The two are different answers to different problems, which is why
+ * they are two buttons rather than one with a severity.
  */
 function StoreControls({ seller }: { seller: { id: string; status: string } }) {
   const suspended = seller.status === "SUSPENDED";
   const approved = seller.status === "APPROVED";
+  const blocked = seller.status === "BLOCKED";
 
   return (
     <Form method="post" style={{ display: "flex", gap: "0.4rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -94,19 +104,14 @@ function StoreControls({ seller }: { seller: { id: string; status: string } }) {
             Deactivate
           </button>
         </>
-      ) : (
+      ) : blocked ? null : (
         <button type="submit" name="intent" value="reactivate" style={btn("#059669")}>
           {suspended ? "Activate" : "Activate anyway"}
         </button>
       )}
-      <button
-        type="button"
-        disabled
-        style={{ ...btn("#7f1d1d"), color: "#cbd5e1", borderColor: "#e2e8f0", cursor: "not-allowed" }}
-        title="Blocking needs a status the database does not have yet. Deactivate refuses the store's orders today."
-      >
-        Block
-      </button>
+      {/* One way back for a blocked store, so the operator is not choosing
+          between two buttons that both mean "let them in again". */}
+      <BlockControl sellerId={seller.id} status={seller.status} />
     </Form>
   );
 }
@@ -138,6 +143,10 @@ export async function action({ request }: ActionFunctionArgs) {
       await suspendSeller(sellerId, actor, reason || "Suspended by owner");
     } else if (intent === "reactivate") {
       await reactivateSeller(sellerId, actor);
+    } else if (intent === "block") {
+      await blockSeller(sellerId, actor, reason || "Blocked by owner");
+    } else if (intent === "unblock") {
+      await unblockSeller(sellerId, actor);
     } else {
       return { error: "Unknown action." };
     }
@@ -190,6 +199,7 @@ export default function AdminStores() {
 
   const approved = sellers.filter((s) => s.status === "APPROVED").length;
   const suspended = sellers.filter((s) => s.status === "SUSPENDED").length;
+  const blocked = sellers.filter((s) => s.status === "BLOCKED").length;
 
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
@@ -242,6 +252,15 @@ export default function AdminStores() {
             {suspended}
           </div>
         </div>
+        {/* Blocked stores get their own count rather than being folded into
+            Deactivated: they are not paused, and an operator scanning the page
+            should be able to see how many were refused outright. */}
+        <div style={card}>
+          <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Blocked</div>
+          <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#7f1d1d" }}>
+            {blocked}
+          </div>
+        </div>
         <div style={card}>
           <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Pending applications</div>
           <div style={{ fontSize: "1.75rem", fontWeight: 700, color: "#b45309" }}>
@@ -282,6 +301,15 @@ export default function AdminStores() {
                     <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
                       {seller.shopDomain} &middot; {seller._count.orders} orders
                     </div>
+                    {/* A block has its own reason column, so it needs its own
+                        line — falling back to the suspension one would print
+                        nothing for a blocked store and leave the operator
+                        wondering why it was refused. */}
+                    {seller.status === "BLOCKED" && seller.blockReason ? (
+                      <div style={{ fontSize: "0.7rem", color: "#7f1d1d" }}>
+                        Blocked &middot; {seller.blockReason}
+                      </div>
+                    ) : null}
                     {seller.suspensionReason ? (
                       <div style={{ fontSize: "0.7rem", color: "#dc2626" }}>
                         {seller.suspensionReason}

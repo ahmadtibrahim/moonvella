@@ -206,6 +206,16 @@ const CHECKS = [
     file: "scripts/verify-stores-ui.ts",
     requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
   },
+  // BLOCKED as a real status, at the level every merchant screen reads it.
+  // Needs no session: it drives the services directly, which is the same code
+  // the routes call, and it asserts the four permission booleans rather than
+  // the screens because the screens need a live Shopify session to sign in.
+  {
+    name: "seller-block",
+    kind: "ts",
+    file: "scripts/verify-seller-block.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

@@ -4,12 +4,13 @@ export const loader = async ({ request }) => {
   const url = new URL(request.url);
 
   if (!url.searchParams.get("shop")) {
-    return { status: null, submittedAt: null };
+    return { status: null, submittedAt: null, blockedMessage: null };
   }
 
   const { authenticate } = await import("../shopify.server");
   const { session } = await authenticate.admin(request);
   const { prisma } = await import("../db.server");
+  const { BLOCKED_MESSAGE } = await import("../services/seller.server");
 
   const application = await prisma.merchantApplication.findUnique({
     where: { shopDomain: session.shop },
@@ -17,7 +18,7 @@ export const loader = async ({ request }) => {
   });
 
   if (!application) {
-    return { status: null, submittedAt: null };
+    return { status: null, submittedAt: null, blockedMessage: BLOCKED_MESSAGE };
   }
 
   return {
@@ -25,6 +26,7 @@ export const loader = async ({ request }) => {
     submittedAt: application.submittedAt
       ? application.submittedAt.toISOString()
       : null,
+    blockedMessage: BLOCKED_MESSAGE,
   };
 };
 
@@ -38,6 +40,12 @@ const getStageConfig = (stage) => {
       return { label: "Needs Information", badge: "mv-badge-warning" };
     case "rejected":
       return { label: "Rejected", badge: "mv-badge-danger" };
+    case "suspended":
+      return { label: "Suspended", badge: "mv-badge-danger" };
+    // Without this the page falls through to "Pending Review", which would tell
+    // a blocked store that its application is still being looked at.
+    case "blocked":
+      return { label: "Blocked", badge: "mv-badge-danger" };
     default:
       return { label: "Pending Review", badge: "mv-badge-pending" };
   }
@@ -55,11 +63,12 @@ const getStatusConfig = (status) => {
 };
 
 export default function StatusPage() {
-  const { status, submittedAt } = useLoaderData();
+  const { status, submittedAt, blockedMessage } = useLoaderData();
   const navigate = useNavigate();
   const applicationStatus = status || "pending";
   const isApproved = applicationStatus === "approved";
   const isRejected = applicationStatus === "rejected";
+  const isBlocked = applicationStatus === "blocked";
   const isPending = applicationStatus === "pending";
   const submittedLabel = submittedAt
     ? `Submitted on ${new Date(submittedAt).toLocaleDateString(undefined, {
@@ -165,6 +174,20 @@ export default function StatusPage() {
                 </button>
                 <p className="mv-page-subtitle" style={{ marginTop: '1rem', fontSize: '0.875rem' }}>
                   Product catalog, wholesale pricing, and import tools remain locked.
+                </p>
+              </>
+            ) : isBlocked ? (
+              <>
+                <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔒</div>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>Partner access blocked</h3>
+                {/* Not "declined" and not "under review": the store is owed the
+                    plain statement, and the one MoonVella asked for. */}
+                <p
+                  className="mv-page-subtitle"
+                  style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}
+                  role="alert"
+                >
+                  {blockedMessage}
                 </p>
               </>
             ) : (

@@ -1,5 +1,5 @@
 import { Link, useLoaderData } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
 import { prisma } from "../db.server";
 
 export const loader = async ({ request }) => {
@@ -50,6 +50,7 @@ export const loader = async ({ request }) => {
     sellerName: context.seller?.storeName ?? context.application?.storeName ?? null,
     stats,
     recentOrders,
+    blockedMessage: BLOCKED_MESSAGE,
   };
 };
 
@@ -61,8 +62,9 @@ function money(cents) {
 }
 
 export default function DashboardPage() {
-  const { access, sellerName, stats, recentOrders } = useLoaderData();
+  const { access, sellerName, stats, recentOrders, blockedMessage } = useLoaderData();
   const isApproved = access === "APPROVED";
+  const isBlocked = access === "BLOCKED";
 
   return (
     <s-page heading="Dashboard">
@@ -90,7 +92,7 @@ export default function DashboardPage() {
           <div className="mv-section-card" style={{ marginBottom: "1.5rem" }}>
             <span
               className={`mv-badge ${
-                access === "SUSPENDED" || access === "REJECTED"
+                access === "SUSPENDED" || access === "REJECTED" || isBlocked
                   ? "mv-badge-danger"
                   : "mv-badge-warning"
               }`}
@@ -98,8 +100,9 @@ export default function DashboardPage() {
               {access}
             </span>
             <p className="mv-page-subtitle" style={{ marginTop: "0.75rem" }}>
-              Wholesale pricing, importing and order intake unlock once your application is
-              approved.
+              {isBlocked
+                ? blockedMessage
+                : "Wholesale pricing, importing and order intake unlock once your application is approved."}
             </p>
           </div>
         )}

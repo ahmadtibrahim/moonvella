@@ -477,6 +477,32 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
       return await handleCancelled(event.id, shop, existingOrder, payload);
     }
 
+    /**
+     * A blocked store may not start new business with MoonVella.
+     *
+     * ONLY THE CREATE PATH IS REFUSED. An order that already exists is real:
+     * the customer paid, the goods may already have shipped, and MoonVella is
+     * on the hook for it. Refusing its updates would mean a blocked store's
+     * cancellation never reaches the warehouse — and a block is exactly when
+     * MoonVella most needs to hear that one of them was cancelled. So this
+     * gate tests for the absence of a recorded order, not for the topic, and
+     * `isUpdated` on an order we never took in is refused the same way a
+     * create is, because it would create one.
+     *
+     * The refusal is recorded as a FAILED event rather than dropped quietly.
+     * The seller's Shopify store has taken an order the MoonVella app did not
+     * accept, and somebody has to be able to see that it happened and why.
+     */
+    if (seller.status === "BLOCKED" && !existingOrder) {
+      const blockReason = seller.blockReason ? ` — ${seller.blockReason}` : "";
+      await finishEvent(
+        event.id,
+        "FAILED",
+        `Refused: seller is blocked${blockReason}. ${payload.name || `#${payload.order_number ?? orderId}`} was not created.`
+      );
+      return { ok: false, reason: "seller blocked" };
+    }
+
     const items = payload.line_items ?? [];
     const variantIds = items
       .map((li) => (li.variant_id ? String(li.variant_id) : null))

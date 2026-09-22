@@ -1,6 +1,6 @@
 import React from "react";
 import { useFetcher, useLoaderData } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
 import { listCatalog } from "../services/catalog.server";
 
 export const loader = async ({ request }) => {
@@ -12,6 +12,9 @@ export const loader = async ({ request }) => {
     canViewWholesale: context.canViewWholesale,
     canImport: context.canImport,
     products,
+    // Sent as a value rather than read from the server module on the client:
+    // the sentence belongs to one constant, but it has to arrive serialized.
+    blockedMessage: BLOCKED_MESSAGE,
   };
 };
 
@@ -78,7 +81,7 @@ function money(cents) {
 }
 
 export default function CatalogPage() {
-  const { access, canViewWholesale, canImport, products } = useLoaderData();
+  const { access, canViewWholesale, canImport, products, blockedMessage } = useLoaderData();
   const fetcher = useFetcher();
 
   const [search, setSearch] = React.useState("");
@@ -108,7 +111,9 @@ export default function CatalogPage() {
   const statusMessage =
     access === "APPROVED"
       ? null
-      : access === "SUSPENDED"
+      : access === "BLOCKED"
+        ? blockedMessage
+        : access === "SUSPENDED"
         ? "Your seller account is suspended. Wholesale pricing and importing are unavailable."
         : access === "REJECTED"
           ? "Your application was not approved. Wholesale pricing and importing are unavailable."
@@ -132,7 +137,7 @@ export default function CatalogPage() {
           <div className="mv-section-card" style={{ marginBottom: "1.5rem" }}>
             <span
               className={`mv-badge ${
-                access === "SUSPENDED" || access === "REJECTED"
+                access === "SUSPENDED" || access === "REJECTED" || access === "BLOCKED"
                   ? "mv-badge-danger"
                   : "mv-badge-warning"
               }`}

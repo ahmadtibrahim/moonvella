@@ -1,6 +1,6 @@
 import React from "react";
 import { Link, useLoaderData, useActionData, useFetcher, Form } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
 import { prisma } from "../db.server";
 import {
   getBillingSettings,
@@ -106,7 +106,14 @@ export const loader = async ({ request }) => {
 export const action = async ({ request }) => {
   const context = await requireSellerContext(request);
   if (!context.seller) return { error: "No seller account." };
-  if (!context.canStartNewBusiness) return { error: `Billing requires an approved seller (current: ${context.access}).` };
+  if (!context.canStartNewBusiness) {
+    return {
+      error:
+        context.access === "BLOCKED"
+          ? BLOCKED_MESSAGE
+          : `Billing requires an approved seller (current: ${context.access}).`,
+    };
+  }
 
   const url = new URL(request.url);
   const form = await request.formData();
