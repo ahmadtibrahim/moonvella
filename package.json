@@ -30,6 +30,7 @@
     "verify:payments": "node scripts/run-verify.mjs scripts/verify-payments.ts",
     "verify:wholesale": "node scripts/run-verify.mjs scripts/verify-wholesale.ts",
     "verify:packaging": "node scripts/run-verify.mjs scripts/verify-packaging.ts --seed-packaging",
+    "verify:shipping": "node scripts/run-verify.mjs scripts/verify-shipping.ts",
     "verify:plaid": "node scripts/run-verify.mjs scripts/verify-plaid.ts",
     "verify:e2e": "node scripts/run-verify.mjs scripts/verify-e2e.ts",
     "verify:product-system": "node scripts/run-verify.mjs scripts/verify-product-system.ts",

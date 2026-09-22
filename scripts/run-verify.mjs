@@ -178,6 +178,10 @@ const CHECKS = [
   { name: "payments", kind: "ts", file: "scripts/verify-payments.ts" },
   { name: "wholesale", kind: "ts", file: "scripts/verify-wholesale.ts" },
   { name: "packaging", kind: "ts", file: "scripts/verify-packaging.ts", packaging: true },
+  // Shipping and the eShipper adapter. The provider request-mapping checks use a
+  // stubbed fetch, so this proves the calls WE build and never claims a real
+  // sandbox booking. Needs no session and no credentials.
+  { name: "shipping", kind: "ts", file: "scripts/verify-shipping.ts" },
   { name: "plaid", kind: "ts", file: "scripts/verify-plaid.ts" },
   { name: "e2e", kind: "ts", file: "scripts/verify-e2e.ts" },
   // The product/variant/media/document/marketing system. Last because it is

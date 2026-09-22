@@ -1,5 +1,3 @@
-import { setIntegrationState } from "./integrationHealth.server";
-
 /**
  * eShipper logistics integration boundary.
  *
@@ -40,6 +38,8 @@ export interface RateQuote {
   transitDays: number | null;
   estimatedDelivery: Date | null;
   expiresAt: Date | null;
+  /** The provider's own quote id, when it issues one. Needed to book by id. */
+  providerQuoteId?: string | null;
   raw?: unknown;
 }
 
@@ -146,13 +146,19 @@ export function eshipperAuthConfigured(): boolean {
 }
 
 export function eshipperEnv(): string {
-  return process.env.ESHIPPER_ENV || "sandbox";
+  // Deliberately empty when unset. A hostname is a string, not proof of an
+  // environment: treating a URL that merely contains "sandbox" as authorization
+  // to call a provider is exactly the mistake this avoids. Only an explicit
+  // ESHIPPER_ENV=sandbox or ESHIPPER_ENV=production enables real calls.
+  return process.env.ESHIPPER_ENV || "";
 }
 
 export function eshipperConfigured(): boolean {
   if (!eshipperAuthConfigured()) return false;
-  if (eshipperEnv() === "production") return true;
-  return /sandbox/i.test(baseUrl() || "");
+  const env = eshipperEnv();
+  if (env === "production") return true;
+  if (env === "sandbox") return /sandbox/i.test(baseUrl() || "");
+  return false;
 }
 
 export function eshipperMode(): "real" | "simulated" {
@@ -211,9 +217,13 @@ async function getToken(force = false): Promise<string> {
 }
 
 function requireRealMode(operation: string) {
-  if (eshipperEnv() !== "production" && !/sandbox/i.test(baseUrl() || "")) {
-    throw new Error(`Refusing a non-sandbox eShipper endpoint for ${operation}. Set ESHIPPER_ENV=production only for live calls.`);
-  }
+  const env = eshipperEnv();
+  if (env === "production") return;
+  if (env === "sandbox" && /sandbox/i.test(baseUrl() || "")) return;
+  throw new Error(
+    `Refusing a real eShipper call for ${operation}: ESHIPPER_ENV is "${env || "(unset)"}" and sandbox could not be confirmed. ` +
+      `Set ESHIPPER_ENV=sandbox with a sandbox base URL, or ESHIPPER_ENV=production only for live bookings.`
+  );
 }
 
 async function eshipperFetch(method: string, path: string, body?: unknown) {
@@ -243,14 +253,17 @@ function simulatedRates(req: RateRequest): RateQuote[] {
   const base = 900 + Math.round(totalWeight * 120) + totalCount * 350;
   const now = new Date();
   return [
-    { carrier: "Canada Post", serviceCode: "CP-EXPEDITED", serviceName: "Expedited Parcel", totalAmount: base, currency: "CAD", transitDays: 3, estimatedDelivery: new Date(now.getTime() + 3 * 86400000), expiresAt: new Date(now.getTime() + 30 * 60000) },
-    { carrier: "Purolator", serviceCode: "PURO-EXPRESS", serviceName: "Purolator Express", totalAmount: Math.round(base * 1.45), currency: "CAD", transitDays: 1, estimatedDelivery: new Date(now.getTime() + 1 * 86400000), expiresAt: new Date(now.getTime() + 30 * 60000) },
-    { carrier: "UPS", serviceCode: "UPS-STANDARD", serviceName: "UPS Standard", totalAmount: Math.round(base * 0.92), currency: "CAD", transitDays: null, estimatedDelivery: null, expiresAt: new Date(now.getTime() + 30 * 60000) },
+    { carrier: "Canada Post", serviceCode: "CP-EXPEDITED", serviceName: "Expedited Parcel", totalAmount: base, currency: "CAD", transitDays: 3, estimatedDelivery: new Date(now.getTime() + 3 * 86400000), expiresAt: new Date(now.getTime() + 30 * 60000), providerQuoteId: `sim_q_cp_${totalCount}` },
+    { carrier: "Purolator", serviceCode: "PURO-EXPRESS", serviceName: "Purolator Express", totalAmount: Math.round(base * 1.45), currency: "CAD", transitDays: 1, estimatedDelivery: new Date(now.getTime() + 1 * 86400000), expiresAt: new Date(now.getTime() + 30 * 60000), providerQuoteId: `sim_q_puro_${totalCount}` },
+    { carrier: "UPS", serviceCode: "UPS-STANDARD", serviceName: "UPS Standard", totalAmount: Math.round(base * 0.92), currency: "CAD", transitDays: null, estimatedDelivery: null, expiresAt: new Date(now.getTime() + 30 * 60000), providerQuoteId: `sim_q_ups_${totalCount}` },
   ];
 }
 
 export async function getRates(req: RateRequest): Promise<RateQuote[]> {
   if (!eshipperConfigured()) {
+    // Imported lazily so importing this module (e.g. from a test or a script)
+    // does not pull in the database layer for a code path that never touches it.
+    const { setIntegrationState } = await import("./integrationHealth.server");
     await setIntegrationState("eshipper", {
       status: "NOT_CONFIGURED",
       detail: `Simulated eShipper rates. Account ${maskedEshipperAccount() ?? "(not configured)"}. Configure credentials for real quotes.`,
@@ -277,6 +290,7 @@ function normalizeRates(raw: unknown): RateQuote[] {
       transitDays: transit === null ? null : Number(transit),
       estimatedDelivery: delivery ? new Date(String(delivery)) : null,
       expiresAt: rate.expiresAt ? new Date(String(rate.expiresAt)) : null,
+      providerQuoteId: rate.quoteId ?? rate.quote_id ?? rate.id ?? null,
       raw: rate,
     };
   });
@@ -298,7 +312,7 @@ export async function getQuote(quoteId: string): Promise<RateQuote | null> {
 }
 
 export async function bookShipment(input: {
-  quote: { carrier: string; serviceCode: string; serviceName: string };
+  quote: { carrier: string; serviceCode: string; serviceName: string; providerQuoteId?: string | null };
   rateRequest: RateRequest;
 }): Promise<BookingResult> {
   if (!eshipperConfigured()) {
@@ -316,12 +330,20 @@ export async function bookShipment(input: {
     };
   }
   requireRealMode("bookShipment");
-  const raw = await eshipperFetch("POST", `/api/v2/ship/${input.quote.serviceCode}`, {
+  // Documented as POST /api/v2/ship/{quoteId}. Without a provider quote id there
+  // is no id to book against, and booking by guessing one would risk a second
+  // label purchase — so refuse and ask for a re-quote instead.
+  if (!input.quote.providerQuoteId) {
+    throw new Error(
+      "This quote has no eShipper quote id. Re-request quotes so the booking can reference the provider quote."
+    );
+  }
+  const raw = await eshipperFetch("POST", `/api/v2/ship/${encodeURIComponent(input.quote.providerQuoteId)}`, {
     ...input.rateRequest,
     serviceCode: input.quote.serviceCode,
   }) as Record<string, unknown>;
   return {
-    providerShipmentId: String(raw.shipmentId ?? raw.id ?? ""),
+    providerShipmentId: String(raw.shipmentId ?? raw.orderId ?? raw.id ?? ""),
     carrier: String(raw.carrier ?? input.quote.carrier),
     serviceName: String(raw.serviceName ?? input.quote.serviceName),
     trackingNumber: String(raw.trackingNumber ?? raw.tracking ?? ""),

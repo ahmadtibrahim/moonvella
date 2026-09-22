@@ -699,10 +699,40 @@ model Shipment {
   trackingUrl           String?
   carrier               String?
   serviceName           String?
+  serviceCode           String?
   provider              String?
   providerShipmentId    String?
+  /// The provider quote id used to book, when the provider issues one. Held so a
+  /// reprint or a reconciliation reads the same quote rather than re-quoting.
+  providerQuoteId       String?
   labelUrl              String?
+  labelDocumentFormat   String?
+  /// The seller's fixed shipping charge allocated to THIS shipment. A split
+  /// shipment carries only its own allocation; the order total is never repeated
+  /// per parcel. Null when no allocation rule is configured.
+  sellerShippingCharge  Int?
+  /// The carrier cost quoted when the shipment was booked.
+  quotedCarrierCost     Int?
+  /// The carrier cost actually booked. Kept separate from the quote because a
+  /// provider may book at a different amount than it quoted.
   bookedCost            Int?
+  /// The final amount the carrier billed, once a supplier invoice is known.
+  finalBilledCost       Int?
+  /// Reconciliation state of the carrier cost: PENDING, RECONCILED, VARIANCE or
+  /// NEEDS_RECONCILIATION. Never used to change the seller's agreed charge.
+  billingStatus         String        @default("PENDING")
+  /// eShipper's invoice number for the supplier bill this shipment belongs to.
+  providerInvoiceNumber String?
+  billingInvoices       String?
+  /// Normalized tracking state for the interface, distinct from the coarse
+  /// ShipmentStatus so "label created" is never reported as "shipped".
+  trackingStatus        String?
+  estimatedDelivery     DateTime?
+  lastTrackingSyncAt    DateTime?
+  lastTrackingError     String?
+  /// A return shipment points at the original shipment it returns.
+  returnOfShipmentId    String?
+  returnReason          String?
   bookingIdempotencyKey String?       @unique
   packageCount          Int?
   status                ShipmentStatus @default(PENDING)
@@ -713,9 +743,37 @@ model Shipment {
   inTransitAt           DateTime?
   deliveredAt           DateTime?
   exceptionAt           DateTime?
+  cancelledAt           DateTime?
   items                 ShipmentItem[]
+  trackingEvents        ShipmentTrackingEvent[]
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
+
+  @@index([orderId])
+  @@index([trackingNumber])
+  @@index([status])
+  @@index([returnOfShipmentId])
+}
+
+/// Every raw carrier event a provider returns, stored append-only so the UI can
+/// show provider detail while still normalizing into a friendly status. Events
+/// are keyed so a redelivered poll cannot insert the same event twice, and an
+/// older event can never overwrite a newer normalized state.
+model ShipmentTrackingEvent {
+  id               String   @id @default(cuid())
+  shipmentId       String
+  shipment         Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  eventKey         String
+  eventAt          DateTime
+  location         String?
+  description      String?
+  carrierEventCode String?
+  statusText       String?
+  proofOfDelivery  String?
+  createdAt        DateTime @default(now())
+
+  @@unique([shipmentId, eventKey])
+  @@index([shipmentId, eventAt])
 }
 
 enum ShipmentStatus {
@@ -961,6 +1019,9 @@ model ShippingQuote {
   orderId           String
   order             Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   provider          String   @default("eshipper")
+  /// The provider's own quote id, when returned. Required to book via
+  /// POST /api/v2/ship/{quoteId}; null for a locally-simulated quote.
+  providerQuoteId   String?
   carrier           String
   serviceCode       String
   serviceName       String
