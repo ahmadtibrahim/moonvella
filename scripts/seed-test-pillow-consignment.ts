@@ -98,7 +98,7 @@ async function main() {
   // Check if product already exists
   const existing = await prisma.product.findUnique({
     where: { productCode: PRODUCT_CODE },
-    select {
+    select: {
       id: true,
       name: true,
       status: true,
