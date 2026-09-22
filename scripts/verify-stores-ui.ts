@@ -314,14 +314,19 @@ async function main() {
     const blocked = await post("/admin/stores", cookie, {
       intent: "block",
       sellerId: seller.id,
-      reason: "Verify stores UI",
+      // Both of these are in the roster's form at once: the row's own reason
+      // box, which belongs to Deactivate, and the modal's, which is the answer
+      // the operator just gave. They are named apart so the second cannot be
+      // dropped in favour of the first.
+      reason: "typed in the row",
+      blockReason: "reason from the dialog",
     });
     const afterBlock = await prisma.seller.findUnique({ where: { id: seller.id } });
     check(
       "Blocking a store blocks it, and records why",
       blocked.status === 302 &&
         afterBlock?.status === "BLOCKED" &&
-        afterBlock?.blockReason === "Verify stores UI" &&
+        afterBlock?.blockReason === "reason from the dialog" &&
         afterBlock?.blockedAt instanceof Date,
       `HTTP ${blocked.status}, status ${afterBlock?.status}, reason ${afterBlock?.blockReason}`
     );
@@ -347,11 +352,7 @@ async function main() {
     const blockedText = rendered(blockedPage.html);
     check(
       "Its block date and reason are on the page MoonVella staff work from",
-      /Blocked/.test(blockedText) &&
-        // The separator and the lower-case "stores" together can only come from
-        // the block reason being drawn beside its label. The store's own name is
-        // "Verify Stores UI", which this cannot match by accident.
-        /·\s*Verify stores UI/.test(blockedText),
+      /Blocked/.test(blockedText) && /·\s*reason from the dialog/.test(blockedText),
       "the operator should not have to open the database to learn why"
     );
 

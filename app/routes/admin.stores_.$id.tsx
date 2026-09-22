@@ -67,7 +67,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
     } else if (intent === "reactivate") {
       await reactivateSeller(id, actor);
     } else if (intent === "block") {
-      await blockSeller(id, actor, reason || "Blocked by owner");
+      // The modal asks for its own reason; the box above belongs to Deactivate.
+      // Both are in this form, so the block reads its own field first.
+      const blockReason = String(form.get("blockReason") || "").trim();
+      await blockSeller(id, actor, blockReason || reason || "Blocked by owner");
     } else if (intent === "unblock") {
       await unblockSeller(id, actor);
     } else {
@@ -651,7 +654,7 @@ export default function AdminStoreDetail() {
           )}
           {/* The reason box above belongs to Deactivate and is only drawn for an
               approved store, so the modal asks for its own. */}
-          <BlockControl sellerId={seller.id} status={seller.status} />
+          <BlockControl status={seller.status} />
         </Form>
       </div>
 

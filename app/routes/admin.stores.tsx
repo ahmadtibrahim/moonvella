@@ -111,7 +111,7 @@ function StoreControls({ seller }: { seller: { id: string; status: string } }) {
       )}
       {/* One way back for a blocked store, so the operator is not choosing
           between two buttons that both mean "let them in again". */}
-      <BlockControl sellerId={seller.id} status={seller.status} />
+      <BlockControl status={seller.status} />
     </Form>
   );
 }
@@ -144,7 +144,11 @@ export async function action({ request }: ActionFunctionArgs) {
     } else if (intent === "reactivate") {
       await reactivateSeller(sellerId, actor);
     } else if (intent === "block") {
-      await blockSeller(sellerId, actor, reason || "Blocked by owner");
+      // The row's reason box belongs to Deactivate and the modal asks for its
+      // own; both fields are in this one form, so the block reads its own
+      // first rather than whichever happens to come first in the document.
+      const blockReason = String(formData.get("blockReason") || "").trim();
+      await blockSeller(sellerId, actor, blockReason || reason || "Blocked by owner");
     } else if (intent === "unblock") {
       await unblockSeller(sellerId, actor);
     } else {

@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 /**
  * Block, unblock, and the confirmation in front of them.
@@ -49,16 +49,15 @@ const CONSEQUENCE =
   "They will lose access to pricing, imports, and order sync, but history will remain.";
 
 export function BlockControl({
-  sellerId,
   status,
   reasonField = true,
 }: {
-  sellerId: string;
   status: string;
   /** The detail page already renders a reason box above; do not draw a second. */
   reasonField?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
   const reasonId = useId();
 
@@ -71,6 +70,16 @@ export function BlockControl({
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Focus moves into the panel when it opens, and lands on Cancel rather than
+  // on the button that blocks. autoFocus would do the same thing and is
+  // deliberately not used: it fires on the initial render as well, so a page
+  // that ever rendered this open would steal focus on load. Without this the
+  // focus stays on the trigger behind the overlay and the next Tab walks out
+  // of the dialog entirely.
+  useEffect(() => {
+    if (open) cancelRef.current?.focus();
   }, [open]);
 
   if (status === "BLOCKED") {
@@ -111,18 +120,9 @@ export function BlockControl({
 
       {open && (
         <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby={titleId}
-          onClick={(event) => {
-            // Only the backdrop itself — a click that started inside the panel
-            // and ended on the backdrop is not a dismissal.
-            if (event.target === event.currentTarget) setOpen(false);
-          }}
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(15, 23, 42, 0.45)",
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
@@ -130,8 +130,23 @@ export function BlockControl({
             zIndex: 1000,
           }}
         >
+          {/* The backdrop is decoration that happens to accept a click, which
+              is what aria-hidden says about it. Clicking it is a convenience
+              for the mouse; the keyboard already has Escape and Cancel, so
+              nothing here is reachable only by pointing at it. It is a sibling
+              of the panel rather than its parent so that hiding it from the
+              screen reader does not hide the question with it. */}
           <div
+            aria-hidden="true"
+            onClick={() => setOpen(false)}
+            style={{ position: "absolute", inset: 0, background: "rgba(15, 23, 42, 0.45)" }}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={titleId}
             style={{
+              position: "relative",
               background: "white",
               borderRadius: 12,
               padding: "1.5rem",
@@ -162,7 +177,12 @@ export function BlockControl({
               <input
                 id={reasonId}
                 type="text"
-                name="reason"
+                // Named apart from the row's own "reason" box rather than
+                // relying on which one wins: on the roster both are in the same
+                // form, and formData.get() returns the first in document order,
+                // so a shared name would silently record the deactivation
+                // reason and drop what the operator typed here.
+                name="blockReason"
                 placeholder="e.g. unpaid invoices"
                 style={{
                   width: "100%",
@@ -176,8 +196,12 @@ export function BlockControl({
             )}
 
             <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
-              {/* Focus lands on Cancel, not on the button that does the thing. */}
-              <button type="button" autoFocus onClick={() => setOpen(false)} style={btn("#64748b")}>
+              <button
+                ref={cancelRef}
+                type="button"
+                onClick={() => setOpen(false)}
+                style={btn("#64748b")}
+              >
                 Cancel
               </button>
               <button type="submit" name="intent" value="block" style={btn("#7f1d1d", true)}>
