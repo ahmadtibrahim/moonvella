@@ -1,7 +1,7 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
-import { getRates, bookShipment, cancelShipment, eshipperMode, type RateRequest } from "./eshipper.server";
+import { getRates, bookShipment, cancelShipment, eshipperMode, type RateRequest, trackByOrderId, trackByTrackingNumber, bulkTrack, getLabel, getOrderDetails, getCustomsInvoice, getReturnQuote, bookReturn, getReturn, schedulePickup, cancelPickup, type TrackingResult, type ReturnQuote, type ReturnBookingResult, type ReturnDetails, type PickupResult } from "./eshipper.server";
 import { buildQuotePackagesForOrder } from "./packaging.server";
 
 interface Actor {
@@ -373,4 +373,345 @@ export async function voidShipment(shipmentId: string, actor: Actor) {
     userAgent: actor.userAgent,
   });
   return result;
+}
+
+export async function getShipmentLabel(shipmentId: string, actor: Actor) {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) throw new Error("No provider shipment ID.");
+  const label = await getLabel(shipment.providerShipmentId);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.label_viewed",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { labelUrl: label.labelUrl },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return label;
+}
+
+export async function getShipmentOrderDetails(shipmentId: string, actor: Actor) {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) throw new Error("No provider shipment ID.");
+  const details = await getOrderDetails(shipment.providerShipmentId);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.order_details_viewed",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return details;
+}
+
+export async function getShipmentCustomsInvoice(shipmentId: string, actor: Actor) {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) throw new Error("No provider shipment ID.");
+  const invoice = await getCustomsInvoice(shipment.providerShipmentId);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.customs_invoice_viewed",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { customsInvoiceUrl: invoice.customsInvoiceUrl },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return invoice;
+}
+
+export async function syncTrackingByOrderId(shipmentId: string, actor: Actor): Promise<TrackingResult> {
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    include: { order: { include: { seller: true } } },
+  });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) throw new Error("No provider shipment ID.");
+
+  const tracking = await trackByOrderId(shipment.providerShipmentId);
+
+  await prisma.shipment.update({
+    where: { id: shipmentId },
+    data: {
+      trackingNumber: tracking.trackingDetails[0]?.description?.includes("tracking") ? shipment.trackingNumber : shipment.trackingNumber,
+      trackingUrl: tracking.trackingUrl,
+      status: tracking.delivered ? "DELIVERED" : tracking.exception ? "EXCEPTION" : tracking.inTransit ? "SHIPPED" : tracking.pickup ? "SHIPPED" : "PENDING",
+    },
+  });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.tracking_synced",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { trackingUrl: tracking.trackingUrl, events: tracking.trackingDetails.length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return tracking;
+}
+
+export async function syncTrackingByTrackingNumber(shipmentId: string, trackingNumber: string, actor: Actor): Promise<TrackingResult> {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+
+  const tracking = await trackByTrackingNumber(trackingNumber);
+
+  await prisma.shipment.update({
+    where: { id: shipmentId },
+    data: {
+      trackingNumber,
+      trackingUrl: tracking.trackingUrl,
+      status: tracking.delivered ? "DELIVERED" : tracking.exception ? "EXCEPTION" : tracking.inTransit ? "SHIPPED" : tracking.pickup ? "SHIPPED" : "PENDING",
+    },
+  });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.tracking_synced",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { trackingUrl: tracking.trackingUrl, events: tracking.trackingDetails.length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return tracking;
+}
+
+export async function bulkSyncTracking(trackingNumbers: string[], actor: Actor): Promise<{ results: TrackingResult[] }> {
+  const results = await bulkTrack(trackingNumbers);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.bulk_tracking_synced",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: "bulk",
+    afterData: { count: results.results.length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return results;
+}
+
+export async function getReturnQuotesForOrder(orderId: string, actor: Actor): Promise<ReturnQuote[]> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { items: true, packages: true },
+  });
+  if (!order) throw new Error("Order not found.");
+
+  const { buildQuotePackagesForOrder } = await import("./packaging.server");
+  const built = await buildQuotePackagesForOrder({
+    items: order.items.map((i) => ({ sku: i.sku, quantity: i.quantity, variantId: i.variantId })),
+    packages: order.packages,
+  });
+  if (built.missing.length > 0) {
+    throw new Error(`Packaging incomplete for return: ${built.missing.join(", ")}`);
+  }
+
+  const request = buildRateRequest(order, built.packages);
+  const rates = await getReturnQuote(request);
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.return_quotes_requested",
+    entityType: AUDIT_ENTITY.ORDER,
+    entityId: orderId,
+    afterData: { count: rates.length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return rates;
+}
+
+export async function bookReturnForOrder(
+  orderId: string,
+  opts: { quoteId: string; returnItems: { orderItemId: string; quantity: number }[]; returnAddress: { name: string; address: string; city: string; province: string; postalCode: string; country: string } },
+  actor: Actor
+): Promise<ReturnBookingResult> {
+  const order = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: { items: true, packages: true, shipments: { include: { items: true } } },
+  });
+  if (!order) throw new Error("Order not found.");
+
+  const quote = await prisma.shippingQuote.findUnique({ where: { id: opts.quoteId } });
+  if (!quote) throw new Error("Return quote not found.");
+
+  const { buildQuotePackagesForOrder } = await import("./packaging.server");
+  const built = await buildQuotePackagesForOrder({
+    items: order.items.map((i) => ({ sku: i.sku, quantity: i.quantity, variantId: i.variantId })),
+    packages: order.packages,
+  });
+
+  const request = buildRateRequest(order, built.packages);
+  const returnItems = opts.returnItems.map((ri) => {
+    const item = order.items.find((i) => i.id === ri.orderItemId);
+    return { sku: item?.sku ?? "", quantity: ri.quantity };
+  });
+
+  const booking = await bookReturn({
+    quote: { carrier: quote.carrier, serviceCode: quote.serviceCode, serviceName: quote.serviceName },
+    rateRequest: request,
+    returnItems,
+    returnAddress: opts.returnAddress,
+  });
+
+  const shipment = await prisma.shipment.create({
+    data: {
+      orderId,
+      status: "PENDING",
+      provider: "eshipper",
+      carrier: booking.carrier,
+      serviceName: booking.serviceName,
+      trackingNumber: booking.trackingNumber,
+      trackingUrl: booking.trackingUrl,
+      labelUrl: booking.labelUrl,
+      bookedCost: booking.bookedCost,
+      packageCount: 1,
+      items: { create: opts.returnItems.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
+    },
+  });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.return_booked",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipment.id,
+    afterData: { providerReturnId: booking.providerReturnId, trackingNumber: booking.trackingNumber, cost: booking.bookedCost },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return booking;
+}
+
+export async function getReturnDetails(shipmentId: string, actor: Actor): Promise<ReturnDetails | null> {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) return null;
+
+  const details = await getReturn(shipment.providerShipmentId);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.return_details_viewed",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return details;
+}
+
+export async function schedulePickupForShipment(
+  shipmentId: string,
+  data: { pickupDate: string; pickupTimeWindow: string; notes?: string },
+  actor: Actor
+): Promise<PickupResult> {
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    include: { order: { include: { seller: true } } },
+  });
+  if (!shipment) throw new Error("Shipment not found.");
+
+  const shipFrom = {
+    name: process.env.MOONVELLA_SHIP_FROM_NAME || "MoonVella",
+    address: process.env.MOONVELLA_SHIP_FROM_ADDRESS || "1 Warehouse Way",
+    city: process.env.MOONVELLA_SHIP_FROM_CITY || "Toronto",
+    province: process.env.MOONVELLA_SHIP_FROM_PROVINCE || "ON",
+    postalCode: process.env.MOONVELLA_SHIP_FROM_POSTAL || "M5H 2N2",
+    country: process.env.MOONVELLA_SHIP_FROM_COUNTRY || "CA",
+    phone: process.env.MOONVELLA_SHIP_FROM_PHONE,
+    email: process.env.MOONVELLA_SHIP_FROM_EMAIL,
+  };
+
+  const booking = await schedulePickup({
+    shipFrom,
+    pickupDate: data.pickupDate,
+    pickupTimeWindow: data.pickupTimeWindow,
+    packages: [{ count: shipment.packageCount || 1, weight: 0 }],
+    notes: data.notes,
+  });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.pickup_scheduled",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { pickupId: booking.pickupId, scheduledDate: booking.scheduledDate },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return booking;
+}
+
+export async function cancelPickupForShipment(shipmentId: string, pickupId: string, actor: Actor): Promise<{ cancelled: boolean }> {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+
+  const result = await cancelPickup(pickupId);
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.pickup_cancelled",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { pickupId, cancelled: result.cancelled },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return result;
+}
+
+export async function getBillingReconciliation(shipmentId: string) {
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    include: { order: { include: { seller: true } } },
+  });
+  if (!shipment) throw new Error("Shipment not found.");
+
+  const quotes = await prisma.shippingQuote.findMany({ where: { orderId: shipment.orderId } });
+  const selectedQuote = quotes.find((q) => q.selected) ?? quotes[0];
+
+  return {
+    shipmentId: shipment.id,
+    providerShipmentId: shipment.providerShipmentId,
+    sellerShippingCharge: shipment.order.moonvellaShipping,
+    quotedCarrierCost: selectedQuote?.totalAmount ?? 0,
+    bookedCarrierCost: shipment.bookedCost ?? 0,
+    finalBilledCarrierCost: null,
+    margin: (shipment.order.moonvellaShipping || 0) - (shipment.bookedCost ?? 0),
+    status: "pending",
+  };
 }

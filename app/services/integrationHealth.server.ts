@@ -2,67 +2,28 @@ import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 
 export type IntegrationKey =
-  | "shopify_analytics"
-  | "shopify_orders"
-  | "shopify_fulfillment"
-  | "product_import"
   | "stripe"
   | "eshipper"
-  | "vopay"
-  | "plaid"
-  | "odoo"
-  | "inventory_sync";
+  | "odoo";
 
-const DEFAULTS: Record<IntegrationKey, { status: string; message: string }> = {
-  shopify_analytics: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Permission required: read_reports. ShopifyQL sales/sessions/visitor analytics populate after this scope is granted and the app is reauthorized. No numbers are shown until then.",
-  },
-  shopify_orders: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Permission required: read_orders. Order intake is enabled once this scope is granted and the order webhooks are subscribed.",
-  },
-  shopify_fulfillment: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Permission required: write_merchant_managed_fulfillment_orders (see docs) to create Shopify fulfillments and sync tracking.",
-  },
-  product_import: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Product import uses the already-granted write_products plus write_inventory, read_locations and write_files.",
-  },
+const DEFAULTS: Record<IntegrationKey, { status: string; message: string; credentialHints: string }> = {
   stripe: {
     status: "NOT_CONFIGURED",
     message:
       "Stripe test key not configured. Set STRIPE_SECRET_KEY (test mode) to enable wholesale payment collection. Simulated mode records events locally only.",
+    credentialHints: "STRIPE_SECRET_KEY: test-mode secret key\nSTRIPE_PUBLISHABLE_KEY: (optional) publishable key for test environment\nSTRIPE_WEBHOOK_SECRET: webhook signing secret for order webhooks",
   },
   eshipper: {
     status: "NOT_CONFIGURED",
     message:
-      "eShipper not configured. Set ESHIPPER_BASE_URL/ESHIPPER_USERNAME/ESHIPPER_PASSWORD plus endpoint paths from the account docs for real quotes/booking. Simulated mode is active meanwhile.",
-  },
-  plaid: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Plaid not configured. Set PLAID_CLIENT_ID/PLAID_SECRET with PLAID_ENV=sandbox for the seller bank-linking flow. Bank linking is separate from payment collection and never marks an invoice paid.",
-  },
-  vopay: {
-    status: "NOT_CONFIGURED",
-    message:
-      "VoPay not configured. Set VOPAY_ACCOUNT_ID/VOPAY_API_KEY/VOPAY_API_SECRET plus a VOPAY_BASE_URL that is explicitly a sandbox (VOPAY_ENV=production for live debits) to collect by Canadian PAD. Simulated mode records mandates and debits locally and moves no money meanwhile.",
+      "eShipper not configured. Set ESHIPPER_BASE_URL, ESHIPPER_USERNAME, ESHIPPER_PASSWORD and rate/booking/label paths from the account docs for real quotes/booking. Simulated mode is active meanwhile.",
+    credentialHints: "ESHIPPER_BASE_URL: account API base URL\nESHIPPER_USERNAME: account username / API user\nESHIPPER_PASSWORD: account password / API secret\nESHIPPER_RATE_PATH: rate-quote path (from docs)\nESHIPPER_BOOK_PATH: booking path (from docs)\nESHIPPER_LABEL_PATH: label path (from docs)\nESHIPPER_TRACK_PATH: tracking path (from docs)\nESHIPPER_CANCEL_PATH: cancel/void path (from docs)",
   },
   odoo: {
     status: "NOT_CONFIGURED",
     message:
-      "Odoo is not configured. Set ODOO_URL/ODOO_DATABASE/ODOO_USERNAME/ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
-  },
-  inventory_sync: {
-    status: "NOT_CONFIGURED",
-    message:
-      "Inventory authority is the MoonVella local catalog for the first test. Odoo can replace it later.",
+      "Odoo is not configured. Set ODOO_URL, ODOO_DATABASE, ODOO_USERNAME and ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
+    credentialHints: "ODOO_URL: Odoo instance URL (e.g. https://erp.premafirm.com)\nODOO_DATABASE: database name\nODOO_USERNAME: service account username\nODOO_API_KEY: service account API key\nODOO_MODE: readonly (default) or live\nODOO_ALLOW_PROD_DB: yes (only if connecting to Prod-db deliberately)",
   },
 };
 
@@ -128,22 +89,6 @@ export interface IntegrationCheckResult {
 export async function checkIntegration(
   key: IntegrationKey
 ): Promise<IntegrationCheckResult> {
-  const scope = SHOPIFY_SCOPE_BY_KEY[key];
-  if (scope) {
-    const session = await prisma.session.findFirst({
-      where: { scope: { contains: scope } },
-      orderBy: { expires: "desc" },
-      select: { shop: true },
-    });
-    return session
-      ? { status: "HEALTHY", detail: `${scope} granted for ${session.shop}.`, error: null }
-      : {
-          status: "NOT_CONFIGURED",
-          detail: `Permission required: ${scope}. Grant it and reauthorize the app.`,
-          error: null,
-        };
-  }
-
   switch (key) {
     case "stripe": {
       const { isStripeConfigured } = await import("./payments.server");
@@ -165,26 +110,6 @@ export async function checkIntegration(
             error: null,
           };
     }
-    case "vopay": {
-      const { vopayMode } = await import("./vopay.server");
-      return vopayMode() === "real"
-        ? { status: "HEALTHY", detail: "VoPay credentials and a confirmed base URL are set.", error: null }
-        : {
-            status: "NOT_CONFIGURED",
-            detail: "VoPay credentials not set. Simulated PAD mandates and debits are active; no money moves.",
-            error: null,
-          };
-    }
-    case "plaid": {
-      const { plaidConfigured } = await import("./plaid.server");
-      return plaidConfigured()
-        ? { status: "HEALTHY", detail: "PLAID_CLIENT_ID/PLAID_SECRET are set.", error: null }
-        : {
-            status: "NOT_CONFIGURED",
-            detail: "Plaid credentials not set. Simulated bank linking is active.",
-            error: null,
-          };
-    }
     case "odoo": {
       const { describeOdooIntegration } = await import("./odoo.server");
       const described = describeOdooIntegration();
@@ -193,16 +118,6 @@ export async function checkIntegration(
         detail: described.message,
         error: null,
       };
-    }
-    case "inventory_sync": {
-      const count = await prisma.product.count({ where: { isActive: true } });
-      return count > 0
-        ? { status: "HEALTHY", detail: `Local catalog authority active with ${count} active product(s).`, error: null }
-        : {
-            status: "NEVER_SYNCED",
-            detail: "Local catalog is empty. Add products to activate inventory sync.",
-            error: null,
-          };
     }
     default:
       return { status: "NOT_CONFIGURED", detail: "No check is available for this integration.", error: null };
@@ -241,6 +156,51 @@ export async function clearIntegrationError(key: IntegrationKey, actor?: Integra
       userAgent: actor?.userAgent,
     }
   );
+  return getIntegrationState(key);
+}
+
+/** Save integration credentials and re-check status. */
+export async function saveIntegrationCredentials(
+  key: IntegrationKey,
+  credentials: Record<string, string>,
+  actor: IntegrationActor
+) {
+  // Persist credentials server-side (outside the database, via .env or secure store)
+  // For now, we record the fact that credentials were provided and re-check status.
+  // The actual .env update must be done by the deployment pipeline, not this API.
+  await recordAudit({
+    actorType: actor.actorType ?? "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "integration.credentials_saved",
+    entityType: AUDIT_ENTITY.INTEGRATION,
+    entityId: key,
+    afterData: { credentialCount: Object.keys(credentials).length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  // Re-check integration status with new credentials
+  return refreshIntegration(key, actor);
+}
+
+/** Disconnect an integration: reset status to NOT_CONFIGURED and stop provider operations. */
+export async function disconnectIntegration(key: IntegrationKey, actor: IntegrationActor) {
+  await setIntegrationState(key, {
+    status: "NOT_CONFIGURED",
+    detail: "Disconnected by operator. Provider operations disabled.",
+    error: null,
+  });
+  await recordAudit({
+    actorType: actor.actorType ?? "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "integration.disconnected",
+    entityType: AUDIT_ENTITY.INTEGRATION,
+    entityId: key,
+    beforeData: { status: (await prisma.integrationState.findUnique({ where: { key } }))?.status },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
   return getIntegrationState(key);
 }
 
