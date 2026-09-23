@@ -26,6 +26,7 @@ import {
   cancelFulfillmentRequest,
 } from "~/services/fulfillmentRequest.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
+import { groupOrderLinesByOrigin } from "~/services/origins.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   await requirePermission(request, "orders.view");
@@ -35,8 +36,12 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       seller: true,
       items: true,
       packages: true,
-      shipments: { include: { items: true } },
-      shippingQuotes: { orderBy: { totalAmount: "asc" } },
+      // The dock is read with both: a shipment's card has to say where it was
+      // collected from, and a quote is only valid for the dock it was priced
+      // from — §1's rule that a quote, a booking and a collection are the same
+      // question asked three times.
+      shipments: { include: { items: true, originLocation: { select: { code: true, name: true } } } },
+      shippingQuotes: { orderBy: { totalAmount: "asc" }, include: { originLocation: { select: { code: true, name: true } } } },
       wholesalePayment: {
         select: {
           id: true,
@@ -63,8 +68,43 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   if (!order) throw new Response("Order not found", { status: 404 });
   const billing = await getBillingSettings(order.sellerId);
   const shopifyFulfillment = await getIntegrationState("shopify_fulfillment");
+
+  /*
+   * Which dock each line leaves from, resolved here so the page can SHOW the
+   * split rather than let an operator discover it at the first booking refusal.
+   *
+   * §1 makes an order whose items come from two docks into two shipments, each
+   * quoted and booked independently. Nothing about that is visible from the
+   * order's own columns, so without this the second parcel is found only when
+   * somebody asks why half the order has no label. A line with no resolvable
+   * origin becomes its own group with `ready: false`, which is also how §1's
+   * "Pickup location required, and booking is blocked" reaches this page.
+   */
+  const grouping = await groupOrderLinesByOrigin(
+    order.items.map((item) => ({
+      orderItemId: item.id,
+      variantId: item.variantId,
+      sku: item.sku,
+      quantity: item.quantity,
+    }))
+  );
+
   return {
     order,
+    collection: {
+      split: grouping.split,
+      blockers: grouping.blockers,
+      groups: grouping.groups.map((group) => ({
+        key: group.key,
+        ready: group.ready,
+        reason: group.reason,
+        code: group.location?.code ?? null,
+        name: group.location?.name ?? null,
+        lines: group.lines.length,
+        quantity: group.lines.reduce((sum, line) => sum + line.quantity, 0),
+        skus: [...new Set(group.lines.map((line) => line.sku))],
+      })),
+    },
     mode: await stripeMode(),
     shopifyFulfillment,
     eshipper: { mode: await eshipperMode(), account: await maskedEshipperAccount() },
@@ -193,7 +233,7 @@ function money(cents: number, currency = "CAD") {
 }
 
 export default function AdminOrderDetail() {
-  const { order, mode, eshipper, billing, shopifyFulfillment } = useLoaderData<typeof loader>();
+  const { order, collection, mode, eshipper, billing, shopifyFulfillment } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
   const selectedQuote = order.shippingQuotes.find((q) => q.selected) ?? null;
@@ -332,6 +372,58 @@ export default function AdminOrderDetail() {
       </div>
 
       <div style={card}>
+        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
+          Collection{collection.groups.length > 1 ? ` — ${collection.groups.length} docks` : ""}
+        </h2>
+        {/*
+          §1's split, on the page where it is decided. An order whose items come
+          from two docks is two shipments, quoted and booked separately, and the
+          operator has to be able to see that BEFORE booking the first half —
+          otherwise the second half looks like an order that silently failed.
+        */}
+        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
+          Each line leaves from the dock its product is mapped to in Odoo. An order containing more than one dock becomes one
+          shipment per dock, each quoted and booked independently; the split does not add a charge of its own.
+        </p>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
+          <thead>
+            <tr><th style={th}>Dock</th><th style={th}>Lines</th><th style={th}>Units</th><th style={th}>Items</th><th style={th}>Ready</th></tr>
+          </thead>
+          <tbody>
+            {collection.groups.map((group) => (
+              <tr key={group.key} style={{ borderTop: "1px solid #f1f5f9" }}>
+                <td style={{ padding: "0.4rem" }}>
+                  {group.code ? (
+                    <>
+                      <strong>{group.code}</strong>
+                      <div style={{ color: "#94a3b8", fontSize: "0.7rem" }}>{group.name}</div>
+                    </>
+                  ) : (
+                    <span style={{ color: "#b45309" }}>Pickup location required</span>
+                  )}
+                </td>
+                <td style={{ padding: "0.4rem" }}>{group.lines}</td>
+                <td style={{ padding: "0.4rem" }}>{group.quantity}</td>
+                <td style={{ padding: "0.4rem", color: "#64748b" }}>{group.skus.join(", ")}</td>
+                <td style={{ padding: "0.4rem", color: group.ready ? "#059669" : "#dc2626" }}>
+                  {group.ready ? "Yes" : "No"}
+                  {!group.ready && group.reason ? (
+                    <div style={{ color: "#b45309", fontSize: "0.7rem" }}>{group.reason}</div>
+                  ) : null}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {collection.blockers.length > 0 ? (
+          <p style={{ fontSize: "0.75rem", color: "#b45309", marginTop: "0.5rem" }} role="status">
+            Booking is blocked for {collection.blockers.length === 1 ? "one dock" : `${collection.blockers.length} docks`} until the
+            origin mapping is complete. No global address is substituted.
+          </p>
+        ) : null}
+      </div>
+
+      <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipping quotes</h2>
         <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
           eShipper: {eshipper.mode}{eshipper.account ? ` · account ${eshipper.account}` : ""}
@@ -353,11 +445,24 @@ export default function AdminOrderDetail() {
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
             <thead>
-              <tr><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Cost</th><th style={th}>Transit</th><th style={th}></th></tr>
+              <tr><th style={th}>From dock</th><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Cost</th><th style={th}>Transit</th><th style={th}></th></tr>
             </thead>
             <tbody>
               {order.shippingQuotes.map((q) => (
                 <tr key={q.id} style={{ borderTop: "1px solid #f1f5f9", background: q.selected ? "#f0fdf4" : undefined }}>
+                  {/*
+                    A quote is priced for one dock. Showing which one is what
+                    stops an operator selecting the cheapest line for a shipment
+                    that leaves from somewhere else — a booking that would have
+                    been refused, or worse, accepted at the wrong address.
+                  */}
+                  <td style={{ padding: "0.4rem" }}>
+                    {q.originLocation ? (
+                      q.originLocation.code
+                    ) : (
+                      <span style={{ color: "#b45309" }} title="This quote predates dock-scoped quoting and cannot be matched to a dock.">not dock-scoped</span>
+                    )}
+                  </td>
                   <td style={{ padding: "0.4rem" }}>{q.carrier}</td>
                   <td style={{ padding: "0.4rem" }}>
                     {q.serviceName}
@@ -421,8 +526,13 @@ export default function AdminOrderDetail() {
             <div key={s.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.6rem", marginBottom: "0.5rem", fontSize: "0.8rem" }}>
               <div><strong>{s.carrier}</strong> {s.serviceName} · {s.status} · {s.trackingNumber || "no tracking"}</div>
               <div style={{ color: "#64748b" }}>
-                booked cost {s.bookedCost != null ? money(s.bookedCost) : "—"}
+                {s.originLocation ? `from ${s.originLocation.code}` : "dock not recorded"} · booked cost {s.bookedCost != null ? money(s.bookedCost) : "—"}
                 {s.shopifyFulfillmentId ? ` · Shopify fulfillment ${s.shopifyFulfillmentId}` : ""}
+              </div>
+              <div style={{ color: "#64748b" }}>
+                pickup {s.pickupMode ?? "not recorded"}
+                {s.pickupStatus ? ` · ${s.pickupStatus}` : ""}
+                {s.status === "BOOKED" && !s.shopifyFulfillmentId ? " · Shopify push waits for dispatch" : ""}
               </div>
               <div style={{ color: "#94a3b8", fontSize: "0.7rem" }}>
                 packed {s.packedAt ? new Date(s.packedAt).toLocaleDateString() : "—"} · shipped {s.shippedAt ? new Date(s.shippedAt).toLocaleDateString() : "—"} · in transit {s.inTransitAt ? new Date(s.inTransitAt).toLocaleDateString() : "—"} · delivered {s.deliveredAt ? new Date(s.deliveredAt).toLocaleDateString() : "—"}

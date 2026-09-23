@@ -393,6 +393,28 @@ const CHECKS = [
     file: "scripts/verify-booking.ts",
     requires: [],
   },
+  // Phase C of the shipping work: the tracking vocabulary, the polling
+  // schedule, the dispatch milestone and the pickup window.
+  //
+  // Two of these are checked against rows rather than by reading the code,
+  // because they are the ones that fail quietly: that each of the nine display
+  // words is returned by exactly the rows that wear it, and that a refresh
+  // which fails leaves the last good carrier status standing instead of
+  // blanking the page. It stubs `fetch` the same way verify-booking does — the
+  // stub answers authentication and REFUSES any host that is not the configured
+  // eShipper base URL — so it proves what this code does and nothing about
+  // eShipper, and cannot poll, book, cancel or charge anything real. No Shopify
+  // or Odoo call is made.
+  //
+  // It reads the provider credential and writes none, so it has no ordering
+  // constraint against verify-credentials. It creates seller, order, shipment
+  // and dock fixtures and removes them.
+  {
+    name: "tracking",
+    kind: "ts",
+    file: "scripts/verify-tracking.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

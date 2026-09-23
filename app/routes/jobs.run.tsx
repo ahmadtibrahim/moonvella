@@ -26,7 +26,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { runDueJobs } from "~/services/jobs.server";
+import { ensureRecurringJobs, runDueJobs } from "~/services/jobs.server";
 import { jobHandlers } from "~/services/jobHandlers.server";
 
 const SECRET_ENV = "MV_JOB_RUNNER_SECRET";
@@ -70,10 +70,24 @@ export async function action({ request }: { request: Request }) {
     });
   }
 
+  /*
+   * The tick queues this bucket's recurring work BEFORE it runs anything, which
+   * is what keeps the tracking sweep alive without any job re-queueing itself.
+   *
+   * This is the external heartbeat the queue cannot provide for itself: cron
+   * calls here every five minutes whether or not the last sweep succeeded, so a
+   * sweep that failed is replaced by the next bucket rather than by a retry loop.
+   * See RECURRING_JOBS for why a self-re-enqueuing handler does not work here.
+   *
+   * It is a no-op for every bucket already queued, so a duplicate tick — the
+   * owner pressing a button while cron fires, say — creates nothing.
+   */
+  const recurring = await ensureRecurringJobs();
+
   const summary = await runDueJobs(jobHandlers, { limit: BATCH });
 
   return Response.json(
-    { ran: summary, at: new Date().toISOString() },
+    { ran: summary, queued: recurring.length, at: new Date().toISOString() },
     // A runner response is operational detail, not a public document.
     { headers: { "Cache-Control": "no-store" } },
   );

@@ -47,11 +47,97 @@ async function cleanup() {
     await prisma.seller.delete({ where: { id: seller.id } });
   }
   await prisma.integrationState.deleteMany({ where: { key: { in: ["eshipper", "shopify_fulfillment", "stripe"] } } });
+  // The dock outlives the orders that referenced it, because the orders are
+  // deleted above and the foreign keys are SetNull. Remove the variants (they
+  // cascade from their product) and the dock itself last.
+  if (dock.productIds.length) {
+    await prisma.product.deleteMany({ where: { id: { in: dock.productIds } } });
+    dock.productIds = [];
+  }
+  if (dock.locationIds.length) {
+    await prisma.pickupLocation.deleteMany({ where: { id: { in: dock.locationIds } } });
+    dock.locationIds = [];
+  }
+  dock.id = null;
+  dock.variantId = null;
 }
 
 let seq = 0;
+
+/**
+ * The dock the goods are collected from, created once for the suite.
+ *
+ * This suite fetches quotes and books shipments, and since Phase C both of those
+ * resolve a real pickup location first: a quote is a price for a parcel leaving
+ * a named address, and a booking spends one. Before this, the address came from
+ * environment variables and the carrier was told whatever the deploy happened to
+ * hold. The dock is created here rather than inline in `makeOrder` because every
+ * order in this suite ships from the same place.
+ */
+const dock = {
+  locationIds: [] as string[],
+  productIds: [] as string[],
+  id: null as string | null,
+  variantId: null as string | null,
+};
+
+async function ensureDock() {
+  if (dock.id && dock.variantId) return { locationId: dock.id, variantId: dock.variantId };
+
+  const location = await prisma.pickupLocation.create({
+    data: {
+      code: `WS-DOCK-${Date.now()}`,
+      name: "Wholesale Verify Dock",
+      odooDatabase: "verify_db",
+      odooCompanyId: 1,
+      odooWarehouseId: 3,
+      odooLocationId: 25,
+      odooPartnerId: 145,
+      contactName: "Dock Receiver",
+      contactPhone: "+1 555 0177",
+      contactEmail: "ws-dock@example.test",
+      street1: "12 Main St",
+      city: "Toronto",
+      province: "ON",
+      postalCode: "M5H 2N2",
+      country: "CA",
+      timeZone: "America/Toronto",
+      pickupOpenTime: "09:00",
+      pickupCloseTime: "16:00",
+    },
+  });
+  dock.locationIds.push(location.id);
+
+  const product = await prisma.product.create({
+    data: {
+      name: "Wholesale Verify Pillow",
+      productCode: `WS-P-${Date.now()}`,
+      category: "Verification",
+      pickupLocationId: location.id,
+    },
+  });
+  dock.productIds.push(product.id);
+
+  const variant = await prisma.productVariant.create({
+    data: {
+      productId: product.id,
+      sku: "MV-HP-001",
+      name: "Hotel Pillow",
+      wholesalePrice: 1299,
+      suggestedRetailPrice: 4900,
+      inventory: 100,
+      isDefault: true,
+    },
+  });
+
+  dock.id = location.id;
+  dock.variantId = variant.id;
+  return { locationId: location.id, variantId: variant.id };
+}
+
 async function makeOrder(sellerId: string, total = 2598) {
   seq++;
+  const origin = await ensureDock();
   const order = await prisma.order.create({
     data: {
       sellerId,
@@ -76,7 +162,22 @@ async function makeOrder(sellerId: string, total = 2598) {
       shopifyCreatedAt: new Date(),
       shopifyUpdatedAt: new Date(),
       supplierReference: `${SHOP}#WS${seq}`,
-      items: { create: [{ name: "Hotel Pillow", sku: "MV-HP-001", quantity: 2, price: 4900, wholesalePrice: 1299, totalDiscount: 0, shopifyLineItemId: `li${seq}` }] },
+      items: {
+        create: [
+          {
+            name: "Hotel Pillow",
+            sku: "MV-HP-001",
+            quantity: 2,
+            price: 4900,
+            wholesalePrice: 1299,
+            totalDiscount: 0,
+            shopifyLineItemId: `li${seq}`,
+            // The gate reads this to find the dock. A line with no mapping is
+            // unbookable by design.
+            variantId: origin.variantId,
+          },
+        ],
+      },
       packages: { create: [{ count: 1, length: 40, width: 30, height: 20, weight: 2.5, units: "cm_kg" }] },
       wholesalePayment: { create: { sellerId, amount: total, currency: "CAD", provider: "stripe", status: "REQUIRES_PAYMENT", idempotencyKey: `ws:${seq}` } },
       fulfillmentRequest: { create: {} },

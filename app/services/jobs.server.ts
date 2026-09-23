@@ -52,6 +52,16 @@ export const JOB_KIND = {
    * Shopify is down.
    */
   SHOPIFY_FULFILLMENT_SYNC: "SHOPIFY_FULFILLMENT_SYNC",
+  /**
+   * Poll the carriers for every shipment whose turn it is.
+   *
+   * §7: "Browser refresh must not be required for tracking updates." Before
+   * this, a parcel's status advanced as often as somebody happened to open its
+   * page. It is a RECURRING job — see RECURRING_JOBS — because a sweep that only
+   * ran once would leave a parcel whose label was issued this afternoon
+   * untracked until somebody looked.
+   */
+  SHIPMENT_TRACKING_SWEEP: "SHIPMENT_TRACKING_SWEEP",
 } as const;
 
 export type JobKind = (typeof JOB_KIND)[keyof typeof JOB_KIND];
@@ -167,6 +177,100 @@ export async function enqueueJob(input: EnqueueInput) {
       sellerAccessVersion: input.sellerAccessVersion ?? null,
     },
   });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Recurring work                                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface RecurringJob {
+  kind: JobKind;
+  /** How often a fresh one is queued. Also the bucket width of its key. */
+  everyMs: number;
+  /** One line, for the owner's screen. */
+  summary: string;
+}
+
+/**
+ * The jobs that must happen on a schedule rather than in response to something.
+ *
+ * WHY THIS IS A DECLARATION AND NOT A HANDLER THAT RE-QUEUES ITSELF.
+ *
+ * The obvious way to keep a periodic job alive is for the handler to enqueue its
+ * own successor. It does not work here. `enqueueJob` treats a PENDING, RUNNING or
+ * SUCCEEDED row with the same key as already-satisfied and returns it unchanged,
+ * so a handler re-enqueuing its own key while RUNNING gets its own row back, with
+ * `runAt` untouched — and then the runner marks that row SUCCEEDED. The heartbeat
+ * stops on the first beat and the queue looks healthy.
+ *
+ * So the beat comes from OUTSIDE: the cron entry point calls `ensureRecurringJobs`
+ * before it runs anything, which queues the current bucket's job if it is not
+ * already there. Each bucket is a NEW row with a NEW key, so the "already
+ * satisfied" rule never applies to it, and a tick that arrives late still queues
+ * the bucket it is in rather than skipping it. If the app is down for an hour,
+ * the next tick queues one sweep — not twelve — because only the current bucket
+ * is ever created.
+ */
+export const RECURRING_JOBS: readonly RecurringJob[] = [
+  {
+    kind: JOB_KIND.SHIPMENT_TRACKING_SWEEP,
+    everyMs: 5 * 60 * 1000,
+    summary: "Poll carriers for shipments that are due a tracking check.",
+  },
+];
+
+/** How long a finished recurring job is kept before it is pruned. */
+const RECURRING_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Queue this tick's recurring work, if this tick has not already done so.
+ *
+ * Called by the cron entry point (app/routes/jobs.run.tsx) before it runs
+ * anything. Safe to call from anywhere and any number of times: the bucket key
+ * makes a second call in the same bucket a no-op.
+ */
+export async function ensureRecurringJobs(now: Date = new Date()): Promise<string[]> {
+  const queued: string[] = [];
+
+  for (const recurring of RECURRING_JOBS) {
+    const bucket = Math.floor(now.getTime() / recurring.everyMs);
+    const key = `recurring:${recurring.kind}:${bucket}`;
+
+    const existing = await prisma.backgroundJob.findUnique({ where: { idempotencyKey: key } });
+    if (existing) continue;
+
+    /*
+     * `maxAttempts: 1` is deliberate. A recurring job that fails is not retried
+     * by the queue — the next tick queues the next bucket regardless, and the
+     * failure is recorded on the row for a person. Retrying inside the bucket
+     * would mean the sweep and its own retry overlapping on the same shipments,
+     * and the per-shipment backoff is already doing that job properly.
+     */
+    await enqueueJob({
+      kind: recurring.kind,
+      idempotencyKey: key,
+      runAt: new Date(bucket * recurring.everyMs),
+      maxAttempts: 1,
+      payload: { recurring: true, bucket },
+    });
+    queued.push(key);
+  }
+
+  /*
+   * Housekeeping, in the same place and for the same reason: without it the
+   * queue fills with 288 finished sweep rows a day. Only rows this function
+   * created are touched, and only once they are past retention, so nothing an
+   * operator might still be reading disappears.
+   */
+  await prisma.backgroundJob.deleteMany({
+    where: {
+      idempotencyKey: { startsWith: "recurring:" },
+      status: { in: ["SUCCEEDED", "FAILED", "CANCELLED"] },
+      createdAt: { lt: new Date(now.getTime() - RECURRING_RETENTION_MS) },
+    },
+  });
+
+  return queued;
 }
 
 /** How long a claimed job may stay RUNNING before the lease is treated as dead. */

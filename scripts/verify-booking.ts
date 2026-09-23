@@ -35,7 +35,7 @@ import {
   resolveUnknownBooking,
   schedulePickupForShipment,
 } from "../app/services/shipping.server";
-import { addOrderPackage, removeOrderPackage } from "../app/services/fulfillment.server";
+import { addOrderPackage, advanceShipment, removeOrderPackage } from "../app/services/fulfillment.server";
 import { addressMateriallyDiffers } from "../app/services/addressValidation.server";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import { packingListFor, parseAddressLines, renderPackingList } from "../app/services/packingList.server";
@@ -55,6 +55,8 @@ const suffix = Date.now().toString(36).toUpperCase();
 const created = {
   sellerIds: [] as string[],
   orderIds: [] as string[],
+  locationIds: [] as string[],
+  productIds: [] as string[],
 };
 
 /* -------------------------------------------------------------------------- */
@@ -167,7 +169,74 @@ async function createSeller(label: string) {
  * be reachable at all — the job below is queued from booking, and a store with
  * no fulfillment order id has nothing to queue for.
  */
-async function createBookableOrder(sellerId: string, label: string, fulfillmentOrderId: string | null = null) {
+/**
+ * A complete pickup location, and a product whose default variant is mapped to
+ * it.
+ *
+ * PHASE C MADE THIS NECESSARY, AND THAT IS THE POINT. Booking now refuses to
+ * send a carrier to an address nobody chose, so an order that is eligible to be
+ * booked must say where its goods are collected from. The fixtures below were
+ * quietly booking against a placeholder assembled out of environment variables;
+ * they now have a real dock, and `originGateChecks` proves the gate refuses when
+ * they do not.
+ */
+async function createOrigin(label: string) {
+  const location = await prisma.pickupLocation.create({
+    data: {
+      code: `VB-DOCK-${label}-${suffix}`,
+      name: `Verify Dock ${label}`,
+      odooDatabase: "verify_db",
+      odooCompanyId: 1,
+      odooWarehouseId: 3,
+      odooLocationId: 25,
+      odooPartnerId: 145,
+      contactName: "Dock Receiver",
+      contactPhone: "+1 555 0188",
+      contactEmail: `dock-${label}-${suffix.toLowerCase()}@example.test`,
+      street1: "12 Main St",
+      city: "Toronto",
+      province: "ON",
+      postalCode: "M5H 2N2",
+      country: "CA",
+      timeZone: "America/Toronto",
+      pickupOpenTime: "09:00",
+      pickupCloseTime: "16:00",
+    },
+  });
+  created.locationIds.push(location.id);
+
+  const product = await prisma.product.create({
+    data: {
+      name: `Verify Booking Product ${label} ${suffix}`,
+      productCode: `VB-P-${label}-${suffix}`,
+      category: "Verification",
+      pickupLocationId: location.id,
+    },
+  });
+  created.productIds.push(product.id);
+
+  const variant = await prisma.productVariant.create({
+    data: {
+      productId: product.id,
+      sku: `VB-PILLOW-${label}`,
+      name: "TEST PILLOW",
+      wholesalePrice: 3000,
+      suggestedRetailPrice: 5000,
+      inventory: 50,
+      isDefault: true,
+    },
+  });
+  return { location, product, variant };
+}
+
+async function createBookableOrder(
+  sellerId: string,
+  label: string,
+  fulfillmentOrderId: string | null = null,
+  opts: { withOrigin?: boolean } = {},
+) {
+  const withOrigin = opts.withOrigin ?? true;
+  const origin = withOrigin ? await createOrigin(label) : null;
   const order = await prisma.order.create({
     data: {
       sellerId,
@@ -211,6 +280,9 @@ async function createBookableOrder(sellerId: string, label: string, fulfillmentO
             price: 5000,
             wholesalePrice: 3000,
             totalDiscount: 0,
+            // The mapping the booking gate reads. Without it the item resolves
+            // to no dock and no label can be bought for it.
+            variantId: origin?.variant.id ?? null,
           },
         ],
       },
@@ -223,6 +295,9 @@ async function createBookableOrder(sellerId: string, label: string, fulfillmentO
   const quote = await prisma.shippingQuote.create({
     data: {
       orderId: order.id,
+      // The dock this price is for. A quote that names no dock cannot be spent
+      // on a shipment, which is what the gate is for.
+      originLocationId: origin?.location.id ?? null,
       provider: "eshipper",
       carrier: "Purolator",
       serviceCode: "PUR-EXP",
@@ -252,7 +327,7 @@ async function createBookableOrder(sellerId: string, label: string, fulfillmentO
     },
   });
 
-  return { order, quote, shipment };
+  return { order, quote, shipment, origin };
 }
 
 const BOOKED_BODY = (tag: string) => ({
@@ -276,6 +351,15 @@ async function cleanup() {
     if (created.sellerIds.length) {
       await prisma.backgroundJob.deleteMany({ where: { sellerId: { in: created.sellerIds } } });
       await prisma.seller.deleteMany({ where: { id: { in: created.sellerIds } } });
+    }
+    // Variants cascade from their product; the dock is referenced by quotes with
+    // ON DELETE SET NULL and by shipments with SetNull as well, so it is removed
+    // last and only after the orders that point at it.
+    if (created.productIds.length) {
+      await prisma.product.deleteMany({ where: { id: { in: created.productIds } } });
+    }
+    if (created.locationIds.length) {
+      await prisma.pickupLocation.deleteMany({ where: { id: { in: created.locationIds } } });
     }
     // Webhook events are keyed by shop domain, not by a relation, so nothing
     // above reaches them. Every shop this suite writes is named after its
@@ -740,7 +824,16 @@ async function bookingOutcomeChecks() {
     check("...and one shipment for the order", (await prisma.shipment.count({ where: { orderId: raced.orderId } })) === 1);
   }
 
-  /* --- the Shopify sync is queued when the immediate push fails ---------- */
+  /*
+   * --- WHERE SHOPIFY IS TOLD: THE DISPATCH MILESTONE, NOT THE BOOKING ------
+   *
+   * This block used to assert the opposite — that a booking pushed to Shopify
+   * and queued a retry when the push failed. §8 changed the rule: booking buys
+   * a label, and a label is not a collected parcel, so pushing at booking told
+   * the customer their goods had shipped when nothing had been handed over. The
+   * push now happens at `handed_to_carrier` / `shipped`, and the checks below
+   * are the two halves of that: a booking pushes nothing, a dispatch pushes.
+   */
   {
     const { shipment, quote } = await createBookableOrder(seller.id, "sync", `FO-${suffix}`);
     responder = () => ({ status: 200, body: BOOKED_BODY("SYNC") });
@@ -749,24 +842,57 @@ async function bookingOutcomeChecks() {
     const job = await prisma.backgroundJob.findFirst({
       where: { kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, sellerId: seller.id },
     });
-    check("a booking whose Shopify push failed queues a retry", Boolean(job), job ? `job ${job.id} (${job.status})` : "no job");
-    check("...keyed so a second booking cannot queue a second one", Boolean(job?.idempotencyKey.includes(shipment.id)), job?.idempotencyKey ?? "(none)");
-    check("...scoped to the seller's access version", job?.sellerAccessVersion === 1, String(job?.sellerAccessVersion));
+    check("a booking queues no Shopify push", job === null, job ? `unexpected job ${job.id}` : "none");
+    const booked = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check("...and tells Shopify nothing about it", booked.shopifyFulfillmentId === null, booked.shopifyFulfillmentId ?? "(null)");
+    check("...and does not claim the customer was notified", booked.shopifyNotifiedAt === null);
+
+    /* --- the dispatch tries the push ------------------------------------- */
+    await advanceShipment(shipment.id, "handed_to_carrier", ACTOR);
+    const dispatched = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    const retry = await prisma.backgroundJob.findFirst({
+      where: { kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, payload: { path: ["shipmentId"], equals: shipment.id } },
+    });
+    check("handing the parcel over is what tries the Shopify push", dispatched.status === "SHIPPED", dispatched.status);
     check(
-      "...and the booking itself is still BOOKED, not failed",
-      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "BOOKED"
+      "...and a push that could not go through queues exactly one retry",
+      Boolean(retry),
+      retry ? `job ${retry.id} (${retry.status})` : "no job"
+    );
+    check("...keyed on the shipment, so a second dispatch cannot queue a second one", Boolean(retry?.idempotencyKey.includes(shipment.id)), retry?.idempotencyKey ?? "(none)");
+    check("...scoped to the seller's access version", retry?.sellerAccessVersion === 1, String(retry?.sellerAccessVersion));
+    check(
+      "...with Shopify's own refusal recorded against the shipment",
+      Boolean(dispatched.shopifySyncError),
+      dispatched.shopifySyncError?.slice(0, 80) ?? "(none)"
+    );
+    check("...and nothing pretending the customer was told", dispatched.shopifyNotifiedAt === null);
+
+    /* --- an event before the milestone does not push --------------------- */
+    const second = await createBookableOrder(seller.id, "premilestone", `FO-PRE-${suffix}`);
+    responder = () => ({ status: 200, body: BOOKED_BODY("PRE") });
+    await bookPreparedShipment(second.shipment.id, second.quote.id, ACTOR);
+    await advanceShipment(second.shipment.id, "packed", ACTOR);
+    const packedJob = await prisma.backgroundJob.findFirst({
+      where: { kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, payload: { path: ["shipmentId"], equals: second.shipment.id } },
+    });
+    check("packing the parcel queues nothing — packing is not dispatch", packedJob === null, packedJob ? `unexpected job ${packedJob.id}` : "none");
+    check(
+      "...and leaves the fulfillment id empty",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: second.shipment.id } })).shopifyFulfillmentId === null
     );
   }
 
-  /* --- a shipment with nothing to sync does not queue a job -------------- */
+  /* --- a dispatch with nothing to push queues nothing -------------------- */
   {
     const { shipment, quote } = await createBookableOrder(seller.id, "nosync");
     responder = () => ({ status: 200, body: BOOKED_BODY("NOSYNC") });
     await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    await advanceShipment(shipment.id, "handed_to_carrier", ACTOR);
     const job = await prisma.backgroundJob.findFirst({
       where: { kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, payload: { path: ["shipmentId"], equals: shipment.id } },
     });
-    check("a booking with no fulfillment order queues nothing", job === null, job ? `unexpected job ${job.id}` : "none");
+    check("an order with no fulfillment order queues nothing, even at dispatch", job === null, job ? `unexpected job ${job.id}` : "none");
   }
 
   restoreFetch();
@@ -923,11 +1049,134 @@ async function packingListChecks() {
   check("a malformed address does not throw", parseAddressLines("{not json").length === 0);
 }
 
+/* -------------------------------------------------------------------------- */
+/* §1 the gate: no dock, no label                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The work order is explicit: "Do not silently fall back to a global address
+ * when a mapping is missing. Show 'Pickup location required' and block booking."
+ *
+ * Everything above books against a fixture that names a dock, because that is
+ * now the only kind of order that can be booked. This group is the control: it
+ * proves the gate is real and that the refusal happens before any money moves.
+ */
+async function originGateChecks() {
+  console.log("\n-- the pickup-location gate --");
+
+  const seller = await createSeller("gate");
+
+  /* --- an order whose lines map to no dock ------------------------------- */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "gate-nodock", null, { withOrigin: false });
+    responder = () => ({ status: 200, body: BOOKED_BODY("GATE") });
+    providerCalls = [];
+
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+
+    const after = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check("booking refuses an order whose lines map to no dock", /pickup location required/i.test(message), message.slice(0, 140));
+    check("...and the shipment is left exactly where it was", after.status === "PENDING", after.status);
+    check("...and the carrier is never called", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check("...and no label time is stamped", after.labelCreatedAt === null);
+    check("...and nothing is recorded as purchased", after.providerShipmentId === null, after.providerShipmentId ?? "(null)");
+
+    const paid = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    check("...and the seller's money is untouched", paid.wholesalePaymentStatus === "SUCCEEDED", paid.wholesalePaymentStatus);
+
+    const audit = await prisma.auditLog.findFirst({
+      where: { entityType: "Shipment", entityId: shipment.id, action: { contains: "booking" } },
+      orderBy: { createdAt: "desc" },
+    });
+    check("the refusal says why, and says it without naming an address", !/1 Warehouse Way/i.test(message), message.slice(0, 60));
+    check("...and is not attributed to a person acting", audit === null, audit?.actorType ?? "(no booking audit, as expected)");
+  }
+
+  /* --- a quote that names no dock --------------------------------------- */
+  {
+    const { shipment, quote } = await createBookableOrder(seller.id, "gate-noquote");
+    await prisma.shippingQuote.update({ where: { id: quote.id }, data: { originLocationId: null } });
+    providerCalls = [];
+
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "a quote that names no dock cannot be spent on a shipment",
+      /quote/i.test(message) && /dock|origin|pickup location/i.test(message),
+      message.slice(0, 140)
+    );
+    check("...and the carrier is still never called", apiCalls().length === 0, `calls=${apiCalls().length}`);
+  }
+
+  /* --- two docks in one order ------------------------------------------- */
+  {
+    const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "gate-split");
+    if (!origin) throw new Error("fixture expected an origin");
+
+    // A second dock, and a second line that lives there. One order, two places
+    // the goods are: no single carrier call can collect it.
+    const second = await createOrigin("gate-split-2");
+    await prisma.orderItem.create({
+      data: {
+        orderId: order.id,
+        shopifyLineItemId: `line-gate-split-2-${suffix}`,
+        name: "TEST PILLOW",
+        sku: `VB-PILLOW-gate-split-2`,
+        quantity: 1,
+        price: 5000,
+        wholesalePrice: 3000,
+        totalDiscount: 0,
+        variantId: second.variant.id,
+      },
+    });
+    await prisma.shipmentItem.create({ data: { shipmentId: shipment.id, orderItemId: (await prisma.orderItem.findFirstOrThrow({ where: { orderId: order.id, variantId: second.variant.id } })).id, quantity: 1 } });
+
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "an order whose goods sit at two docks is refused, not merged",
+      /split/i.test(message) || /two|different/i.test(message),
+      message.slice(0, 160)
+    );
+    check("...and names both docks so the operator can act", /Verify Dock/i.test(message), message.slice(0, 160));
+    check("...and tells the operator what to do about it", /one shipment per dock/i.test(message), message.slice(0, 200));
+    check("the carrier is not called for a split order", apiCalls().length === 0, `calls=${apiCalls().length}`);
+
+    /*
+     * And the split must not cost the seller anything. The work order: "Do not
+     * charge the seller extra automatically because of the split." A refused
+     * booking that had already taken a second shipping charge would be exactly
+     * that, so the charge is asserted here rather than assumed.
+     */
+    const charged = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check(
+      "splitting an order does not add a second charge to the seller",
+      charged.sellerShippingCharge === 2500,
+      String(charged.sellerShippingCharge)
+    );
+  }
+}
+
 async function main() {
   await quoteInvalidationChecks();
   await quoteWithdrawalWiringChecks();
   await addressChangeChecks();
   await bookingOutcomeChecks();
+  await originGateChecks();
   await pickupChecks();
   await packingListChecks();
 

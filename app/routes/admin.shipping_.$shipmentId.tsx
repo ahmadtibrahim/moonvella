@@ -24,7 +24,14 @@ import {
 // Display-only helpers, imported from the isomorphic module: this route renders
 // them, so pulling them from shipping.server would drag server code into the
 // client bundle and fail the build.
-import { trackingLabel, pickCheapestQuote, pickFastestQuote } from "~/services/shippingLogic";
+import {
+  trackingLabel,
+  trackingDisplay,
+  trackingDisplayLabel,
+  pickCheapestQuote,
+  pickFastestQuote,
+  type TrackingDisplayStatus,
+} from "~/services/shippingLogic";
 import {
   advanceShipment,
   addOrderPackage,
@@ -52,6 +59,124 @@ function parseAddress(raw: string | null): Record<string, string> {
   }
 }
 
+/** The dock a shipment collects from, flattened for display. */
+interface OriginView {
+  code: string;
+  name: string;
+  addressLines: string[];
+  contact: string | null;
+  /** The dock's own opening hours, in the dock's own words. */
+  pickupLine: string | null;
+  instructions: string | null;
+  /** True when these are the facts frozen at quotation, not today's row. */
+  frozen: boolean;
+}
+
+function nonEmpty(values: (string | null | undefined)[]): string[] {
+  return values.map((v) => (v ?? "").trim()).filter(Boolean);
+}
+
+/**
+ * Where this parcel collects from, preferring the shipped-with facts.
+ *
+ * The snapshot wins once it exists: it is what was quoted and booked, and a dock
+ * that was edited afterwards must not retroactively rewrite the page for a
+ * parcel already on a truck. The live row answers for a shipment that has no
+ * snapshot yet. Neither being present returns null, and the caller says
+ * "Pickup location required" rather than borrowing an address — §1's rule, and
+ * the reason this replaced a card that printed MOONVELLA_SHIP_FROM_* with a
+ * "1 Warehouse Way" default under a heading that read like a fact.
+ */
+function originView(shipment: {
+  originSnapshot: unknown;
+  originLocation: {
+    code: string;
+    name: string;
+    street1: string | null;
+    street2: string | null;
+    city: string | null;
+    province: string | null;
+    postalCode: string | null;
+    country: string | null;
+    contactName: string | null;
+    contactPhone: string | null;
+    contactEmail: string | null;
+    timeZone: string | null;
+    pickupOpenTime: string | null;
+    pickupCloseTime: string | null;
+    instructions: string | null;
+  } | null;
+}): OriginView | null {
+  const snapshot = shipment.originSnapshot as {
+    code?: unknown;
+    name?: unknown;
+    address?: Record<string, unknown>;
+    contact?: Record<string, unknown>;
+    pickup?: Record<string, unknown>;
+  } | null;
+
+  if (snapshot && typeof snapshot === "object" && typeof snapshot.code === "string") {
+    const address = (snapshot.address ?? {}) as Record<string, unknown>;
+    const contact = (snapshot.contact ?? {}) as Record<string, unknown>;
+    const pickup = (snapshot.pickup ?? {}) as Record<string, unknown>;
+    const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+    const open = text(pickup.openTime);
+    const close = text(pickup.closeTime);
+    const zone = text(pickup.timeZone);
+    return {
+      code: snapshot.code,
+      name: text(snapshot.name) || snapshot.code,
+      addressLines: nonEmpty([
+        text(address.street1),
+        text(address.street2),
+        [text(address.city), text(address.province), text(address.postalCode)].filter(Boolean).join(", "),
+        text(address.country),
+      ]),
+      contact: nonEmpty([text(contact.name), text(contact.phone), text(contact.email)]).join(" · ") || null,
+      pickupLine: open && close ? `${open}–${close}${zone ? ` (${zone})` : ""}` : null,
+      instructions: text(pickup.instructions) || null,
+      frozen: true,
+    };
+  }
+
+  const live = shipment.originLocation;
+  if (!live) return null;
+  return {
+    code: live.code,
+    name: live.name,
+    addressLines: nonEmpty([
+      live.street1,
+      live.street2,
+      [live.city, live.province, live.postalCode].filter(Boolean).join(", "),
+      live.country,
+    ]),
+    contact: nonEmpty([live.contactName, live.contactPhone, live.contactEmail]).join(" · ") || null,
+    pickupLine: live.pickupOpenTime && live.pickupCloseTime ? `${live.pickupOpenTime}–${live.pickupCloseTime}${live.timeZone ? ` (${live.timeZone})` : ""}` : null,
+    instructions: live.instructions,
+    frozen: false,
+  };
+}
+
+/** Colors for the normalized tracking word, matching the shipments list. */
+const trackingDisplayColor: Record<TrackingDisplayStatus, string> = {
+  BOOKED: "#0369a1",
+  PICKED_UP: "#0369a1",
+  IN_TRANSIT: "#0369a1",
+  OUT_FOR_DELIVERY: "#b45309",
+  DELIVERED: "#059669",
+  EXCEPTION: "#dc2626",
+  CANCELLED: "#64748b",
+  RETURNED: "#b45309",
+  UNKNOWN: "#64748b",
+};
+
+/** How a parcel is meant to leave the dock, in an operator's words. */
+const PICKUP_MODE_LABEL: Record<string, string> = {
+  NEEDED: "Pickup needed",
+  REGULAR: "Regular pickup (standing collection)",
+  DROPOFF: "Drop-off at the carrier",
+};
+
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const user = await requirePermission(request, "shipping.view");
   const shipmentId = String(params.shipmentId);
@@ -60,6 +185,10 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     include: {
       items: { include: { orderItem: true } },
       trackingEvents: { orderBy: { eventAt: "desc" }, take: 50 },
+      // The dock, for the Ship from card. The shipment's own snapshot is read
+      // from a scalar column; this is the fallback for a parcel that has not
+      // been quoted or booked yet.
+      originLocation: true,
       order: {
         include: {
           seller: true,
@@ -125,6 +254,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       estimatedDelivery: shipment.estimatedDelivery,
       lastTrackingSyncAt: shipment.lastTrackingSyncAt,
       lastTrackingError: shipment.lastTrackingError,
+      trackingSyncFailures: shipment.trackingSyncFailures,
+      // Kept out of the list page's own wording: these two are what an operator
+      // reads to decide whether the Shopify push needs retrying, and they are
+      // per-shipment facts that the integration row cannot answer for.
+      shopifySyncedAt: shipment.shopifySyncedAt,
+      shopifySyncError: shipment.shopifySyncError,
+      shopifyNotifiedAt: shipment.shopifyNotifiedAt,
       returnOfShipmentId: shipment.returnOfShipmentId,
       returnReason: shipment.returnReason,
       packageCount: shipment.packageCount,
@@ -135,6 +271,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       bookingOutcomeUnknownAt: shipment.bookingOutcomeUnknownAt,
       lastBookingError: shipment.lastBookingError,
       pickupStatus: shipment.pickupStatus,
+      pickupMode: shipment.pickupMode,
       providerPickupId: shipment.providerPickupId,
       pickupScheduledFor: shipment.pickupScheduledFor,
       pickupWindow: shipment.pickupWindow,
@@ -158,6 +295,9 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       seller: { id: order.seller.id, storeName: order.seller.storeName, currency: order.seller.currency },
     },
     items,
+    // Where this parcel ships from — the dock's facts, or null when there is no
+    // mapping, which the page states in the same words the booking gate uses.
+    origin: originView(shipment),
     packages: order.packages,
     quotes,
     returnQuotes,
@@ -534,7 +674,8 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents } = data;
+  const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
   const cheapest = pickCheapestQuote(quotes);
@@ -588,15 +729,33 @@ export default function AdminShipmentDetail() {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.25rem" }}>
         <div style={card}>
           <h2 style={h2}>Ship from</h2>
-          <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
-            <div>{process.env.MOONVELLA_SHIP_FROM_NAME || "MoonVella warehouse"}</div>
-            <div>{process.env.MOONVELLA_SHIP_FROM_ADDRESS || "1 Warehouse Way"}</div>
-            <div>
-              {process.env.MOONVELLA_SHIP_FROM_CITY || "Toronto"}, {process.env.MOONVELLA_SHIP_FROM_PROVINCE || "ON"} {process.env.MOONVELLA_SHIP_FROM_POSTAL || "M5H 2N2"}
+          {/*
+            The dock, or nothing. This card used to print MOONVELLA_SHIP_FROM_*
+            with a "1 Warehouse Way" default, which meant the page and the label
+            could disagree while both looked authoritative. §1 settles it: a
+            missing mapping is stated and booking is blocked, never substituted.
+          */}
+          {origin ? (
+            <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
+              <div>
+                {origin.name} <span style={{ color: "#94a3b8" }}>({origin.code})</span>
+              </div>
+              {origin.addressLines.map((line) => (
+                <div key={line}>{line}</div>
+              ))}
+              {origin.contact ? <div>{origin.contact}</div> : null}
+              {origin.pickupLine ? <div style={{ color: "#94a3b8" }}>Dock hours {origin.pickupLine}</div> : null}
+              {origin.instructions ? <div style={{ color: "#94a3b8" }}>{origin.instructions}</div> : null}
+              <div style={{ color: "#94a3b8", marginTop: "0.3rem" }}>
+                {origin.frozen ? "Frozen when this shipment was quoted or booked." : "Live dock record — this shipment has no frozen copy yet."}
+              </div>
             </div>
-            <div>{process.env.MOONVELLA_SHIP_FROM_COUNTRY || "CA"}</div>
-            <div style={{ color: "#94a3b8" }}>{process.env.MOONVELLA_SHIP_FROM_PHONE || "no phone configured"}</div>
-          </div>
+          ) : (
+            <p style={{ fontSize: "0.8rem", color: "#b45309" }}>
+              Pickup location required. This shipment&apos;s items are not mapped to an Odoo warehouse location, so there is no
+              address to collect from and booking is blocked. Map the items&apos; origin, then requote.
+            </p>
+          )}
         </div>
         <div style={card}>
           <h2 style={h2}>Ship to</h2>
@@ -775,13 +934,37 @@ export default function AdminShipmentDetail() {
 
       <div style={card}>
         <h2 style={h2}>Tracking</h2>
+        {/*
+          Both words, because they say different things. The bold line is the
+          normalized status — one of nine, the set every screen agrees on. The
+          line beneath is the internal state, which keeps apart what the nine
+          merge (a failed delivery attempt is not a refusal). The carrier's own
+          wording is in the event table below, unchanged.
+        */}
         <p style={{ fontSize: "0.78rem", marginBottom: "0.4rem" }}>
-          {shipment.trackingNumber || "no tracking number"} · {trackingLabel(shipment.trackingStatus)}
+          <span style={{ color: trackingDisplayColor[display], fontWeight: 600 }}>{trackingDisplayLabel(display)}</span>
+          {" · "}
+          {shipment.trackingNumber || "no tracking number"} · {trackingLabel(shipment.trackingStatus)} ({shipment.status})
           {shipment.trackingUrl ? <> · <a href={shipment.trackingUrl} target="_blank" rel="noreferrer" style={{ color: "#0369a1" }}>carrier tracking</a></> : null}
         </p>
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginBottom: "0.6rem" }}>
           Last successful update: {shipment.lastTrackingSyncAt ? new Date(shipment.lastTrackingSyncAt).toLocaleString() : "never"}
+          {shipment.trackingSyncFailures > 0
+            ? ` · ${shipment.trackingSyncFailures} failed ${shipment.trackingSyncFailures === 1 ? "attempt" : "attempts"} since (the last good status above is kept)`
+            : ""}
         </p>
+        <p style={{ fontSize: "0.72rem", marginBottom: "0.4rem" }}>
+          {shipment.estimatedDelivery
+            ? `Carrier's delivery estimate: ${new Date(shipment.estimatedDelivery).toLocaleDateString()}`
+            : "No delivery estimate from the carrier. An estimate is only shown when the carrier gives one — nothing is inferred from elapsed time."}
+        </p>
+        {shipment.trackingNumber ? (
+          <p style={{ fontSize: "0.68rem", color: "#64748b", marginBottom: "0.6rem" }}>
+            {shipment.packageCount != null
+              ? `${shipment.packageCount} package${shipment.packageCount === 1 ? "" : "s"} on this label`
+              : "Package count was not recorded on this shipment."}
+          </p>
+        ) : null}
         {shipment.providerShipmentId ? (
           <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "0.6rem" }}>
             <Form method="post"><button type="submit" name="intent" value="sync_tracking" style={btn("#0369a1")}>Sync tracking</button></Form>
@@ -825,6 +1008,17 @@ export default function AdminShipmentDetail() {
           booked shipment does not prove pickup is scheduled" is only useful to
           an operator who can tell the two apart on the page in front of them.
         */}
+        {/*
+          How this parcel is meant to leave the dock, before what the provider
+          has confirmed about collecting it. §9 keeps the two apart on purpose: a
+          dock with a standing collection does not need a one-off request, and a
+          one-off request for that dock is how two drivers arrive for one carton.
+        */}
+        <p style={{ fontSize: "0.78rem", marginBottom: "0.3rem" }}>
+          {shipment.pickupMode
+            ? PICKUP_MODE_LABEL[shipment.pickupMode] ?? `Pickup mode: ${shipment.pickupMode}`
+            : "Pickup mode not recorded — this shipment predates the origin mapping, so confirm with the dock before relying on the state below."}
+        </p>
         <p style={{ fontSize: "0.78rem", marginBottom: "0.5rem", color: PICKUP_COLOR[shipment.pickupStatus ?? "NONE"] ?? "#64748b" }}>
           {PICKUP_LABEL[shipment.pickupStatus ?? "NONE"] ?? `Pickup state: ${shipment.pickupStatus}`}
           {shipment.pickupScheduledFor ? ` · ${new Date(shipment.pickupScheduledFor).toLocaleDateString()}` : ""}
@@ -955,6 +1149,25 @@ export default function AdminShipmentDetail() {
           <div>Shopify fulfillment order: {order.id ? "see order" : "—"}</div>
           <div>Shopify fulfillment id: {shipment.shopifyFulfillmentId || "not pushed"}</div>
           <div>Shopify fulfillment sync: {shopifyFulfillment.state} — {shopifyFulfillment.detail}</div>
+          {/*
+            The per-shipment answer, which the integration row cannot give. §8
+            pushes at the dispatch milestone, so "not pushed" on a booked parcel
+            is the designed state and not a fault — saying "awaiting dispatch"
+            rather than "failed" is the difference between an operator waiting
+            and an operator retrying something that must not be retried early.
+          */}
+          <div style={{ color: shipment.shopifySyncError ? "#dc2626" : "#64748b" }}>
+            {shipment.shopifyFulfillmentId
+              ? `Pushed to Shopify${shipment.shopifySyncedAt ? ` on ${new Date(shipment.shopifySyncedAt).toLocaleString()}` : ""}.`
+              : shipment.shopifySyncError
+                ? `Last push failed: ${shipment.shopifySyncError}`
+                : "Not pushed yet — the push happens when this parcel is handed to the carrier, not when the label is bought."}
+          </div>
+          {shipment.shopifyNotifiedAt ? (
+            <div style={{ color: "#94a3b8" }}>
+              Customer notified through Shopify on {new Date(shipment.shopifyNotifiedAt).toLocaleString()}. A retry does not notify again.
+            </div>
+          ) : null}
           <div style={{ color: "#94a3b8" }}>Payment, order fulfillment and parcel tracking are separate statuses.</div>
         </div>
       </div>

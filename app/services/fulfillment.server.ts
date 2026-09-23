@@ -1,6 +1,8 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
+import { isFulfillmentMilestone } from "./shippingLogic";
+import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
 
 export interface ShipmentInput {
   carrier: string;
@@ -80,10 +82,24 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
     userAgent: actor.userAgent,
   });
 
-  // Tracking is pushed through the shared Shopify fulfillmentCreate path.
+  /*
+   * A manually recorded shipment is already past the dispatch milestone: it is
+   * created with a carrier and a tracking number and marked SHIPPED, which is
+   * somebody recording a parcel that has physically gone. So this one does push,
+   * unlike a booking.
+   */
   const shopify = await syncShipmentTracking(shipment.id, actor, {
     notifyCustomer: input.notifyCustomer ?? false,
   });
+  if (!shopify.pushed && shopify.reason !== "no_fulfillment_order_id") {
+    await enqueueJob({
+      kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC,
+      idempotencyKey: jobKey(JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, order.sellerId, shipment.id),
+      sellerId: order.sellerId,
+      sellerAccessVersion: order.seller.accessVersion,
+      payload: { shipmentId: shipment.id },
+    });
+  }
 
   return { shipment, shopify };
 }
@@ -133,8 +149,33 @@ export async function advanceShipment(
     userAgent: actor.userAgent,
   });
 
-  if (event === "handed_to_carrier" || event === "shipped") {
-    await syncShipmentTracking(shipmentId, actor, { notifyCustomer: opts?.notifyCustomer ?? false });
+  /*
+   * THE DISPATCH MILESTONE. This is where Shopify is told, and nowhere earlier:
+   * a booked label is not a collected parcel, and §8 forbids presenting one as
+   * the other. `isFulfillmentMilestone` is the single definition of that moment
+   * so the two event names cannot drift apart in one place and not the other.
+   */
+  if (isFulfillmentMilestone(event)) {
+    const sync = await syncShipmentTracking(shipmentId, actor, {
+      notifyCustomer: opts?.notifyCustomer ?? false,
+    });
+    // Queued only when there is something to retry, and keyed per shipment so a
+    // second dispatch of the same parcel collapses into the same job. A
+    // successful push queues nothing — Shopify has been told, and a second
+    // fulfillmentCreate is an error rather than a no-op.
+    if (!sync.pushed && sync.reason !== "no_fulfillment_order_id") {
+      const order = await prisma.order.findUniqueOrThrow({
+        where: { id: shipment.orderId },
+        select: { sellerId: true, seller: { select: { accessVersion: true } } },
+      });
+      await enqueueJob({
+        kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC,
+        idempotencyKey: jobKey(JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, order.sellerId, shipmentId),
+        sellerId: order.sellerId,
+        sellerAccessVersion: order.seller.accessVersion,
+        payload: { shipmentId },
+      });
+    }
   }
 
   return shipment;

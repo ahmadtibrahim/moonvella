@@ -884,42 +884,42 @@ model RefundItem {
 }
 
 model Shipment {
-  id                    String                  @id @default(cuid())
-  orderId               String
-  order                 Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  shopifyFulfillmentId  String?
-  trackingNumber        String?
-  trackingUrl           String?
-  carrier               String?
-  serviceName           String?
-  serviceCode           String?
-  provider              String?
-  providerShipmentId    String?
+  id                      String                  @id @default(cuid())
+  orderId                 String
+  order                   Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  shopifyFulfillmentId    String?
+  trackingNumber          String?
+  trackingUrl             String?
+  carrier                 String?
+  serviceName             String?
+  serviceCode             String?
+  provider                String?
+  providerShipmentId      String?
   /// The provider quote id used to book, when the provider issues one. Held so a
   /// reprint or a reconciliation reads the same quote rather than re-quoting.
-  providerQuoteId       String?
-  labelUrl              String?
-  labelDocumentFormat   String?
+  providerQuoteId         String?
+  labelUrl                String?
+  labelDocumentFormat     String?
   /// The seller's fixed shipping charge allocated to THIS shipment. A split
   /// shipment carries only its own allocation; the order total is never repeated
   /// per parcel. Null when no allocation rule is configured.
-  sellerShippingCharge  Int?
+  sellerShippingCharge    Int?
   /// The carrier cost quoted when the shipment was booked.
-  quotedCarrierCost     Int?
+  quotedCarrierCost       Int?
   /// The carrier cost actually booked. Kept separate from the quote because a
   /// provider may book at a different amount than it quoted.
-  bookedCost            Int?
+  bookedCost              Int?
   /// The final amount the carrier billed, once a supplier invoice is known.
-  finalBilledCost       Int?
+  finalBilledCost         Int?
   /// Reconciliation state of the carrier cost: PENDING, RECONCILED, VARIANCE or
   /// NEEDS_RECONCILIATION. Never used to change the seller's agreed charge.
-  billingStatus         String                  @default("PENDING")
+  billingStatus           String                  @default("PENDING")
   /// eShipper's invoice number for the supplier bill this shipment belongs to.
-  providerInvoiceNumber String?
-  billingInvoices       String?
+  providerInvoiceNumber   String?
+  billingInvoices         String?
   /// Normalized tracking state for the interface, distinct from the coarse
   /// ShipmentStatus so "label created" is never reported as "shipped".
-  trackingStatus        String?
+  trackingStatus          String?
   /// When the provider was last asked to book, and what it last said.
   ///
   /// `lastBookingError` holds the provider's own refusal, redacted, so an
@@ -928,53 +928,98 @@ model Shipment {
   /// timeout — a timeout is recorded as BOOKING_UNKNOWN with its own timestamp,
   /// because "the provider said no" and "the provider said nothing" lead to
   /// different next actions.
-  bookingAttemptedAt    DateTime?
+  bookingAttemptedAt      DateTime?
   bookingOutcomeUnknownAt DateTime?
-  lastBookingError      String?
+  lastBookingError        String?
   /// The pickup, if one was arranged for this shipment. A booked shipment does
   /// NOT imply a scheduled pickup: the label is bought from the carrier and the
   /// collection is booked separately, and conflating them is how a parcel sits
   /// on a dock waiting for a truck nobody called.
   ///
   /// Values: NONE | SCHEDULED | CANCELLED | FAILED | MISSED | UNKNOWN.
-  pickupStatus          String?
-  providerPickupId      String?
-  pickupScheduledFor    DateTime?
+  pickupStatus            String?
+  /// How this parcel is meant to leave the dock: NEEDED (call a truck), REGULAR
+  /// (the dock already has a standing collection), DROPOFF (the carrier's depot
+  /// takes it). Defaulted from the origin when the shipment is booked, then held
+  /// here because the dock's arrangement can change afterwards and a parcel
+  /// already prepared must keep the answer it was prepared under.
+  ///
+  /// A booked shipment is not a collected one. This column says what was
+  /// ARRANGED; `pickupStatus` says what the provider confirmed.
+  pickupMode              String?
+  providerPickupId        String?
+  pickupScheduledFor      DateTime?
   /// The collection window as the provider confirmed it. Kept as text because
   /// carriers return windows in their own words ("09:00-17:00", "before noon"),
   /// and normalizing that into a timestamp pair would invent precision the
   /// carrier did not offer.
-  pickupWindow          String?
-  pickupConfirmation    String?
-  pickupLastError       String?
+  pickupWindow            String?
+  pickupConfirmation      String?
+  pickupLastError         String?
   /// When a cancellation was CONFIRMED, and only then: set while pickupStatus is
   /// CANCELLED and cleared the moment it is not. A pickup that the provider says
   /// still stands, or one whose cancellation nobody answered, keeps no
   /// timestamp — a column that records a confirmation must not outlive the state
   /// it confirms, or the record contradicts itself and the wrong half is
   /// believed. History lives in the audit log.
-  pickupCancelledAt     DateTime?
-  estimatedDelivery     DateTime?
-  lastTrackingSyncAt    DateTime?
-  lastTrackingError     String?
+  pickupCancelledAt       DateTime?
+  estimatedDelivery       DateTime?
+  lastTrackingSyncAt      DateTime?
+  /// When the carrier was last ASKED, whether or not it answered. The backoff
+  /// between attempts is computed from trackingSyncFailures but has to be
+  /// measured from somewhere, and lastTrackingSyncAt cannot be that place: only
+  /// a successful poll writes it, so a shipment whose very first poll failed
+  /// had no timestamp and was re-polled every sweep. Falls back to
+  /// lastTrackingSyncAt for rows written before this column existed.
+  lastTrackingAttemptAt   DateTime?
+  lastTrackingError       String?
+  /// Consecutive failed tracking polls. Drives the backoff between attempts and
+  /// is reset the moment a poll succeeds, so "this shipment has been unreachable
+  /// four times" is a fact on the row rather than a calculation over a log. A
+  /// failed poll never clears the last good status — see syncTrackingForShipment.
+  trackingSyncFailures    Int                     @default(0)
+  /// When a tracking sweep last CLAIMED this row to poll it. The claim is what
+  /// stops two sweeps polling the same parcel at once, and it is cleared when
+  /// the poll finishes, either way. A row still claimed after the lease has
+  /// expired belonged to a sweep that died, and is treated as free again.
+  ///
+  /// Deliberately NOT lastTrackingSyncAt: that column means "the carrier last
+  /// answered", and a claim is not an answer. Overloading it would make a
+  /// crashed sweep look like a successful refresh.
+  trackingPollClaimedAt   DateTime?
+  /// When the customer was last told, through Shopify, that this parcel is on
+  /// its way. Recorded so a retry, a second push or a re-run of the sweep cannot
+  /// notify twice: Shopify sends the e-mail on the call, and a duplicate
+  /// notification is not something an operator can undo.
+  shopifyNotifiedAt       DateTime?
+  /// The Shopify fulfillment this shipment created, when the push succeeded, and
+  /// when it last succeeded. Recorded on the shipment so a retry can ask "have I
+  /// already done this" without asking Shopify, which answers "already
+  /// fulfilled" by erroring rather than by being idempotent.
+  shopifySyncedAt         DateTime?
+  /// Why the last push to Shopify did not go through, in Shopify's own words.
+  /// Cleared on success. Kept per shipment rather than only on the integration
+  /// row, because "this one parcel did not reach Shopify" is a fact about the
+  /// parcel and an operator needs it on the parcel's page.
+  shopifySyncError        String?
   /// A return shipment points at the original shipment it returns.
-  returnOfShipmentId    String?
-  returnReason          String?
-  bookingIdempotencyKey String?                 @unique
-  packageCount          Int?
-  status                ShipmentStatus          @default(PENDING)
-  labelCreatedAt        DateTime?
-  packedAt              DateTime?
-  handedToCarrierAt     DateTime?
-  shippedAt             DateTime?
-  inTransitAt           DateTime?
-  deliveredAt           DateTime?
-  exceptionAt           DateTime?
-  cancelledAt           DateTime?
+  returnOfShipmentId      String?
+  returnReason            String?
+  bookingIdempotencyKey   String?                 @unique
+  packageCount            Int?
+  status                  ShipmentStatus          @default(PENDING)
+  labelCreatedAt          DateTime?
+  packedAt                DateTime?
+  handedToCarrierAt       DateTime?
+  shippedAt               DateTime?
+  inTransitAt             DateTime?
+  deliveredAt             DateTime?
+  exceptionAt             DateTime?
+  cancelledAt             DateTime?
   /// The origin this shipment collects from. A single order whose items come
   /// from two origins becomes two shipments, and this is what tells them apart.
-  originLocationId      String?
-  originLocation        PickupLocation?         @relation(fields: [originLocationId], references: [id], onDelete: SetNull)
+  originLocationId        String?
+  originLocation          PickupLocation?         @relation(fields: [originLocationId], references: [id], onDelete: SetNull)
   /// The origin address and contact AS THEY WERE when this shipment was quoted
   /// or booked.
   ///
@@ -985,16 +1030,16 @@ model Shipment {
   /// the carrier's record and the audit trail would then disagree with our own
   /// history. So the snapshot freezes the quotation-time facts, and the live
   /// row governs anything new.
-  originSnapshot        Json?
+  originSnapshot          Json?
   /// The packages as quoted or booked: type, packed L/W/H in inches, weight in
   /// pounds, count and the item quantities allocated to each. Frozen for the
   /// same reason as the origin, so a later packaging edit cannot retroactively
   /// change what was sent.
-  packageSnapshot       Json?
-  items                 ShipmentItem[]
-  trackingEvents        ShipmentTrackingEvent[]
-  createdAt             DateTime                @default(now())
-  updatedAt             DateTime                @updatedAt
+  packageSnapshot         Json?
+  items                   ShipmentItem[]
+  trackingEvents          ShipmentTrackingEvent[]
+  createdAt               DateTime                @default(now())
+  updatedAt               DateTime                @updatedAt
 
   @@index([orderId])
   @@index([trackingNumber])
@@ -1286,10 +1331,19 @@ model SellerBankAccount {
 }
 
 model ShippingQuote {
-  id                String    @id @default(cuid())
+  id                String          @id @default(cuid())
   orderId           String
-  order             Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  provider          String    @default("eshipper")
+  order             Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  /// The dock this price was asked for.
+  ///
+  /// A quote is a price for a parcel leaving a particular address, so an order
+  /// whose goods sit at two docks needs two answers — and a booking must not
+  /// spend a price that was quoted from the other one. Null only on quotes
+  /// written before origins reached this path; the booking gate treats a null
+  /// as "unknown dock" and refuses it rather than assuming the only one.
+  originLocationId  String?
+  originLocation    PickupLocation? @relation("QuoteOrigin", fields: [originLocationId], references: [id], onDelete: SetNull)
+  provider          String          @default("eshipper")
   /// The provider's own quote id, when returned. Required to book via
   /// POST /api/v2/ship/{quoteId}; null for a locally-simulated quote.
   providerQuoteId   String?
@@ -1297,14 +1351,14 @@ model ShippingQuote {
   serviceCode       String
   serviceName       String
   totalAmount       Int
-  currency          String    @default("CAD")
+  currency          String          @default("CAD")
   transitDays       Int?
   estimatedDelivery DateTime?
-  quotedAt          DateTime  @default(now())
+  quotedAt          DateTime        @default(now())
   expiresAt         DateTime?
-  selected          Boolean   @default(false)
+  selected          Boolean         @default(false)
   raw               String?
-  createdAt         DateTime  @default(now())
+  createdAt         DateTime        @default(now())
 
   @@index([orderId])
 }
@@ -1921,6 +1975,16 @@ model PickupLocation {
   /// tail-lift, appointment windows.
   accessRequirements String?
 
+  /// How parcels leave this dock by default: NEEDED (call a truck), REGULAR (a
+  /// standing collection already comes here), DROPOFF (handed in at the
+  /// carrier's depot, so no collection is involved).
+  ///
+  /// A dock with a standing collection is the case a one-off pickup request gets
+  /// wrong: the truck that already comes will take the parcel, and booking a
+  /// second collection for the same door is how two drivers arrive for one box.
+  /// The parcel records the answer it was prepared under; this is the default.
+  pickupMode String @default("NEEDED")
+
   /// The most recent Google Address Validation verdict for this address, and
   /// when it was reached. Kept on the row so a screen can say "this address has
   /// never been checked" without calling Google on every render.
@@ -1935,6 +1999,7 @@ model PickupLocation {
   products        Product[]        @relation("ProductPickupLocation")
   variants        ProductVariant[] @relation("VariantPickupLocation")
   shipmentOrigins Shipment[]
+  quotedFrom      ShippingQuote[]  @relation("QuoteOrigin")
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 

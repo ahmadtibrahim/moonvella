@@ -101,6 +101,7 @@ const ORIGIN_SELECT = {
   pickupCloseTime: true,
   instructions: true,
   accessRequirements: true,
+  pickupMode: true,
 } as const;
 
 function describe(location: OriginLocation, source: OriginSource): ResolvedOrigin {
@@ -421,6 +422,146 @@ export async function groupOrderLinesByOrigin(
     .map((group) => group.reason ?? "Pickup location required.");
 
   return { groups: list, blockers, split: list.length > 1 };
+}
+
+/**
+ * The dock a parcel is being prepared from, resolved once and handed to the
+ * quote, the booking and the pickup.
+ *
+ * WHY THIS IS ONE ANSWER AND NOT THREE LOOKUPS. Quoting, booking and collection
+ * are the same question asked at three moments: where does a truck go. Resolving
+ * them separately is how a quote ends up priced from one address and a label
+ * bought against another, and the discrepancy is invisible until a driver is
+ * sent to the wrong door. The resolution therefore returns the group as well as
+ * the location, so the caller can say which OTHER docks the shipment is mixed
+ * with rather than only that something is wrong.
+ */
+export interface ShipmentOrigin {
+  /** The single dock these lines leave from. Null when nothing usable resolved. */
+  location: OriginLocation | null;
+  /** The frozen copy written onto a shipment, so later edits cannot move it. */
+  snapshot: OriginSnapshot | null;
+  ready: boolean;
+  reason: string | null;
+  missing: string[];
+  /** Every dock named by these lines, in the order they were first seen. */
+  groups: ShipmentGroup[];
+  /** True when the lines leave from more than one dock. */
+  split: boolean;
+}
+
+/**
+ * Resolve the origin for a set of order lines.
+ *
+ * One dock or nothing. A set of lines that resolves to two docks is refused
+ * rather than assigned to either: the work order's answer to a mixed order is
+ * to split it into one shipment per origin, and a shipment that quietly shipped
+ * half its goods from the wrong address would be a worse outcome than an
+ * operator being told to split it.
+ */
+export async function resolveOriginForLines(lines: OriginOrderLine[]): Promise<ShipmentOrigin> {
+  const grouping = await groupOrderLinesByOrigin(lines);
+
+  if (grouping.groups.length === 0) {
+    return {
+      location: null,
+      snapshot: null,
+      ready: false,
+      missing: [],
+      reason:
+        "Pickup location required. This shipment has no items allocated to it, so there is " +
+        "nothing to collect and no dock to collect it from.",
+      groups: [],
+      split: false,
+    };
+  }
+
+  if (grouping.split) {
+    const named = grouping.groups
+      .map((group) =>
+        group.location
+          ? `${group.location.name} (${group.location.code})`
+          : `an unmapped item (${group.lines.map((line) => line.sku).join(", ")})`
+      )
+      .join(" and ");
+    return {
+      location: null,
+      snapshot: null,
+      ready: false,
+      missing: [],
+      reason:
+        `These items leave from ${grouping.groups.length} different docks: ${named}. ` +
+        `Split this into one shipment per dock and quote each one — a single shipment ` +
+        `collected from two addresses cannot be priced or booked honestly.`,
+      groups: grouping.groups,
+      split: true,
+    };
+  }
+
+  const group = grouping.groups[0];
+  if (!group.ready || !group.location) {
+    return {
+      location: null,
+      snapshot: null,
+      ready: false,
+      missing: group.missing,
+      reason: group.reason ?? MISSING_ORIGIN_REASON,
+      groups: grouping.groups,
+      split: false,
+    };
+  }
+
+  return {
+    location: group.location,
+    snapshot: snapshotOrigin(group.location),
+    ready: true,
+    reason: null,
+    missing: [],
+    groups: grouping.groups,
+    split: false,
+  };
+}
+
+/** The address a carrier is given, once an origin has been resolved. */
+export interface CarrierShipFrom {
+  name: string;
+  /** Street and unit in one line: carriers take a single address field. */
+  address: string;
+  city: string;
+  province: string;
+  postalCode: string;
+  country: string;
+  /**
+   * Optional, because not every address a carrier is given has them: a return
+   * destination configured as an address alone is still a destination, and
+   * inventing a phone number for it would put a wrong number on a label.
+   */
+  phone?: string | null;
+  email?: string | null;
+}
+
+/**
+ * Turn a frozen origin into the address a carrier is sent to.
+ *
+ * `street2` is joined onto `street1` rather than dropped, because at a dock with
+ * units the unit number is the difference between a collection and a wasted
+ * trip, and the carrier's request has one address line to put it on. The contact
+ * name is preferred over the location name for the same reason: the label is
+ * read by a driver looking for a person.
+ */
+export function carrierShipFrom(snapshot: OriginSnapshot): CarrierShipFrom {
+  const unit = snapshot.address.street2?.trim();
+  const street = snapshot.address.street1?.trim() ?? "";
+  return {
+    name: snapshot.contact.name?.trim() || snapshot.name,
+    address: unit ? `${street}, ${unit}` : street,
+    city: snapshot.address.city?.trim() ?? "",
+    province: snapshot.address.province?.trim() ?? "",
+    postalCode: snapshot.address.postalCode?.trim() ?? "",
+    country: snapshot.address.country?.trim() ?? "",
+    phone: snapshot.contact.phone?.trim() || null,
+    email: snapshot.contact.email?.trim() || null,
+  };
 }
 
 /**

@@ -45,6 +45,15 @@ export interface OriginLocation {
   pickupCloseTime: string | null;
   instructions: string | null;
   accessRequirements: string | null;
+  /**
+   * NEEDED | REGULAR | DROPOFF — how parcels leave this dock by default.
+   *
+   * Read here rather than only on the server because it is a fact the form has
+   * to show and the booking has to copy onto the shipment; it is deliberately
+   * NOT a required field, since a location that has never been asked the
+   * question is NEEDED and that is a usable answer.
+   */
+  pickupMode: string;
 }
 
 /**

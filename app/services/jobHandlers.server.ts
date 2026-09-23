@@ -12,7 +12,7 @@ import { JOB_KIND, PermanentJobError, type JobHandler } from "./jobs.server";
 import { runContactSyncJob } from "./odooContacts.server";
 import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
-import { syncShipmentTracking } from "./shipping.server";
+import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
 
@@ -134,6 +134,42 @@ export const jobHandlers: Record<string, JobHandler> = {
    * Shopify the order left the building, and the customer is not notified —
    * that happens when the carrier is recorded as having collected.
    */
+  /**
+   * Poll the carriers for every shipment that is due a check.
+   *
+   * Idempotent by construction: the sweep is a read-modify-write over rows whose
+   * own policy decides whether they are due, and a second run in the same minute
+   * finds every shipment either not yet due or already claimed. Re-running it
+   * cannot advance a status that the carrier has not stated — nothing in the
+   * path infers progress from the clock.
+   *
+   * A failure here is not fatal to the tick: a provider that refuses one parcel
+   * must not stop the other twenty-four from being polled, so the sweep collects
+   * errors and reports them. It throws only when the sweep itself could not run,
+   * which the runner retries.
+   */
+  [JOB_KIND.SHIPMENT_TRACKING_SWEEP]: async (job) => {
+    const flagged = await flagMissedPickups();
+    const summary = await sweepShipmentTracking();
+    return {
+      summary:
+        `Polled ${summary.polled} shipment(s): ${summary.advanced} advanced` +
+        (summary.failed ? `, ${summary.failed} failed` : "") +
+        (summary.skipped ? `, ${summary.skipped} not due` : "") +
+        (flagged.flagged ? `; flagged ${flagged.flagged} missed pickup(s)` : ""),
+      detail: {
+        bucket: (job.payload as { bucket?: unknown } | null)?.bucket ?? null,
+        considered: summary.considered,
+        polled: summary.polled,
+        advanced: summary.advanced,
+        failed: summary.failed,
+        skipped: summary.skipped,
+        errors: summary.errors,
+        missedPickups: flagged.flagged,
+      },
+    };
+  },
+
   [JOB_KIND.SHOPIFY_FULFILLMENT_SYNC]: async (job) => {
     const shipmentId = (job.payload as { shipmentId?: unknown } | null)?.shipmentId;
     if (typeof shipmentId !== "string" || !shipmentId) {

@@ -53,6 +53,10 @@ function tracking(partial: Partial<TrackingResult>): TrackingResult {
   return {
     trackingUrl: "",
     trackingDetails: [],
+  outForDelivery: false,
+  deliveryEstimate: null,
+  deliveredPackages: null,
+  totalPackages: null,
     labelGenerated: false,
     pickup: false,
     inTransit: false,

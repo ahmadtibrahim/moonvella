@@ -1,0 +1,14 @@
+-- When the carrier was last ASKED, as distinct from when it last ANSWERED.
+--
+-- The polling backoff is computed from the failure count but was enforced
+-- against `lastTrackingSyncAt`, which only a SUCCESSFUL poll writes. A
+-- shipment whose very first poll failed therefore kept failing every sweep —
+-- the backoff never engaged, because the timestamp it needed was the one
+-- thing a failing shipment does not have. `lastTrackingAttemptAt` is written
+-- on both outcomes, so the stretch applies to a run of failures whether or
+-- not the shipment has ever synced.
+--
+-- Nullable, so rows written before this migration keep behaving as they did:
+-- their attempt time is their last successful sync, which is exactly what the
+-- policy falls back to.
+ALTER TABLE "Shipment" ADD COLUMN "lastTrackingAttemptAt" TIMESTAMP(3);

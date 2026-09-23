@@ -90,11 +90,36 @@ export interface TrackingResult {
   labelGenerated: boolean;
   pickup: boolean;
   inTransit: boolean;
+  /**
+   * The parcel is on the van. A distinct signal, not a synonym for inTransit:
+   * the work order names "Out for delivery" as one of the nine statuses a
+   * shipment can be shown in, and folding it into "In transit" would lose the
+   * only stage at which a customer can still be told "today".
+   */
+  outForDelivery: boolean;
   exception: boolean;
   undelivered: boolean;
   delivered: boolean;
   returned: boolean;
   cancelled: boolean;
+  /**
+   * The delivery date the CARRIER gave, when it gave one.
+   *
+   * Null means the carrier stated no estimate, which is not the same as "no
+   * estimate exists" and must never be filled in from the service's transit
+   * days or from elapsed time — §7 forbids inferring delivery from a clock.
+   */
+  deliveryEstimate: Date | null;
+  /**
+   * How many of the shipment's parcels the carrier reports as delivered, when
+   * it reports per-parcel detail at all. Null when it does not.
+   *
+   * This is what makes a partial delivery visible instead of rounding it up to
+   * a whole one: three of four cartons arriving is a real state, and a shipment
+   * marked DELIVERED would stop the sweep from ever learning about the fourth.
+   */
+  deliveredPackages: number | null;
+  totalPackages: number | null;
 }
 
 export interface BulkTrackingResult {
@@ -853,11 +878,15 @@ export async function trackByOrderId(orderId: string): Promise<TrackingResult> {
       labelGenerated: true,
       pickup: false,
       inTransit: false,
+      outForDelivery: false,
       exception: false,
       undelivered: false,
       delivered: false,
       returned: false,
       cancelled: false,
+      deliveryEstimate: null,
+      deliveredPackages: null,
+      totalPackages: null,
     };
   }
   await requireRealMode("trackByOrderId");
@@ -875,11 +904,15 @@ export async function trackByTrackingNumber(trackingNumber: string): Promise<Tra
       labelGenerated: true,
       pickup: false,
       inTransit: false,
+      outForDelivery: false,
       exception: false,
       undelivered: false,
       delivered: false,
       returned: false,
       cancelled: false,
+      deliveryEstimate: null,
+      deliveredPackages: null,
+      totalPackages: null,
     };
   }
   await requireRealMode("trackByTrackingNumber");
@@ -896,11 +929,15 @@ export async function bulkTrack(trackingNumbers: string[]): Promise<BulkTracking
         labelGenerated: true,
         pickup: false,
         inTransit: false,
+        outForDelivery: false,
         exception: false,
         undelivered: false,
         delivered: false,
         returned: false,
         cancelled: false,
+        deliveryEstimate: null,
+        deliveredPackages: null,
+        totalPackages: null,
       })),
     };
   }
@@ -926,17 +963,33 @@ function normalizeTracking(raw: unknown): TrackingResult {
       statusText: String(de.statusText ?? de.status ?? ""),
     };
   });
+  // Only a date the carrier actually stated. A malformed one is dropped rather
+  // than turned into today: an unparsable estimate is not an estimate of now.
+  const estimateRaw = r.deliveryEstimate ?? r.estimatedDelivery ?? r.expectedDelivery ?? r.deliveryDate ?? null;
+  const estimateDate = estimateRaw ? new Date(String(estimateRaw)) : null;
+  const deliveryEstimate = estimateDate && !Number.isNaN(estimateDate.getTime()) ? estimateDate : null;
+
+  const count = (value: unknown): number | null => {
+    if (value === undefined || value === null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+  };
+
   return {
     trackingUrl: String(r.trackingUrl ?? ""),
     trackingDetails: details,
     labelGenerated: Boolean(r.labelGenerated ?? r.label_created ?? false),
     pickup: Boolean(r.pickup ?? false),
     inTransit: Boolean(r.inTransit ?? r.in_transit ?? false),
+    outForDelivery: Boolean(r.outForDelivery ?? r.out_for_delivery ?? false),
     exception: Boolean(r.exception ?? false),
     undelivered: Boolean(r.undelivered ?? false),
     delivered: Boolean(r.delivered ?? false),
     returned: Boolean(r.returned ?? false),
     cancelled: Boolean(r.cancelled ?? false),
+    deliveryEstimate,
+    deliveredPackages: count(r.deliveredPackages ?? r.delivered_packages),
+    totalPackages: count(r.totalPackages ?? r.total_packages ?? r.packageCount),
   };
 }
 

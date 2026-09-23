@@ -63,6 +63,17 @@ import {
  * that Google passed it.
  */
 
+/**
+ * The three ways a parcel leaves a dock. §9's list, and the whole list.
+ *
+ * It is per dock because that is where the fact lives: a dock with a standing
+ * collection is not asked for a one-off pickup, and a dock that hands parcels in
+ * at the carrier's counter never has a truck sent at all. The same three words
+ * are stored on the shipment when it is booked, so a dock's arrangement changing
+ * later cannot re-answer the question for a parcel already prepared.
+ */
+const PICKUP_MODES = ["NEEDED", "REGULAR", "DROPOFF"] as const;
+
 const LOCATION_SELECT = {
   id: true,
   code: true,
@@ -86,6 +97,10 @@ const LOCATION_SELECT = {
   pickupCloseTime: true,
   instructions: true,
   accessRequirements: true,
+  // Read here because missingOriginFields() takes the whole location shape and
+  // the form has to show how parcels leave this dock; a select that omitted it
+  // would make this page's verdict disagree with the booking gate's.
+  pickupMode: true,
   isActive: true,
 } as const;
 
@@ -197,6 +212,25 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
     return parsed;
   };
 
+  /**
+   * How this dock's parcels leave, refused rather than defaulted when it is not
+   * one of the three answers.
+   *
+   * A blank means the question was never asked, and the schema's own default
+   * (NEEDED — call a truck) is the safe reading of that. Anything else that is
+   * not a mode is a malformed request, and silently turning it into NEEDED would
+   * have a dock with a standing collection collecting one-off pickup requests
+   * for every parcel, which is the exact confusion this column exists to stop.
+   */
+  const readPickupMode = () => {
+    const value = text("pickupMode").toUpperCase();
+    if (!value) return "NEEDED";
+    if (!PICKUP_MODES.includes(value as (typeof PICKUP_MODES)[number])) {
+      throw new Error(`Unknown pickup mode "${value}".`);
+    }
+    return value;
+  };
+
   try {
     switch (intent) {
       case "save_location": {
@@ -221,6 +255,7 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
           timeZone: orNull("timeZone"),
           pickupOpenTime: orNull("pickupOpenTime"),
           pickupCloseTime: orNull("pickupCloseTime"),
+          pickupMode: readPickupMode(),
           instructions: orNull("instructions"),
           accessRequirements: orNull("accessRequirements"),
         };
@@ -769,6 +804,23 @@ function LocationForm({ location, canManage }: { location: LocationRow | null; c
           )}
           {field("pickupOpenTime", "Opens at", "HH:MM in the time zone above.")}
           {field("pickupCloseTime", "Closes at")}
+          <Field
+            id="loc-pickupMode"
+            label="How parcels leave this dock"
+            hint="A dock with a standing collection is never asked for a one-off pickup; a drop-off never has a truck sent. Defaults to Pickup needed."
+          >
+            <select
+              id="loc-pickupMode"
+              name="pickupMode"
+              style={input}
+              defaultValue={value("pickupMode") || "NEEDED"}
+              disabled={!canManage}
+            >
+              <option value="NEEDED">Pickup needed — call a truck per shipment</option>
+              <option value="REGULAR">Existing regular pickup — a standing collection takes it</option>
+              <option value="DROPOFF">Drop-off — handed in at the carrier&apos;s depot</option>
+            </select>
+          </Field>
           {field("instructions", "Driver instructions")}
           {field(
             "accessRequirements",
