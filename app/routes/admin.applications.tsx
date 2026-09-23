@@ -17,8 +17,14 @@ export async function loader({ request }: LoaderFunctionArgs) {
 
   const [pendingApplications, approvedCount, rejectedCount, needsInfoCount] =
     await Promise.all([
+      // A row exists for every store that has opened the application page,
+      // because the imported Shopify profile is stored on one — so `submittedAt`
+      // is what separates an application from a draft, and the queue lists
+      // applications. It is also what makes the answers below non-null when the
+      // row is rendered: the submit action writes the contact details and
+      // `submittedAt` together, and nothing else writes `submittedAt` at all.
       prisma.merchantApplication.findMany({
-        where: { status: { in: ["PENDING", "NEEDS_INFO"] } },
+        where: { status: { in: ["PENDING", "NEEDS_INFO"] }, submittedAt: { not: null } },
         orderBy: { submittedAt: "desc" },
         select: {
           id: true,

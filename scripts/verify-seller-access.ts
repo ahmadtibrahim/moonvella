@@ -59,6 +59,12 @@ const SHOP_REJECTED = `vsa-rejected-${suffix.toLowerCase()}.myshopify.com`;
 const SHOP_DEACTIVATED = `vsa-deactivated-${suffix.toLowerCase()}.myshopify.com`;
 const SHOP_BLOCKED = `vsa-blocked-${suffix.toLowerCase()}.myshopify.com`;
 const SHOPS = [SHOP_PENDING, SHOP_APPROVED, SHOP_REJECTED, SHOP_DEACTIVATED, SHOP_BLOCKED];
+/** The store of §6, which opens the page and submits nothing until check 24. */
+const SHOP_DRAFT = `vsa-draft-${suffix.toLowerCase()}.myshopify.com`;
+/** Everything this suite writes, for `cleanup()`. The draft has a seller by the
+ * end of §6, so it has to be swept like the rest — a store left behind here is
+ * visible to the suites that count the roster. */
+const ALL_SHOPS = [...SHOPS, SHOP_DRAFT];
 
 /**
  * When the claim-time fixture is due, and the clock the runner is given.
@@ -499,6 +505,141 @@ async function main() {
       applicationsLeft === SHOPS.length,
       `${applicationsLeft} application(s)`,
     );
+
+    /* ------------------------------------------------------------------ */
+    /* 6. The draft a store gets for opening the page                       */
+    /* ------------------------------------------------------------------ */
+    /*
+     * WHAT THIS IS FOR. app.moonvella.com/app/application answered every store
+     * with "Application Error", live, because the loader's first visit writes a
+     * row containing the imported Shopify profile and the row the model required
+     * — contact name, email, legal name, category — was more than the import has
+     * to give. Prisma refused the whole query before it reached the database, so
+     * the page never rendered for a store with nothing stored yet.
+     *
+     * The fix is that those four are the merchant's answers, so a row that
+     * precedes them stores NULL and `submittedAt` is what says whether there are
+     * answers at all. The checks below pin the three things that has to mean: the
+     * write succeeds, a draft is not an application the owner can act on, and a
+     * real submission is still approved with the merchant's own details.
+     */
+    // The loader's write, reproduced: the imported profile and nothing the
+    // merchant has not said. This is the exact query that threw.
+    let draftWriteError = "";
+    let draft = null;
+    try {
+      draft = await prisma.merchantApplication.upsert({
+        where: { shopDomain: SHOP_DRAFT },
+        create: {
+          shopDomain: SHOP_DRAFT,
+          storeName: "Draft Store",
+          shopifyShopId: "gid://shopify/Shop/00000000000",
+          storeOwnerEmail: "owner@draft.invalid",
+          storeContactEmail: "contact@draft.invalid",
+          addressCountryCode: "CA",
+          profileFieldSources: { storeName: "SHOPIFY" },
+          shopifyProfileJson: { name: "Draft Store" },
+          profileRefreshedAt: new Date(),
+          profileRefreshError: null,
+        },
+        update: { storeName: "Draft Store", profileRefreshedAt: new Date() },
+      });
+    } catch (error) {
+      draftWriteError = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      21,
+      "Opening the application page stores the imported profile, which is all the import has",
+      draftWriteError === "" &&
+        draft?.submittedAt === null &&
+        draft?.contactName === null &&
+        draft?.email === null,
+      draftWriteError || `submittedAt ${draft?.submittedAt}, contactName ${draft?.contactName}`,
+    );
+
+    // The loader must not fill the merchant's own answers in. The columns accept
+    // a value now, so nothing but this stops the import from putting the shop's
+    // owner name where the merchant's contact name belongs.
+    const applicationSource = readFileSync(join(routesDir, "app.application.jsx"), "utf8");
+    const importBlock = applicationSource.slice(
+      applicationSource.indexOf("if (!application?.profileRefreshedAt)"),
+      applicationSource.indexOf("const row ="),
+    );
+    check(
+      22,
+      "And it writes none of the merchant's answers, so an import cannot answer for them",
+      importBlock.length > 0 &&
+        !/contactName|legalBusinessName|productCategory/.test(importBlock),
+      importBlock.length ? "the import payload names only imported fields" : "the import block was not found",
+    );
+
+    let approveDraftError = "";
+    try {
+      await approveApplication(draft?.id ?? "", actor);
+    } catch (error) {
+      approveDraftError = error instanceof Error ? error.message : String(error);
+    }
+    const draftSeller = await prisma.seller.findUnique({ where: { shopDomain: SHOP_DRAFT } });
+    check(
+      23,
+      "A draft cannot be approved into a seller record: there is nothing to approve yet",
+      /has not submitted its application/i.test(approveDraftError) && draftSeller === null,
+      approveDraftError || "the approval succeeded",
+    );
+
+    // The positive control. The same row, submitted the way the action submits
+    // it — answers and `submittedAt` written together — must still approve, and
+    // must carry the merchant's details onto the seller rather than the shop's.
+    await prisma.merchantApplication.update({
+      where: { shopDomain: SHOP_DRAFT },
+      data: {
+        contactName: "Draft Contact",
+        email: "draft.contact@example.invalid",
+        legalBusinessName: "Draft Contact Ltd",
+        productCategory: "Other",
+        submittedAt: new Date(),
+      },
+    });
+    const approvedDraft = await approveApplication(draft?.id ?? "", actor);
+    const submittedSeller = await prisma.seller.findUnique({ where: { shopDomain: SHOP_DRAFT } });
+    check(
+      24,
+      "A submitted application still approves, with the merchant's answers on the seller",
+      approvedDraft?.application.status === "APPROVED" &&
+        submittedSeller?.contactName === "Draft Contact" &&
+        submittedSeller?.contactEmail === "draft.contact@example.invalid",
+      `${approvedDraft?.application.status} / ${submittedSeller?.contactName} / ${submittedSeller?.contactEmail}`,
+    );
+
+    // The review queue and its counters read `status`, which a draft shares with
+    // a waiting application. `submittedAt` is the only thing that separates them,
+    // so each pending query has to carry it or the owner is shown stores that
+    // have not applied.
+    const queueSources = [
+      "admin.applications.tsx",
+      "admin._index.tsx",
+      "admin.stores.tsx",
+    ].map((file) => readFileSync(join(routesDir, file), "utf8"));
+    // Only the queries that ask for PENDING are in scope. The counts of the
+    // decided states are not: a row that is APPROVED or REJECTED was submitted
+    // by definition, and a NEEDS_INFO one went through a review.
+    const pendingQueries = queueSources
+      .flatMap((source) => {
+        const lines = source.split("\n");
+        return lines
+          .map((line, index) => ({ line, index }))
+          .filter(({ line }) => /merchantApplication\.(count|findMany)/.test(line))
+          .map(({ index }) => lines.slice(index, index + 3).join("\n"));
+      })
+      .filter((query) => /"PENDING"/.test(query));
+    check(
+      25,
+      "Every pending-application query asks whether it was submitted, so no screen offers a draft for review",
+      pendingQueries.length === 4 &&
+        pendingQueries.every((query) => /submittedAt: \{ not: null \}/.test(query)),
+      `${pendingQueries.length} pending quer${pendingQueries.length === 1 ? "y" : "ies"} found, ` +
+        `${pendingQueries.filter((q) => !/submittedAt: \{ not: null \}/.test(q)).length} without the filter`,
+    );
   } finally {
     await cleanup();
   }
@@ -541,7 +682,7 @@ async function seedFixtures() {
 
 async function cleanup() {
   const sellers = await prisma.seller.findMany({
-    where: { shopDomain: { in: SHOPS } },
+    where: { shopDomain: { in: ALL_SHOPS } },
     select: { id: true },
   });
   const sellerIds = sellers.map((seller) => seller.id);
@@ -551,7 +692,7 @@ async function cleanup() {
     await prisma.seller.deleteMany({ where: { id: { in: sellerIds } } });
   }
   await prisma.backgroundJob.deleteMany({ where: { idempotencyKey: `vsa-stale-${suffix}` } });
-  await prisma.merchantApplication.deleteMany({ where: { shopDomain: { in: SHOPS } } });
+  await prisma.merchantApplication.deleteMany({ where: { shopDomain: { in: ALL_SHOPS } } });
   void STAMP;
 }
 

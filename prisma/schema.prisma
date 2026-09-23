@@ -171,15 +171,29 @@ model MerchantApplication {
   storeUrl          String?
   country           String?
   currency          String?
-  contactName       String
-  email             String
+  /// The merchant's own answers, given on submission. Nullable because a row
+  /// exists before anything is answered: opening the application page caches the
+  /// imported Shopify profile onto a row, which is what gives the page a stored
+  /// snapshot, a "last refreshed" time, and a Refresh button that means
+  /// something. Such a row is a DRAFT — imported facts and no answers — and
+  /// `submittedAt` is what says which of the two a row is.
+  ///
+  /// NULL is the only honest way to store "not answered yet". A blank string is
+  /// a value that looks like an answer: it would reach the review queue, and the
+  /// seller record an approval writes, as though the merchant had said it. This
+  /// is the same substitution the pricing rules refuse, in the same shape.
+  contactName       String?
+  email             String?
   phone             String?
   urgentPhone       String?
   /// The emergency contact's own name. The application asks whether the urgent
   /// number belongs to the person above or to somebody else, and a number
   /// without a name is not an answer to "who do we call".
   urgentContactName String?
-  legalBusinessName String
+  /// Nullable for the same reason as `contactName` above: it is the merchant's
+  /// answer, and a draft row has none. It is never derived from the store name —
+  /// a legal name is a fact about a business, not a rendering of its shop.
+  legalBusinessName String?
   /// DEPRECATED, and no longer written or rendered. It was one free-text box
   /// standing in for an address, which cannot be mapped onto Odoo's street /
   /// street2 / city / zip / state / country fields without guessing where one
@@ -216,7 +230,11 @@ model MerchantApplication {
   shopifyProfileJson  Json?             @default("{}")
   profileRefreshedAt  DateTime?
   profileRefreshError String?
-  productCategory     String
+  /// The merchant's answer, and nullable for the same reason as `contactName`
+  /// above: a draft row has none. The submission form supplies "Other" when the
+  /// merchant picks nothing from the list, which is what makes the difference
+  /// between "they answered Other" and "they have not answered".
+  productCategory     String?
   markets             String            @default("[]")
   status              ApplicationStatus @default(PENDING)
   submittedAt         DateTime?

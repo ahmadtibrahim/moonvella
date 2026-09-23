@@ -240,16 +240,21 @@ export async function loader({ request }) {
         ADDRESS_KEYS.map((k) => [k, storedSources[k] ?? "IMPORT_FAILED"]),
       ),
     },
+    // A row exists as soon as the page is opened, because the imported profile is
+    // stored on it — but the merchant's own answers are only there once they have
+    // submitted. Those come back as null on a draft and are rendered as empty
+    // fields: an input holding the string "null" would be worse than a blank one,
+    // and a select that pre-picks "Other" would claim an answer nobody gave.
     application: row
       ? {
-          contactName: row.contactName,
+          contactName: row.contactName ?? "",
           phone: row.phone ?? "",
           urgentPhone: row.urgentPhone ?? "",
           urgentContactName: row.urgentContactName ?? "",
-          email: row.email,
-          legalBusinessName: row.legalBusinessName,
+          email: row.email ?? "",
+          legalBusinessName: row.legalBusinessName ?? "",
           gstHstNumber: row.gstHstNumber ?? "",
-          productCategory: row.productCategory,
+          productCategory: row.productCategory ?? "",
           markets: safeParseArray(row.markets),
           status: row.status,
         }
@@ -587,10 +592,16 @@ export default function ApplicationPage() {
     // Prefilled from the store's own email as a convenience. It stays a field
     // the applicant can change: the person MoonVella should call about this
     // account is often not the mailbox the storefront publishes.
-    email: application?.email ?? imported.values.storeOwnerEmail ?? "",
+    //
+    // `||`, not `??`, for the two below: a draft row answers these with an empty
+    // string, and an empty answer has to fall back the same way a missing row
+    // does — otherwise a store would be shown an empty email box where a new
+    // one is offered its own store email, and a category select with a value
+    // matching no option.
+    email: application?.email || imported.values.storeOwnerEmail || "",
     legalBusinessName: application?.legalBusinessName ?? "",
     gstHstNumber: application?.gstHstNumber ?? "",
-    productCategory: application?.productCategory ?? "Bedding & Bath",
+    productCategory: application?.productCategory || "Bedding & Bath",
     markets:
       application?.markets && application.markets.length
         ? application.markets

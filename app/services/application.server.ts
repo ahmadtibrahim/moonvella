@@ -59,10 +59,28 @@ function sellerDataFromApplication(application: {
   country: string | null;
   currency: string | null;
   shopifyPlan: string | null;
-  contactName: string;
-  email: string;
+  contactName: string | null;
+  email: string | null;
   phone: string | null;
 }) {
+  /*
+   * A DRAFT IS NOT AN APPLICATION.
+   *
+   * Opening the application page writes a row holding the imported Shopify
+   * profile before the merchant has answered anything, so a row with no contact
+   * answers exists for every store that has merely looked at the page. Those
+   * columns are the merchant's own answers — `Seller.contactEmail` is who
+   * MoonVella writes to — and an approval must not manufacture them from the
+   * shop's own name or drop a null into a column that requires a value. So the
+   * refusal is here, before the seller record is written, rather than a
+   * substitution: there is nothing to approve until the merchant has said who
+   * they are.
+   */
+  if (!application.contactName || !application.email) {
+    throw new Error(
+      "This store has not submitted its application yet, so there is nothing to approve."
+    );
+  }
   return {
     storeName: application.storeName,
     shopDomain: application.shopDomain,

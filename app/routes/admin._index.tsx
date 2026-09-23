@@ -18,14 +18,19 @@ export async function loader({ request }: LoaderFunctionArgs) {
     integrations,
   ] = await Promise.all([
     prisma.seller.count(),
-    prisma.merchantApplication.count({ where: { status: "PENDING" } }),
+    // Submitted only: a draft row is written for every store that opens the
+    // application page, and counting those would report merchants waiting for a
+    // decision who have not applied.
+    prisma.merchantApplication.count({
+      where: { status: "PENDING", submittedAt: { not: null } },
+    }),
     prisma.seller.count({ where: { status: "APPROVED" } }),
     prisma.order.aggregate({
       _sum: { moonvellaTotal: true },
       _count: true,
     }),
     prisma.merchantApplication.findMany({
-      where: { status: "PENDING" },
+      where: { status: "PENDING", submittedAt: { not: null } },
       orderBy: { submittedAt: "desc" },
       take: 5,
       select: {

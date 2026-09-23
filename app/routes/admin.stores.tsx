@@ -47,7 +47,11 @@ export async function loader({ request }: LoaderFunctionArgs) {
         _count: { select: { orders: true } },
       },
     }),
-    prisma.merchantApplication.count({ where: { status: "PENDING" } }),
+    // Submitted only, for the same reason as the dashboard tile: a draft row is
+    // written for every store that opens the application page.
+    prisma.merchantApplication.count({
+      where: { status: "PENDING", submittedAt: { not: null } },
+    }),
   ]);
 
   const done = new URL(request.url).searchParams.get("done") || "";
