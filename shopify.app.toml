@@ -71,7 +71,15 @@ api_version = "2026-10"
 #   topics = [ "orders/create", "orders/updated", "orders/cancelled" ]
 
 [auth]
-redirect_urls = [ "https://app.moonvella.com/api/auth" ]
+# The callback path is derived from `authPathPrefix` in app/shopify.server.js:
+# the framework registers `${authPathPrefix}/callback`, i.e. /auth/callback.
+# This line previously read "/api/auth" — a leftover from the initial scaffold,
+# which shipped the placeholder https://example.com/api/auth and had the path
+# swapped for this host's without ever being checked against the app. No route
+# serves /api/auth (there is no app/routes/api.* file; the router answers 404
+# with "No route matches URL /api/auth"), so the OAuth callback would have been
+# rejected against this allowlist. Verified against the deployed container.
+redirect_urls = [ "https://app.moonvella.com/auth/callback" ]
 
 [build]
 include_config_on_deploy = true
