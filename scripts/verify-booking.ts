@@ -27,6 +27,7 @@
 
 import { PrismaClient } from "@prisma/client";
 import {
+  QUOTE_INVALIDATION,
   bookPreparedShipment,
   cancelPickupForShipment,
   invalidateQuotes,
@@ -34,6 +35,9 @@ import {
   resolveUnknownBooking,
   schedulePickupForShipment,
 } from "../app/services/shipping.server";
+import { addOrderPackage, removeOrderPackage } from "../app/services/fulfillment.server";
+import { addressMateriallyDiffers } from "../app/services/addressValidation.server";
+import { intakeOrder } from "../app/services/orderIntake.server";
 import { packingListFor, parseAddressLines, renderPackingList } from "../app/services/packingList.server";
 import { eshipperMode } from "../app/services/eshipper.server";
 import { JOB_KIND } from "../app/services/jobs.server";
@@ -273,6 +277,10 @@ async function cleanup() {
       await prisma.backgroundJob.deleteMany({ where: { sellerId: { in: created.sellerIds } } });
       await prisma.seller.deleteMany({ where: { id: { in: created.sellerIds } } });
     }
+    // Webhook events are keyed by shop domain, not by a relation, so nothing
+    // above reaches them. Every shop this suite writes is named after its
+    // seller label; the prefix is what makes them collectable.
+    await prisma.webhookEvent.deleteMany({ where: { shopDomain: { startsWith: "verify-booking-" } } });
   } catch (error) {
     console.error("cleanup failed:", error);
   }
@@ -327,6 +335,216 @@ async function quoteInvalidationChecks() {
     "...and the shipment is untouched by the attempt",
     (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "PENDING"
   );
+}
+
+/** One quote on an order, in the shape the rate flow stores. */
+async function giveQuote(orderId: string, label: string) {
+  return prisma.shippingQuote.create({
+    data: {
+      orderId,
+      provider: "eshipper",
+      carrier: "Purolator",
+      serviceCode: "PUR-EXP",
+      serviceName: "Purolator Express",
+      providerQuoteId: `Q-${label}-${suffix}`,
+      totalAmount: 3200,
+      currency: "CAD",
+      selected: true,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      raw: JSON.stringify({ baseCharge: 30, taxes: 2 }),
+    },
+  });
+}
+
+/**
+ * Withdrawing a quote is only worth anything if the writes that make a quote
+ * wrong actually call it. These checks go through the production entry points —
+ * the parcel helpers the admin pages call — rather than the function they end
+ * up in, because "implemented but never called" is the failure this guards.
+ */
+async function quoteWithdrawalWiringChecks() {
+  console.log("\n-- quote withdrawal is wired to the parcel helpers --");
+  const seller = await createSeller("parcel");
+  const { order } = await createBookableOrder(seller.id, "parcel");
+
+  const added = await addOrderPackage(order.id, { count: 2, length: 50, width: 40, height: 30, weight: 9 }, ACTOR);
+  check(
+    "adding a parcel withdraws the order's quotes",
+    (await prisma.shippingQuote.count({ where: { orderId: order.id } })) === 0
+  );
+  const afterAdd = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+  check(
+    "...and records the parcels as the reason",
+    afterAdd.quoteInvalidationReason === QUOTE_INVALIDATION.packagesChanged,
+    afterAdd.quoteInvalidationReason ?? "(null)"
+  );
+  const addAudit = await prisma.auditLog.findFirst({
+    where: { entityId: order.id, action: "shipping.quotes_invalidated" },
+    orderBy: { createdAt: "desc" },
+  });
+  check("...and attributes it to the person who added the parcel", addAudit?.actorId === ACTOR.actorId, addAudit?.actorId ?? "(none)");
+
+  await giveQuote(order.id, "parcel-again");
+  await removeOrderPackage(order.id, added.id, ACTOR);
+  check(
+    "removing a parcel withdraws the order's quotes too",
+    (await prisma.shippingQuote.count({ where: { orderId: order.id } })) === 0
+  );
+
+  // A withdrawn quote is gone, not merely hidden: the booking gate reads the
+  // rows, so a remembered id has nothing left to select.
+  check(
+    "the withdrawn quotes cannot be booked by remembering an id",
+    (await prisma.shippingQuote.findMany({ where: { orderId: order.id } })).length === 0
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* §6 quote withdrawal on an address change (the webhook path)                */
+/* -------------------------------------------------------------------------- */
+
+const ADDRESS_HOME = {
+  name: "Verify Customer",
+  address1: "1 Test Street",
+  address2: null,
+  city: "Toronto",
+  province: "ON",
+  zip: "M5H 2N2",
+  country_code: "CA",
+};
+
+const ADDRESS_MOVED = { ...ADDRESS_HOME, city: "Ottawa", zip: "K1A 0A6" };
+
+type IntakePayload = Parameters<typeof intakeOrder>[0]["payload"];
+
+/** When the fixture order was placed, so the two webhooks below are ordered. */
+const T0 = new Date(Date.now() - 120_000).toISOString();
+
+function webhookPayload(id: number, address: unknown, updatedAt: string): IntakePayload {
+  return {
+    id,
+    name: `#${id}`,
+    order_number: id,
+    email: "buyer@example.test",
+    currency: "CAD",
+    financial_status: "paid",
+    fulfillment_status: null,
+    created_at: T0,
+    updated_at: updatedAt,
+    customer: { first_name: "Verify", last_name: "Customer" },
+    shipping_address: address,
+    line_items: [],
+    refunds: [],
+  } as IntakePayload;
+}
+
+/**
+ * The address on an order is written by the Shopify webhook, with nobody
+ * watching. A quote is a price to a destination, so a customer who moves
+ * invalidates every quote on the order — and a webhook that merely repeats the
+ * address it already stored must invalidate nothing, or every routine update to
+ * an order would empty its quote table.
+ *
+ * The comparison is checked directly as well, because it is the decision the
+ * whole path rests on: an address that cannot be read counts as a change.
+ */
+async function addressChangeChecks() {
+  console.log("\n-- address change through the order webhook --");
+
+  check(
+    "an identical address is not a change",
+    addressMateriallyDiffers(JSON.stringify(ADDRESS_HOME), ADDRESS_HOME) === false
+  );
+  check(
+    "a re-serialised address is not a change",
+    addressMateriallyDiffers(
+      JSON.stringify({ ...ADDRESS_HOME, name: undefined, address2: undefined }),
+      { ...ADDRESS_HOME }
+    ) === false
+  );
+  check("a moved address is a change", addressMateriallyDiffers(JSON.stringify(ADDRESS_HOME), ADDRESS_MOVED) === true);
+  check(
+    "a single changed character is a change",
+    addressMateriallyDiffers(JSON.stringify(ADDRESS_HOME), { ...ADDRESS_HOME, address1: "1 Test St" }) === true
+  );
+  check("an unreadable stored address counts as a change", addressMateriallyDiffers("{not json", ADDRESS_HOME) === true);
+  check("an absent incoming address counts as a change", addressMateriallyDiffers(JSON.stringify(ADDRESS_HOME), null) === true);
+
+  const seller = await createSeller("addr");
+  const shop = seller.shopDomain;
+  const payloadId = 770000 + created.orderIds.length;
+  const order = await prisma.order.create({
+    data: {
+      sellerId: seller.id,
+      shopifyOrderId: `gid://shopify/Order/${payloadId}`,
+      shopifyOrderName: `#ADDR-${suffix}`,
+      shopifyOrderNumber: payloadId,
+      // The intake path finds an existing order by this reference, so the
+      // webhook can only be aimed at this fixture if it is built the same way
+      // the create path builds it.
+      supplierReference: `${shop}#${payloadId}`,
+      currency: "CAD",
+      subtotal: 10000,
+      totalTax: 1300,
+      totalShipping: 0,
+      totalDiscounts: 0,
+      totalPrice: 11300,
+      moonvellaSubtotal: 6000,
+      moonvellaTax: 780,
+      moonvellaShipping: 0,
+      moonvellaDiscounts: 0,
+      moonvellaTotal: 6780,
+      wholesalePaymentStatus: "SUCCEEDED",
+      shopifyCreatedAt: new Date(),
+      shopifyUpdatedAt: new Date(),
+      shippingAddress: JSON.stringify(ADDRESS_HOME),
+      customerName: "Verify Customer",
+    },
+  });
+  created.orderIds.push(order.id);
+  await giveQuote(order.id, "addr");
+
+  const T1 = new Date(Date.now() - 60_000).toISOString();
+  const T2 = new Date(Date.now() - 30_000).toISOString();
+  const home = await intakeOrder({
+    topic: "ORDERS_UPDATED",
+    shop,
+    payload: webhookPayload(payloadId, ADDRESS_HOME, T1),
+  });
+  check("a routine update is accepted", home.ok === true && !home.duplicate, JSON.stringify(home));
+  check(
+    "...and leaves the order's quotes alone",
+    (await prisma.shippingQuote.count({ where: { orderId: order.id } })) === 1
+  );
+  const afterSame = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+  check("...and records no withdrawal", afterSame.quotesInvalidatedAt === null, String(afterSame.quotesInvalidatedAt));
+
+  const moved = await intakeOrder({
+    topic: "ORDERS_UPDATED",
+    shop,
+    payload: webhookPayload(payloadId, ADDRESS_MOVED, T2),
+  });
+  check("an update that moves the address is accepted", moved.ok === true && !moved.duplicate, JSON.stringify(moved));
+  check(
+    "...and withdraws the order's quotes",
+    (await prisma.shippingQuote.count({ where: { orderId: order.id } })) === 0
+  );
+  const afterMove = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+  check(
+    "...and records the address as the reason",
+    afterMove.quoteInvalidationReason === QUOTE_INVALIDATION.addressChanged,
+    afterMove.quoteInvalidationReason ?? "(null)"
+  );
+  check("...and records when", afterMove.quotesInvalidatedAt !== null);
+  check(
+    "...and the order now carries the new address",
+    (JSON.parse(afterMove.shippingAddress ?? "{}") as { city?: string }).city === "Ottawa"
+  );
+  const moveAudit = await prisma.auditLog.findFirst({
+    where: { entityId: order.id, action: "shipping.quotes_invalidated" },
+    orderBy: { createdAt: "desc" },
+  });
+  check("...and attributes it to the webhook, not a person", moveAudit?.actorType === "WEBHOOK", moveAudit?.actorType ?? "(none)");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -707,6 +925,8 @@ async function packingListChecks() {
 
 async function main() {
   await quoteInvalidationChecks();
+  await quoteWithdrawalWiringChecks();
+  await addressChangeChecks();
   await bookingOutcomeChecks();
   await pickupChecks();
   await packingListChecks();

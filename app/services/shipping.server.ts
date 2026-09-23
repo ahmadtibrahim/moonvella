@@ -1,5 +1,5 @@
 import { prisma } from "~/db.server";
-import { recordAudit, AUDIT_ENTITY } from "./audit.server";
+import { recordAudit, AUDIT_ENTITY, type AuditActorType } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import {
   getRates,
@@ -67,6 +67,12 @@ interface Actor {
   actorName?: string | null;
   ipAddress?: string | null;
   userAgent?: string | null;
+  /**
+   * Who this is, for the audit trail. Defaults to an admin user, because that is
+   * who calls almost everything here — a webhook says so explicitly rather than
+   * being recorded as a person who was not there.
+   */
+  actorType?: AuditActorType;
 }
 
 function parseAddress(raw: string | null): Record<string, string> {
@@ -305,7 +311,7 @@ export async function invalidateQuotes(orderId: string, reason: string, actor: A
     data: { quotesInvalidatedAt: new Date(), quoteInvalidationReason: reason },
   });
   await recordAudit({
-    actorType: "ADMIN_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.quotes_invalidated",
@@ -317,6 +323,16 @@ export async function invalidateQuotes(orderId: string, reason: string, actor: A
   });
   return { removed: removed.count };
 }
+
+/**
+ * The reasons a quote stops describing its order, in one place so the wording
+ * (which the operator reads) and the call sites (which decide when) cannot
+ * drift apart.
+ */
+export const QUOTE_INVALIDATION = {
+  packagesChanged: "The order's packages changed after these quotes were requested.",
+  addressChanged: "The ship-to address changed after these quotes were requested.",
+} as const;
 
 /**
  * Take exclusive responsibility for booking one shipment.

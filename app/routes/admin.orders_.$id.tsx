@@ -13,7 +13,12 @@ import {
 } from "~/services/shipping.server";
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
-import { addManualShipment, advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
+import {
+  addManualShipment,
+  addOrderPackage,
+  advanceShipment,
+  type ShipmentAdvanceEvent,
+} from "~/services/fulfillment.server";
 import {
   acceptFulfillmentRequest,
   rejectFulfillmentRequest,
@@ -83,17 +88,19 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   try {
     if (intent === "add_package") {
-      await prisma.orderPackage.create({
-        data: {
-          orderId,
+      // Through the shared helper, which audits the change and withdraws the
+      // quotes the change invalidated.
+      await addOrderPackage(
+        orderId,
+        {
           count: Math.max(1, Number(form.get("count") || 1)),
           length: Number(form.get("length")),
           width: Number(form.get("width")),
           height: Number(form.get("height")),
           weight: Number(form.get("weight")),
-          units: "cm_kg",
         },
-      });
+        actor
+      );
     } else if (intent === "get_quotes") {
       await getQuotesForOrder(orderId, actor);
     } else if (intent === "select_quote") {
@@ -332,6 +339,15 @@ export default function AdminOrderDetail() {
         <Form method="post" style={{ marginBottom: "0.75rem" }}>
           <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")}>Get shipping quotes</button>
         </Form>
+        {/* Why the quotes are gone. "No quotes yet" and "the quotes were
+            withdrawn because the packages changed" lead to different actions,
+            and only one of them means somebody should press the button. */}
+        {order.quotesInvalidatedAt ? (
+          <p style={{ fontSize: "0.75rem", color: "#b45309", marginBottom: "0.5rem" }} role="status">
+            Earlier quotes were withdrawn on {new Date(order.quotesInvalidatedAt).toLocaleString()}:{" "}
+            {order.quoteInvalidationReason || "no reason recorded"}. Request quotes again.
+          </p>
+        ) : null}
         {order.shippingQuotes.length === 0 ? (
           <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No quotes yet.</p>
         ) : (

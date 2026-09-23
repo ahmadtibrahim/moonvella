@@ -1,6 +1,6 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
-import { syncShipmentTracking } from "./shipping.server";
+import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
 
 export interface ShipmentInput {
   carrier: string;
@@ -293,6 +293,10 @@ export async function addOrderPackage(orderId: string, input: OrderPackageInput,
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
+  // The rule lives at the write, not at each caller: a quote prices the parcels
+  // that existed when it was asked for, and this is now one of them. Every
+  // page that adds a parcel comes through here, so none of them can forget.
+  await invalidateQuotes(orderId, QUOTE_INVALIDATION.packagesChanged, actor);
   return pkg;
 }
 
@@ -311,6 +315,7 @@ export async function removeOrderPackage(orderId: string, packageId: string, act
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
+  await invalidateQuotes(orderId, QUOTE_INVALIDATION.packagesChanged, actor);
   return { deleted: true };
 }
 

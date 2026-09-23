@@ -3,6 +3,8 @@ import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import { toCm, toKg } from "./packaging.server";
+import { addressMateriallyDiffers } from "./addressValidation.server";
+import { invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
 
 interface TaxLine {
   price?: string | null;
@@ -656,6 +658,20 @@ async function handleUpdated(
   const amounts = computeAmounts(payload, built);
   let refundsCreated = 0;
 
+  /*
+   * Read before the write, so the comparison is against what the order said
+   * when it was last quoted rather than against the value this same event is
+   * about to store. A webhook that repeats an unchanged address must not
+   * withdraw anything, or every routine update would empty the quote table.
+   */
+  const beforeUpdate = await prisma.order.findUnique({
+    where: { id: order.id },
+    select: { shippingAddress: true },
+  });
+  const addressChanged =
+    Boolean(payload.shipping_address) &&
+    addressMateriallyDiffers(beforeUpdate?.shippingAddress, payload.shipping_address);
+
   await prisma.$transaction(async (tx) => {
     const incoming = new Set(built.rows.map((row) => row.shopifyLineItemId));
     for (const row of built.rows) {
@@ -718,6 +734,28 @@ async function handleUpdated(
     },
     prisma as never
   );
+
+  /*
+   * A quote prices the parcels AND the destination that existed when it was
+   * asked for. If the customer's address changed, every quote on the order is a
+   * price to somewhere else, so they are withdrawn — and the withdrawal is
+   * recorded on the order, where the operator who wonders where the quotes went
+   * is already looking.
+   *
+   * After the transaction rather than inside it, deliberately: this is the same
+   * function the admin pages call, so there is one definition of what
+   * withdrawing a quote means. Folding it into the transaction would mean a
+   * second copy of that write, and the failure it guards against — a stale
+   * quote surviving a crash in a sub-second window — is recoverable by
+   * re-quoting, unlike a second definition that silently drifts.
+   */
+  if (addressChanged) {
+    await invalidateQuotes(order.id, QUOTE_INVALIDATION.addressChanged, {
+      actorId: shop,
+      actorName: shop,
+      actorType: "WEBHOOK",
+    });
+  }
 
   await finishEvent(eventId, "SUCCESS");
   return { ok: true, orderId: order.id, updated: true, moonvellaItems: built.rows.length, refunds: refundsCreated };

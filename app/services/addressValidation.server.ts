@@ -129,6 +129,56 @@ export function addressInputHash(address: StructuredAddress): string {
   return createHash("sha256").update(material).digest("hex");
 }
 
+/**
+ * Read an address stored in this app's own shipping-address column — the shape
+ * a Shopify order payload arrives in — as a StructuredAddress.
+ *
+ * It exists so that "did the address materially change?" is answered by
+ * `addressInputHash` rather than by comparing JSON strings, which would call
+ * any reordering or reformatting a change and any real change a change alike.
+ * The field names differ because Shopify's are its own; the mapping is the only
+ * place that translation happens.
+ */
+export function structuredFromStoredAddress(raw: string | null | undefined): StructuredAddress | null {
+  if (!raw) return null;
+  let parsed: Record<string, string>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, string>;
+  } catch {
+    return null;
+  }
+  return {
+    street1: parsed.address1 || parsed.address || "",
+    street2: parsed.address2 || null,
+    city: parsed.city || "",
+    province: parsed.province || parsed.provinceCode || "",
+    postalCode: parsed.zip || parsed.postalCode || "",
+    country: parsed.country || parsed.countryCode || "",
+  };
+}
+
+/**
+ * The same reading, for an address that has not been stored yet. A webhook
+ * carries the object; this app stores the string.
+ */
+export function structuredFromShopifyAddress(value: unknown): StructuredAddress | null {
+  if (!value || typeof value !== "object") return null;
+  return structuredFromStoredAddress(JSON.stringify(value));
+}
+
+/**
+ * Whether an incoming address differs from the stored one in any way that would
+ * change where a parcel goes. Anything unknown counts as a change: a comparison
+ * that cannot be made must not be reported as "no change", because the cost of
+ * being wrong is booking a label to the old address.
+ */
+export function addressMateriallyDiffers(stored: string | null | undefined, incoming: unknown): boolean {
+  const before = structuredFromStoredAddress(stored);
+  const after = structuredFromShopifyAddress(incoming);
+  if (!before || !after) return true;
+  return addressInputHash(before) !== addressInputHash(after);
+}
+
 /** Which required fields are absent. An incomplete address is not worth calling about. */
 export function missingAddressFields(address: StructuredAddress): string[] {
   const missing: string[] = [];

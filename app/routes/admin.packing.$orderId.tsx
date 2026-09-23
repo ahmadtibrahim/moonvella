@@ -12,6 +12,7 @@ import {
   addOrderPackage,
   removeOrderPackage,
 } from "~/services/fulfillment.server";
+import { invalidateQuotes, QUOTE_INVALIDATION } from "~/services/shipping.server";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   await requirePermission(request, "orders.view");
@@ -147,6 +148,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
         ipAddress: ip,
         userAgent,
       });
+      // The one parcel write that does not go through addOrderPackage, because
+      // it inserts several rows at once. Same rule, same reason: the quotes on
+      // this order now price a different set of parcels.
+      await invalidateQuotes(orderId, QUOTE_INVALIDATION.packagesChanged, actor);
     } else if (intent === "create_shipment") {
       const allocations: { orderItemId: string; quantity: number }[] = [];
       for (const [key, value] of form.entries()) {

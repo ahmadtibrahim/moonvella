@@ -3,7 +3,6 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { toCm, toKg } from "~/services/packaging.server";
-import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 import {
   getQuotesForOrder,
   selectQuote,
@@ -26,7 +25,12 @@ import {
 // them, so pulling them from shipping.server would drag server code into the
 // client bundle and fail the build.
 import { trackingLabel, pickCheapestQuote, pickFastestQuote } from "~/services/shippingLogic";
-import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
+import {
+  advanceShipment,
+  addOrderPackage,
+  removeOrderPackage,
+  type ShipmentAdvanceEvent,
+} from "~/services/fulfillment.server";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 
@@ -147,6 +151,8 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       moonvellaShipping: order.moonvellaShipping,
       customerName: order.customerName,
       customerEmail: order.customerEmail,
+      quotesInvalidatedAt: order.quotesInvalidatedAt,
+      quoteInvalidationReason: order.quoteInvalidationReason,
       shipTo: parseAddress(order.shippingAddress),
       billingAddress: parseAddress(order.billingAddress),
       seller: { id: order.seller.id, storeName: order.seller.storeName, currency: order.seller.currency },
@@ -199,33 +205,22 @@ export async function action({ request, params }: ActionFunctionArgs) {
         throw new Error("Length, width and height must all be greater than zero.");
       }
       if (!(weight > 0)) throw new Error("Gross shipping weight must be greater than zero.");
-      await prisma.orderPackage.create({
-        data: {
-          orderId,
+      // Written through the shared helper rather than here, so the audit row and
+      // the quote withdrawal travel with the write instead of depending on this
+      // page remembering both.
+      await addOrderPackage(
+        orderId,
+        {
           count: Math.max(1, Math.floor(Number(form.get("count") || 1))),
           length: Number(toCm(length, dimensionUnit).toFixed(2)),
           width: Number(toCm(width, dimensionUnit).toFixed(2)),
           height: Number(toCm(height, dimensionUnit).toFixed(2)),
           weight: Number(toKg(weight, weightUnit).toFixed(3)),
-          units: "cm_kg",
         },
-      });
-      await recordAudit({
-        actorType: "ADMIN_USER",
-        actorId: actor.actorId,
-        actorName: actor.actorName,
-        action: "order.package_added",
-        entityType: AUDIT_ENTITY.ORDER,
-        entityId: orderId,
-        afterData: { dimensionUnit, weightUnit },
-        ipAddress: ip,
-        userAgent: actor.userAgent,
-      });
+        actor
+      );
     } else if (intent === "remove_package") {
-      const packageId = String(form.get("packageId"));
-      const pkg = await prisma.orderPackage.findUnique({ where: { id: packageId } });
-      if (!pkg || pkg.orderId !== orderId) throw new Error("Package not found for this order.");
-      await prisma.orderPackage.delete({ where: { id: packageId } });
+      await removeOrderPackage(orderId, String(form.get("packageId")), actor);
     } else if (intent === "get_quotes") {
       await getQuotesForOrder(orderId, actor);
     } else if (intent === "select_quote") {
@@ -679,6 +674,16 @@ export default function AdminShipmentDetail() {
         <Form method="post" style={{ marginBottom: "0.6rem" }}>
           <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")} disabled={packages.length === 0}>Get quotes</button>
         </Form>
+        {/* Why the quotes are gone, in the place the operator is standing when
+            they ask. Recorded on the order at the moment they were withdrawn,
+            because "no quotes yet" and "your quotes were withdrawn because the
+            packages changed" call for different next actions. */}
+        {order.quotesInvalidatedAt ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginBottom: "0.5rem" }} role="status">
+            Earlier quotes were withdrawn on {new Date(order.quotesInvalidatedAt).toLocaleString()}:{" "}
+            {order.quoteInvalidationReason || "no reason recorded"}. Request quotes again.
+          </p>
+        ) : null}
         {quotes.length === 0 ? (
           <p style={{ fontSize: "0.78rem", color: "#64748b" }}>No quotes yet.</p>
         ) : (
