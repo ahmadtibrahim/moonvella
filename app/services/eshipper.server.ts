@@ -556,23 +556,97 @@ export async function testEshipperAuthentication(): Promise<EshipperAuthTest> {
   }
 }
 
-async function eshipperFetch(method: string, path: string, body?: unknown) {
+/**
+ * A call that never came back.
+ *
+ * SEPARATE FROM A REFUSAL, and the distinction is the whole point: a refusal
+ * means nothing was purchased and a retry is safe, while a timeout means the
+ * provider may have acted on a request we never saw the answer to. Only this
+ * class leads to a booking being marked unresolved, so it must never be thrown
+ * for a response the provider actually sent — a 500 with a body is a refusal,
+ * however unhelpful.
+ */
+export class ProviderTimeoutError extends Error {
+  readonly timeout = true;
+  constructor(operation: string, ms: number, cause?: unknown) {
+    super(
+      `eShipper ${operation} did not answer within ${Math.round(ms / 1000)}s. ` +
+        `Whether the request took effect is unknown.`
+    );
+    this.name = "ProviderTimeoutError";
+    this.cause = cause;
+  }
+}
+
+/**
+ * How long any single provider call may take.
+ *
+ * Deliberately shorter than the platform's own request timeout, so a slow
+ * provider produces our answer ("we do not know") rather than a killed request
+ * whose outcome nobody recorded. Thirty seconds is generous for a JSON call and
+ * still short enough that an operator is not left watching a spinner.
+ */
+const PROVIDER_TIMEOUT_MS = Number(process.env.ESHIPPER_TIMEOUT_MS || 30_000);
+
+export function isProviderTimeout(error: unknown): boolean {
+  return (error as { timeout?: boolean } | null)?.timeout === true;
+}
+
+/**
+ * One provider call.
+ *
+ * `operation` names the call in a timeout message, because "did not answer" is
+ * useless without saying what was being asked. A 401 is retried once with a
+ * fresh token; a TIMEOUT IS NOT RETRIED — re-issuing a request that may have
+ * been received is exactly the second purchase this file exists to avoid.
+ */
+async function eshipperFetch(method: string, path: string, body?: unknown, operation = path) {
   const { baseUrl } = await eshipperConfig();
-  const doFetch = async () =>
-    fetch(`${baseUrl}${path}`, {
-      method,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${await getToken()}`,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  let res = await doFetch();
+  const attempt = async (): Promise<Response> => {
+    // One signal per attempt, kept in scope so a rejection can be attributed:
+    // "the provider did not answer" and "the request never left" look identical
+    // from a bare catch, and they mean opposite things about whether a label
+    // might exist. Fresh per attempt so the token refresh below gets its own
+    // full allowance rather than whatever was left of the first one.
+    const signal = AbortSignal.timeout(PROVIDER_TIMEOUT_MS);
+    try {
+      return await fetch(`${baseUrl}${path}`, {
+        method,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${await getToken()}`,
+        },
+        body: body ? JSON.stringify(body) : undefined,
+        signal,
+      });
+    } catch (error) {
+      if (signal.aborted || (error as { name?: string } | null)?.name === "TimeoutError") {
+        throw new ProviderTimeoutError(operation, PROVIDER_TIMEOUT_MS, error);
+      }
+      /*
+       * Not a timeout: DNS, a refused connection, TLS. The request never
+       * reached the provider, so nothing can have been purchased and this is an
+       * ordinary failure the caller may retry. Wrapping it as a timeout would
+       * turn every network blip into an unknown booking that has to be
+       * reconciled by hand — and an alarm that fires when nothing is wrong is
+       * how the real one gets ignored.
+       */
+      throw error;
+    }
+  };
+  let res = await attempt();
   if (res.status === 401) {
     await getToken(true);
-    res = await doFetch();
+    res = await attempt();
   }
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await res.text();
+  } catch {
+    // The status line arrived but the body did not: the provider answered, so
+    // this is a refusal whose reason is missing rather than an unknown outcome.
+    throw new Error(`eShipper ${operation} answered ${res.status} but its body could not be read.`);
+  }
   // Redacted, not raw: this message can be persisted as an integration detail.
   if (!res.ok) throw new Error(`eShipper error ${res.status}: ${redactSecrets(text)}`);
   if (!text) return {};
@@ -674,10 +748,17 @@ export async function bookShipment(input: {
       "This quote has no eShipper quote id. Re-request quotes so the booking can reference the provider quote."
     );
   }
-  const raw = await eshipperFetch("POST", `/api/v2/ship/${encodeURIComponent(input.quote.providerQuoteId)}`, {
-    ...input.rateRequest,
-    serviceCode: input.quote.serviceCode,
-  }) as Record<string, unknown>;
+  const raw = await eshipperFetch(
+    "POST",
+    `/api/v2/ship/${encodeURIComponent(input.quote.providerQuoteId)}`,
+    {
+      ...input.rateRequest,
+      serviceCode: input.quote.serviceCode,
+    },
+    // Named, because this is the one call whose timeout means "you may own a
+    // label you cannot see" rather than "nothing happened".
+    "bookShipment"
+  ) as Record<string, unknown>;
   return {
     providerShipmentId: String(raw.shipmentId ?? raw.orderId ?? raw.id ?? ""),
     carrier: String(raw.carrier ?? input.quote.carrier),
@@ -708,10 +789,18 @@ export async function updateShipment(data: Record<string, unknown>): Promise<Boo
   };
 }
 
+/**
+ * Ask the provider what it holds under this id.
+ *
+ * Used to resolve a booking whose call never returned: if the provider has a
+ * shipment for the reference we sent, the booking exists and is adopted rather
+ * than repeated. `id` is the provider's quote id when that is all we have — the
+ * only reference the provider was given before the call went quiet.
+ */
 export async function getShipment(orderId: string): Promise<BookingResult | null> {
   if (!(await eshipperConfigured())) return null;
   await requireRealMode("getShipment");
-  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}`) as Record<string, unknown>;
+  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}`, undefined, "getShipment") as Record<string, unknown>;
   if (!raw || Object.keys(raw).length === 0) return null;
   return {
     providerShipmentId: String(raw.shipmentId ?? raw.id ?? ""),

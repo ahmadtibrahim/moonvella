@@ -373,6 +373,26 @@ const CHECKS = [
     file: "scripts/verify-origins.ts",
     requires: [],
   },
+  // Phase B of the shipping work: choosing a quote, booking, the pickup that is
+  // not implied by it, and the packing list.
+  //
+  // The checks that matter most are the two failure states booking used to
+  // share. A provider that REFUSED must leave a retryable shipment; a provider
+  // that never ANSWERED must leave one nobody retries, because a second attempt
+  // is how an order gets two labels. Both are exercised here, along with the
+  // double-click race, by stubbing `fetch` — the stub answers authentication
+  // and REFUSES any host that is not the configured eShipper base URL, so the
+  // suite proves the requests this code builds and nothing about eShipper, and
+  // cannot book, cancel or charge anything. No Shopify or Odoo call is made.
+  //
+  // It reads the provider credential and writes no credentials of its own, so
+  // it has no ordering constraint against verify-credentials.
+  {
+    name: "booking",
+    kind: "ts",
+    file: "scripts/verify-booking.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

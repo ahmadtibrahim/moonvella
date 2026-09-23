@@ -10,7 +10,27 @@ import { syncTrackingForShipment, voidShipment } from "~/services/shipping.serve
 import { trackingLabel } from "~/services/shippingLogic";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
 
-const STATUSES = ["PENDING", "SHIPPED", "DELIVERED", "EXCEPTION", "CANCELLED"] as const;
+/**
+ * Every state a shipment can be in, in the order an operator meets them.
+ *
+ * The booking states sit between PENDING and SHIPPED because that is where they
+ * happen. They are separate entries and not folded into EXCEPTION because each
+ * one asks for something different: BOOKING is wait, BOOKING_FAILED is retry,
+ * BOOKING_UNKNOWN is "find out before touching it". A single "problem" bucket
+ * would offer the same button to all three, and for one of them it is wrong.
+ */
+const STATUSES = [
+  "PENDING",
+  "BOOKING",
+  "BOOKING_FAILED",
+  "BOOKING_UNKNOWN",
+  "BOOKED",
+  "CANCELLING",
+  "SHIPPED",
+  "DELIVERED",
+  "EXCEPTION",
+  "CANCELLED",
+] as const;
 const PAGE_SIZE = 25;
 
 const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
@@ -106,7 +126,25 @@ export async function loader({ request }: LoaderFunctionArgs) {
     prisma.shipment.count({ where }),
     prisma.shipment.count({ where: { ...where, status: "DELIVERED" } }),
     prisma.shipment.count({ where: { ...where, status: "PENDING" } }),
-    prisma.shipment.count({ where: { ...where, status: "EXCEPTION" } }),
+    /*
+     * What needs a person, not just what is failing.
+     *
+     * A failed booking and a booking nobody can account for are both things
+     * somebody has to act on, and neither is an EXCEPTION — the states are kept
+     * apart precisely so they are not buried in the same count as a carrier
+     * exception. A failed pickup belongs here too: the shipment is fine but
+     * nobody is coming to collect it.
+     */
+    prisma.shipment.count({
+      where: {
+        ...where,
+        OR: [
+          { status: "EXCEPTION" },
+          { status: { in: ["BOOKING_FAILED", "BOOKING_UNKNOWN"] } },
+          { pickupStatus: "FAILED" },
+        ],
+      },
+    }),
     prisma.seller.findMany({ select: { id: true, storeName: true }, orderBy: { storeName: "asc" } }),
     prisma.order.count({ where: { wholesalePaymentStatus: "SUCCEEDED", fulfillmentStatus: { in: ["PENDING", "PROCESSING", "PARTIAL"] } } }),
   ]);
@@ -164,6 +202,11 @@ const smallBtn = (color: string): React.CSSProperties => ({ padding: "0.2rem 0.4
 
 const statusColor: Record<string, string> = {
   PENDING: "#b45309",
+  BOOKING: "#0369a1",
+  BOOKING_FAILED: "#dc2626",
+  BOOKING_UNKNOWN: "#b45309",
+  BOOKED: "#059669",
+  CANCELLING: "#64748b",
   SHIPPED: "#0369a1",
   DELIVERED: "#059669",
   EXCEPTION: "#dc2626",
@@ -205,7 +248,7 @@ export default function AdminShipping() {
           { label: "Total shipments", value: total, color: "#082a4a" },
           { label: "Awaiting booking", value: pending, color: "#b45309" },
           { label: "Delivered", value: delivered, color: "#059669" },
-          { label: "Exceptions", value: exceptions, color: "#dc2626" },
+          { label: "Needs attention", value: exceptions, color: "#dc2626" },
         ].map((c) => (
           <div key={c.label} style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1rem" }}>
             <div style={{ fontSize: "0.72rem", color: "#64748b" }}>{c.label}</div>
@@ -350,7 +393,16 @@ export default function AdminShipping() {
                     <td style={td}>
                       <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
                         <Link to={`/admin/shipping/${s.id}`} style={{ ...smallBtn("#082a4a"), textDecoration: "none" }}>Open</Link>
-                        {s.status === "PENDING" && s.providerShipmentId ? (
+                        {/*
+                          Keyed on the provider shipment id, which is what these
+                          two actions actually need, rather than on PENDING.
+                          Before bookings landed on BOOKED, "PENDING with a
+                          provider id" was the booked-not-yet-shipped state; now
+                          that state has a name of its own, and leaving the old
+                          test here would hide Sync and Cancel on every booked
+                          shipment.
+                        */}
+                        {s.providerShipmentId && ["BOOKED", "SHIPPED", "EXCEPTION", "CANCELLING"].includes(s.status) ? (
                           <>
                             <Form method="post">
                               <input type="hidden" name="intent" value="sync_tracking" />
@@ -364,7 +416,7 @@ export default function AdminShipping() {
                             </Form>
                           </>
                         ) : null}
-                        {s.status === "SHIPPED" || s.status === "EXCEPTION" ? (
+                        {s.status === "BOOKED" || s.status === "SHIPPED" || s.status === "EXCEPTION" ? (
                           <Form method="post" style={{ display: "flex", gap: "0.2rem", alignItems: "center" }}>
                             <input type="hidden" name="intent" value="advance_shipment" />
                             <input type="hidden" name="shipmentId" value={s.id} />

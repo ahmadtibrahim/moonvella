@@ -8,6 +8,8 @@ import {
   getQuotesForOrder,
   selectQuote,
   bookPreparedShipment,
+  reconcileBookingOutcome,
+  resolveUnknownBooking,
   getShipmentLabel,
   getShipmentOrderDetails,
   getShipmentCustomsInvoice,
@@ -47,7 +49,7 @@ function parseAddress(raw: string | null): Record<string, string> {
 }
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requirePermission(request, "shipping.view");
+  const user = await requirePermission(request, "shipping.view");
   const shipmentId = String(params.shipmentId);
   const shipment = await prisma.shipment.findUnique({
     where: { id: shipmentId },
@@ -125,6 +127,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       createdAt: shipment.createdAt,
       labelCreatedAt: shipment.labelCreatedAt,
       shopifyFulfillmentId: shipment.shopifyFulfillmentId,
+      bookingAttemptedAt: shipment.bookingAttemptedAt,
+      bookingOutcomeUnknownAt: shipment.bookingOutcomeUnknownAt,
+      lastBookingError: shipment.lastBookingError,
+      pickupStatus: shipment.pickupStatus,
+      providerPickupId: shipment.providerPickupId,
+      pickupScheduledFor: shipment.pickupScheduledFor,
+      pickupWindow: shipment.pickupWindow,
+      pickupConfirmation: shipment.pickupConfirmation,
+      pickupLastError: shipment.pickupLastError,
     },
     order: {
       id: order.id,
@@ -154,6 +165,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     },
     shopifyFulfillment: { state: shopifyFulfillment.status, detail: shopifyFulfillment.detail },
     trackingEvents: shipment.trackingEvents,
+    // Deciding that a booking which timed out did not happen is a judgement
+    // about money and about whether a second label may be bought. It is not a
+    // shipping-management permission, so the control is shown only to an owner
+    // and the action re-checks the role rather than trusting this flag.
+    isOwner: user.role === "OWNER",
   };
 }
 
@@ -216,6 +232,31 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await selectQuote(orderId, String(form.get("quoteId")), actor);
     } else if (intent === "book_shipment") {
       await bookPreparedShipment(shipmentId, String(form.get("quoteId") || "") || undefined, actor);
+    } else if (intent === "reconcile_booking") {
+      const outcome = await reconcileBookingOutcome(shipmentId, actor);
+      return redirect(`${back}?notice=${outcome.adopted ? "booking-recovered" : "booking-not-found"}`);
+    } else if (intent === "resolve_unknown_booking") {
+      // Re-checked here, not just hidden in the page: a form can be posted by
+      // anyone who can reach the route, and this is the one control that can
+      // put a possibly-purchased label back on the bookable list.
+      if (user.role !== "OWNER") {
+        throw new Error("Only an owner can record the outcome of an unknown booking.");
+      }
+      const decision = String(form.get("decision") || "");
+      if (decision !== "nothing_purchased" && decision !== "label_exists") {
+        throw new Error("Choose what was found before recording the outcome.");
+      }
+      await resolveUnknownBooking(
+        shipmentId,
+        decision,
+        {
+          reason: String(form.get("reason") || ""),
+          providerShipmentId: String(form.get("providerShipmentId") || "") || undefined,
+          trackingNumber: String(form.get("trackingNumber") || "") || undefined,
+        },
+        actor
+      );
+      return redirect(`${back}?notice=booking-resolved`);
     } else if (intent === "get_label") {
       const label = await getShipmentLabel(shipmentId, actor);
       if (!label.labelUrl) throw new Error("The provider did not return a label URL.");
@@ -297,12 +338,202 @@ const h2: React.CSSProperties = { fontSize: "0.95rem", fontWeight: 600, color: "
 const input: React.CSSProperties = { padding: "0.4rem 0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.78rem", boxSizing: "border-box" };
 const label: React.CSSProperties = { fontSize: "0.68rem", color: "#64748b", display: "block" };
 const btn = (color: string): React.CSSProperties => ({ padding: "0.4rem 0.75rem", border: `1px solid ${color}`, borderRadius: 6, background: "white", color, fontSize: "0.72rem", fontWeight: 600, cursor: "pointer" });
+/**
+ * Pickup states, in the operator's words.
+ *
+ * Absent means NONE rather than unknown: a shipment that has never had a pickup
+ * is a fact, and saying so is what stops a booking being read as one. UNKNOWN is
+ * reserved for a provider that did not answer, where nobody knows whether a
+ * truck is coming — the one case that needs someone to go and look.
+ */
+const PICKUP_LABEL: Record<string, string> = {
+  NONE: "No pickup has been requested for this shipment.",
+  SCHEDULED: "A pickup is scheduled with the carrier.",
+  CANCELLED: "The pickup was cancelled.",
+  FAILED: "The last pickup request failed — the shipment itself is unaffected, so retry the pickup.",
+  MISSED: "The carrier did not collect as scheduled.",
+  UNKNOWN: "The pickup's status could not be confirmed — check with the carrier before assuming anything.",
+};
+
+const PICKUP_COLOR: Record<string, string> = {
+  NONE: "#b45309",
+  SCHEDULED: "#059669",
+  CANCELLED: "#64748b",
+  FAILED: "#dc2626",
+  MISSED: "#dc2626",
+  UNKNOWN: "#b45309",
+};
+
 const th: React.CSSProperties = { padding: "0.4rem", fontSize: "0.68rem", color: "#64748b", textAlign: "left" };
 const td: React.CSSProperties = { padding: "0.4rem", fontSize: "0.78rem" };
 
 function money(cents: number | null | undefined, currency = "CAD") {
   if (cents == null) return "—";
   return `${(cents / 100).toFixed(2)} ${currency}`;
+}
+
+/**
+ * The booking state machine, rendered.
+ *
+ * One panel rather than a status field somewhere and a button somewhere else,
+ * because the states are not interchangeable and the action for each is
+ * different: BOOKING is "wait", BOOKING_FAILED is "retry", BOOKING_UNKNOWN is
+ * "find out first", BOOKED is "print the label". A single Book button shown
+ * against all of them would offer a re-purchase to two states where that is
+ * exactly the wrong thing to do.
+ */
+interface ProcessProps {
+  shipment: {
+    status: string;
+    providerShipmentId: string | null;
+    carrier: string | null;
+    serviceName: string | null;
+    trackingNumber: string | null;
+    labelUrl: string | null;
+    bookingAttemptedAt: string | Date | null;
+    bookingOutcomeUnknownAt: string | Date | null;
+    lastBookingError: string | null;
+    quotedCarrierCost: number | null;
+    pickupStatus: string | null;
+  };
+  paid: boolean;
+  packages: number;
+  selectedQuote: { id: string; carrier: string; serviceName: string; totalAmount: number; currency: string; expiresAt: string | Date | null } | null;
+  canBook: boolean;
+  isOwner: boolean;
+}
+
+function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isOwner }: ProcessProps) {
+  const when = (value: string | Date | null) => (value ? new Date(value).toLocaleString() : "—");
+
+  const body = (() => {
+    if (shipment.status === "BOOKING") {
+      return (
+        <>
+          <p style={{ fontSize: "0.78rem", color: "#b45309", marginBottom: "0.3rem" }}>
+            A booking attempt is in flight (started {when(shipment.bookingAttemptedAt)}).
+          </p>
+          <p style={{ fontSize: "0.72rem", color: "#64748b" }}>
+            Do not start another one — the provider has been asked once and a second request can buy a second label. If this
+            does not finish, the shipment will move to an unknown outcome and can be reconciled from there.
+          </p>
+        </>
+      );
+    }
+
+    if (shipment.status === "BOOKING_UNKNOWN") {
+      return (
+        <>
+          <p style={{ fontSize: "0.78rem", color: "#b45309", marginBottom: "0.3rem", fontWeight: 600 }}>
+            Booking outcome unknown — the provider did not answer in time, on {when(shipment.bookingOutcomeUnknownAt)}.
+          </p>
+          <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
+            A label may already have been purchased. Booking again while this is unknown is how an order ends up with two, so
+            it is blocked. Reconcile first: it asks the provider whether it holds this booking and adopts it if it does.
+          </p>
+          {shipment.lastBookingError ? (
+            <p style={{ fontSize: "0.7rem", color: "#94a3b8", marginBottom: "0.5rem" }}>Provider said: {shipment.lastBookingError}</p>
+          ) : null}
+          <Form method="post" style={{ marginBottom: "0.6rem" }}>
+            <input type="hidden" name="intent" value="reconcile_booking" />
+            <button type="submit" style={btn("#0369a1")}>Reconcile with the provider</button>
+          </Form>
+
+          {isOwner ? (
+            <details style={{ border: "1px dashed #cbd5e1", borderRadius: 8, padding: "0.6rem" }}>
+              <summary style={{ fontSize: "0.75rem", fontWeight: 600, color: "#082a4a", cursor: "pointer" }}>
+                Record what the provider&apos;s portal shows (owner only)
+              </summary>
+              <p style={{ fontSize: "0.7rem", color: "#64748b", margin: "0.4rem 0" }}>
+                Use this only after reconciling and checking the provider directly. Both options are recorded against your name
+                with your reason, and this is the only way a possibly-purchased label is made bookable again.
+              </p>
+              <Form method="post" style={{ display: "grid", gap: "0.4rem" }}>
+                <input type="hidden" name="intent" value="resolve_unknown_booking" />
+                <label style={label}>
+                  What was found<br />
+                  <select name="decision" style={input} defaultValue="nothing_purchased">
+                    <option value="nothing_purchased">No label was purchased — safe to book again</option>
+                    <option value="label_exists">A label exists — record it instead of buying another</option>
+                  </select>
+                </label>
+                <label style={label}>Provider shipment id (required if a label exists)<br /><input name="providerShipmentId" style={{ ...input, width: "100%" }} /></label>
+                <label style={label}>Tracking number (optional)<br /><input name="trackingNumber" style={{ ...input, width: "100%" }} /></label>
+                <label style={label}>
+                  Reason — what you checked, where, and what it showed<br />
+                  <textarea name="reason" rows={3} style={{ ...input, width: "100%" }} placeholder="e.g. Checked the eShipper portal on 24 Sep at 15:10; no shipment under this quote id; confirmed with the account's order list." />
+                </label>
+                <button type="submit" style={btn("#b45309")}>Record outcome</button>
+              </Form>
+            </details>
+          ) : (
+            <p style={{ fontSize: "0.72rem", color: "#64748b" }}>
+              Only an owner can record what the provider&apos;s portal shows. Ask one to reconcile and decide.
+            </p>
+          )}
+        </>
+      );
+    }
+
+    if (shipment.providerShipmentId) {
+      return (
+        <>
+          <p style={{ fontSize: "0.78rem", color: "#059669", marginBottom: "0.3rem" }}>
+            Booked: {shipment.carrier} {shipment.serviceName} · provider shipment {shipment.providerShipmentId}
+            {shipment.trackingNumber ? ` · tracking ${shipment.trackingNumber}` : ""}
+          </p>
+          <p style={{ fontSize: "0.72rem", color: "#64748b" }}>
+            Printing or retrieving the label does not buy anything again and does not deduct stock a second time.
+          </p>
+          {/* The distinction §9 turns on, said where someone might otherwise
+              assume the carrier has been told to collect. */}
+          <p style={{ fontSize: "0.72rem", color: shipment.pickupStatus === "SCHEDULED" ? "#059669" : "#b45309", marginTop: "0.3rem" }}>
+            {shipment.pickupStatus === "SCHEDULED"
+              ? "A pickup is scheduled for this shipment."
+              : "A booking is not a pickup: the carrier has not been asked to collect this shipment."}
+          </p>
+        </>
+      );
+    }
+
+    if (!paid) {
+      return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Booking is blocked until the wholesale payment succeeds.</p>;
+    }
+    if (packages === 0) {
+      return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Add the packed dimensions and gross weight before booking.</p>;
+    }
+    if (!selectedQuote) {
+      return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Select a quote above. Selecting does not book.</p>;
+    }
+
+    const retrying = shipment.status === "BOOKING_FAILED";
+    return (
+      <>
+        {retrying ? (
+          <p style={{ fontSize: "0.78rem", color: "#dc2626", marginBottom: "0.4rem" }}>
+            The last attempt failed and nothing was purchased: {shipment.lastBookingError || "no reason recorded"}.
+          </p>
+        ) : null}
+        <p style={{ fontSize: "0.78rem", marginBottom: "0.4rem" }}>
+          {retrying ? "Retrying" : "Booking"} <strong>{selectedQuote.carrier} {selectedQuote.serviceName}</strong> at <strong>{money(selectedQuote.totalAmount, selectedQuote.currency)}</strong>.
+          {selectedQuote.expiresAt ? ` Quote expires ${new Date(selectedQuote.expiresAt).toLocaleTimeString()}.` : ""}
+          {shipment.quotedCarrierCost != null && shipment.quotedCarrierCost !== selectedQuote.totalAmount ? (
+            <span style={{ color: "#b45309" }}> The quote changed from {money(shipment.quotedCarrierCost)} since it was prepared.</span>
+          ) : null}
+        </p>
+        <p style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: "0.4rem" }}>
+          This purchases a real label when eShipper is configured. The seller&apos;s fixed shipping charge is unchanged.
+        </p>
+        <Form method="post">
+          <input type="hidden" name="intent" value="book_shipment" />
+          <input type="hidden" name="quoteId" value={selectedQuote.id} />
+          <button type="submit" style={btn("#059669")} disabled={!canBook}>{retrying ? "Retry booking" : "Book shipment"}</button>
+        </Form>
+      </>
+    );
+  })();
+
+  return body;
 }
 
 export default function AdminShipmentDetail() {
@@ -487,34 +718,18 @@ export default function AdminShipmentDetail() {
           </table>
         )}
 
-        <div style={{ marginTop: "0.75rem", border: "1px dashed #cbd5e1", borderRadius: 8, padding: "0.6rem" }}>
-          <div style={{ fontSize: "0.78rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.3rem" }}>Final review before booking</div>
-          {shipment.providerShipmentId ? (
-            <p style={{ fontSize: "0.78rem", color: "#64748b" }}>This shipment is already booked. Reprinting the label does not create a new shipment.</p>
-          ) : !paid ? (
-            <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Booking is blocked until the wholesale payment succeeds.</p>
-          ) : !selectedQuote ? (
-            <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Select a quote above. Selecting does not book.</p>
-          ) : (
-            <>
-              <p style={{ fontSize: "0.78rem", marginBottom: "0.4rem" }}>
-                Booking <strong>{selectedQuote.carrier} {selectedQuote.serviceName}</strong> at <strong>{money(selectedQuote.totalAmount, selectedQuote.currency)}</strong>.
-                {selectedQuote.expiresAt ? ` Quote expires ${new Date(selectedQuote.expiresAt).toLocaleTimeString()}.` : ""}
-                {shipment.quotedCarrierCost != null && shipment.quotedCarrierCost !== selectedQuote.totalAmount ? (
-                  <span style={{ color: "#b45309" }}> The quote changed from {money(shipment.quotedCarrierCost)} since it was prepared.</span>
-                ) : null}
-              </p>
-              <p style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: "0.4rem" }}>
-                This purchases a real label when eShipper is configured. The seller&apos;s fixed shipping charge is unchanged.
-              </p>
-              <Form method="post">
-                <input type="hidden" name="intent" value="book_shipment" />
-                <input type="hidden" name="quoteId" value={selectedQuote.id} />
-                <button type="submit" style={btn("#059669")} disabled={!canBook}>Book shipment</button>
-              </Form>
-            </>
-          )}
-        </div>
+      </div>
+
+      <div style={card}>
+        <h2 style={h2}>Process shipment</h2>
+        <ProcessShipment
+          shipment={shipment}
+          paid={paid}
+          packages={packages.length}
+          selectedQuote={selectedQuote}
+          canBook={canBook}
+          isOwner={data.isOwner}
+        />
       </div>
 
       <div style={card}>
@@ -525,15 +740,29 @@ export default function AdminShipmentDetail() {
           ) : (
             <span style={{ ...btn("#94a3b8"), cursor: "not-allowed" }}>Shipping label (none yet)</span>
           )}
+          {/*
+            Named for what each one is, because two of them are easy to mistake
+            for something else: the packing list is the only one that states no
+            prices, and the provider's order-details sheet is a copy of what
+            eShipper holds — it is not the carrier's invoice and must not be
+            filed as one.
+          */}
+          <Link to={`/admin/packing-list/${shipment.id}`} style={{ ...btn("#0369a1"), textDecoration: "none" }}>
+            Packing list (print, no prices)
+          </Link>
           {shipment.providerShipmentId ? (
             <>
               <Form method="post"><button type="submit" name="intent" value="get_label" style={btn("#0369a1")}>Retrieve label (no rebook)</button></Form>
-              <Form method="post"><button type="submit" name="intent" value="order_details" style={btn("#082a4a")}>Shipment details</button></Form>
+              <Form method="post"><button type="submit" name="intent" value="order_details" style={btn("#082a4a")}>Provider shipment details</button></Form>
               <Form method="post"><button type="submit" name="intent" value="customs_invoice" style={btn("#082a4a")}>Customs invoice</button></Form>
             </>
           ) : null}
           <Link to={`/admin/orders/${order.id}`} style={{ ...btn("#082a4a"), textDecoration: "none" }}>Seller invoice (order)</Link>
         </div>
+        <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.5rem" }}>
+          The provider shipment-details sheet is eShipper&apos;s own copy of the order, not the carrier&apos;s invoice. Carrier charges
+          are reconciled from the invoice the carrier issues and are recorded under Billing below.
+        </p>
         {shipment.lastTrackingError ? (
           <p style={{ fontSize: "0.7rem", color: "#dc2626", marginTop: "0.5rem" }}>Carrier document/tracking error: {shipment.lastTrackingError}</p>
         ) : null}
@@ -586,20 +815,41 @@ export default function AdminShipmentDetail() {
 
       <div style={card}>
         <h2 style={h2}>Pickup</h2>
+        {/*
+          The current pickup state, stated before the form that changes it. "A
+          booked shipment does not prove pickup is scheduled" is only useful to
+          an operator who can tell the two apart on the page in front of them.
+        */}
+        <p style={{ fontSize: "0.78rem", marginBottom: "0.5rem", color: PICKUP_COLOR[shipment.pickupStatus ?? "NONE"] ?? "#64748b" }}>
+          {PICKUP_LABEL[shipment.pickupStatus ?? "NONE"] ?? `Pickup state: ${shipment.pickupStatus}`}
+          {shipment.pickupScheduledFor ? ` · ${new Date(shipment.pickupScheduledFor).toLocaleDateString()}` : ""}
+          {shipment.pickupWindow ? ` · ${shipment.pickupWindow}` : ""}
+          {shipment.pickupConfirmation ? ` · confirmation ${shipment.pickupConfirmation}` : ""}
+          {shipment.providerPickupId ? ` · provider pickup ${shipment.providerPickupId}` : ""}
+        </p>
+        {shipment.pickupLastError ? (
+          <p style={{ fontSize: "0.7rem", color: "#dc2626", marginBottom: "0.5rem" }}>{shipment.pickupLastError}</p>
+        ) : null}
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           <input type="hidden" name="intent" value="schedule_pickup" />
           <label style={label}>Pickup date<br /><input type="date" name="pickupDate" style={input} required /></label>
           <label style={label}>Time window<br /><input name="pickupTimeWindow" placeholder="09:00-17:00" style={input} /></label>
           <label style={label}>Notes<br /><input name="notes" style={input} /></label>
-          <button type="submit" style={btn("#0369a1")} disabled={!shipment.providerShipmentId}>Schedule pickup</button>
+          <button type="submit" style={btn("#0369a1")} disabled={!shipment.providerShipmentId}>
+            {shipment.pickupStatus === "SCHEDULED" ? "Schedule another pickup" : "Schedule pickup"}
+          </button>
         </Form>
         <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", marginTop: "0.5rem" }}>
           <input type="hidden" name="intent" value="cancel_pickup" />
-          <label style={label}>Pickup id to cancel<br /><input name="pickupId" style={input} required /></label>
-          <button type="submit" style={btn("#dc2626")}>Cancel pickup</button>
+          <label style={label}>
+            Pickup id to cancel{shipment.providerPickupId ? " (defaults to the scheduled one)" : ""}<br />
+            <input name="pickupId" style={input} placeholder={shipment.providerPickupId ?? ""} />
+          </label>
+          <button type="submit" style={btn("#dc2626")} disabled={!shipment.providerPickupId}>Cancel pickup</button>
         </Form>
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.4rem" }}>
-          Pickup cancellation is separate from shipment cancellation and from any financial credit.
+          Pickup cancellation is separate from shipment cancellation and from any financial credit. If the provider does not
+          answer, the pickup is left unknown rather than cancelled — a carrier may still be coming.
         </p>
       </div>
 

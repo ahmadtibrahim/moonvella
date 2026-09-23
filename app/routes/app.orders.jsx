@@ -31,7 +31,7 @@ export const loader = async ({ request }) =>
         shopifyCreatedAt: true,
         _count: { select: { items: true } },
         shipments: {
-          select: { trackingNumber: true, trackingUrl: true, carrier: true, status: true },
+          select: { id: true, trackingNumber: true, trackingUrl: true, carrier: true, status: true },
         },
       },
     });
@@ -146,11 +146,26 @@ export default function OrdersPage() {
                     <td style={{ padding: "0.5rem" }}>{o.paymentStatus}</td>
                     <td style={{ padding: "0.5rem" }}>{o.fulfillmentStatus}</td>
                     <td style={{ padding: "0.5rem" }}>
-                      {o.shipments.length === 0
-                        ? "—"
-                        : o.shipments
-                            .map((s) => s.trackingNumber || s.status)
-                            .join(", ")}
+                      {/* One row per shipment, each with its own packing list.
+                          The link is a plain anchor for the same reason the
+                          marketing pack is: the document route authenticates
+                          from the session, and a merchant surface reached by URL
+                          alone would be the thing this app refuses to have. */}
+                      {o.shipments.length === 0 ? (
+                        "—"
+                      ) : (
+                        o.shipments.map((s) => (
+                          <div key={s.id}>
+                            {s.trackingNumber || s.status}
+                            <a
+                              href={`/app/packing-list/${s.id}`}
+                              style={{ marginLeft: "0.4rem", fontSize: "0.72rem" }}
+                            >
+                              Packing list
+                            </a>
+                          </div>
+                        ))
+                      )}
                     </td>
                   </tr>
                 ))}

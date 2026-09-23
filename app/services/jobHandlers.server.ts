@@ -12,6 +12,8 @@ import { JOB_KIND, PermanentJobError, type JobHandler } from "./jobs.server";
 import { runContactSyncJob } from "./odooContacts.server";
 import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
+import { syncShipmentTracking } from "./shipping.server";
+import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
 
 /** The seller a job belongs to: the column, or the payload as a fallback. */
@@ -113,6 +115,81 @@ export const jobHandlers: Record<string, JobHandler> = {
           outcome: item.outcome,
         })),
       },
+    };
+  },
+
+  /**
+   * Push a booked shipment's tracking into Shopify, when the booking's own
+   * attempt did not get through.
+   *
+   * Idempotent through `shopifyFulfillmentId`: once a fulfillment id is stored,
+   * the push happened and a re-run returns without calling Shopify again. That
+   * guard is the whole point — `fulfillmentCreate` is not idempotent, and a
+   * second call for the same fulfillment order is an error rather than a
+   * no-op, so a retry that did not check would fail forever on a job that had
+   * already succeeded.
+   *
+   * Pushing tracking is not marking the order shipped. The fulfillment carries
+   * tracking info for the items in this shipment only; nothing here tells
+   * Shopify the order left the building, and the customer is not notified —
+   * that happens when the carrier is recorded as having collected.
+   */
+  [JOB_KIND.SHOPIFY_FULFILLMENT_SYNC]: async (job) => {
+    const shipmentId = (job.payload as { shipmentId?: unknown } | null)?.shipmentId;
+    if (typeof shipmentId !== "string" || !shipmentId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no shipmentId, so there is nothing to sync.`,
+      );
+    }
+
+    const shipment = await prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: {
+        id: true,
+        shopifyFulfillmentId: true,
+        trackingNumber: true,
+        providerShipmentId: true,
+        order: { select: { shopifyFulfillmentOrderId: true } },
+      },
+    });
+    if (!shipment) {
+      throw new PermanentJobError(`Shipment ${shipmentId} no longer exists.`);
+    }
+    if (shipment.shopifyFulfillmentId) {
+      return {
+        summary: `Already synced (fulfillment ${shipment.shopifyFulfillmentId}); nothing sent.`,
+        detail: { shipmentId, shopifyFulfillmentId: shipment.shopifyFulfillmentId, skipped: true },
+      };
+    }
+    if (!shipment.order.shopifyFulfillmentOrderId) {
+      throw new PermanentJobError(
+        `Shipment ${shipmentId} has no Shopify fulfillment order id; there is nothing to fulfill against.`,
+      );
+    }
+    if (!shipment.trackingNumber) {
+      // Retryable rather than permanent: a label issued before the carrier
+      // assigned a number gains one once tracking is synced, and pushing a
+      // fulfillment with no tracking number would only have to be redone.
+      throw new Error(
+        `Shipment ${shipmentId} has no tracking number yet; will retry after tracking is synced.`,
+      );
+    }
+
+    const result = await syncShipmentTracking(
+      shipmentId,
+      { actorId: `job:${job.id}`, actorName: "Background job (Shopify fulfillment sync)" },
+      { notifyCustomer: false },
+    );
+    if (!result.pushed) {
+      // A refusal the handler can describe but not fix: the runner retries it
+      // and, if it keeps refusing, the reason is on the job for a person.
+      throw new Error(
+        `Shopify did not accept the fulfillment (${result.reason}${"message" in result && result.message ? `: ${result.message}` : ""}).`,
+      );
+    }
+    return {
+      summary: `Tracking pushed to Shopify (fulfillment ${result.shopifyFulfillmentId}).`,
+      detail: { shipmentId, shopifyFulfillmentId: result.shopifyFulfillmentId },
     };
   },
 };

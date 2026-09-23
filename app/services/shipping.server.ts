@@ -15,6 +15,8 @@ import {
   getReturnQuote,
   bookReturn,
   getReturn,
+  getShipment,
+  isProviderTimeout,
   schedulePickup,
   cancelPickup,
   type RateRequest,
@@ -24,6 +26,41 @@ import {
   type PickupResult,
 } from "./eshipper.server";
 import { buildQuotePackagesForOrder } from "./packaging.server";
+import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
+
+/**
+ * The states from which a booking may be attempted.
+ *
+ * PENDING is a shipment nobody has asked the provider about. BOOKING_FAILED is
+ * one the provider refused, where nothing was purchased — retrying it is the
+ * whole point of recording it separately from a timeout. BOOKING and
+ * BOOKING_UNKNOWN are deliberately absent: the first is in flight, and the
+ * second may already own a label.
+ */
+const BOOKABLE_STATES = ["PENDING", "BOOKING_FAILED"] as const;
+
+/**
+ * Why a shipment in a given state cannot be booked, in the words the operator
+ * needs to decide what to do next.
+ *
+ * Written once and used by both the guard that runs before anything is sent and
+ * the claim that runs at the provider call. Two copies of this sentence drift,
+ * and the drift is not cosmetic: an operator told only "this shipment cannot be
+ * booked" for a shipment whose booking outcome is UNKNOWN is one retry away from
+ * buying a second label, which is the exact failure the state exists to prevent.
+ */
+function bookingRefusal(status: string): string {
+  if (status === "BOOKING") {
+    return "A booking attempt for this shipment is already in flight. Wait for it to finish rather than sending a second one.";
+  }
+  if (status === "BOOKING_UNKNOWN") {
+    return (
+      "This shipment's booking outcome is unknown — the provider may already have bought a label. " +
+      "Reconcile the booking before attempting another one."
+    );
+  }
+  return `This shipment cannot be booked from its current state (${status}).`;
+}
 
 interface Actor {
   actorId: string;
@@ -242,6 +279,69 @@ export async function getQuotesForOrder(orderId: string, actor: Actor) {
   return prisma.shippingQuote.findMany({ where: { orderId }, orderBy: { totalAmount: "asc" } });
 }
 
+/**
+ * Remove every quote on an order, because they no longer describe it.
+ *
+ * DELETED, NOT FLAGGED. A flag would leave the row reachable by id, and the
+ * booking paths accept a quote by id — so a superseded quote that still exists
+ * is a stale price that can still be booked by anyone holding the id. Removing
+ * the rows closes that off for every caller at once rather than relying on each
+ * of them to check a flag.
+ *
+ * HISTORY IS NOT LOST BY THIS. A quote is evidence only until it is used; once
+ * a shipment is booked, the carrier, service, cost and provider quote id are
+ * copied onto the shipment itself, which is what the audit trail and the
+ * reconciliation read. What is deleted is the *offer*, not the purchase.
+ *
+ * Returns how many were removed, so a caller can say "3 quotes withdrawn" rather
+ * than reporting a re-quote that was already the state of things.
+ */
+export async function invalidateQuotes(orderId: string, reason: string, actor: Actor) {
+  const removed = await prisma.shippingQuote.deleteMany({ where: { orderId } });
+  if (removed.count === 0) return { removed: 0 };
+
+  await prisma.order.update({
+    where: { id: orderId },
+    data: { quotesInvalidatedAt: new Date(), quoteInvalidationReason: reason },
+  });
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.quotes_invalidated",
+    entityType: AUDIT_ENTITY.ORDER,
+    entityId: orderId,
+    afterData: { removed: removed.count, reason },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return { removed: removed.count };
+}
+
+/**
+ * Take exclusive responsibility for booking one shipment.
+ *
+ * A conditional UPDATE, so two operators clicking Book at the same moment produce
+ * one attempt and one refusal — the loser's update matches nothing. The loser is
+ * told what the shipment is doing rather than being handed a generic error,
+ * because "already being booked" and "already booked" call for different actions
+ * from whoever is holding the second browser tab.
+ */
+async function claimForBooking(shipmentId: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const claim = await prisma.shipment.updateMany({
+    where: { id: shipmentId, status: { in: [...BOOKABLE_STATES] }, providerShipmentId: null },
+    data: { status: "BOOKING", bookingAttemptedAt: new Date() },
+  });
+  if (claim.count === 1) return { ok: true };
+
+  const current = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!current) return { ok: false, reason: "Shipment not found." };
+  if (current.providerShipmentId) {
+    return { ok: false, reason: "already_booked" };
+  }
+  return { ok: false, reason: bookingRefusal(current.status) };
+}
+
 export async function selectQuote(orderId: string, quoteId: string, actor: Actor) {
   const quote = await prisma.shippingQuote.findUnique({ where: { id: quoteId } });
   if (!quote || quote.orderId !== orderId) throw new Error("Quote not found for this order.");
@@ -382,7 +482,12 @@ export async function bookPreparedShipment(shipmentId: string, quoteId: string |
   if (shipment.providerShipmentId) {
     return { shipment, sync: { pushed: false, reason: "already_booked" } };
   }
-  if (shipment.status !== "PENDING") throw new Error(`Only a PENDING shipment can be booked (this is ${shipment.status}).`);
+  // BOOKING_FAILED is bookable on purpose: the provider refused and nothing was
+  // purchased, so retrying is the correct next action. BOOKING and
+  // BOOKING_UNKNOWN are not — see BOOKABLE_STATES.
+  if (!(BOOKABLE_STATES as readonly string[]).includes(shipment.status)) {
+    throw new Error(bookingRefusal(shipment.status));
+  }
 
   const order = shipment.order;
   if (order.wholesalePaymentStatus !== "SUCCEEDED") {
@@ -426,12 +531,28 @@ async function finalizeBooking(
   quote: { carrier: string; serviceCode: string; serviceName: string; providerQuoteId: string | null; totalAmount: number },
   actor: Actor
 ) {
+  /*
+   * Claimed before anything is sent, and every path to the provider goes
+   * through here, so this is the single place a second booking can be stopped.
+   * Two operators with the shipment page open both pressing Book produce one
+   * attempt: the loser's conditional UPDATE matches nothing.
+   */
+  const claim = await claimForBooking(shipmentId);
+  if (!claim.ok) {
+    if (claim.reason === "already_booked") {
+      const existing = await prisma.shipment.findUniqueOrThrow({ where: { id: shipmentId } });
+      return { shipment: existing, sync: { pushed: false, reason: "already_booked" } };
+    }
+    throw new Error(claim.reason);
+  }
+
   const shipment = await prisma.shipment.findUniqueOrThrow({ where: { id: shipmentId } });
   // Items are included because the rate request needs the ordered quantity, and
-  // a Prisma result only carries relations that were asked for.
+  // a Prisma result only carries relations that were asked for. The seller is
+  // included for the retry job queued below, which is scoped to their access.
   const order = await prisma.order.findUniqueOrThrow({
     where: { id: orderId },
-    include: { packages: true, items: true },
+    include: { packages: true, items: true, seller: { select: { id: true, accessVersion: true } } },
   });
 
   try {
@@ -448,6 +569,9 @@ async function finalizeBooking(
     const updated = await prisma.shipment.update({
       where: { id: shipment.id },
       data: {
+        // BOOKED, not PENDING: the provider has answered and the label exists.
+        // Only a booking that reached this line has one.
+        status: "BOOKED",
         providerShipmentId: booking.providerShipmentId,
         carrier: booking.carrier,
         serviceName: booking.serviceName,
@@ -459,6 +583,10 @@ async function finalizeBooking(
         trackingStatus: TRACKING_STATE.label_created,
         labelCreatedAt: new Date(),
         billingStatus: "PENDING",
+        // A successful booking clears the record of the failures before it, so
+        // the page stops reporting a problem that is no longer true.
+        lastBookingError: null,
+        bookingOutcomeUnknownAt: null,
       },
     });
 
@@ -493,22 +621,274 @@ async function finalizeBooking(
     // Tracking is pushed to Shopify separately so a Shopify failure does not
     // lose the booking. A label is NOT reported as shipped.
     const sync = await syncShipmentTracking(updated.id, actor);
+
+    /*
+     * The push above is the attempt; this is the retry.
+     *
+     * Queued only when there is something to retry — a seller with no
+     * fulfillment order id will not grow one, and a job that can only report
+     * the same missing id five times is noise in the queue. The job is scoped
+     * to the seller's access version, so a store blocked between booking and
+     * the retry does not get its fulfillment pushed.
+     *
+     * A successful push queues nothing: Shopify has already been told, and a
+     * second fulfillmentCreate for the same fulfillment order is an error, not
+     * a no-op.
+     */
+    if (!sync.pushed && order.shopifyFulfillmentOrderId) {
+      await enqueueJob({
+        kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC,
+        idempotencyKey: jobKey(JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, order.seller.id, updated.id),
+        sellerId: order.seller.id,
+        sellerAccessVersion: order.seller.accessVersion,
+        payload: { shipmentId: updated.id },
+      });
+    }
+
     return { shipment: updated, sync };
   } catch (error) {
+    const message = error instanceof Error ? error.message : "booking failed";
+
+    /*
+     * A timeout is not a failure, and must not be recorded as one.
+     *
+     * The provider may have bought the label and lost the reply on the way
+     * back, which is why the two outcomes get different states. BOOKING_FAILED
+     * says nothing was purchased and a retry is safe — a promise we cannot make
+     * after a timeout. BOOKING_UNKNOWN says a person has to find out, and the
+     * booking path refuses to run again until one has (see claimForBooking).
+     * Guessing either way is how an order ends up with two labels.
+     */
+    const timedOut = isProviderTimeout(error);
+
     await prisma.shipment.update({
       where: { id: shipment.id },
-      data: { status: "EXCEPTION", exceptionAt: new Date() },
+      data: timedOut
+        ? {
+            status: "BOOKING_UNKNOWN",
+            bookingOutcomeUnknownAt: new Date(),
+            lastBookingError: message,
+          }
+        : { status: "BOOKING_FAILED", lastBookingError: message },
     });
-    await setIntegrationState("eshipper", {
-      status: "FAILED",
-      error: error instanceof Error ? error.message : "booking failed",
+    await setIntegrationState("eshipper", { status: "FAILED", error: message });
+    await recordAudit({
+      actorType: "ADMIN_USER",
+      actorId: actor.actorId,
+      actorName: actor.actorName,
+      action: timedOut ? "shipping.booking_outcome_unknown" : "shipping.booking_failed",
+      entityType: AUDIT_ENTITY.SHIPMENT,
+      entityId: shipment.id,
+      afterData: { message, providerQuoteId: quote.providerQuoteId, timedOut },
+      ipAddress: actor.ipAddress,
+      userAgent: actor.userAgent,
     });
+
+    if (timedOut) {
+      throw new Error(
+        `Booking outcome unknown: the provider did not answer in time (${message}). ` +
+          `It may already hold a label for this shipment, so do not book again — ` +
+          `reconcile the booking first. The seller has not been charged a second time.`
+      );
+    }
+
     // Payment remains SUCCEEDED; the order stays eligible for a safe re-book.
     throw new Error(
-      `${BOOKING_ERROR}: ${error instanceof Error ? error.message : "unknown"}. ` +
-        `The seller has not been charged again — retry booking safely.`
+      `${BOOKING_ERROR}: ${message}. ` +
+        `Nothing was purchased, and the seller has not been charged again — retry booking safely.`
     );
   }
+}
+
+/**
+ * Ask the provider whether an interrupted booking actually happened.
+ *
+ * THE ONLY QUESTION THIS ANSWERS is "does the provider hold a shipment we
+ * cannot see". If it does, the booking is adopted from the provider's own copy
+ * rather than repeated — that is the whole point of `getShipment`, and the
+ * reason its timeout is not retried internally.
+ *
+ * If it answers with nothing, that is recorded and NOTHING ELSE CHANGES. An
+ * empty answer is not proof that no label exists: the lookup is by the quote id
+ * the provider was given before the call went quiet, and a provider that
+ * indexes nothing under that reference would answer empty whether or not a
+ * label was purchased. Turning that into BOOKING_FAILED would hand the operator
+ * a re-book button on the strength of a lookup that cannot support the claim,
+ * so a person decides through resolveUnknownBooking once they have checked the
+ * provider's own portal.
+ */
+export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) {
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (shipment.status !== "BOOKING_UNKNOWN") {
+    throw new Error(
+      shipment.status === "BOOKED"
+        ? "This shipment is already booked."
+        : `Only a shipment awaiting an unknown booking outcome can be reconciled (this is ${shipment.status}).`
+    );
+  }
+  if (!shipment.providerQuoteId) {
+    throw new Error(
+      "No provider quote id was stored for this booking, so the provider cannot be asked what it holds. " +
+        "Check the provider's portal and record the outcome instead."
+    );
+  }
+
+  const mode = await eshipperMode();
+  if (mode !== "real") {
+    throw new Error(
+      "eShipper is not in real mode, so nothing was purchased and there is nothing to reconcile. " +
+        "Record the outcome to clear this shipment."
+    );
+  }
+
+  const found = await getShipment(shipment.providerQuoteId);
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.booking_reconciled",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { found: Boolean(found), providerQuoteId: shipment.providerQuoteId },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  if (!found || !found.providerShipmentId) {
+    await prisma.shipment.update({
+      where: { id: shipmentId },
+      data: {
+        lastBookingError:
+          `Reconciled: the provider returned no shipment for quote ${shipment.providerQuoteId}. ` +
+          `This is not proof that no label exists — check the provider's portal.`,
+      },
+    });
+    return {
+      adopted: false as const,
+      providerQuoteId: shipment.providerQuoteId,
+      message:
+        "The provider holds no shipment under this quote id. That is not proof nothing was purchased, " +
+        "so this shipment stays unknown until someone checks the provider's portal and records the outcome.",
+    };
+  }
+
+  // The provider has it. Adopt its copy rather than buying a second label.
+  const updated = await prisma.shipment.update({
+    where: { id: shipmentId },
+    data: {
+      status: "BOOKED",
+      providerShipmentId: found.providerShipmentId,
+      carrier: found.carrier || shipment.carrier,
+      serviceName: found.serviceName || shipment.serviceName,
+      trackingNumber: found.trackingNumber || shipment.trackingNumber,
+      trackingUrl: found.trackingUrl,
+      labelUrl: found.labelUrl ?? shipment.labelUrl,
+      labelDocumentFormat: found.labelUrl ? "PDF" : shipment.labelDocumentFormat,
+      bookedCost: found.bookedCost || shipment.quotedCarrierCost,
+      trackingStatus: TRACKING_STATE.label_created,
+      labelCreatedAt: shipment.labelCreatedAt ?? new Date(),
+      bookingOutcomeUnknownAt: null,
+      lastBookingError: null,
+    },
+  });
+  await setIntegrationState("eshipper", {
+    status: "HEALTHY",
+    detail: `Recovered booking ${found.providerShipmentId} for quote ${shipment.providerQuoteId}.`,
+  });
+
+  return {
+    adopted: true as const,
+    shipment: updated,
+    message: `The provider already held this booking (${found.providerShipmentId}). It has been recorded locally; no second label was purchased.`,
+  };
+}
+
+/**
+ * Record what a person found when they checked the provider themselves.
+ *
+ * The escape hatch for the case reconcile cannot settle: a timeout whose quote
+ * id the provider will not answer for. Because it can put a shipment back into
+ * a bookable state — and because putting it there wrongly is the exact mistake
+ * the unknown state exists to prevent — it demands a written reason, which is
+ * stored on the shipment and in the audit trail. There is no equivalent of this
+ * for the ordinary failure path, because an ordinary failure does not need a
+ * person's judgement.
+ *
+ * `label_exists` requires the provider's own identifiers. Recording "a label
+ * exists" without a provider shipment id would leave a BOOKED shipment that
+ * cannot be tracked, labelled, cancelled or billed.
+ */
+export async function resolveUnknownBooking(
+  shipmentId: string,
+  decision: "nothing_purchased" | "label_exists",
+  input: { reason: string; providerShipmentId?: string; trackingNumber?: string },
+  actor: Actor
+) {
+  const reason = input.reason?.trim();
+  if (!reason || reason.length < 10) {
+    throw new Error(
+      "A written reason is required (at least 10 characters): say what was checked and where."
+    );
+  }
+
+  const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
+  if (!shipment) throw new Error("Shipment not found.");
+  if (shipment.status !== "BOOKING_UNKNOWN") {
+    throw new Error(`Only a shipment awaiting an unknown booking outcome can be resolved (this is ${shipment.status}).`);
+  }
+
+  if (decision === "label_exists") {
+    const providerShipmentId = input.providerShipmentId?.trim();
+    if (!providerShipmentId) {
+      throw new Error("Recording a label as existing requires the provider's shipment id.");
+    }
+    const updated = await prisma.shipment.update({
+      where: { id: shipmentId },
+      data: {
+        status: "BOOKED",
+        providerShipmentId,
+        trackingNumber: input.trackingNumber?.trim() || shipment.trackingNumber,
+        bookingOutcomeUnknownAt: null,
+        lastBookingError: `Resolved by hand: label recorded. ${reason}`,
+      },
+    });
+    await recordAudit({
+      actorType: "ADMIN_USER",
+      actorId: actor.actorId,
+      actorName: actor.actorName,
+      action: "shipping.booking_resolved_by_hand",
+      entityType: AUDIT_ENTITY.SHIPMENT,
+      entityId: shipmentId,
+      afterData: { decision, reason, providerShipmentId },
+      ipAddress: actor.ipAddress,
+      userAgent: actor.userAgent,
+    });
+    return { shipment: updated, decision };
+  }
+
+  // nothing_purchased: the shipment becomes ordinary-failed, which is what puts
+  // it back in BOOKABLE_STATES and lets the retry button work again.
+  const updated = await prisma.shipment.update({
+    where: { id: shipmentId },
+    data: {
+      status: "BOOKING_FAILED",
+      bookingOutcomeUnknownAt: null,
+      lastBookingError: `Checked by hand and recorded as not purchased: ${reason}`,
+    },
+  });
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "shipping.booking_resolved_by_hand",
+    entityType: AUDIT_ENTITY.SHIPMENT,
+    entityId: shipmentId,
+    afterData: { decision, reason },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+  return { shipment: updated, decision };
 }
 
 export async function syncShipmentTracking(
@@ -941,26 +1321,87 @@ export async function getReturnDetails(shipmentId: string, actor: Actor): Promis
   return details;
 }
 
+/**
+ * Schedule the carrier pickup for a shipment.
+ *
+ * A SEPARATE ACT FROM BOOKING, in both directions. A booked shipment is not a
+ * scheduled pickup — the label exists and the carrier has not been told to
+ * collect anything — and this does not touch the booking fields at all. That
+ * separation is what lets a pickup be retried on its own: if the booking
+ * succeeded and this call failed, the shipment keeps its label, its tracking
+ * and its BOOKED state, and only `pickupStatus` records the failure. Rebooking
+ * to "fix" a pickup would buy a second label.
+ *
+ * Blocked for a shipment with no provider shipment id, which is the same
+ * condition the page already uses to disable the button. There is nothing for
+ * a carrier to collect.
+ */
 export async function schedulePickupForShipment(
   shipmentId: string,
   data: { pickupDate: string; pickupTimeWindow: string; notes?: string },
   actor: Actor
-): Promise<PickupResult> {
+): Promise<PickupResult & { pickupStatus: string }> {
   const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
   if (!shipment) throw new Error("Shipment not found.");
+  if (!shipment.providerShipmentId) {
+    throw new Error("Book the shipment before scheduling a pickup — there is nothing for the carrier to collect yet.");
+  }
 
-  const booking = await schedulePickup({
-    shipFrom: {
-      ...shipFrom(),
-      phone: process.env.MOONVELLA_SHIP_FROM_PHONE,
-      email: process.env.MOONVELLA_SHIP_FROM_EMAIL,
+  const requestedAt = new Date();
+  let booking: PickupResult;
+  try {
+    booking = await schedulePickup({
+      shipFrom: {
+        ...shipFrom(),
+        phone: process.env.MOONVELLA_SHIP_FROM_PHONE,
+        email: process.env.MOONVELLA_SHIP_FROM_EMAIL,
+      },
+      pickupDate: data.pickupDate,
+      pickupTimeWindow: data.pickupTimeWindow,
+      packages: [{ count: shipment.packageCount || 1, weight: 0 }],
+      notes: data.notes,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "pickup request failed";
+    // The booking is deliberately untouched. §9: booking success says nothing
+    // about the pickup, and a failed pickup must not cost the shipment its
+    // label or read as a failed shipment.
+    await prisma.shipment.update({
+      where: { id: shipmentId },
+      data: { pickupStatus: "FAILED", pickupLastError: message },
+    });
+    await recordAudit({
+      actorType: "ADMIN_USER",
+      actorId: actor.actorId,
+      actorName: actor.actorName,
+      action: "shipping.pickup_failed",
+      entityType: AUDIT_ENTITY.SHIPMENT,
+      entityId: shipmentId,
+      afterData: { message, requestedDate: data.pickupDate, window: data.pickupTimeWindow },
+      ipAddress: actor.ipAddress,
+      userAgent: actor.userAgent,
+    });
+    throw new Error(
+      `Pickup could not be scheduled: ${message}. The shipment itself is unaffected — its booking and label are intact, ` +
+        `so retry the pickup on its own rather than rebooking.`
+    );
+  }
+
+  // The provider words its own date; keep the string it sent when it parses and
+  // the requested date when it does not, rather than storing an invalid Date.
+  const scheduledFor = new Date(booking.scheduledDate);
+  const updated = await prisma.shipment.update({
+    where: { id: shipmentId },
+    data: {
+      pickupStatus: "SCHEDULED",
+      providerPickupId: booking.pickupId,
+      pickupScheduledFor: Number.isNaN(scheduledFor.getTime()) ? null : scheduledFor,
+      pickupWindow: data.pickupTimeWindow || null,
+      pickupConfirmation: booking.confirmationNumber ?? null,
+      pickupLastError: null,
+      pickupCancelledAt: null,
     },
-    pickupDate: data.pickupDate,
-    pickupTimeWindow: data.pickupTimeWindow,
-    packages: [{ count: shipment.packageCount || 1, weight: 0 }],
-    notes: data.notes,
   });
-
   await recordAudit({
     actorType: "ADMIN_USER",
     actorId: actor.actorId,
@@ -968,20 +1409,85 @@ export async function schedulePickupForShipment(
     action: "shipping.pickup_scheduled",
     entityType: AUDIT_ENTITY.SHIPMENT,
     entityId: shipmentId,
-    afterData: { pickupId: booking.pickupId, scheduledDate: booking.scheduledDate },
+    afterData: {
+      pickupId: booking.pickupId,
+      scheduledDate: booking.scheduledDate,
+      confirmation: booking.confirmationNumber ?? null,
+      requestedAt,
+    },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
 
-  return booking;
+  return { ...booking, pickupStatus: updated.pickupStatus ?? "SCHEDULED" };
 }
 
-export async function cancelPickupForShipment(shipmentId: string, pickupId: string, actor: Actor) {
+/**
+ * Cancel a scheduled pickup.
+ *
+ * Separate from cancelling the shipment, and separate from any refund: this
+ * tells the carrier not to collect, and nothing about money. The stored pickup
+ * id is used when the caller does not supply one, so the operator does not have
+ * to keep a provider identifier on a clipboard to undo their own action.
+ */
+export async function cancelPickupForShipment(shipmentId: string, pickupId: string | undefined, actor: Actor) {
   const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
   if (!shipment) throw new Error("Shipment not found.");
 
-  const result = await cancelPickup(pickupId);
+  const target = pickupId?.trim() || shipment.providerPickupId;
+  if (!target) throw new Error("There is no scheduled pickup on this shipment to cancel.");
 
+  let result: { cancelled: boolean };
+  try {
+    result = await cancelPickup(target);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "pickup cancellation failed";
+    // Not CANCELLED and not FAILED: the request never got an answer, so a truck
+    // may still be coming. Recording it as cancelled would stop anyone checking.
+    // `pickupCancelledAt` is cleared with it, because that column records a
+    // CONFIRMED cancellation and is only true while the pickup is CANCELLED —
+    // leaving a timestamp behind on an unresolved pickup is the same record
+    // saying two things, which is how a stale one gets believed.
+    await prisma.shipment.update({
+      where: { id: shipmentId },
+      data: { pickupStatus: "UNKNOWN", pickupLastError: message, pickupCancelledAt: null },
+    });
+    await recordAudit({
+      actorType: "ADMIN_USER",
+      actorId: actor.actorId,
+      actorName: actor.actorName,
+      action: "shipping.pickup_cancel_unknown",
+      entityType: AUDIT_ENTITY.SHIPMENT,
+      entityId: shipmentId,
+      afterData: { pickupId: target, message },
+      ipAddress: actor.ipAddress,
+      userAgent: actor.userAgent,
+    });
+    throw new Error(
+      `Pickup cancellation outcome unknown: ${message}. The pickup may still be standing — ` +
+        `do not assume it was cancelled.`
+    );
+  }
+
+  /*
+   * Three outcomes, recorded as three different things. A confirmed
+   * cancellation ends the pickup; a provider that answered "no" leaves it
+   * standing, so it stays SCHEDULED; a provider that could not be reached at
+   * all leaves an outcome nobody knows, which is UNKNOWN and not CANCELLED —
+   * a truck may still be coming.
+   */
+  const data = result.cancelled
+    ? { pickupStatus: "CANCELLED", pickupCancelledAt: new Date(), pickupLastError: null }
+    : {
+        pickupStatus: shipment.pickupStatus === "FAILED" ? "FAILED" : "SCHEDULED",
+        pickupLastError: "The provider did not confirm the cancellation; the pickup still stands.",
+        // The provider is the authority on whether a truck is coming, and it
+        // has just said the pickup stands. A cancellation timestamp would
+        // contradict the status it sits next to.
+        pickupCancelledAt: null,
+      };
+
+  await prisma.shipment.update({ where: { id: shipmentId }, data });
   await recordAudit({
     actorType: "ADMIN_USER",
     actorId: actor.actorId,
@@ -989,12 +1495,12 @@ export async function cancelPickupForShipment(shipmentId: string, pickupId: stri
     action: "shipping.pickup_cancelled",
     entityType: AUDIT_ENTITY.SHIPMENT,
     entityId: shipmentId,
-    afterData: { pickupId, cancelled: result.cancelled },
+    afterData: { pickupId: target, cancelled: result.cancelled, usedStoredId: !pickupId?.trim() },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
 
-  return result;
+  return { ...result, pickupId: target };
 }
 
 /**

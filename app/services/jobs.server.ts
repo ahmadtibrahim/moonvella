@@ -42,6 +42,16 @@ export const JOB_KIND = {
   SHOPIFY_ARCHIVE_PRODUCTS: "SHOPIFY_ARCHIVE_PRODUCTS",
   /** Create or update MoonVella products from Odoo templates. */
   ODOO_PRODUCT_IMPORT: "ODOO_PRODUCT_IMPORT",
+  /**
+   * Tell Shopify a shipment's tracking, after a booking whose immediate push
+   * did not go through.
+   *
+   * Queued rather than retried in the request because the booking is already
+   * paid for and committed: a Shopify outage must not turn a purchased label
+   * into a failed booking, and it must not hold the operator's page open while
+   * Shopify is down.
+   */
+  SHOPIFY_FULFILLMENT_SYNC: "SHOPIFY_FULFILLMENT_SYNC",
 } as const;
 
 export type JobKind = (typeof JOB_KIND)[keyof typeof JOB_KIND];

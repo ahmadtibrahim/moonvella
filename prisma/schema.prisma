@@ -760,6 +760,15 @@ model Order {
   fulfillmentRequest        FulfillmentRequest?
   shippingQuotes            ShippingQuote[]
   packages                  OrderPackage[]
+  /// When the order's quotes stopped describing it, and why.
+  ///
+  /// A quote prices the parcels that existed when it was asked for. Change the
+  /// packaging, the address or the date and every quote on the order is a price
+  /// for something else — so they are removed and this records what removed
+  /// them. The booking gate reads the surviving quotes, which means a superseded
+  /// quote cannot be booked by remembering its id.
+  quotesInvalidatedAt       DateTime?
+  quoteInvalidationReason   String?
   createdAt                 DateTime               @default(now())
   updatedAt                 DateTime               @updatedAt
 
@@ -911,6 +920,40 @@ model Shipment {
   /// Normalized tracking state for the interface, distinct from the coarse
   /// ShipmentStatus so "label created" is never reported as "shipped".
   trackingStatus        String?
+  /// When the provider was last asked to book, and what it last said.
+  ///
+  /// `lastBookingError` holds the provider's own refusal, redacted, so an
+  /// operator reading a failed booking sees the reason rather than a status
+  /// code. It is cleared on a successful booking and never overwritten by a
+  /// timeout — a timeout is recorded as BOOKING_UNKNOWN with its own timestamp,
+  /// because "the provider said no" and "the provider said nothing" lead to
+  /// different next actions.
+  bookingAttemptedAt    DateTime?
+  bookingOutcomeUnknownAt DateTime?
+  lastBookingError      String?
+  /// The pickup, if one was arranged for this shipment. A booked shipment does
+  /// NOT imply a scheduled pickup: the label is bought from the carrier and the
+  /// collection is booked separately, and conflating them is how a parcel sits
+  /// on a dock waiting for a truck nobody called.
+  ///
+  /// Values: NONE | SCHEDULED | CANCELLED | FAILED | MISSED | UNKNOWN.
+  pickupStatus          String?
+  providerPickupId      String?
+  pickupScheduledFor    DateTime?
+  /// The collection window as the provider confirmed it. Kept as text because
+  /// carriers return windows in their own words ("09:00-17:00", "before noon"),
+  /// and normalizing that into a timestamp pair would invent precision the
+  /// carrier did not offer.
+  pickupWindow          String?
+  pickupConfirmation    String?
+  pickupLastError       String?
+  /// When a cancellation was CONFIRMED, and only then: set while pickupStatus is
+  /// CANCELLED and cleared the moment it is not. A pickup that the provider says
+  /// still stands, or one whose cancellation nobody answered, keeps no
+  /// timestamp — a column that records a confirmation must not outlive the state
+  /// it confirms, or the record contradicts itself and the wrong half is
+  /// believed. History lives in the audit log.
+  pickupCancelledAt     DateTime?
   estimatedDelivery     DateTime?
   lastTrackingSyncAt    DateTime?
   lastTrackingError     String?
@@ -981,8 +1024,31 @@ model ShipmentTrackingEvent {
   @@index([shipmentId, eventAt])
 }
 
+/// The coarse lifecycle of a parcel, and the booking's own outcome.
+///
+/// WHY BOOKING STATES ARE SEPARATE FROM SHIPPING STATES. A booking can fail, or
+/// it can end without an answer — the provider was asked and never replied. Those
+/// are facts about the PURCHASE, and neither of them is "PENDING": a PENDING
+/// shipment with a label is one thing, and a shipment whose booking outcome
+/// nobody knows is another, and the second must never be retried blind. Keeping
+/// them distinct is what lets the UI say "Booking outcome unknown — reconcile"
+/// instead of offering a button that might buy a second label.
 enum ShipmentStatus {
+  /// Prepared, not yet sent to the provider.
   PENDING
+  /// In flight at the provider: a booking call is out and no answer has come
+  /// back. A shipment found in this state has no answer rather than no booking.
+  BOOKING
+  /// The provider accepted the booking. Documents exist; the parcel has NOT
+  /// necessarily been collected.
+  BOOKED
+  /// The provider refused. Safe to retry: nothing was purchased.
+  BOOKING_FAILED
+  /// The call did not return a usable answer (timeout, connection reset). A
+  /// booking may or may not exist, so this state is reconciled, never retried.
+  BOOKING_UNKNOWN
+  /// A cancellation has been sent and not yet confirmed.
+  CANCELLING
   SHIPPED
   DELIVERED
   EXCEPTION
