@@ -10,13 +10,17 @@ import {
   updateBillingSettings,
   setDefaultPaymentMethod,
   removePaymentMethod,
-  stripeConfigured,
 } from "../services/sellerBilling.server";
+import { isStripeConfigured } from "../services/payments.server";
 
 export const loader = async ({ request }) => {
   const context = await requireSellerContext(request);
+  // Key presence, from the encrypted credential store or the environment. It is
+  // not a claim that the key works — that is the authenticated probe behind
+  // Settings' "Connected".
+  const stripeConfigured = await isStripeConfigured();
   if (!context.seller) {
-    return { access: context.access, settings: null, methods: [], invoices: [], attempts: [], stripe: { configured: stripeConfigured(), mode: stripeConfigured() ? "real" : "simulated" } };
+    return { access: context.access, settings: null, methods: [], invoices: [], attempts: [], stripe: { configured: stripeConfigured, mode: stripeConfigured ? "real" : "simulated" } };
   }
 
   const [settings, methods, invoices, attempts] = await Promise.all([
@@ -87,7 +91,7 @@ export const loader = async ({ request }) => {
       amount: a.amount,
       createdAt: a.createdAt,
     })),
-    stripe: { configured: stripeConfigured(), mode: stripeConfigured() ? "real" : "simulated" },
+    stripe: { configured: stripeConfigured, mode: stripeConfigured ? "real" : "simulated" },
   };
 };
 
