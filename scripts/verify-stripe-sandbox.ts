@@ -51,6 +51,7 @@ import {
   isSimulatedId,
 } from "../app/services/stripeMode.server";
 import { stripeWebhookSecret } from "../app/services/credentials.server";
+import { getIntegrationState } from "../app/services/integrationHealth.server";
 import { action as stripeWebhookAction } from "../app/routes/webhooks.stripe";
 
 const prisma = new PrismaClient();
@@ -499,6 +500,56 @@ async function main() {
     check("a repeated delivery is accepted, not errored", replay.status === 200, `HTTP ${replay.status}`);
     check("a repeated delivery writes no second event row", before === 1 && after === 1, `${before} -> ${after}`);
     check("a repeated delivery writes no second payment method", methodRowsAfter === 1, `${methodRowsAfter} row(s)`);
+
+    // ------------------------------------------ E2. A seller that is not here
+    /*
+     * A sandbox setup intent made against another database, or one whose seller
+     * has since been deleted, is delivered with a sellerId this database does
+     * not have. The only write it leads to is a payment method owned by that
+     * seller, so it cannot succeed however many times it is retried — and a 500
+     * means Stripe retries it for days while the integration is reported as
+     * FAILED, which is an outage that is not happening. It must be recorded and
+     * answered 200.
+     */
+    console.log("\n-- E2. A setup event for a seller this database does not have --------");
+
+    const unknownEventId = `evt_sandbox_unknown_${Date.now()}`;
+    createdEventIds.push(unknownEventId);
+    const unknownPayload = JSON.stringify({
+      id: unknownEventId,
+      type: "setup_intent.succeeded",
+      data: {
+        object: {
+          id: `seti_sandbox_unknown_${Date.now()}`,
+          customer: customer.id,
+          metadata: { sellerId: "seller-that-is-not-in-this-database" },
+        },
+      },
+    });
+
+    const stateBefore = await getIntegrationState("stripe");
+    const unknown = await deliverWebhook(unknownPayload, webhookSecret);
+    const unknownBody = await unknown.text();
+    check("an event for an unknown seller is accepted, not errored", unknown.status === 200, `HTTP ${unknown.status} ${unknownBody}`);
+
+    const unknownRow = await prisma.paymentEvent.findUnique({ where: { eventId: unknownEventId } });
+    check("...and is recorded as unmatched rather than dropped", unknownRow?.status === "UNMATCHED", String(unknownRow?.status));
+    check(
+      "...and says which seller it named",
+      /does not have/i.test(unknownRow?.errorMessage ?? ""),
+      unknownRow?.errorMessage ?? "(none)"
+    );
+    check(
+      "...and no payment method was saved",
+      (await prisma.sellerPaymentMethod.count({ where: { sellerId: "seller-that-is-not-in-this-database" } })) === 0
+    );
+
+    const stateAfter = await getIntegrationState("stripe");
+    check(
+      "...and the integration is not reported as failed by it",
+      stateAfter.status !== "FAILED" || stateAfter.status === stateBefore.status,
+      `${stateBefore.status} -> ${stateAfter.status}`
+    );
   }
 
   // ------------------------------------------- G. Sandbox payment success/failure

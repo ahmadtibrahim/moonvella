@@ -294,6 +294,33 @@ async function applySetupEvent(event: StripeEvent, object: Record<string, unknow
     return { matched: false, reason: "no_seller" };
   }
 
+  /*
+   * The setup intent names a seller this database does not have — a sandbox
+   * intent created against another database, or a seller deleted after the
+   * intent was made. That is not a failure to retry: the only write this event
+   * leads to is a payment method owned by that seller, so a foreign key refuses
+   * it every time. Throwing would answer Stripe 500, which it redelivers with
+   * backoff, and each redelivery would report the integration as FAILED — an
+   * outage that is not happening, on the page whose whole job is to be believed
+   * when it says something is wrong. The event is recorded with the reason
+   * instead, exactly as a missing metadata field already is.
+   */
+  const seller = await prisma.seller.findUnique({ where: { id: sellerId }, select: { id: true } });
+  if (!seller) {
+    await prisma.paymentEvent.create({
+      data: {
+        provider: "stripe",
+        eventId: event.id,
+        type: event.type,
+        payload: JSON.stringify(event),
+        status: "UNMATCHED",
+        errorMessage: `Setup event names seller ${sellerId}, which this database does not have. Nothing was saved.`,
+        processedAt: new Date(),
+      },
+    });
+    return { matched: false, reason: "unknown_seller" };
+  }
+
   const mode = await stripeMode();
   if (mode === "simulated" || mode === "disabled") {
     await prisma.paymentEvent.create({
