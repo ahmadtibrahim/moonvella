@@ -358,6 +358,21 @@ const CHECKS = [
     file: "scripts/verify-odoo-import.ts",
     requires: [],
   },
+  // Phase A of the shipping work: origin mappings, packaging inheritance,
+  // address validation and image selection. It builds its own fixtures and
+  // removes them, because the deployed catalogue has no pillow products to lean
+  // on, and it stubs `fetch` for the Google calls — the stub REFUSES any host
+  // that is not Google's address-validation API, so a check that tried to reach
+  // a real provider fails here instead of succeeding against an account. No
+  // eShipper, Shopify or Odoo call is made. It saves and clears the `google`
+  // credential rows, snapshotting the integration row first, so it runs after
+  // verify-credentials for the same reason verify-odoo does.
+  {
+    name: "origins",
+    kind: "ts",
+    file: "scripts/verify-origins.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

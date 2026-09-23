@@ -18,7 +18,18 @@
  * to stub fetch entirely for its own purposes.
  */
 
-const PROVIDER_HOSTS = ["api.stripe.com", "eshipper.com"];
+const PROVIDER_HOSTS = [
+  "api.stripe.com",
+  "eshipper.com",
+  // Google Maps Platform. Address validation and Places autocomplete are both
+  // billable and both reachable from a code path a simulated suite can wander
+  // into, so the guard covers them too rather than trusting the suite to
+  // remember. The API host is separate from the Maps host on purpose: a suite
+  // that stubs one and not the other would fail here rather than spend quota.
+  "addressvalidation.googleapis.com",
+  "maps.googleapis.com",
+  "places.googleapis.com",
+];
 
 let installed = false;
 

@@ -12,7 +12,7 @@
  * operator can see what they are editing without retyping it.
  */
 
-export type CredentialKey = "stripe" | "eshipper" | "odoo";
+export type CredentialKey = "stripe" | "eshipper" | "odoo" | "google";
 
 export interface CredentialOption {
   value: string;
@@ -109,6 +109,32 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
         label: "Consignment owner",
         secret: false,
         placeholder: "partner name or numeric id",
+      },
+    ],
+  },
+  google: {
+    label: "Google Maps Platform",
+    note:
+      "TWO KEYS, AND THEY ARE NOT INTERCHANGEABLE. The browser key is handed to the " +
+      "page that renders address autocomplete, so it is public by construction — " +
+      "restrict it by HTTP referrer in the Google Cloud console, and enable only " +
+      "Places API (New) on it. The server key is used only by this server for Address " +
+      "Validation; it is encrypted, never rendered on this page, never sent to a " +
+      "browser, and should be restricted by IP address. Enabling validation on the " +
+      "browser key would let anyone who views the page spend the account's quota.",
+    fields: [
+      {
+        name: "GOOGLE_MAPS_BROWSER_KEY",
+        label: "Browser key (Places autocomplete)",
+        secret: false,
+        placeholder: "AIza… restricted by referrer",
+      },
+      {
+        name: "GOOGLE_MAPS_SERVER_KEY",
+        label: "Server key (Address Validation)",
+        secret: true,
+        type: "password",
+        placeholder: "AIza… restricted by IP",
       },
     ],
   },

@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { recordImageOutcomes, resolveImagesForImport } from "./importMediaSelection.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 
@@ -100,7 +101,28 @@ interface ResolvedPricing {
   markupPercent: number;
   customWholesalePrice: number | null;
   customRetailPrice: number | null;
-  images: { originalSource: string; mediaContentType: "IMAGE"; alt?: string }[];
+  images: ImportImageRequest[];
+}
+
+/**
+ * One image an import may send.
+ *
+ * `mediaAssetId` is carried through so the outcome of this attempt can be
+ * recorded against the seller's own selection row — that is what makes a retry
+ * retry only what failed, instead of resending everything.
+ *
+ * `alreadyUploadedAs` is the store's id for an image a previous attempt already
+ * placed. A non-null value means the image is skipped: the store is not ours to
+ * write twice, and a duplicate is visible to shoppers.
+ */
+interface ImportImageRequest {
+  mediaAssetId: string | null;
+  originalSource: string;
+  mediaContentType: "IMAGE";
+  alt?: string;
+  /** MoonVella variant ids this image is attached to, for the store-side link. */
+  variantIds: string[];
+  alreadyUploadedAs: string | null;
 }
 
 interface ShopifyVariant {
@@ -133,9 +155,26 @@ const PRODUCT_MEDIA_ADD = `#graphql
     }
   }`;
 
-const PRODUCT_MEDIA_COUNT = `#graphql
-  query MoonVellaProductMediaCount($id: ID!) {
-    product(id: $id) { media(first: 1) { nodes { id } } }
+/**
+ * The ids of a product's media, so an upload can be identified by what appeared
+ * rather than by what came back.
+ *
+ * WHY THIS EXISTS. `productUpdate(media:)` accepts a list and returns the
+ * product, not the media it created — so after adding four images there is no
+ * way to say which id belongs to which source. Uploading one at a time and
+ * diffing this list is what makes a per-image result possible, and a per-image
+ * result is what the work order requires: "report partial upload failures and
+ * allow retry" is unimplementable if five uploads produce one undifferentiated
+ * outcome.
+ *
+ * The alternative, `productCreateMedia`, does return the created media, but its
+ * ordering is not documented to follow the input when some entries fail — and a
+ * wrongly attributed id would mark the wrong image as uploaded, so a retry
+ * would resend the one that succeeded and skip the one that failed.
+ */
+const PRODUCT_MEDIA_IDS = `#graphql
+  query MoonVellaProductMediaIds($id: ID!) {
+    product(id: $id) { media(first: 100) { nodes { id } } }
   }`;
 
 const VARIANTS_BULK_CREATE = `#graphql
@@ -235,37 +274,245 @@ async function markImportFailed(sellerId: string, productId: string, message: st
     .catch(() => undefined);
 }
 
-/** Best effort; returns warning strings rather than throwing. */
-async function addProductMedia(
-  admin: AdminGraphql,
+/**
+ * Write each image's outcome back to the seller's selection row.
+ *
+ * Wrapped so a bookkeeping failure cannot fail an import that has already
+ * succeeded: the images are in the store, and rolling that back is not possible
+ * from here. A row that did not get written means the next run resends one
+ * image, which the store will accept as a duplicate — visible and fixable.
+ * Losing the whole import would be neither.
+ */
+async function persistMediaOutcomes(
+  sellerId: string,
   productId: string,
-  media: ResolvedPricing["images"]
-): Promise<string[]> {
-  if (!media.length) return [];
+  outcomes: MediaUploadOutcome[]
+): Promise<void> {
+  if (!outcomes.length) return;
+  const recordable = outcomes.filter((outcome) => outcome.mediaAssetId !== null);
+  if (!recordable.length) return;
   try {
-    const res = await admin.graphql(PRODUCT_MEDIA_ADD, {
-      variables: { productId, media },
-    });
-    const json = await res.json();
-    const errors = json?.data?.productUpdate?.userErrors ?? [];
-    return errors.map(
-      (e: { field?: unknown; message: string }) =>
-        `Image skipped (${Array.isArray(e.field) ? e.field.join(".") : e.field ?? "media"}): ${e.message}`
+    await recordImageOutcomes(
+      sellerId,
+      productId,
+      recordable.map((outcome) => ({
+        mediaAssetId: outcome.mediaAssetId as string,
+        ok: outcome.ok,
+        providerMediaId: outcome.providerMediaId,
+        error: outcome.error,
+      }))
     );
-  } catch (error) {
-    return [`Image upload failed: ${error instanceof Error ? error.message : "unknown error"}`];
+  } catch {
+    // Deliberately silent: see the note above. The import's own warnings
+    // already carry the per-image result the operator needs.
   }
 }
 
-async function countProductMedia(admin: AdminGraphql, productId: string): Promise<number | null> {
+/** Media ids currently on the product, or null when the store did not answer. */
+async function productMediaIds(admin: AdminGraphql, productId: string): Promise<Set<string> | null> {
   try {
-    const res = await admin.graphql(PRODUCT_MEDIA_COUNT, { variables: { id: productId } });
+    const res = await admin.graphql(PRODUCT_MEDIA_IDS, { variables: { id: productId } });
     const json = await res.json();
-    if (!json?.data?.product) return null;
-    return json.data.product.media?.nodes?.length ?? 0;
+    const nodes = json?.data?.product?.media?.nodes ?? [];
+    return new Set<string>(nodes.map((node: { id: string }) => node.id));
   } catch {
     return null;
   }
+}
+
+export interface MediaUploadOutcome {
+  mediaAssetId: string | null;
+  ok: boolean;
+  providerMediaId: string | null;
+  error: string | null;
+  /** The store's id for an image that was already there and was not resent. */
+  skippedExistingId: string | null;
+}
+
+export interface MediaUploadResult {
+  outcomes: MediaUploadOutcome[];
+  warnings: string[];
+  /** The store id for each MoonVella asset that now has one. */
+  mediaIdByAsset: Map<string, string>;
+}
+
+/**
+ * Send the selected images, one at a time, and report on each.
+ *
+ * ONE CALL PER IMAGE, DELIBERATELY. The batch form is faster and would report a
+ * single outcome for the whole set, which is exactly the report the work order
+ * rules out: when four images survive and the fifth is rejected, "the image
+ * upload failed" is a lie about the four that worked, and the operator has no
+ * way to know which one to fix. The cost is one extra round trip per image, on
+ * an operation that runs once per product per import.
+ *
+ * AN IMAGE A PREVIOUS ATTEMPT ALREADY PLACED IS NOT SENT AGAIN, and that is
+ * decided from our own record of the store's id, not by comparing URLs or
+ * filenames — both of which the seller may change, and neither of which is
+ * unique. The store's id is.
+ *
+ * When the store accepts a request but no new media id appears, that is
+ * reported as a failure rather than a success. Counting the request as done
+ * would leave the seller with an image that is not in their store and a row
+ * saying it was uploaded, and the retry that should have followed never
+ * happens.
+ */
+async function addSelectedProductMedia(
+  admin: AdminGraphql,
+  shopifyProductId: string,
+  images: ResolvedPricing["images"]
+): Promise<MediaUploadResult> {
+  const outcomes: MediaUploadOutcome[] = [];
+  const warnings: string[] = [];
+  const mediaIdByAsset = new Map<string, string>();
+  if (!images.length) return { outcomes, warnings, mediaIdByAsset };
+
+  let known = await productMediaIds(admin, shopifyProductId);
+
+  for (const image of images) {
+    const label = image.alt?.trim() || image.originalSource;
+
+    if (image.alreadyUploadedAs) {
+      outcomes.push({
+        mediaAssetId: image.mediaAssetId,
+        ok: true,
+        providerMediaId: image.alreadyUploadedAs,
+        error: null,
+        skippedExistingId: image.alreadyUploadedAs,
+      });
+      if (image.mediaAssetId) mediaIdByAsset.set(image.mediaAssetId, image.alreadyUploadedAs);
+      continue;
+    }
+
+    try {
+      const res = await admin.graphql(PRODUCT_MEDIA_ADD, {
+        variables: {
+          productId: shopifyProductId,
+          media: [
+            {
+              originalSource: image.originalSource,
+              mediaContentType: image.mediaContentType,
+              ...(image.alt ? { alt: image.alt } : {}),
+            },
+          ],
+        },
+      });
+      const json = await res.json();
+      const errors = json?.data?.productUpdate?.userErrors ?? [];
+      if (errors.length) {
+        const message = errors
+          .map((e: { field?: unknown; message: string }) =>
+            `${Array.isArray(e.field) ? e.field.join(".") : e.field ?? "media"}: ${e.message}`
+          )
+          .join("; ");
+        outcomes.push({
+          mediaAssetId: image.mediaAssetId,
+          ok: false,
+          providerMediaId: null,
+          error: message,
+          skippedExistingId: null,
+        });
+        warnings.push(`Image not uploaded (${label}): ${message}`);
+        continue;
+      }
+
+      const after = await productMediaIds(admin, shopifyProductId);
+      // Held in a local so the narrowing survives into the closure below; a
+      // `let` narrowed by a preceding check is not narrowed inside a callback.
+      const before = known;
+      const added = after && before ? [...after].filter((id) => !before.has(id)) : [];
+      if (after) known = after;
+
+      if (added.length === 1) {
+        outcomes.push({
+          mediaAssetId: image.mediaAssetId,
+          ok: true,
+          providerMediaId: added[0],
+          error: null,
+          skippedExistingId: null,
+        });
+        if (image.mediaAssetId) mediaIdByAsset.set(image.mediaAssetId, added[0]);
+        continue;
+      }
+
+      const message =
+        added.length === 0
+          ? "the store accepted the image but it did not appear on the product"
+          : `the store reported ${added.length} new images for one upload, so the new image could not be identified`;
+      outcomes.push({
+        mediaAssetId: image.mediaAssetId,
+        ok: false,
+        providerMediaId: null,
+        error: message,
+        skippedExistingId: null,
+      });
+      warnings.push(`Image not confirmed (${label}): ${message}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown error";
+      outcomes.push({
+        mediaAssetId: image.mediaAssetId,
+        ok: false,
+        providerMediaId: null,
+        error: message,
+        skippedExistingId: null,
+      });
+      warnings.push(`Image upload failed (${label}): ${message}`);
+    }
+  }
+
+  return { outcomes, warnings, mediaIdByAsset };
+}
+
+/**
+ * Attach each uploaded image to the variants it belonged to in MoonVella.
+ *
+ * The association is MoonVella's own — an asset is attached to a variant by a
+ * MediaAssetAssignment — and dropping it here would mean a seller who picks a
+ * subset of images silently loses the variant pictures along with it. The link
+ * is made with the store's media id, so it survives the seller renaming or
+ * reordering anything.
+ *
+ * A link that cannot be made is a warning, not a failure: the image is already
+ * in the store and usable, and the seller can attach it by hand. Failing the
+ * whole import over a variant link would be a worse trade.
+ */
+async function linkVariantImages(
+  admin: AdminGraphql,
+  shopifyProductId: string,
+  images: ResolvedPricing["images"],
+  mediaIdByAsset: Map<string, string>,
+  shopifyVariantByLocal: Map<string, string>
+): Promise<string[]> {
+  const warnings: string[] = [];
+  const updates: { id: string; mediaId: string }[] = [];
+
+  for (const image of images) {
+    if (!image.mediaAssetId || image.variantIds.length === 0) continue;
+    const mediaId = mediaIdByAsset.get(image.mediaAssetId);
+    if (!mediaId) continue;
+    for (const localVariantId of image.variantIds) {
+      const shopifyVariantId = shopifyVariantByLocal.get(localVariantId);
+      if (!shopifyVariantId) continue;
+      updates.push({ id: shopifyVariantId, mediaId });
+    }
+  }
+  if (!updates.length) return warnings;
+
+  try {
+    const res = await admin.graphql(VARIANTS_BULK_UPDATE, {
+      variables: { productId: shopifyProductId, variants: updates },
+    });
+    const json = await res.json();
+    const errors = json?.data?.productVariantsBulkUpdate?.userErrors ?? [];
+    for (const error of errors) {
+      warnings.push(`Variant image not linked: ${error.message}`);
+    }
+  } catch (error) {
+    warnings.push(
+      `Variant images not linked: ${error instanceof Error ? error.message : "unknown error"}`
+    );
+  }
+  return warnings;
 }
 
 async function fetchFirstLocationId(admin: AdminGraphql): Promise<string | null> {
@@ -488,7 +735,8 @@ async function createNewProduct(
   }
   const shopifyProductId: string = createJson.data.productCreate.product.id;
 
-  const warnings = await addProductMedia(admin, shopifyProductId, opts.images);
+  const upload = await addSelectedProductMedia(admin, shopifyProductId, opts.images);
+  const warnings = [...upload.warnings];
 
   const variantInputs = product.variants.map((variant) => ({
     optionValues: [{ optionName: "Title", name: variant.name }],
@@ -530,6 +778,22 @@ async function createNewProduct(
     local,
     shopifyVariant: createdVariants[index] ?? null,
   }));
+
+  // Variant links come after the variants exist, which is why this is here and
+  // not beside the upload: a media id can be attached to a variant only once
+  // the store has told us the variant's own id.
+  const shopifyVariantByLocal = new Map(
+    resolved
+      .filter((item): item is { local: ImportableVariant; shopifyVariant: ShopifyVariant } =>
+        Boolean(item.shopifyVariant)
+      )
+      .map((item) => [item.local.id, item.shopifyVariant.id])
+  );
+  warnings.push(
+    ...(await linkVariantImages(admin, shopifyProductId, opts.images, upload.mediaIdByAsset, shopifyVariantByLocal))
+  );
+
+  await persistMediaOutcomes(seller.id, product.id, upload.outcomes);
 
   const result = await persistMappings(
     seller,
@@ -592,9 +856,21 @@ async function resyncExistingProduct(
     return { ok: false, error: message };
   }
 
-  if (opts.images.length && (await countProductMedia(admin, shopifyProductId)) === 0) {
-    warnings.push(...(await addProductMedia(admin, shopifyProductId, opts.images)));
-  }
+  /*
+   * The previous version of this branch sent the images only when the product
+   * had NO media at all, which was a crude stand-in for "have we done this
+   * already". It got the interesting case exactly backwards: a seller who had
+   * added one image by hand, or excluded one earlier, had a product with media,
+   * so a newly selected image was never sent — and there was no record of which
+   * images had been sent, so there was no way to tell.
+   *
+   * The check is now per image and comes from our own record of the store's id
+   * for each one. An image already placed is skipped and reported; an image
+   * that failed is retried; an image the seller excluded is not in the list at
+   * all and cannot reappear.
+   */
+  const upload = await addSelectedProductMedia(admin, shopifyProductId, opts.images);
+  warnings.push(...upload.warnings);
 
   const mappingByVariant = new Map(
     existing.variantMappings.map((mapping) => [mapping.productVariantId, mapping])
@@ -686,6 +962,19 @@ async function resyncExistingProduct(
     warnings.push(...(await setInventoryQuantities(admin, quantities)));
   }
 
+  const shopifyVariantByLocal = new Map(
+    resolved
+      .filter((item): item is { local: ImportableVariant; shopifyVariant: ShopifyVariant } =>
+        Boolean(item.shopifyVariant)
+      )
+      .map((item) => [item.local.id, item.shopifyVariant.id])
+  );
+  warnings.push(
+    ...(await linkVariantImages(admin, shopifyProductId, opts.images, upload.mediaIdByAsset, shopifyVariantByLocal))
+  );
+
+  await persistMediaOutcomes(seller.id, product.id, upload.outcomes);
+
   const result = await persistMappings(
     seller,
     product,
@@ -772,12 +1061,50 @@ export async function importProductForSeller(
       ? options.customRetailPrice
       : existing?.customRetailPrice ?? null;
 
+  /*
+   * WHICH IMAGES GO IS THE SELLER'S DECISION, NOT THIS FUNCTION'S.
+   *
+   * The eligible set is still approved-and-seller-visible, and that gate is
+   * applied inside `resolveImagesForImport` so the preview a seller chooses from
+   * and the list this function sends cannot disagree. What changes here is that
+   * the list is the seller's saved selection rather than every eligible image:
+   * an image they removed stays removed on the next import, and an image a
+   * previous attempt already placed is carried with the store's own id for it
+   * so it is not sent a second time.
+   *
+   * With no stored selection the behaviour is what it always was — every
+   * eligible image — and `defaulted` says so, so the interface can tell the
+   * seller nothing has been chosen yet. Importing nothing until a choice is
+   * made would turn a missing step into a broken product.
+   */
+  const selection = await resolveImagesForImport(sellerId, productId);
   const opts: ResolvedPricing = {
     publish: options.publish,
     markupPercent: options.markupPercent ?? 0,
     customWholesalePrice,
     customRetailPrice,
-    images: buildMediaInputs(collectProductImages(product)),
+    images: [
+      ...selection.images.map((image) => ({
+        mediaAssetId: image.mediaAssetId,
+        originalSource: image.url,
+        mediaContentType: "IMAGE" as const,
+        ...(image.alt ? { alt: image.alt } : {}),
+        variantIds: image.variantIds,
+        alreadyUploadedAs: image.alreadyUploadedAs,
+      })),
+      // Legacy assets are included only when no selection has been saved, so a
+      // seller who has chosen a set does not receive extras they never saw.
+      ...(selection.defaulted
+        ? buildMediaInputs(collectProductImages(product)).map((image) => ({
+            mediaAssetId: null,
+            originalSource: image.originalSource,
+            mediaContentType: "IMAGE" as const,
+            ...(image.alt ? { alt: image.alt } : {}),
+            variantIds: [] as string[],
+            alreadyUploadedAs: null,
+          }))
+        : []),
+    ],
   };
 
   try {

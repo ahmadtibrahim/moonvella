@@ -2,6 +2,10 @@ import React from "react";
 import { useFetcher, useLoaderData } from "react-router";
 import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
 import { listCatalog } from "../services/catalog.server";
+// The image chooser is its own typed component: `.jsx` in this project is never
+// typechecked, and the panel holding a copy of somebody's catalogue images is
+// the last place a typo should be found by a seller rather than by the compiler.
+import ImagePicker from "../components/ImagePicker";
 
 /**
  * The catalogue is a preview for anybody who is not blocked, and the list
@@ -290,6 +294,10 @@ export default function CatalogPage() {
                   >
                     Download marketing pack
                   </a>
+                ) : null}
+
+                {canImport ? (
+                  <ImagePicker productId={product.id} disabled={fetcher.state !== "idle"} />
                 ) : null}
 
                 {canImport ? (

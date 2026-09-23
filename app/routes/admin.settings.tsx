@@ -424,6 +424,7 @@ const INTEGRATION_LABEL: Record<string, string> = {
   stripe: "Stripe",
   eshipper: "eShipper",
   odoo: "Odoo",
+  google: "Google Maps Platform",
   shopify_orders: "Shopify orders",
   shopify_fulfillment: "Shopify fulfillment",
   shopify_analytics: "Shopify analytics",
@@ -624,8 +625,11 @@ function CredentialsForm({
   );
 }
 
-/** The three credential keys, in the order the page presents them. */
-const CREDENTIAL_KEY_ORDER: CredentialKey[] = ["stripe", "eshipper", "odoo"];
+/** Every credential key, in the order the page presents them. Adding one here is
+ *  what makes its card render — the list is deliberately explicit rather than
+ *  derived from CREDENTIAL_INTEGRATIONS, so a key added to the field definitions
+ *  cannot appear on a live settings page without this line being changed too. */
+const CREDENTIAL_KEY_ORDER: CredentialKey[] = ["stripe", "eshipper", "odoo", "google"];
 
 function isCredentialIntegrationKey(key: string): key is CredentialKey {
   return (CREDENTIAL_KEY_ORDER as string[]).includes(key);

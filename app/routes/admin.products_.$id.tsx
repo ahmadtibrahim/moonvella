@@ -1,6 +1,7 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
+import { prisma } from "~/db.server";
 import { permissionsFor } from "~/services/permissions";
 import {
   getProduct,
@@ -27,20 +28,35 @@ import {
 } from "~/services/media.server";
 import { publicationReadiness } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
-import { listPresets, saveVariantPackages, copyVariantPackaging } from "~/services/packaging.server";
+import {
+  getProductPackages,
+  listPresets,
+  resolvePackagesForVariant,
+  saveProductPackages,
+  saveVariantPackages,
+  copyVariantPackaging,
+} from "~/services/packaging.server";
+import {
+  missingOriginFields,
+  resolveOriginForVariant,
+  saveOriginMappings,
+  type OriginLocation,
+} from "~/services/origins.server";
 import { card, INK, MUTED, catalogueValue, listValue } from "~/components/product/ui";
 import DetailsTab from "~/components/product/DetailsTab";
 import VariantsTab from "~/components/product/VariantsTab";
+import ShippingTab from "~/components/product/ShippingTab";
 import MediaTab from "~/components/product/MediaTab";
 import DocumentsTab from "~/components/product/DocumentsTab";
 import MarketingTab from "~/components/product/MarketingTab";
 
-export const TABS = ["details", "variants", "media", "documents", "marketing"] as const;
+export const TABS = ["details", "variants", "shipping", "media", "documents", "marketing"] as const;
 export type TabKey = (typeof TABS)[number];
 
 const TAB_LABELS: Record<TabKey, string> = {
   details: "Product Details",
   variants: "Variants",
+  shipping: "Shipping",
   media: "Media",
   documents: "Documents",
   marketing: "Marketing Kit",
@@ -59,6 +75,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   }
 
   const url = new URL(request.url);
+  const tab = readTab(url.searchParams.get("tab"));
   const [presets, media, readiness, pack] = await Promise.all([
     listPresets(),
     listProductMedia(productId),
@@ -76,7 +93,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     media,
     readiness,
     pack,
-    tab: readTab(url.searchParams.get("tab")),
+    /**
+     * Resolving every variant's origin and packaging costs a query per variant
+     * per question, so it is only done when the Shipping tab is open. It goes
+     * through the same functions the quoting and booking paths call rather than
+     * reading the columns here — the page must show what the gate will decide,
+     * and a second implementation of "is this ready" is a second answer.
+     */
+    shipping: tab === "shipping" ? await shippingContext(product) : null,
+    tab,
     /**
      * "Preview seller view" is a navigation rather than a client-side toggle, so
      * the preview is a URL someone can send to a colleague and reload.
@@ -91,6 +116,105 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       manage: held.has("products.manage"),
       cost: held.has("products.cost.edit"),
     },
+  };
+}
+
+type LoadedProduct = NonNullable<Awaited<ReturnType<typeof getProduct>>>;
+
+/**
+ * The packaging rows of a submitted form, zipped by index.
+ *
+ * The text and number fields are parallel arrays, because every row is in the
+ * document in the same order and no row is added or removed without a round
+ * trip. The two checkboxes are the exception: an unchecked box submits nothing
+ * at all, so a row with the box off would shift every value after it by one.
+ * They are named per row and read by index, which is the only way to know which
+ * carton a missing value belongs to.
+ *
+ * EVERY COLUMN THE SERVICE STORES IS READ HERE, and that is not tidiness. Both
+ * saves are whole-set replaces — the old rows are deleted and the submitted ones
+ * created — so a field this function forgets is a field the save deletes. A
+ * carton edited through the editor would quietly lose its declared value, its
+ * description and its "ships separately" flag, and the quote would change
+ * without anybody touching a number.
+ */
+function packageRows(form: FormData) {
+  const at = (name: string, index: number) => String(form.getAll(name)[index] ?? "");
+  return form.getAll("pkg_length").map((_, index) => ({
+    label: at("pkg_label", index),
+    packageType: at("pkg_packageType", index) || "carton",
+    presetId: at("pkg_presetId", index) || null,
+    length: at("pkg_length", index),
+    width: at("pkg_width", index),
+    height: at("pkg_height", index),
+    // The forms default to inches and pounds; the service converts once, to the
+    // canonical centimetres and kilograms, without rounding the stored value.
+    dimensionUnit: at("pkg_dimUnit", index) || "in",
+    grossWeight: at("pkg_weight", index),
+    weightUnit: at("pkg_weightUnit", index) || "lb",
+    unitsPerPackage: at("pkg_unitsPerPackage", index) || "1",
+    packagesPerUnit: at("pkg_packagesPerUnit", index) || "1",
+    description: at("pkg_description", index) || null,
+    declaredValue: at("pkg_declaredValue", index) || null,
+    shipsSeparately: form.get(`pkg_shipsSeparately_${index}`) === "true",
+    // Defaults to allowed when the control is absent entirely, so a form that
+    // predates the column cannot silently forbid consolidation.
+    consolidatable: form.has(`pkg_consolidatable_${index}`)
+      ? form.get(`pkg_consolidatable_${index}`) === "true"
+      : true,
+  }));
+}
+
+/**
+ * Everything the Shipping tab shows, resolved the way the booking path resolves it.
+ *
+ * The variant rows carry the ANSWER ("inherits the product's packaging", "no
+ * location mapped") rather than the raw foreign keys, because that answer is
+ * what an operator is checking — a table of ids would be a table nobody can
+ * read. `packages` is the product's own default rows, which is what the editor
+ * edits; `variants[].packageCount` is what each variant would actually be
+ * quoted from, which is not always the same number.
+ */
+async function shippingContext(product: LoadedProduct) {
+  const [locations, packages] = await Promise.all([
+    // Inactive locations are listed as well as active ones: a mapping that
+    // points at a switched-off dock has to be visible in the select that set it,
+    // otherwise the row looks unmapped and the mapping is quietly replaced.
+    prisma.pickupLocation.findMany({ orderBy: [{ isActive: "desc" }, { code: "asc" }] }),
+    getProductPackages(product.id),
+  ]);
+
+  const variants = await Promise.all(
+    product.variants.map(async (variant) => {
+      const [origin, packaging] = await Promise.all([
+        resolveOriginForVariant(variant.id),
+        resolvePackagesForVariant(variant.id),
+      ]);
+      return {
+        id: variant.id,
+        name: variant.name,
+        sku: variant.sku,
+        pickupLocationId: variant.pickupLocationId,
+        originSource: origin.source,
+        originReady: origin.ready,
+        originReason: origin.reason,
+        originName: origin.location?.name ?? null,
+        packageSource: packaging.source,
+        packageCount: packaging.packages.length,
+      };
+    })
+  );
+
+  return {
+    locations: locations.map((location) => ({
+      id: location.id,
+      code: location.code,
+      name: location.name,
+      isActive: location.isActive,
+      missing: missingOriginFields(location as OriginLocation),
+    })),
+    packages,
+    variants,
   };
 }
 
@@ -335,30 +459,43 @@ export async function action({ request, params }: ActionFunctionArgs) {
       /* ---------------------------------------------------------------- */
       /* Shipping and packaging — a separate feature, kept working          */
       /* ---------------------------------------------------------------- */
-      case "save_packaging": {
-        const lengths = form.getAll("pkg_length").map(String);
-        const rows = lengths.map((length, i) => ({
-          label: String(form.getAll("pkg_label")[i] ?? ""),
-          packageType: String(form.getAll("pkg_packageType")[i] ?? "carton"),
-          presetId: String(form.getAll("pkg_presetId")[i] ?? "") || null,
-          length,
-          width: String(form.getAll("pkg_width")[i] ?? ""),
-          height: String(form.getAll("pkg_height")[i] ?? ""),
-          // The form defaults to inches and pounds; the service converts to the
-          // canonical centimetres and kilograms before anything is stored.
-          dimensionUnit: String(form.getAll("pkg_dimUnit")[i] ?? "in"),
-          grossWeight: String(form.getAll("pkg_weight")[i] ?? ""),
-          weightUnit: String(form.getAll("pkg_weightUnit")[i] ?? "lb"),
-          unitsPerPackage: String(form.getAll("pkg_unitsPerPackage")[i] ?? "1"),
-          packagesPerUnit: String(form.getAll("pkg_packagesPerUnit")[i] ?? "1"),
-        }));
-        await saveVariantPackages(text("variantId"), rows);
+      case "save_packaging":
+        await saveVariantPackages(text("variantId"), packageRows(form));
         break;
-      }
 
       case "copy_packaging":
         await copyVariantPackaging(text("fromVariantId"), text("toVariantId"));
         break;
+
+      /**
+       * The product's own packaging defaults, and the origins the Shipping tab
+       * sets. Both are written through services rather than here, so the
+       * validation — every id checked before anything is written, every package
+       * row refused as a set rather than filtered — lives in one place.
+       */
+      case "save_product_packages":
+        await saveProductPackages(productId, packageRows(form));
+        break;
+
+      case "save_origin": {
+        const locationIds = form.getAll("originLocationId").map(String);
+        await saveOriginMappings(
+          productId,
+          {
+            productLocationId: optional("pickupLocationId"),
+            variantOverrides: form
+              .getAll("originVariantId")
+              .map(String)
+              .filter(Boolean)
+              .map((variantId, index) => ({
+                variantId,
+                locationId: (locationIds[index] ?? "").trim() || null,
+              })),
+          },
+          { actorId: user.id, actorName: user.name }
+        );
+        break;
+      }
 
       default:
         throw new Error("Unknown action.");
@@ -375,7 +512,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function AdminProductDetail() {
-  const { product, presets, media, readiness, pack, tab, can, preview } =
+  const { product, presets, media, readiness, pack, shipping, tab, can, preview } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
@@ -461,6 +598,16 @@ export default function AdminProductDetail() {
       ) : null}
       {tab === "variants" ? (
         <VariantsTab product={product} presets={presets} canEditCost={can.cost} />
+      ) : null}
+      {tab === "shipping" && shipping ? (
+        <ShippingTab
+          product={{ id: product.id, name: product.name, pickupLocationId: product.pickupLocationId }}
+          variants={shipping.variants}
+          locations={shipping.locations}
+          packages={shipping.packages}
+          presets={presets}
+          canManage={can.manage}
+        />
       ) : null}
       {tab === "media" ? <MediaTab product={product} media={media} /> : null}
       {tab === "documents" ? <DocumentsTab product={product} media={media} /> : null}

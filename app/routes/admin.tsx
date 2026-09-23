@@ -38,6 +38,10 @@ const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permi
   { href: "/admin/odoo", label: "Odoo Import", icon: "I", permission: "products.view" },
   { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view" },
   { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view" },
+  // The docks goods are collected from. It sits next to Shipping rather than
+  // under Settings because it is the record a shipping decision is made from:
+  // the booking gate reads the address verdict on each of these rows.
+  { href: "/admin/origins", label: "Pickup Locations", icon: "K", permission: "shipping.view" },
   { href: "/admin/users", label: "Users", icon: "U", permission: "users.view" },
   // Settings has no permission gate: every signed-in user needs it to change
   // their own password. The sections inside it are gated individually.

@@ -16,21 +16,21 @@ datasource db {
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
@@ -42,21 +42,21 @@ model Session {
 /// so the name follows the job. The rename cost nothing at the moment it was
 /// made: the table held zero rows.
 model AdminUser {
-  id                 String    @id @default(cuid())
+  id           String    @id @default(cuid())
   /// Always stored trimmed and lower-cased, and sign-in normalises the same
   /// way, so "A@B.com" and "a@b.com" can never become two accounts.
-  email              String    @unique
-  name               String
+  email        String    @unique
+  name         String
   /// Null until an invitation is accepted. A pending invitee therefore holds no
   /// credential at all, rather than a placeholder that could be guessed.
-  passwordHash       String?
-  role               AdminRole @default(VIEWER)
-  isActive           Boolean   @default(true)
+  passwordHash String?
+  role         AdminRole @default(VIEWER)
+  isActive     Boolean   @default(true)
 
   /// The primary owner. At most one row may carry this flag: the migration
   /// creates a partial unique index on it, so the invariant is enforced by the
   /// database and not only by the application code that happens to respect it.
-  isPrimaryOwner     Boolean   @default(false)
+  isPrimaryOwner Boolean @default(false)
 
   /// Set when the invited person proves control of the address by accepting.
   /// Distinguishes a proven address from one an operator merely typed in.
@@ -65,23 +65,23 @@ model AdminUser {
   /// ordinary invitation flow.
   mustChangePassword Boolean   @default(false)
 
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
-  lastLoginAt        DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  lastLoginAt DateTime?
 
   /// Durable per-account failure tally, surfaced in the user list. LoginAttempt
   /// remains the source of truth for throttling; this is the visible counter.
-  failedLoginCount   Int       @default(0)
-  lockedUntil        DateTime?
+  failedLoginCount Int       @default(0)
+  lockedUntil      DateTime?
 
   /// Who created the account. Null for the primary owner, who is created by the
   /// CLI and has no creator.
-  createdById        String?
-  createdBy          AdminUser? @relation("CreatedUsers", fields: [createdById], references: [id], onDelete: SetNull)
-  createdUsers       AdminUser[] @relation("CreatedUsers")
+  createdById  String?
+  createdBy    AdminUser?  @relation("CreatedUsers", fields: [createdById], references: [id], onDelete: SetNull)
+  createdUsers AdminUser[] @relation("CreatedUsers")
 
-  sessions           AdminSession[]
-  invitationsSent    AdminInvitation[] @relation("InvitedBy")
+  sessions             AdminSession[]
+  invitationsSent      AdminInvitation[]     @relation("InvitedBy")
   reviewedApplications MerchantApplication[] @relation("ReviewedApplications")
 
   @@index([isActive])
@@ -164,29 +164,29 @@ model AdminInvitation {
 }
 
 model MerchantApplication {
-  id                    String                @id @default(cuid())
-  shopDomain            String                @unique
-  storeName             String
-  shopifyPlan           String?
-  storeUrl              String?
-  country               String?
-  currency              String?
-  contactName           String
-  email                 String
-  phone                 String?
-  urgentPhone           String?
+  id                String  @id @default(cuid())
+  shopDomain        String  @unique
+  storeName         String
+  shopifyPlan       String?
+  storeUrl          String?
+  country           String?
+  currency          String?
+  contactName       String
+  email             String
+  phone             String?
+  urgentPhone       String?
   /// The emergency contact's own name. The application asks whether the urgent
   /// number belongs to the person above or to somebody else, and a number
   /// without a name is not an answer to "who do we call".
-  urgentContactName     String?
-  legalBusinessName     String
+  urgentContactName String?
+  legalBusinessName String
   /// DEPRECATED, and no longer written or rendered. It was one free-text box
   /// standing in for an address, which cannot be mapped onto Odoo's street /
   /// street2 / city / zip / state / country fields without guessing where one
   /// ends and the next begins. The structured columns below replaced it. Kept
   /// as a nullable column so values already stored are not destroyed.
-  sellerAddress         String?
-  gstHstNumber          String?
+  sellerAddress     String?
+  gstHstNumber      String?
 
   // --- imported from Shopify -------------------------------------------
   // Everything below is filled from the authenticated Admin API session, never
@@ -194,44 +194,44 @@ model MerchantApplication {
   // session's shop domain, so a form cannot claim to be another store.
   /// The permanent Shopify shop id (`gid://shopify/Shop/…`). It survives a
   /// domain change, which the myshopify domain does not.
-  shopifyShopId         String?
+  shopifyShopId       String?
   /// `shop.email` — the account owner's address.
-  storeOwnerEmail       String?
+  storeOwnerEmail     String?
   /// `shop.contactEmail` — the address the storefront publishes. Stored
   /// separately from the owner's: they are different people on most stores,
   /// and one mailbox cannot be both.
-  storeContactEmail     String?
-  addressLine1          String?
-  addressLine2          String?
-  addressCity           String?
-  addressProvinceCode   String?
-  addressPostalCode     String?
-  addressCountryCode    String?
+  storeContactEmail   String?
+  addressLine1        String?
+  addressLine2        String?
+  addressCity         String?
+  addressProvinceCode String?
+  addressPostalCode   String?
+  addressCountryCode  String?
   /// Which fields the import actually produced a value for, which it found
   /// empty in Shopify, and which a merchant has since edited. Without this a
   /// blank box cannot say whether Shopify had nothing or nobody ever looked.
-  profileFieldSources   Json?                 @default("{}")
+  profileFieldSources Json?             @default("{}")
   /// The last raw response, kept so the page can show why a field is missing
   /// rather than showing an empty input and an apology.
-  shopifyProfileJson    Json?                 @default("{}")
-  profileRefreshedAt    DateTime?
-  profileRefreshError   String?
-  productCategory       String
-  markets               String                @default("[]")
-  status                ApplicationStatus     @default(PENDING)
-  submittedAt           DateTime?
-  reviewedAt            DateTime?
-  reviewedById          String?
-  reviewedBy            AdminUser?            @relation("ReviewedApplications", fields: [reviewedById], references: [id])
-  rejectionReason       String?
-  internalNotes         String?
-  businessStartDate     DateTime?
-  createdAt             DateTime              @default(now())
-  updatedAt             DateTime              @updatedAt
-  shopifyStoreProfile   String?               @default("{}")
-  shopifySalesReview    String?               @default("{}")
-  merchantContact       String?               @default("{}")
-  seller                Seller?
+  shopifyProfileJson  Json?             @default("{}")
+  profileRefreshedAt  DateTime?
+  profileRefreshError String?
+  productCategory     String
+  markets             String            @default("[]")
+  status              ApplicationStatus @default(PENDING)
+  submittedAt         DateTime?
+  reviewedAt          DateTime?
+  reviewedById        String?
+  reviewedBy          AdminUser?        @relation("ReviewedApplications", fields: [reviewedById], references: [id])
+  rejectionReason     String?
+  internalNotes       String?
+  businessStartDate   DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  shopifyStoreProfile String?           @default("{}")
+  shopifySalesReview  String?           @default("{}")
+  merchantContact     String?           @default("{}")
+  seller              Seller?
 
   @@index([status])
   @@index([shopDomain])
@@ -253,54 +253,54 @@ enum ApplicationStatus {
 }
 
 model Seller {
-  id                    String        @id @default(cuid())
-  shopDomain            String        @unique
-  storeName             String
-  shopDomainFull        String
-  contactEmail          String
-  contactName           String?
-  phone                 String?
-  country               String?
-  currency              String        @default("CAD")
-  shopifyPlan           String?
-  storeUrl              String?
-  applicationId         String?       @unique
-  application           MerchantApplication? @relation(fields: [applicationId], references: [id])
-  status                SellerStatus  @default(PENDING)
-  approvedAt            DateTime?
-  suspendedAt           DateTime?
-  suspensionReason      String?
+  id                 String                   @id @default(cuid())
+  shopDomain         String                   @unique
+  storeName          String
+  shopDomainFull     String
+  contactEmail       String
+  contactName        String?
+  phone              String?
+  country            String?
+  currency           String                   @default("CAD")
+  shopifyPlan        String?
+  storeUrl           String?
+  applicationId      String?                  @unique
+  application        MerchantApplication?     @relation(fields: [applicationId], references: [id])
+  status             SellerStatus             @default(PENDING)
+  approvedAt         DateTime?
+  suspendedAt        DateTime?
+  suspensionReason   String?
   // Blocked is a separate state from suspended, so it gets its own columns: a
   // suspension reason that actually holds a block reason is a record that lies
   // about which control was used.
-  blockedAt             DateTime?
-  blockReason           String?
+  blockedAt          DateTime?
+  blockReason        String?
   /// Deactivation is a third control, so it gets a third pair of columns for
   /// the same reason block did: a suspension reason column holding a
   /// deactivation reason is a record that lies about which control was used.
-  deactivatedAt         DateTime?
-  deactivationReason    String?
+  deactivatedAt      DateTime?
+  deactivationReason String?
   /// Bumped on every access-changing write. Deferred work carries the version
   /// it was queued under and is cancelled if it no longer matches, so a job
   /// created while a seller was approved cannot run after they were blocked.
-  accessVersion         Int           @default(1)
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt
-  installedAt           DateTime?
-  domainRegisteredAt    DateTime?
-  businessStartDate     DateTime?
-  lastSyncAt            DateTime?
-  syncStatus            SyncStatus    @default(NEVER)
-  products              SellerProduct[]
-  orders                Order[]
-  wholesalePayments     WholesalePayment[]
-  billingSettings       SellerBillingSettings?
-  paymentMethods        SellerPaymentMethod[]
-  bankAccounts          SellerBankAccount[]
-  settings              SellerSettings?
-  brandKit              SellerBrandKit?
-  contactMappings       ExternalContactMapping[]
-  jobs                  BackgroundJob[]
+  accessVersion      Int                      @default(1)
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  installedAt        DateTime?
+  domainRegisteredAt DateTime?
+  businessStartDate  DateTime?
+  lastSyncAt         DateTime?
+  syncStatus         SyncStatus               @default(NEVER)
+  products           SellerProduct[]
+  orders             Order[]
+  wholesalePayments  WholesalePayment[]
+  billingSettings    SellerBillingSettings?
+  paymentMethods     SellerPaymentMethod[]
+  bankAccounts       SellerBankAccount[]
+  settings           SellerSettings?
+  brandKit           SellerBrandKit?
+  contactMappings    ExternalContactMapping[]
+  jobs               BackgroundJob[]
 
   @@index([status])
   @@index([shopDomain])
@@ -354,7 +354,6 @@ enum ProductArchiveStatus {
 
 /**
  * A unit of deferred work.
- *
  * MoonVella had no queue at all before this: every action was synchronous, so a
  * slow or unreachable third party made the owner's click fail. Approval must
  * survive Odoo being down and blocking must survive Shopify being slow, so the
@@ -379,17 +378,17 @@ enum SyncStatus {
 }
 
 model SellerSettings {
-  id                    String   @id @default(cuid())
-  sellerId              String   @unique
-  seller                Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  autoSyncInventory     Boolean  @default(true)
-  quantityBuffer        Int      @default(5)
-  lowStockAlerts        Boolean  @default(true)
-  autoImportOrders      Boolean  @default(true)
-  estimatedDeliveryMsg  String   @default("Typically ships within 2–4 business days.")
-  defaultMarkup         Int      @default(200)
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  id                   String   @id @default(cuid())
+  sellerId             String   @unique
+  seller               Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  autoSyncInventory    Boolean  @default(true)
+  quantityBuffer       Int      @default(5)
+  lowStockAlerts       Boolean  @default(true)
+  autoImportOrders     Boolean  @default(true)
+  estimatedDeliveryMsg String   @default("Typically ships within 2–4 business days.")
+  defaultMarkup        Int      @default(200)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 }
 
 /// A product family. It is a description, not a thing that exists in a
@@ -410,21 +409,34 @@ model SellerSettings {
 /// converted into MediaAsset rows with a shared assignment. See MediaAsset for
 /// the model that replaced them.
 model Product {
-  id                    String            @id @default(cuid())
-  name                  String
-  description           String?
-  category              String
-  currency              String            @default("CAD")
-  categoryId            String?
-  categoryRef           Category?         @relation(fields: [categoryId], references: [id])
-  variants              ProductVariant[]
-  sellerProducts        SellerProduct[]
-  orderItems            OrderItem[]       @relation("OrderItemProduct")
-  isActive              Boolean           @default(true)
-  isPublished           Boolean           @default(true)
-  isArchived            Boolean           @default(false)
-  createdAt             DateTime          @default(now())
-  updatedAt             DateTime          @updatedAt
+  id               String           @id @default(cuid())
+  name             String
+  description      String?
+  category         String
+  currency         String           @default("CAD")
+  categoryId       String?
+  categoryRef      Category?        @relation(fields: [categoryId], references: [id])
+  variants         ProductVariant[]
+  sellerProducts   SellerProduct[]
+  /// Where this product ships from, by default. A variant may override it.
+  ///
+  /// A REFERENCE, not a copy of the address. The address itself lives once, on
+  /// PickupLocation, because the same dock is shared by many products and an
+  /// address typed onto each of them cannot be corrected in one place — the
+  /// failure that produces is a parcel collected from a door nobody updated.
+  /// Null is meaningful and is never filled in from a "global" default: an
+  /// unmapped product cannot be quoted or booked, and says so by name.
+  pickupLocationId String?
+  pickupLocation   PickupLocation?  @relation("ProductPickupLocation", fields: [pickupLocationId], references: [id])
+  /// Packaging defaults for this product. A variant with its own rows overrides
+  /// them; a variant without inherits these.
+  packages         ProductPackage[]
+  orderItems       OrderItem[]      @relation("OrderItemProduct")
+  isActive         Boolean          @default(true)
+  isPublished      Boolean          @default(true)
+  isArchived       Boolean          @default(false)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
 
   /// The family code. Required, unique, trimmed and upper-cased, and validated
   /// against a documented character set by app/utils/productCode.ts.
@@ -473,49 +485,49 @@ model Product {
 // replacement is MediaAsset + MediaAssetAssignment.
 
 model Category {
-  id          String    @id @default(cuid())
-  name        String    @unique
-  slug        String    @unique
+  id          String     @id @default(cuid())
+  name        String     @unique
+  slug        String     @unique
   description String?
   parentId    String?
-  parent      Category? @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  parent      Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
   children    Category[] @relation("CategoryHierarchy")
   products    Product[]
-  sortOrder   Int       @default(0)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  sortOrder   Int        @default(0)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 }
 
 model ProductVariant {
-  id                String    @id @default(cuid())
-  productId         String
-  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
-  sku               String    @unique
-  name              String
-  wholesalePrice    Int
-  suggestedRetailPrice Int
-  costPrice         Int?
-  inventory         Int       @default(0)
-  reserved          Int       @default(0)
-  lowStockThreshold Int       @default(5)
-  variantImageUrl   String?
-  shipsSeparately   Boolean   @default(false)
-  packingInstructions String?
-  shippingDescription String?
-  declaredValueDefault Int?
+  id                    String                 @id @default(cuid())
+  productId             String
+  product               Product                @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku                   String                 @unique
+  name                  String
+  wholesalePrice        Int
+  suggestedRetailPrice  Int
+  costPrice             Int?
+  inventory             Int                    @default(0)
+  reserved              Int                    @default(0)
+  lowStockThreshold     Int                    @default(5)
+  variantImageUrl       String?
+  shipsSeparately       Boolean                @default(false)
+  packingInstructions   String?
+  shippingDescription   String?
+  declaredValueDefault  Int?
   /// Free-text dimensions from the flat model ("60x40x15"), retained verbatim
   /// rather than parsed. The migration moved `weight` into the canonical
   /// productWeightKg below, but a free-text string cannot be split into three
   /// trustworthy numbers — guessing "60x40x15" is cm and not inches would be
   /// inventing data. Kept so the value survives; the typed columns are what
   /// anything new reads.
-  legacyDimensions  String?
-  isActive          Boolean   @default(true)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-  orderItems        OrderItem[] @relation("OrderItemVariant")
+  legacyDimensions      String?
+  isActive              Boolean                @default(true)
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  orderItems            OrderItem[]            @relation("OrderItemVariant")
   sellerProductVariants SellerProductVariant[]
-  packages          VariantPackage[]
+  packages              VariantPackage[]
 
   /// Optional barcode/UPC. Unique when present — a barcode identifies exactly
   /// one sellable unit — but nullable, because most variants will not have one
@@ -535,7 +547,7 @@ model ProductVariant {
   currency String @default("CAD")
 
   /// When false the variant is not stock-tracked and `inventory` is advisory.
-  trackInventory Boolean @default(true)
+  trackInventory       Boolean @default(true)
   /// Placeholder for a future external inventory system. Never populated with
   /// a credential.
   externalInventoryRef String?
@@ -554,71 +566,133 @@ model ProductVariant {
   productHeightCm Decimal? @db.Decimal(10, 2)
   productWeightKg Decimal? @db.Decimal(10, 3)
 
-  variantOptions    VariantOption[]
-  mediaAssignments  MediaAssetAssignment[]
-  externalMappings  ExternalVariantMapping[]
+  /// Overrides the product's pickup location for this variant alone, for the
+  /// case where one size is stocked at a different dock. Null means "inherit
+  /// the product's" and is not the same as "no location": the resolver walks
+  /// variant → product and reports a missing mapping only when BOTH are null.
+  pickupLocationId String?
+  pickupLocation   PickupLocation? @relation("VariantPickupLocation", fields: [pickupLocationId], references: [id])
+
+  variantOptions   VariantOption[]
+  mediaAssignments MediaAssetAssignment[]
+  externalMappings ExternalVariantMapping[]
 
   @@index([productId, sortOrder])
 }
 
 model PackagingPreset {
-  id            String   @id @default(cuid())
-  name          String   @unique
-  packageType   String   @default("carton")
-  length        Float
-  width         Float
-  height        Float
-  dimensionUnit String   @default("cm")
-  emptyWeight   Float?
-  weightUnit    String   @default("kg")
-  maxWeight     Float?
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  packages      VariantPackage[]
+  id              String           @id @default(cuid())
+  name            String           @unique
+  packageType     String           @default("carton")
+  length          Float
+  width           Float
+  height          Float
+  dimensionUnit   String           @default("cm")
+  emptyWeight     Float?
+  weightUnit      String           @default("kg")
+  maxWeight       Float?
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  packages        VariantPackage[]
+  productPackages ProductPackage[]
 }
 
 model VariantPackage {
-  id             String          @id @default(cuid())
-  variantId      String
-  variant        ProductVariant  @relation(fields: [variantId], references: [id], onDelete: Cascade)
-  label          String?
-  packageType    String          @default("carton")
-  presetId       String?
-  preset         PackagingPreset? @relation(fields: [presetId], references: [id])
-  length         Float
-  width          Float
-  height         Float
-  dimensionUnit  String          @default("cm")
-  grossWeight    Float
-  weightUnit     String          @default("kg")
-  unitsPerPackage Int            @default(1)
-  packagesPerUnit Int            @default(1)
-  sortOrder      Int             @default(0)
-  createdAt      DateTime        @default(now())
-  updatedAt      DateTime        @updatedAt
+  id              String           @id @default(cuid())
+  variantId       String
+  variant         ProductVariant   @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  label           String?
+  packageType     String           @default("carton")
+  presetId        String?
+  preset          PackagingPreset? @relation(fields: [presetId], references: [id])
+  length          Float
+  width           Float
+  height          Float
+  dimensionUnit   String           @default("cm")
+  grossWeight     Float
+  weightUnit      String           @default("kg")
+  unitsPerPackage Int              @default(1)
+  packagesPerUnit Int              @default(1)
+  sortOrder       Int              @default(0)
+  /// What the box is, in the packer's words ("double-wall carton, foam corners").
+  description     String?
+  /// Insurance basis for this parcel when the carrier offers declared value.
+  /// Cents, like every other money column here. Null means "not declared",
+  /// which is different from zero and is never sent as 0.
+  declaredValue   Int?
+  /// A parcel that must travel on its own — a crate, a pallet, anything the
+  /// packer may not combine with another parcel. Distinct from
+  /// ProductVariant.shipsSeparately, which is about the ITEM; this is about the
+  /// BOX, and one item can ship as two boxes where only one is indivisible.
+  shipsSeparately Boolean          @default(false)
+  /// Whether this parcel may be merged into another parcel of the same ship
+  /// group during packing. Advisory to the packer; it never merges on its own.
+  consolidatable  Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
 
   @@index([variantId])
 }
 
+/// Packaging defaults for a PRODUCT, inherited by its variants.
+///
+/// WHY A SECOND TABLE. The directive is explicit that a variant inherits its
+/// product's packaging unless it overrides it, and shows the reader which of
+/// the two a value came from. One table cannot express that: rows attached to
+/// the variant alone leave "did this come from the product, or was it typed
+/// here?" unanswerable, and the answer decides what a later edit to the product
+/// does to this variant. Two tables make inheritance a fact about which rows
+/// exist rather than a flag somebody has to keep true.
+///
+/// The columns are deliberately identical to VariantPackage's, and the resolver
+/// returns one shape for both, so nothing downstream needs to know which table
+/// a parcel came from.
+model ProductPackage {
+  id              String           @id @default(cuid())
+  productId       String
+  product         Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  label           String?
+  packageType     String           @default("carton")
+  presetId        String?
+  preset          PackagingPreset? @relation(fields: [presetId], references: [id])
+  length          Float
+  width           Float
+  height          Float
+  dimensionUnit   String           @default("cm")
+  grossWeight     Float
+  weightUnit      String           @default("kg")
+  unitsPerPackage Int              @default(1)
+  packagesPerUnit Int              @default(1)
+  sortOrder       Int              @default(0)
+  description     String?
+  declaredValue   Int?
+  shipsSeparately Boolean          @default(false)
+  consolidatable  Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([productId])
+}
+
 model SellerProduct {
-  id                    String        @id @default(cuid())
-  sellerId              String
-  seller                Seller        @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  productId             String
-  product               Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
-  shopifyProductId      String?
-  shopifyVariantIds     String        @default("[]")
-  importedAt            DateTime?
-  importStatus          SyncStatus    @default(NEVER)
-  lastImportError       String?
-  isActive              Boolean       @default(true)
-  customWholesalePrice  Int?
-  customRetailPrice     Int?
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt
-  orderItems            OrderItem[]   @relation("OrderItemSellerProduct")
-  variantMappings       SellerProductVariant[]
+  id                   String                 @id @default(cuid())
+  sellerId             String
+  seller               Seller                 @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  productId            String
+  product              Product                @relation(fields: [productId], references: [id], onDelete: Cascade)
+  shopifyProductId     String?
+  shopifyVariantIds    String                 @default("[]")
+  importedAt           DateTime?
+  importStatus         SyncStatus             @default(NEVER)
+  lastImportError      String?
+  isActive             Boolean                @default(true)
+  customWholesalePrice Int?
+  customRetailPrice    Int?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  orderItems           OrderItem[]            @relation("OrderItemSellerProduct")
+  variantMappings      SellerProductVariant[]
 
   @@unique([sellerId, productId])
   @@index([sellerId])
@@ -646,48 +720,48 @@ model SellerProductVariant {
 }
 
 model Order {
-  id                    String        @id @default(cuid())
-  sellerId              String
-  seller                Seller        @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  shopifyOrderId        String
-  shopifyOrderName      String
-  shopifyOrderNumber    Int
-  customerEmail         String?
-  customerName          String?
-  customerPhone         String?
-  shippingAddress       String?
-  billingAddress        String?
-  currency              String        @default("CAD")
-  subtotal              Int
-  totalTax              Int
-  totalShipping         Int
-  totalDiscounts        Int
-  totalPrice            Int
-  moonvellaSubtotal     Int
-  moonvellaTax          Int
-  moonvellaShipping     Int
-  moonvellaDiscounts    Int
-  moonvellaTotal        Int
-  paymentStatus         PaymentStatus @default(PENDING)
-  fulfillmentStatus     FulfillmentStatus @default(PENDING)
-  financialStatus       String?
-  shopifyCreatedAt      DateTime
-  shopifyUpdatedAt      DateTime
-  processedAt           DateTime?
-  cancelledAt           DateTime?
-  cancelReason          String?
-  supplierReference     String?       @unique
+  id                        String                 @id @default(cuid())
+  sellerId                  String
+  seller                    Seller                 @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  shopifyOrderId            String
+  shopifyOrderName          String
+  shopifyOrderNumber        Int
+  customerEmail             String?
+  customerName              String?
+  customerPhone             String?
+  shippingAddress           String?
+  billingAddress            String?
+  currency                  String                 @default("CAD")
+  subtotal                  Int
+  totalTax                  Int
+  totalShipping             Int
+  totalDiscounts            Int
+  totalPrice                Int
+  moonvellaSubtotal         Int
+  moonvellaTax              Int
+  moonvellaShipping         Int
+  moonvellaDiscounts        Int
+  moonvellaTotal            Int
+  paymentStatus             PaymentStatus          @default(PENDING)
+  fulfillmentStatus         FulfillmentStatus      @default(PENDING)
+  financialStatus           String?
+  shopifyCreatedAt          DateTime
+  shopifyUpdatedAt          DateTime
+  processedAt               DateTime?
+  cancelledAt               DateTime?
+  cancelReason              String?
+  supplierReference         String?                @unique
   shopifyFulfillmentOrderId String?
-  wholesalePaymentStatus WholesalePaymentStatus @default(REQUIRES_PAYMENT)
-  items                 OrderItem[]
-  refunds               Refund[]
-  shipments             Shipment[]
-  wholesalePayment      WholesalePayment?
-  fulfillmentRequest    FulfillmentRequest?
-  shippingQuotes        ShippingQuote[]
-  packages              OrderPackage[]
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt
+  wholesalePaymentStatus    WholesalePaymentStatus @default(REQUIRES_PAYMENT)
+  items                     OrderItem[]
+  refunds                   Refund[]
+  shipments                 Shipment[]
+  wholesalePayment          WholesalePayment?
+  fulfillmentRequest        FulfillmentRequest?
+  shippingQuotes            ShippingQuote[]
+  packages                  OrderPackage[]
+  createdAt                 DateTime               @default(now())
+  updatedAt                 DateTime               @updatedAt
 
   @@index([sellerId])
   @@index([shopifyOrderId])
@@ -713,26 +787,26 @@ enum FulfillmentStatus {
 }
 
 model OrderItem {
-  id                    String        @id @default(cuid())
-  orderId               String
-  order                 Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId             String?
-  product               Product?      @relation("OrderItemProduct", fields: [productId], references: [id])
-  variantId             String?
-  variant               ProductVariant? @relation("OrderItemVariant", fields: [variantId], references: [id])
-  sellerProductId       String?
-  sellerProduct         SellerProduct? @relation("OrderItemSellerProduct", fields: [sellerProductId], references: [id])
-  shopifyLineItemId     String
-  name                  String
-  sku                   String
-  quantity              Int
-  price                 Int
-  wholesalePrice        Int
-  totalDiscount         Int
-  isMoonvellaProduct    Boolean       @default(true)
-  createdAt             DateTime      @default(now())
-  refundItems           RefundItem[]
-  shipmentItems         ShipmentItem[]
+  id                 String          @id @default(cuid())
+  orderId            String
+  order              Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId          String?
+  product            Product?        @relation("OrderItemProduct", fields: [productId], references: [id])
+  variantId          String?
+  variant            ProductVariant? @relation("OrderItemVariant", fields: [variantId], references: [id])
+  sellerProductId    String?
+  sellerProduct      SellerProduct?  @relation("OrderItemSellerProduct", fields: [sellerProductId], references: [id])
+  shopifyLineItemId  String
+  name               String
+  sku                String
+  quantity           Int
+  price              Int
+  wholesalePrice     Int
+  totalDiscount      Int
+  isMoonvellaProduct Boolean         @default(true)
+  createdAt          DateTime        @default(now())
+  refundItems        RefundItem[]
+  shipmentItems      ShipmentItem[]
 
   // --- variant snapshot ---------------------------------------------------
   //
@@ -747,12 +821,12 @@ model OrderItem {
   // `name`, `sku`, `price` and `wholesalePrice` above are the original snapshot
   // columns and keep their meaning: product name, the SKU charged, the price
   // charged and the wholesale price charged.
-  productCode     String?
-  variantName     String?
+  productCode       String?
+  variantName       String?
   /// The ordered option pairs as they stood at purchase, JSON-encoded. A string
   /// rather than a relation for the same reason as the rest: the variant's
   /// options may be renamed or deleted afterwards.
-  selectedOptions String?
+  selectedOptions   String?
   /// The seller's own list price for this variant at the time, recorded only
   /// when it differed from what was actually charged. `price` remains what the
   /// customer paid; this is the intended figure, kept so a discounted line can
@@ -777,33 +851,33 @@ model OrderItem {
 }
 
 model Refund {
-  id                    String        @id @default(cuid())
-  orderId               String
-  order                 Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  shopifyRefundId       String
-  amount                Int
-  reason                String?
-  processedAt           DateTime
-  items                 RefundItem[]
-  createdAt             DateTime      @default(now())
+  id              String       @id @default(cuid())
+  orderId         String
+  order           Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  shopifyRefundId String
+  amount          Int
+  reason          String?
+  processedAt     DateTime
+  items           RefundItem[]
+  createdAt       DateTime     @default(now())
 }
 
 model RefundItem {
-  id              String      @id @default(cuid())
-  refundId        String
-  refund          Refund      @relation(fields: [refundId], references: [id], onDelete: Cascade)
-  orderItemId     String
-  orderItem       OrderItem   @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
-  quantity        Int
-  amount          Int
-  reason          String?
-  createdAt       DateTime    @default(now())
+  id          String    @id @default(cuid())
+  refundId    String
+  refund      Refund    @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  orderItemId String
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  quantity    Int
+  amount      Int
+  reason      String?
+  createdAt   DateTime  @default(now())
 }
 
 model Shipment {
-  id                    String        @id @default(cuid())
+  id                    String                  @id @default(cuid())
   orderId               String
-  order                 Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  order                 Order                   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   shopifyFulfillmentId  String?
   trackingNumber        String?
   trackingUrl           String?
@@ -830,7 +904,7 @@ model Shipment {
   finalBilledCost       Int?
   /// Reconciliation state of the carrier cost: PENDING, RECONCILED, VARIANCE or
   /// NEEDS_RECONCILIATION. Never used to change the seller's agreed charge.
-  billingStatus         String        @default("PENDING")
+  billingStatus         String                  @default("PENDING")
   /// eShipper's invoice number for the supplier bill this shipment belongs to.
   providerInvoiceNumber String?
   billingInvoices       String?
@@ -843,9 +917,9 @@ model Shipment {
   /// A return shipment points at the original shipment it returns.
   returnOfShipmentId    String?
   returnReason          String?
-  bookingIdempotencyKey String?       @unique
+  bookingIdempotencyKey String?                 @unique
   packageCount          Int?
-  status                ShipmentStatus @default(PENDING)
+  status                ShipmentStatus          @default(PENDING)
   labelCreatedAt        DateTime?
   packedAt              DateTime?
   handedToCarrierAt     DateTime?
@@ -854,15 +928,36 @@ model Shipment {
   deliveredAt           DateTime?
   exceptionAt           DateTime?
   cancelledAt           DateTime?
+  /// The origin this shipment collects from. A single order whose items come
+  /// from two origins becomes two shipments, and this is what tells them apart.
+  originLocationId      String?
+  originLocation        PickupLocation?         @relation(fields: [originLocationId], references: [id], onDelete: SetNull)
+  /// The origin address and contact AS THEY WERE when this shipment was quoted
+  /// or booked.
+  ///
+  /// WHY A COPY, WHEN THE WHOLE POINT OF PickupLocation IS NOT TO COPY. The
+  /// shared record is the source of truth for quoting; this is evidence. An
+  /// operator correcting a dock's postal code next month must not silently
+  /// rewrite where a parcel booked last week was collected from — the label,
+  /// the carrier's record and the audit trail would then disagree with our own
+  /// history. So the snapshot freezes the quotation-time facts, and the live
+  /// row governs anything new.
+  originSnapshot        Json?
+  /// The packages as quoted or booked: type, packed L/W/H in inches, weight in
+  /// pounds, count and the item quantities allocated to each. Frozen for the
+  /// same reason as the origin, so a later packaging edit cannot retroactively
+  /// change what was sent.
+  packageSnapshot       Json?
   items                 ShipmentItem[]
   trackingEvents        ShipmentTrackingEvent[]
-  createdAt             DateTime      @default(now())
-  updatedAt             DateTime      @updatedAt
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
 
   @@index([orderId])
   @@index([trackingNumber])
   @@index([status])
   @@index([returnOfShipmentId])
+  @@index([originLocationId])
 }
 
 /// Every raw carrier event a provider returns, stored append-only so the UI can
@@ -895,13 +990,13 @@ enum ShipmentStatus {
 }
 
 model ShipmentItem {
-  id              String      @id @default(cuid())
-  shipmentId      String
-  shipment        Shipment    @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
-  orderItemId     String
-  orderItem       OrderItem   @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
-  quantity        Int
-  createdAt       DateTime    @default(now())
+  id          String    @id @default(cuid())
+  shipmentId  String
+  shipment    Shipment  @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  orderItemId String
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  quantity    Int
+  createdAt   DateTime  @default(now())
 }
 
 /// The append-only security and activity log.
@@ -918,18 +1013,18 @@ model ShipmentItem {
 /// entityType "AdminUser". Nothing here may hold a secret, a password, a hash,
 /// a session token or an invitation token — see recordAudit() callers.
 model AuditLog {
-  id                String      @id @default(cuid())
-  actorType         ActorType
-  actorId           String
-  actorName         String?
-  action            String
-  entityType        String
-  entityId          String
-  beforeData        String?
-  afterData         String?
-  ipAddress         String?
-  userAgent         String?
-  createdAt         DateTime    @default(now())
+  id         String    @id @default(cuid())
+  actorType  ActorType
+  actorId    String
+  actorName  String?
+  action     String
+  entityType String
+  entityId   String
+  beforeData String?
+  afterData  String?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
 
   @@index([entityType, entityId])
   @@index([actorId])
@@ -959,16 +1054,16 @@ model ShippingZone {
 }
 
 model WebhookEvent {
-  id                    String   @id @default(cuid())
-  shopDomain            String
-  topic                 String
-  payload               String
-  status                WebhookStatus @default(PENDING)
-  errorMessage          String?
-  processedAt           DateTime?
-  retryCount            Int      @default(0)
-  idempotencyKey        String   @unique
-  createdAt             DateTime @default(now())
+  id             String        @id @default(cuid())
+  shopDomain     String
+  topic          String
+  payload        String
+  status         WebhookStatus @default(PENDING)
+  errorMessage   String?
+  processedAt    DateTime?
+  retryCount     Int           @default(0)
+  idempotencyKey String        @unique
+  createdAt      DateTime      @default(now())
 
   @@index([shopDomain, topic])
   @@index([status])
@@ -1086,21 +1181,21 @@ model SellerBillingSettings {
 }
 
 model SellerPaymentMethod {
-  id                       String              @id @default(cuid())
-  sellerId                 String
-  seller                   Seller              @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  provider                 String              @default("stripe")
-  stripeCustomerId         String?
-  stripePaymentMethodId    String?             @unique
-  brand                    String?
-  last4                    String?
-  expMonth                 Int?
-  expYear                  Int?
-  isDefault                Boolean             @default(false)
-  status                   PaymentMethodStatus @default(ACTIVE)
-  authorizationConsentAt   DateTime?
-  createdAt                DateTime            @default(now())
-  updatedAt                DateTime            @updatedAt
+  id                     String              @id @default(cuid())
+  sellerId               String
+  seller                 Seller              @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  provider               String              @default("stripe")
+  stripeCustomerId       String?
+  stripePaymentMethodId  String?             @unique
+  brand                  String?
+  last4                  String?
+  expMonth               Int?
+  expYear                Int?
+  isDefault              Boolean             @default(false)
+  status                 PaymentMethodStatus @default(ACTIVE)
+  authorizationConsentAt DateTime?
+  createdAt              DateTime            @default(now())
+  updatedAt              DateTime            @updatedAt
 
   @@index([sellerId])
 }
@@ -1125,10 +1220,10 @@ model SellerBankAccount {
 }
 
 model ShippingQuote {
-  id                String   @id @default(cuid())
+  id                String    @id @default(cuid())
   orderId           String
-  order             Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  provider          String   @default("eshipper")
+  order             Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  provider          String    @default("eshipper")
   /// The provider's own quote id, when returned. Required to book via
   /// POST /api/v2/ship/{quoteId}; null for a locally-simulated quote.
   providerQuoteId   String?
@@ -1136,14 +1231,14 @@ model ShippingQuote {
   serviceCode       String
   serviceName       String
   totalAmount       Int
-  currency          String   @default("CAD")
+  currency          String    @default("CAD")
   transitDays       Int?
   estimatedDelivery DateTime?
-  quotedAt          DateTime @default(now())
+  quotedAt          DateTime  @default(now())
   expiresAt         DateTime?
-  selected          Boolean  @default(false)
+  selected          Boolean   @default(false)
   raw               String?
-  createdAt         DateTime @default(now())
+  createdAt         DateTime  @default(now())
 
   @@index([orderId])
 }
@@ -1195,14 +1290,14 @@ model FulfillmentRequest {
 }
 
 model IntegrationState {
-  id            String            @id @default(cuid())
-  key           String            @unique
-  status        IntegrationStatus @default(NOT_CONFIGURED)
-  lastSuccessAt DateTime?
-  lastErrorAt   DateTime?
-  lastError     String?
-  detail        String?
-  updatedAt     DateTime          @updatedAt
+  id             String            @id @default(cuid())
+  key            String            @unique
+  status         IntegrationStatus @default(NOT_CONFIGURED)
+  lastSuccessAt  DateTime?
+  lastErrorAt    DateTime?
+  lastError      String?
+  detail         String?
+  updatedAt      DateTime          @updatedAt
   /**
    * Set by an operator's Disconnect. While it is set, credential resolution
    * refuses every source for this key — including the environment — so the
@@ -1215,7 +1310,6 @@ model IntegrationState {
 
 /**
  * Operator-supplied provider credentials, stored encrypted at rest.
- *
  * `value` is always AES-256-GCM ciphertext (see services/credentials.server.ts);
  * plaintext is never written to this table and never leaves the server. An
  * absent row means "not configured here", which lets credential resolution fall
@@ -1315,9 +1409,15 @@ model PadMandate {
   @@index([state])
 }
 
-/* ========================================================================== */
-/* Product / variant / media                                                  */
-/* ========================================================================== */
+/**
+ * ==========================================================================
+ */
+/**
+ * Product / variant / media
+ */
+/**
+ * ==========================================================================
+ */
 
 /// Lifecycle of a product family, independent of whether sellers can see it.
 ///
@@ -1444,7 +1544,7 @@ model MediaAsset {
   /// in our storage, so the migration cannot import them; keeping the URL means
   /// the original is still findable and the migration is not lossy. Null for
   /// anything uploaded through the normal pipeline.
-  sourceUrl        String?
+  sourceUrl String?
 
   width           Int?
   height          Int?
@@ -1481,9 +1581,9 @@ model MediaAsset {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  supersedes  MediaAsset?  @relation("AssetSupersession", fields: [supersedesId], references: [id])
-  supersededBy MediaAsset[] @relation("AssetSupersession")
-  assignments MediaAssetAssignment[]
+  supersedes   MediaAsset?            @relation("AssetSupersession", fields: [supersedesId], references: [id])
+  supersededBy MediaAsset[]           @relation("AssetSupersession")
+  assignments  MediaAssetAssignment[]
 
   @@index([productId, category])
   @@index([checksum])
@@ -1539,17 +1639,17 @@ model VariantOption {
 /// and failure history. `lastSyncError` is deliberately free text that must
 /// never be given a token or credential to quote — see the audit rules.
 model ExternalProductMapping {
-  id                String    @id @default(cuid())
+  id                String               @id @default(cuid())
   productId         String
-  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product           Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
   /// "SHOPIFY" for a merchant's storefront copy, "ODOO" for the source catalog.
   /// An ODOO row keeps the Odoo database name in `shopDomain`, which is the
   /// tenant that owns the record — not a shop domain, but the same question
   /// ("which system's copy is this?") with the same answer shape.
-  provider          String    @default("SHOPIFY")
+  provider          String               @default("SHOPIFY")
   shopDomain        String
   externalProductId String?
-  importStatus      String    @default("NOT_IMPORTED")
+  importStatus      String               @default("NOT_IMPORTED")
   lastSyncedAt      DateTime?
   lastSyncError     String?
   /// Archiving state in the merchant's Shopify store, tracked per product so
@@ -1557,11 +1657,11 @@ model ExternalProductMapping {
   /// FAILED for a product this app imported; never set by a title or vendor
   /// match.
   archiveStatus     ProductArchiveStatus @default(NOT_APPLICABLE)
-  archiveAttempts   Int       @default(0)
+  archiveAttempts   Int                  @default(0)
   archiveLastError  String?
   archivedAt        DateTime?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
 
   @@unique([provider, shopDomain, productId])
   @@index([shopDomain])
@@ -1595,19 +1695,20 @@ model ExternalVariantMapping {
 /// has to be written against a shape, and retrofitting the seller's brand into
 /// generated assets after merchants have downloaded them is not possible.
 model SellerBrandKit {
-  id        String   @id @default(cuid())
-  sellerId  String   @unique
-  seller    Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  storeName String?
+  id             String   @id @default(cuid())
+  sellerId       String   @unique
+  seller         Seller   @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  storeName      String?
   /// Object key of the seller's logo, in the same storage backend as media.
   logoStorageKey String?
   callToAction   String?
   /// JSON object of named colours, e.g. {"primary":"#1B4D3E"}. A free-form map
   /// because brands do not agree on a palette size.
   brandColours   Json?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 }
+
 /// Where one seller exists in Odoo.
 ///
 /// One row per (seller, role). The uniqueness is the point: a retry, a
@@ -1619,21 +1720,21 @@ model SellerBrandKit {
 /// The mapping is the authority; matching is only used to refuse a write that
 /// would collide with an unrelated record.
 model ExternalContactMapping {
-  id            String            @id @default(cuid())
-  sellerId      String
-  seller        Seller            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
-  role          ContactRole
+  id                 String            @id @default(cuid())
+  sellerId           String
+  seller             Seller            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  role               ContactRole
   /// The Odoo res.partner id. Null until a write succeeds — a PENDING mapping
   /// with a null id is a promise, not a record, and the interface says so.
-  odooPartnerId Int?
+  odooPartnerId      Int?
   /// What the record was called when it was written, so a later run can say
   /// "renamed from X" instead of silently overwriting.
-  odooName      String?
-  status        ContactSyncStatus @default(PENDING)
-  attempts      Int               @default(0)
-  lastError     String?
-  lastAttemptAt DateTime?
-  syncedAt      DateTime?
+  odooName           String?
+  status             ContactSyncStatus @default(PENDING)
+  attempts           Int               @default(0)
+  lastError          String?
+  lastAttemptAt      DateTime?
+  syncedAt           DateTime?
   /// SHA-256 of the mapped field set. When it is unchanged, a retry is a no-op
   /// and says so, rather than issuing a write that would churn Odoo's audit
   /// trail on every reapplication.
@@ -1647,15 +1748,15 @@ model ExternalContactMapping {
   // on the record whose whole purpose is to be the durable link between the
   // two systems.
   /// The Shopify store display name at the time of the sync.
-  storeName          String?
+  storeName       String?
   /// `gid://shopify/Shop/…`. Survives a myshopify domain change.
-  shopifyShopId      String?
-  myshopifyDomain    String?
+  shopifyShopId   String?
+  myshopifyDomain String?
   /// The resolved tag id used, so a later run can tell that the tag was
   /// re-created under a different id and needs re-applying.
-  odooTagId          Int?
-  createdAt     DateTime          @default(now())
-  updatedAt     DateTime          @updatedAt
+  odooTagId       Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   @@unique([sellerId, role])
   @@index([status])
@@ -1663,33 +1764,227 @@ model ExternalContactMapping {
 
 /// Deferred work: see JobStatus for why this exists.
 model BackgroundJob {
-  id             String    @id @default(cuid())
+  id                  String    @id @default(cuid())
   /// "ODOO_CONTACT_SYNC" | "SHOPIFY_PRODUCT_ARCHIVE"
-  kind           String
-  sellerId       String?
-  seller         Seller?   @relation(fields: [sellerId], references: [id], onDelete: SetNull)
-  payload        Json?
-  status         JobStatus @default(PENDING)
-  attempts       Int       @default(0)
-  maxAttempts    Int       @default(5)
-  lastError      String?
+  kind                String
+  sellerId            String?
+  seller              Seller?   @relation(fields: [sellerId], references: [id], onDelete: SetNull)
+  payload             Json?
+  status              JobStatus @default(PENDING)
+  attempts            Int       @default(0)
+  maxAttempts         Int       @default(5)
+  lastError           String?
   /// When the job becomes eligible. A failure pushes this forward (backoff)
   /// instead of spinning.
-  runAt          DateTime  @default(now())
-  startedAt      DateTime?
-  finishedAt     DateTime?
+  runAt               DateTime  @default(now())
+  startedAt           DateTime?
+  finishedAt          DateTime?
   /// The seller.accessVersion at queue time. A job whose version no longer
   /// matches is cancelled, not run.
   sellerAccessVersion Int?
   /// Human-readable progress for the owner panel, e.g. archive counts.
-  result         Json?
+  result              Json?
   /// Same key queued twice is one job. Prevents a double-clicked Block from
   /// queueing two archive passes.
-  idempotencyKey String    @unique
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  idempotencyKey      String    @unique
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
 
   @@index([status, runAt])
   @@index([kind, status])
   @@index([sellerId])
+}
+
+/// A place MoonVella collects from — the shared address record an origin
+/// mapping points at.
+///
+/// WHY THIS IS ITS OWN RECORD. The directive requires the address to exist once
+/// and be referenced, not copied onto every product: a dock's phone number
+/// changes, and a copy per product means every copy is a chance to miss one.
+/// So this row owns the address, the contact, the hours and the access notes,
+/// and products and variants point at it.
+///
+/// THE ODOO IDS ARE THE POINT OF THE MAPPING. A pickup location is not a
+/// MoonVella invention — it is a warehouse or stock location that already
+/// exists in Odoo, and the four id columns are how this row is tied to it. They
+/// are nullable because an address may be captured before the Odoo side is
+/// confirmed, but a row with no Odoo identity is reported as unmapped rather
+/// than silently treated as authoritative.
+///
+/// `odooDatabase` scopes the ids: two Odoo databases both have a location with
+/// id 25, and a mapping that does not say which database it came from will
+/// resolve to the wrong one the moment a second database is connected.
+model PickupLocation {
+  id   String @id @default(cuid())
+  /// Stable, human-typed reference used on screens and in the audit trail.
+  code String @unique
+  name String
+
+  // --- Odoo identity ------------------------------------------------------
+  odooDatabase    String?
+  odooCompanyId   Int?
+  odooWarehouseId Int?
+  odooLocationId  Int?
+  /// The `res.partner` behind the address, when Odoo models it as one.
+  odooPartnerId   Int?
+
+  // --- contact ------------------------------------------------------------
+  contactName  String?
+  contactPhone String?
+  contactEmail String?
+
+  // --- address, structured ------------------------------------------------
+  street1    String?
+  street2    String?
+  city       String?
+  province   String?
+  postalCode String?
+  country    String?
+
+  // --- operating window ---------------------------------------------------
+  /// IANA zone, e.g. "America/Toronto". Pickup times below are in THIS zone,
+  /// which is not necessarily the server's or the seller's — a dock that
+  /// closes at 16:00 closes at 16:00 where the dock is.
+  timeZone           String?
+  /// "HH:MM" in `timeZone`.
+  pickupOpenTime     String?
+  pickupCloseTime    String?
+  /// Free text the driver needs: gate code, ship-at-door, appointment required.
+  instructions       String?
+  /// Requirements for the carrier to collect at all — dock height, forklift,
+  /// tail-lift, appointment windows.
+  accessRequirements String?
+
+  /// The most recent Google Address Validation verdict for this address, and
+  /// when it was reached. Kept on the row so a screen can say "this address has
+  /// never been checked" without calling Google on every render.
+  addressVerdict        AddressVerdict @default(UNVALIDATED)
+  addressCheckedAt      DateTime?
+  /// True when an owner has explicitly accepted an address Google could not
+  /// resolve. An overridden address is never described as Google validated.
+  addressOverridden     Boolean        @default(false)
+  addressOverrideReason String?
+
+  isActive        Boolean          @default(true)
+  products        Product[]        @relation("ProductPickupLocation")
+  variants        ProductVariant[] @relation("VariantPickupLocation")
+  shipmentOrigins Shipment[]
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@index([isActive])
+  @@index([odooDatabase, odooLocationId])
+}
+
+/// The verdict of an address check, for both origin and delivery addresses.
+///
+/// The four states are the directive's, and the last two are the ones that get
+/// collapsed by accident: `UNAVAILABLE` is Google not answering — which must
+/// NEVER be recorded as acceptable — and `OVERRIDDEN` is an owner having read
+/// the problem and taken responsibility for it, with a reason on the record.
+enum AddressVerdict {
+  UNVALIDATED
+  ACCEPTED
+  CONFIRMATION_REQUIRED
+  CORRECTION_REQUIRED
+  UNAVAILABLE
+  OVERRIDDEN
+}
+
+/// One address validation result, kept as evidence.
+///
+/// WHAT IS NOT STORED: the Google response. Google's terms restrict how long a
+/// response may be retained and what may be cached, so this row holds the
+/// verdict, the address as Google would normalise it, the component-level
+/// corrections the reader needs to see, and the place id — not the payload.
+///
+/// THE INPUT HASH IS HOW DUPLICATE CALLS ARE AVOIDED. Validating an address is
+/// a billable call, and a page that validates on every render pays for the same
+/// address repeatedly. A row is reused while the hash of the structured input
+/// is unchanged; a material edit changes the hash and forces a fresh check.
+model AddressValidation {
+  id                String         @id @default(cuid())
+  /// What was validated: a PickupLocation, or an Order's delivery address.
+  subjectType       String
+  subjectId         String
+  /// SHA-256 over the normalised structured input. A different hash is a
+  /// different address and needs its own verdict.
+  inputHash         String
+  verdict           AddressVerdict
+  /// The address as typed, and as Google would have it. Both are kept so the
+  /// interface can show them side by side and a person decides which is right.
+  originalAddress   Json
+  suggestedAddress  Json?
+  /// Component-level differences only ("postal code", "unit"), never the whole
+  /// payload, so a reviewer sees what would actually change.
+  differences       Json?
+  /// Google's own granularity and the field-level confirmations, reduced to the
+  /// small set the interface needs.
+  granularity       String?
+  placeId           String?
+  /// Why the check could not be completed, when it could not.
+  unavailableReason String?
+  /// Who accepted an unresolved address, and why. Required for OVERRIDDEN.
+  overriddenById    String?
+  overriddenByName  String?
+  overrideReason    String?
+  checkedAt         DateTime       @default(now())
+  /// When this verdict stops being usable for booking. Null means it does not
+  /// age out on its own — an edit is what invalidates it.
+  expiresAt         DateTime?
+  createdAt         DateTime       @default(now())
+
+  @@index([subjectType, subjectId])
+  @@index([inputHash])
+}
+
+/// Which images an import into a seller's store is allowed to bring across.
+///
+/// WHY THE CHOICE IS PERSISTED. Two separate requirements need the decision to
+/// outlive the import that made it. The first is that a later sync must not
+/// silently add back an image the seller excluded — a selection held only in a
+/// form is re-asked next time, and the default answer to "which images?" is
+/// "all of them", so the exclusion would quietly reverse itself. The second is
+/// that a retry must not duplicate what an earlier attempt already uploaded,
+/// which needs the previous attempt's choices to still exist.
+///
+/// KEYED ON THE MOONVELLA SIDE, DELIBERATELY. `productId` and `mediaAssetId`
+/// are MoonVella ids, not the seller's: the selection has to be matchable
+/// before anything has been uploaded anywhere, and it has to survive the
+/// seller renaming or reordering images in their own store. The unique
+/// constraint is what makes a retry idempotent — re-saving the same choice
+/// updates one row rather than creating a second.
+model ImportMediaSelection {
+  id           String  @id @default(cuid())
+  sellerId     String
+  productId    String
+  mediaAssetId String
+  selected     Boolean @default(false)
+  /// The chosen main image. At most one per (seller, product): the service
+  /// clears the previous one in the same transaction, because a partial unique
+  /// index on a boolean is a constraint Prisma cannot express.
+  isMain       Boolean @default(false)
+  sortOrder    Int     @default(0)
+
+  // --- upload outcome, so a retry is a retry and not a duplicate -----------
+  /// PENDING, UPLOADED, FAILED or SKIPPED. A row that already reached
+  /// UPLOADED is never sent again: the seller's store is not ours to write
+  /// twice, and a second identical image is visible to shoppers.
+  uploadStatus    String    @default("PENDING")
+  /// The store's own id for the uploaded image, kept so a later sync can
+  /// recognise its own earlier work rather than matching on a URL or a
+  /// filename, both of which the seller may change.
+  providerMediaId String?
+  uploadAttempts  Int       @default(0)
+  /// The last failure, in the provider's own words, so the operator can see
+  /// what to fix. Never a credential — provider messages are redacted before
+  /// they are written.
+  lastUploadError String?
+  uploadedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sellerId, productId, mediaAssetId])
+  @@index([sellerId, productId])
 }

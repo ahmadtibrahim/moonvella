@@ -55,6 +55,11 @@ interface Package {
   weightUnit: string;
   unitsPerPackage: number;
   packagesPerUnit: number;
+  /** The four facts a quote may also be told about the parcel. */
+  description: string | null;
+  declaredValue: number | null;
+  shipsSeparately: boolean;
+  consolidatable: boolean;
 }
 
 interface Variant {
@@ -353,11 +358,13 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
         <input type="hidden" name="tab" value="variants" />
         <input type="hidden" name="variantId" value={variant.id} />
 
+        <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem", marginTop: "0.5rem" }}>
           <thead>
             <tr style={{ textAlign: "left", color: FAINT }}>
               <th style={{ padding: "0.3rem" }}>Label</th>
               <th style={{ padding: "0.3rem" }}>Type</th>
+              <th style={{ padding: "0.3rem" }}>Description</th>
               <th style={{ padding: "0.3rem" }}>L</th>
               <th style={{ padding: "0.3rem" }}>W</th>
               <th style={{ padding: "0.3rem" }}>H</th>
@@ -365,6 +372,9 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
               <th style={{ padding: "0.3rem" }}>Gross wt</th>
               <th style={{ padding: "0.3rem" }}>Unit</th>
               <th style={{ padding: "0.3rem" }}>Units/pkg</th>
+              <th style={{ padding: "0.3rem" }}>Declared value</th>
+              <th style={{ padding: "0.3rem" }}>Ships separately</th>
+              <th style={{ padding: "0.3rem" }}>May consolidate</th>
             </tr>
           </thead>
           <tbody>
@@ -384,6 +394,15 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                     name="pkg_packageType"
                     defaultValue={row?.packageType ?? "carton"}
                     aria-label={`Carton ${index + 1} type`}
+                  />
+                </td>
+                <td style={{ padding: "0.2rem" }}>
+                  <input
+                    style={input}
+                    name="pkg_description"
+                    defaultValue={row?.description ?? ""}
+                    placeholder="what is in this box"
+                    aria-label={`Carton ${index + 1} description`}
                   />
                 </td>
                 {(["length", "width", "height"] as const).map((dimension) => (
@@ -437,12 +456,51 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                     aria-label={`Carton ${index + 1} units per package`}
                   />
                 </td>
-                <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
-                <input type="hidden" name="pkg_presetId" value={row?.presetId ?? ""} />
+                <td style={{ padding: "0.2rem" }}>
+                  <input
+                    style={input}
+                    name="pkg_declaredValue"
+                    inputMode="decimal"
+                    defaultValue={
+                      row?.declaredValue === null || row?.declaredValue === undefined
+                        ? ""
+                        : (row.declaredValue / 100).toFixed(2)
+                    }
+                    aria-label={`Carton ${index + 1} declared value`}
+                  />
+                </td>
+                {/* Named per row: an unchecked box submits nothing at all, so a
+                    shared name would shift every row after the first one that is
+                    off and silently reassign their values. */}
+                <td style={{ padding: "0.2rem", textAlign: "center" }}>
+                  <input
+                    type="checkbox"
+                    name={`pkg_shipsSeparately_${index}`}
+                    value="true"
+                    defaultChecked={row?.shipsSeparately ?? false}
+                    aria-label={`Carton ${index + 1} ships separately`}
+                  />
+                </td>
+                <td style={{ padding: "0.2rem", textAlign: "center" }}>
+                  <input
+                    type="checkbox"
+                    name={`pkg_consolidatable_${index}`}
+                    value="true"
+                    defaultChecked={row?.consolidatable ?? true}
+                    aria-label={`Carton ${index + 1} may be consolidated`}
+                  />
+                </td>
+                {/* Inside a cell: an input that is a direct child of a `<tr>` is
+                    invalid markup and browsers move it out of the table. */}
+                <td style={{ display: "none" }}>
+                  <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
+                  <input type="hidden" name="pkg_presetId" value={row?.presetId ?? ""} />
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+        </div>
 
         <div style={{ marginTop: "0.5rem" }}>
           <button type="submit" name="intent" value="save_packaging" style={btn(INK, { solid: true })}>

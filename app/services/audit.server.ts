@@ -12,6 +12,7 @@ export const AUDIT_ENTITY = {
   SHIPMENT: "Shipment",
   PAYMENT: "WholesalePayment",
   SETTINGS: "SellerSettings",
+  PICKUP_LOCATION: "PickupLocation",
   ADMIN_USER: "AdminUser",
   INVITATION: "AdminInvitation",
   INTEGRATION: "Integration",

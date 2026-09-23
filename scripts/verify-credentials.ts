@@ -175,9 +175,15 @@ async function main() {
   const allFields = Object.values(CREDENTIAL_INTEGRATIONS).flatMap((integration) => integration.fields);
   const secretNames = allFields.filter((field) => field.secret).map((field) => field.name).sort();
   check(
-    "the four provider secrets are marked secret",
+    "the five provider secrets are marked secret",
     JSON.stringify(secretNames) ===
-      JSON.stringify(["ESHIPPER_PASSWORD", "ODOO_API_KEY", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"]),
+      JSON.stringify([
+        "ESHIPPER_PASSWORD",
+        "GOOGLE_MAPS_SERVER_KEY",
+        "ODOO_API_KEY",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+      ]),
     secretNames.join(",")
   );
   check(
@@ -187,8 +193,13 @@ async function main() {
       // The complete list, by design: a new field cannot be added without
       // someone deciding here whether it is a secret. ODOO_CONSIGNMENT_* name
       // whose stock an import may sell; they identify records rather than
-      // authenticate, so they are not secrets.
-      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER"].includes(field.name))
+      // authenticate, so they are not secrets. GOOGLE_MAPS_BROWSER_KEY is the
+      // one field here that IS handed to a browser, which is exactly why it must
+      // not be stored as a secret: the address form has to read it, and a value
+      // the server refuses to render is a form that cannot complete an address.
+      // Its safety comes from the referrer restriction, not from this store — and
+      // the Address Validation call must use the server key, never this one.
+      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
   );
 
   // 1. Encryption -------------------------------------------------------------

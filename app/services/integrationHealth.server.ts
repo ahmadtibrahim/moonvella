@@ -25,13 +25,14 @@ export type IntegrationKey =
   | "stripe"
   | "eshipper"
   | "odoo"
+  | "google"
   | "shopify_analytics"
   | "shopify_orders"
   | "shopify_fulfillment"
   | "product_import";
 
 /** Configured with credentials on the Settings page; each has a form. */
-export const CREDENTIAL_KEYS: IntegrationKey[] = ["stripe", "eshipper", "odoo"];
+export const CREDENTIAL_KEYS: IntegrationKey[] = ["stripe", "eshipper", "odoo", "google"];
 
 /**
  * Narrows an integration key to one the credential store serves. The credential
@@ -53,6 +54,16 @@ export const DEFAULTS: Record<
   IntegrationKey,
   { status: string; message: string; credentialHints?: string }
 > = {
+  google: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Google Maps Platform is not configured. Address validation is unavailable, which " +
+      "keeps the booking gate shut rather than treating an unchecked address as a good one. " +
+      "Save a referrer-restricted browser key for Places autocomplete and a separate " +
+      "IP-restricted server key for Address Validation.",
+    credentialHints:
+      "GOOGLE_MAPS_BROWSER_KEY: public key, restricted by HTTP referrer, with only Places API (New) enabled\nGOOGLE_MAPS_SERVER_KEY: server key, restricted by IP, with Address Validation API enabled",
+  },
   stripe: {
     status: "NOT_CONFIGURED",
     message:
