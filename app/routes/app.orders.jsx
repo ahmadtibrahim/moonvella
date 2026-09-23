@@ -1,10 +1,19 @@
 import { Link, useLoaderData } from "react-router";
-import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
 import { prisma } from "../db.server";
 
-export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
-
+/**
+ * Order history for any store that is not blocked, and rows only for those the
+ * rules table says may read them.
+ *
+ * The distinction matters: a suspension keeps order history deliberately, so
+ * this loader must not refuse a suspended store the page — but a blocked one is
+ * refused the route outright. `withMerchantAccess` decides the second question
+ * and `canViewOrders` the first, so the page's own empty state and the server's
+ * refusal cannot drift apart.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
   let orders = [];
   if (context.seller && context.canViewOrders) {
     const rows = await prisma.order.findMany({
@@ -46,7 +55,7 @@ export const loader = async ({ request }) => {
     orders,
     blockedMessage: BLOCKED_MESSAGE,
   };
-};
+  });
 
 function money(cents, currency = "CAD") {
   return `${(cents / 100).toFixed(2)} ${currency}`;

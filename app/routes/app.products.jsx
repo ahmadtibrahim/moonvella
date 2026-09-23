@@ -1,12 +1,21 @@
 import { Link, useFetcher, useLoaderData } from "react-router";
-import { requireSellerContext } from "../services/seller.server";
+import { withMerchantAccess } from "../services/seller.server";
 import { prisma } from "../db.server";
 
-export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
-
+/**
+ * The imported-product list, with prices and SKUs, for approved sellers.
+ *
+ * The rows are only read when the caller may see wholesale figures. The page
+ * already refused to render them for anybody else, but refusing to render is
+ * not the same as not sending: a loader's return value is serialized into the
+ * HTML as hydration data, so a suspended seller got the wholesale columns in
+ * the page source with a message on top telling them pricing was locked. The
+ * gate now sits on the query.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
   let imported = [];
-  if (context.seller) {
+  if (context.seller && context.canViewWholesale) {
     const rows = await prisma.sellerProduct.findMany({
       where: { sellerId: context.seller.id },
       orderBy: { createdAt: "desc" },
@@ -91,10 +100,10 @@ export const loader = async ({ request }) => {
     canImport: context.canImport,
     imported,
   };
-};
+  });
 
 export const action = async ({ request }) => {
-  const { requireApprovedSeller, AccessError } = await import(
+  const { requireMerchantAccess, AccessError } = await import(
     "../services/seller.server"
   );
   const { authenticate } = await import("../shopify.server");
@@ -104,7 +113,7 @@ export const action = async ({ request }) => {
 
   let context;
   try {
-    context = await requireApprovedSeller(request);
+    context = await requireMerchantAccess(request, "BUSINESS");
   } catch (error) {
     if (error instanceof AccessError) {
       return { ok: false, error: error.message };

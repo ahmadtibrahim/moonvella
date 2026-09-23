@@ -184,7 +184,11 @@ async function main() {
     "connection identifiers are not marked secret",
     allFields
       .filter((field) => !field.secret)
-      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE"].includes(field.name))
+      // The complete list, by design: a new field cannot be added without
+      // someone deciding here whether it is a secret. ODOO_CONSIGNMENT_* name
+      // whose stock an import may sell; they identify records rather than
+      // authenticate, so they are not secrets.
+      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER"].includes(field.name))
   );
 
   // 1. Encryption -------------------------------------------------------------

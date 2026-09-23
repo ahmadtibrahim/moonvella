@@ -316,6 +316,48 @@ const CHECKS = [
     file: "scripts/verify-seller-block.ts",
     requires: [],
   },
+  // The seller access states, as the server enforces them. Needs no session:
+  // it drives the services the routes call, and it walks the route list to
+  // assert that every merchant route guards itself rather than trusting the
+  // layout — the check that catches a NEW route added without a guard.
+  {
+    name: "seller-access",
+    kind: "ts",
+    file: "scripts/verify-seller-access.ts",
+    requires: [],
+  },
+  // The company and contact mapping written to Odoo on approval. The pure
+  // mapping and decision points run for real; the database half asserts what
+  // happens when Odoo is not configured, which is this environment and is the
+  // case the directive requires to be an explicit hold rather than a silent
+  // skip. Makes no Odoo call and writes no partner.
+  {
+    name: "contact-mapping",
+    kind: "ts",
+    file: "scripts/verify-contact-mapping.ts",
+    requires: [],
+  },
+  // Archiving a blocked store's catalogue. Never reaches Shopify: the run it
+  // drives is the one where Shopify cannot be reached, and what it asserts is
+  // that this is reported as a failure with a reason rather than as completion.
+  // Its fixtures are mapping rows that belong to no real shop.
+  {
+    name: "archive",
+    kind: "ts",
+    file: "scripts/verify-archive.ts",
+    requires: [],
+  },
+  // The Odoo catalogue import. There is no Odoo connection here, and that is
+  // the case it is written for: a genuine blocker, nothing invented to fill the
+  // gap, and no row written while it refuses. The half that will run against a
+  // real Odoo — prices, stock, drafts, media preservation — is checked by
+  // reading the module.
+  {
+    name: "odoo-import",
+    kind: "ts",
+    file: "scripts/verify-odoo-import.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

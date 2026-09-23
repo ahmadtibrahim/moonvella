@@ -1335,3 +1335,290 @@ export async function describeOdooIntegration(): Promise<{
           "its own — writes also require ODOO_ALLOW_WRITES=yes in the deployment environment."),
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Seller contact mapping                                                     */
+/* -------------------------------------------------------------------------- */
+/*
+ * What follows is the read and write surface the approval-time contact sync
+ * needs, and nothing more. Every field name here was checked against the
+ * INSTALLED database before being written — `ir_model_fields` on `res.partner`,
+ * `res.country`, `res.country.state`, `res.partner.category` and `product.tag` —
+ * rather than against Odoo's documentation, because a field that a stock Odoo
+ * has and this database does not is a write that fails at the worst moment.
+ *
+ * Two findings from that check shape the code:
+ *
+ *   • `company_type` is `store: false` on this database. It is computed from
+ *     `is_company`, so "company type → Company" is expressed by writing
+ *     `is_company: true`. Writing `company_type` directly is not possible.
+ *
+ *   • The only custom `res.partner` fields installed belong to PremaFirm's
+ *     freight business (`x_freight_tax_treatment`, `x_freight_billing_relationship`,
+ *     `x_*_driver_*`). None of them is a tax-registration field and none is
+ *     MoonVella's, so the seller's GST/HST number goes to `vat` — the standard
+ *     Odoo tax-ID field — and the customer designation goes to `customer_rank`,
+ *     which is the field Odoo itself uses to mark a partner as a customer.
+ *     Reusing a freight classification field would have written MoonVella's
+ *     sellers into PremaFirm's tax reporting.
+ */
+
+const COUNTRY_MODEL = "res.country";
+const STATE_MODEL = "res.country.state";
+const PARTNER_CATEGORY_MODEL = "res.partner.category";
+const PRODUCT_TAG_MODEL = "product.tag";
+
+/**
+ * The contact tag MoonVella applies, resolved BY NAME at sync time and stored
+ * on the mapping.
+ *
+ * Resolved rather than hardcoded: `res.partner.category` ids are installation
+ * data, and the id verified in this database today (248, "Moonvella app") is not
+ * a fact about Odoo. The product tag is a different model entirely — `product.tag`,
+ * id 2, "MoonVella App", capital A — and the two are resolved by separate
+ * functions so that neither can be passed where the other belongs.
+ */
+export const MOONVELLA_CONTACT_TAG_NAME = "Moonvella app";
+export const MOONVELLA_PRODUCT_TAG_NAME = "MoonVella App";
+
+export interface OdooLookup {
+  id: number;
+  name: string;
+}
+
+/** Resolve an ISO country code to `res.country.id`. Null when not installed. */
+export async function findCountryByCode(code: string): Promise<OdooLookup | null> {
+  const trimmed = code.trim().toUpperCase();
+  if (!trimmed) return null;
+  const rows = await searchRead<OdooLookup>(
+    COUNTRY_MODEL,
+    [["code", "=", trimmed]],
+    ["id", "name", "code"],
+    { limit: 2 },
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Resolve a province/state code WITHIN a country.
+ *
+ * The country is part of the domain and not decoration: "ON" is Ontario in
+ * Canada and nothing in the United States, and a lookup that ignored the
+ * country would happily attach a Canadian province to a US address the first
+ * time somebody's country code was wrong.
+ */
+export async function findStateByCode(
+  countryId: number,
+  code: string,
+): Promise<OdooLookup | null> {
+  const trimmed = code.trim().toUpperCase();
+  if (!trimmed || !countryId) return null;
+  const rows = await searchRead<OdooLookup>(
+    STATE_MODEL,
+    [
+      ["country_id", "=", countryId],
+      ["code", "=", trimmed],
+    ],
+    ["id", "name", "code"],
+    { limit: 2 },
+  );
+  return rows[0] ?? null;
+}
+
+/** Resolve the MoonVella contact tag on `res.partner.category`. Read-only. */
+export async function findContactTagByName(
+  name: string = MOONVELLA_CONTACT_TAG_NAME,
+): Promise<OdooLookup | null> {
+  const rows = await searchRead<OdooLookup>(
+    PARTNER_CATEGORY_MODEL,
+    [["name", "=", name]],
+    ["id", "name"],
+    { limit: 2 },
+  );
+  return rows[0] ?? null;
+}
+
+/** Resolve the MoonVella product tag on `product.tag`. A DIFFERENT model. */
+export async function findProductTagByName(
+  name: string = MOONVELLA_PRODUCT_TAG_NAME,
+): Promise<OdooLookup | null> {
+  const rows = await searchRead<OdooLookup>(
+    PRODUCT_TAG_MODEL,
+    [["name", "=", name]],
+    ["id", "name"],
+    { limit: 2 },
+  );
+  return rows[0] ?? null;
+}
+
+export interface OdooPartnerRecord extends OdooRecord {
+  name?: string;
+  email?: string | false;
+  phone?: string | false;
+  vat?: string | false;
+  street?: string | false;
+  street2?: string | false;
+  city?: string | false;
+  zip?: string | false;
+  website?: string | false;
+  is_company?: boolean;
+  customer_rank?: number;
+  parent_id?: [number, string] | false;
+  category_id?: number[];
+}
+
+export const PARTNER_READ_FIELDS = [
+  "id",
+  "name",
+  "email",
+  "phone",
+  "vat",
+  "street",
+  "street2",
+  "city",
+  "zip",
+  "state_id",
+  "country_id",
+  "website",
+  "is_company",
+  "customer_rank",
+  "parent_id",
+  "category_id",
+  "active",
+];
+
+/**
+ * Read one partner by id. Returns null when it is gone.
+ *
+ * `active` is matched against both values on purpose. Odoo hides archived
+ * records from a plain search, and an archived partner is not a missing one:
+ * treating it as missing would make the contact sync stop and ask a person to
+ * decide whether a record that is still there, still carries the seller's tax
+ * id, and is simply switched off had "been removed or merged".
+ */
+export async function readPartner(id: number): Promise<OdooPartnerRecord | null> {
+  if (!id) return null;
+  const rows = await searchRead<OdooPartnerRecord>(
+    PARTNER_MODEL,
+    [
+      ["id", "=", id],
+      ["active", "in", [true, false]],
+    ],
+    PARTNER_READ_FIELDS,
+    { limit: 1 },
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * The partner fields the contact sync is allowed to write.
+ *
+ * Written as an interface rather than a bag of keys so that adding one is a
+ * deliberate act: every entry here is a column on somebody's customer record.
+ */
+export interface PartnerValues {
+  name: string;
+  email?: string | null;
+  phone?: string | null;
+  vat?: string | null;
+  street?: string | null;
+  street2?: string | null;
+  city?: string | null;
+  zip?: string | null;
+  state_id?: number | null;
+  country_id?: number | null;
+  website?: string | null;
+  is_company?: boolean;
+  customer_rank?: number;
+  parent_id?: number | null;
+  category_ids?: number[];
+}
+
+/**
+ * Drop empty values and turn the interface into Odoo's own column names.
+ *
+ * A null is not written. Writing `phone: null` over a number somebody recorded
+ * in Odoo would delete data MoonVella never supplied, which is the opposite of
+ * "preserve unrelated Odoo fields" — so an absent value means "say nothing
+ * about this column", not "clear it".
+ */
+export function partnerWritePayload(values: PartnerValues): Record<string, unknown> {
+  const payload: Record<string, unknown> = { name: values.name };
+
+  const put = (key: string, value: unknown) => {
+    if (value === undefined || value === null || value === "") return;
+    payload[key] = value;
+  };
+
+  put("email", values.email);
+  put("phone", values.phone);
+  put("vat", values.vat);
+  put("street", values.street);
+  put("street2", values.street2);
+  put("city", values.city);
+  put("zip", values.zip);
+  put("state_id", values.state_id);
+  put("country_id", values.country_id);
+  put("website", values.website);
+  put("parent_id", values.parent_id);
+  if (values.is_company !== undefined) payload.is_company = values.is_company;
+  if (values.customer_rank !== undefined) payload.customer_rank = values.customer_rank;
+  if (values.category_ids && values.category_ids.length > 0) {
+    // `[6, 0, ids]` REPLACES the tag set, which would drop every other tag on
+    // the record. `[4, id]` adds one without touching the rest, which is what
+    // "preserve other tags" requires.
+    payload.category_id = values.category_ids.map((id) => [4, id]);
+  }
+
+  return payload;
+}
+
+/** Create a partner with the mapped fields. Preview unless `confirm`. */
+export async function createPartner(
+  values: PartnerValues,
+  options: { confirm?: boolean } = {},
+): Promise<{ id: number } | OdooWritePreview> {
+  const payload = partnerWritePayload(values);
+  return guardedWrite(
+    "partner.create",
+    PARTNER_MODEL,
+    "create",
+    payload,
+    options.confirm === true,
+    async (permit) => {
+      const id = await executeKw<number>(PARTNER_MODEL, "create", [payload], {}, permit);
+      return { id };
+    },
+  );
+}
+
+/**
+ * Write the mapped fields onto a partner MoonVella already owns a mapping to.
+ *
+ * This is the retry path. A second approval, a reapplication, or a retry after
+ * an outage writes to the SAME partner id, because the mapping says that id is
+ * this seller's. It deliberately does not go through `decidePartnerAction`: the
+ * decision was already made and recorded when the mapping was created, and
+ * re-deciding would turn a retry into a second judgement about identity.
+ *
+ * Only the mapped fields are sent. Everything else on the record — PremaFirm's
+ * columns, other tags, notes, the salesperson — is left exactly as it was.
+ */
+export async function updatePartner(
+  partnerId: number,
+  values: PartnerValues,
+  options: { confirm?: boolean } = {},
+): Promise<{ id: number } | OdooWritePreview> {
+  const payload = partnerWritePayload(values);
+  return guardedWrite(
+    "partner.update",
+    PARTNER_MODEL,
+    "write",
+    { partnerId, payload },
+    options.confirm === true,
+    async (permit) => {
+      await executeKw<boolean>(PARTNER_MODEL, "write", [[partnerId], payload], {}, permit);
+      return { id: partnerId };
+    },
+  );
+}

@@ -1,7 +1,17 @@
 import { useLoaderData } from "react-router";
 import { prisma } from "../db.server";
+import { withMerchantAccess } from "../services/seller.server";
 
-export const loader = async () => {
+/**
+ * The shipping table is global data rather than this seller's, which is why
+ * this loader used to read it without identifying the caller at all. Two things
+ * were wrong with that: it is still a merchant surface, so a blocked store
+ * could open it and see MoonVella's carrier costs, and a route that never
+ * authenticates is one refactor away from serving data to anybody who knows the
+ * URL. It now goes through the same gate as every other merchant page.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async () => {
   const zones = await prisma.shippingZone.findMany({
     where: { isActive: true },
     orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
@@ -19,7 +29,7 @@ export const loader = async () => {
       status: zone.status,
     })),
   };
-};
+  });
 
 function money(cents) {
   return `$${(Number(cents || 0) / 100).toFixed(2)}`;

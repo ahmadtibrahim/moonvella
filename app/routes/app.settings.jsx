@@ -1,11 +1,11 @@
 import { useLoaderData, useActionData, useNavigation, Link, Form } from "react-router";
-import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
+import { requireMerchantAccess, withMerchantAccess, AccessError } from "../services/seller.server";
 import { prisma } from "../db.server";
 import { recordAudit, AUDIT_ENTITY } from "../services/audit.server";
+import { JOB_KIND, enqueueJob, jobKey } from "../services/jobs.server";
 
-export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
-
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
   let settings = null;
   let paymentMethod = null;
   let billingMode = null;
@@ -28,6 +28,24 @@ export const loader = async ({ request }) => {
   return {
     access: context.access,
     canEdit: context.canStartNewBusiness,
+    // The people we call about an order. Kept editable in Settings for as long
+    // as the store can see the app at all, because the person who answers the
+    // phone for a delivery changes far more often than an application does.
+    contact: {
+      name: app?.contactName ?? context.seller?.contactName ?? null,
+      email: app?.email ?? context.seller?.contactEmail ?? null,
+      phone: app?.phone ?? context.seller?.phone ?? null,
+      urgentName: app?.urgentContactName ?? null,
+      urgentPhone: app?.urgentPhone ?? null,
+    },
+    // Shown beside the fields, never merged into them: the storefront's public
+    // address and the person who handles deliveries are usually different
+    // mailboxes, and an app that treats one as the other sends the wrong
+    // message to the wrong place.
+    shopifyEmails: {
+      contact: app?.storeContactEmail ?? null,
+      owner: app?.storeOwnerEmail ?? null,
+    },
     store: {
       storeName: app?.storeName ?? context.seller?.storeName ?? null,
       shopDomain: context.shop,
@@ -52,7 +70,7 @@ export const loader = async ({ request }) => {
         }
       : null,
   };
-};
+  });
 
 function clampInt(value, min, max, fallback) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -60,22 +78,125 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, parsed));
 }
 
+/**
+ * Who we call about an order.
+ *
+ * A separate write from the sync preferences, and deliberately a separate
+ * access level: a store that is still pending, or one that has been
+ * deactivated and may apply again, has no wholesale tools but does still own
+ * the answer to "which number should the driver ring". Refusing them that
+ * would leave the wrong number on the record until somebody is approved.
+ */
+async function saveContactDetails(context, form) {
+  const seller = context.seller;
+  const application = context.application;
+
+  const name = String(form.get("contactName") || "").trim().slice(0, 200);
+  const email = String(form.get("contactEmail") || "").trim().slice(0, 320);
+  const phone = String(form.get("contactPhone") || "").trim().slice(0, 60);
+  const urgentPhone = String(form.get("urgentPhone") || "").trim().slice(0, 60);
+  const urgentName = String(form.get("urgentContactName") || "").trim().slice(0, 200);
+
+  // The application row declares these as required, and a blank contact name
+  // is not a correction — it is the removal of the only person we know to
+  // call. Refused by name rather than accepted and rendered as an empty box.
+  if (!name) return { error: "A contact name is required — this is the person we call about an order." };
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    return { error: "A valid contact email is required." };
+  }
+
+  const before = {
+    name: application?.contactName ?? seller.contactName ?? null,
+    email: application?.email ?? seller.contactEmail ?? null,
+    phone: application?.phone ?? seller.phone ?? null,
+    urgentName: application?.urgentContactName ?? null,
+    urgentPhone: application?.urgentPhone ?? null,
+  };
+
+  await prisma.$transaction(async (tx) => {
+    if (application) {
+      await tx.merchantApplication.update({
+        where: { id: application.id },
+        data: {
+          contactName: name,
+          email,
+          phone: phone || null,
+          urgentPhone: urgentPhone || null,
+          urgentContactName: urgentName || null,
+        },
+      });
+    }
+    // Mirrored onto the seller so the two screens that read a seller row —
+    // the owner's store detail and the contact sync — do not disagree with the
+    // application about who the contact is.
+    await tx.seller.update({
+      where: { id: seller.id },
+      data: { contactName: name, contactEmail: email, phone: phone || null },
+    });
+  });
+
+  await recordAudit({
+    actorType: "MERCHANT",
+    actorId: seller.id,
+    actorName: seller.storeName,
+    action: "seller.contact_updated",
+    entityType: AUDIT_ENTITY.SELLER,
+    entityId: seller.id,
+    beforeData: before,
+    afterData: { name, email, phone: phone || null, urgentName: urgentName || null, urgentPhone: urgentPhone || null },
+  });
+
+  // The Odoo contact is only written for a store that has been approved, so
+  // the queue entry is only useful there. Before approval the change is simply
+  // recorded; approval queues a sync that reads the current values, so nothing
+  // is lost by not queueing one now. Queueing one for a pending store would
+  // have the runner create an Odoo partner for a company nobody has approved.
+  let queued = false;
+  if (seller.status === "APPROVED") {
+    const current = await prisma.seller.findUnique({
+      where: { id: seller.id },
+      select: { accessVersion: true },
+    });
+    await enqueueJob({
+      kind: JOB_KIND.ODOO_CONTACT_SYNC,
+      idempotencyKey: jobKey(JOB_KIND.ODOO_CONTACT_SYNC, seller.id),
+      sellerId: seller.id,
+      sellerAccessVersion: current?.accessVersion ?? 1,
+      payload: { sellerId: seller.id },
+    });
+    queued = true;
+  }
+
+  return {
+    ok: true,
+    message: queued
+      ? "Contact details saved. The Odoo contact will be updated shortly."
+      : "Contact details saved.",
+  };
+}
+
 export const action = async ({ request }) => {
-  const context = await requireSellerContext(request);
-  if (!context.seller) return { error: "No seller account." };
-  if (!context.canStartNewBusiness) {
+  const form = await request.formData();
+  const intent = String(form.get("intent") || "");
+
+  let context;
+  try {
     // Settings is where product sync is switched on, so a blocked store being
     // told to wait for approval would be doubly wrong: it is not pending, and
     // what it is asking for is the thing that was blocked.
-    return {
-      error:
-        context.access === "BLOCKED"
-          ? BLOCKED_MESSAGE
-          : `Settings require an approved seller account (current status: ${context.access}).`,
-    };
+    context = await requireMerchantAccess(request, intent === "contact" ? "VIEW" : "BUSINESS");
+  } catch (error) {
+    if (error instanceof AccessError) {
+      return { error: error.message };
+    }
+    throw error;
+  }
+  if (!context.seller) return { error: "No seller account." };
+
+  if (intent === "contact") {
+    return saveContactDetails(context, form);
   }
 
-  const form = await request.formData();
   const data = {
     autoSyncInventory: form.get("autoSyncInventory") === "on",
     quantityBuffer: clampInt(form.get("quantityBuffer"), 0, 10000, 5),
@@ -122,7 +243,8 @@ function valueOrUnknown(value) {
 }
 
 export default function SettingsPage() {
-  const { access, canEdit, store, settings, paymentMethod, billingMode } = useLoaderData();
+  const { access, canEdit, store, contact, shopifyEmails, settings, paymentMethod, billingMode } =
+    useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const isApproved = access === "APPROVED";
@@ -202,6 +324,90 @@ export default function SettingsPage() {
             Values come from your submitted MoonVella application and cannot be edited here. Live Shopify
             profile sync is completed in the application phase.
           </p>
+        </div>
+
+        <div className="mv-section-card" style={{ marginBottom: "2rem" }}>
+          <h3 className="mv-settings-title">Who we contact about your orders</h3>
+          <p className="mv-branding-message" style={{ marginBottom: "1rem", fontSize: "0.8rem" }}>
+            These are the people MoonVella calls about an order, a pickup or a delivery. They are
+            kept separately from the addresses your Shopify store publishes — the storefront address
+            is often a shared inbox that nobody watches when a truck is at the door.
+          </p>
+
+          <Form method="post">
+            <input type="hidden" name="intent" value="contact" />
+            <div className="mv-settings-grid">
+              <div className="mv-settings-field">
+                <span className="mv-settings-label">Contact name</span>
+                <input
+                  type="text"
+                  className="mv-settings-input"
+                  name="contactName"
+                  maxLength={200}
+                  defaultValue={contact.name ?? ""}
+                  required
+                />
+              </div>
+              <div className="mv-settings-field">
+                <span className="mv-settings-label">Contact email</span>
+                <input
+                  type="email"
+                  className="mv-settings-input"
+                  name="contactEmail"
+                  maxLength={320}
+                  defaultValue={contact.email ?? ""}
+                  required
+                />
+                <span className="mv-branding-message" style={{ fontSize: "0.72rem" }}>
+                  {shopifyEmails.contact
+                    ? `Your storefront publishes ${shopifyEmails.contact}. Enter the address for ${
+                        contact.name ? contact.name : "the order contact"
+                      } here if it is different.`
+                    : "The address of the person who handles orders, if it is not your storefront's."}
+                </span>
+              </div>
+              <div className="mv-settings-field">
+                <span className="mv-settings-label">Phone</span>
+                <input
+                  type="tel"
+                  className="mv-settings-input"
+                  name="contactPhone"
+                  maxLength={60}
+                  defaultValue={contact.phone ?? ""}
+                />
+              </div>
+              <div className="mv-settings-field">
+                <span className="mv-settings-label">Urgent contact phone</span>
+                <input
+                  type="tel"
+                  className="mv-settings-input"
+                  name="urgentPhone"
+                  maxLength={60}
+                  defaultValue={contact.urgentPhone ?? ""}
+                />
+                <span className="mv-branding-message" style={{ fontSize: "0.72rem" }}>
+                  For urgent issues related to orders, fulfillment or delivery.
+                </span>
+              </div>
+              <div className="mv-settings-field">
+                <span className="mv-settings-label">Name for the urgent number (if it is somebody else)</span>
+                <input
+                  type="text"
+                  className="mv-settings-input"
+                  name="urgentContactName"
+                  maxLength={200}
+                  defaultValue={contact.urgentName ?? ""}
+                />
+                <span className="mv-branding-message" style={{ fontSize: "0.72rem" }}>
+                  Leave blank if the urgent number is the contact above.
+                </span>
+              </div>
+            </div>
+
+            <button type="submit" className="mv-btn mv-btn-primary" style={{ marginTop: "1.25rem" }}>
+              Save contact details
+            </button>
+          </Form>
         </div>
 
         <Form method="post">

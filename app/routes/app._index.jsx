@@ -1,14 +1,26 @@
 import { Link, useLoaderData } from "react-router";
-import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, requireMerchantAccess } from "../services/seller.server";
 import { prisma } from "../db.server";
 
 export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
+  const context = await requireMerchantAccess(request, "VIEW");
 
   let stats = { imported: 0, orders: 0, unitsSold: 0, moonvellaSales: 0 };
   let recentOrders = [];
 
-  if (context.seller) {
+  /**
+   * Order totals and the order list are gated on `canViewOrders`, not on the
+   * mere existence of a seller row.
+   *
+   * This page previously loaded both for any seller at all, which meant a
+   * blocked store — whose rules table says orders are not readable — was shown
+   * its order count, its revenue and its last five orders. The block message
+   * appeared at the top of the page and the numbers underneath contradicted it.
+   * `requireMerchantAccess` refuses a blocked store before this line now; the
+   * separate `canViewOrders` check is what keeps the two gates from having to
+   * agree by coincidence.
+   */
+  if (context.seller && context.canViewOrders) {
     const [imported, orderAgg, units, recent] = await Promise.all([
       prisma.sellerProduct.count({ where: { sellerId: context.seller.id } }),
       prisma.order.aggregate({

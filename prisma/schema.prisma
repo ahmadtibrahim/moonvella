@@ -175,9 +175,47 @@ model MerchantApplication {
   email                 String
   phone                 String?
   urgentPhone           String?
+  /// The emergency contact's own name. The application asks whether the urgent
+  /// number belongs to the person above or to somebody else, and a number
+  /// without a name is not an answer to "who do we call".
+  urgentContactName     String?
   legalBusinessName     String
-  sellerAddress         String
+  /// DEPRECATED, and no longer written or rendered. It was one free-text box
+  /// standing in for an address, which cannot be mapped onto Odoo's street /
+  /// street2 / city / zip / state / country fields without guessing where one
+  /// ends and the next begins. The structured columns below replaced it. Kept
+  /// as a nullable column so values already stored are not destroyed.
+  sellerAddress         String?
   gstHstNumber          String?
+
+  // --- imported from Shopify -------------------------------------------
+  // Everything below is filled from the authenticated Admin API session, never
+  // from a submitted browser field. The shop identity is taken from the
+  // session's shop domain, so a form cannot claim to be another store.
+  /// The permanent Shopify shop id (`gid://shopify/Shop/…`). It survives a
+  /// domain change, which the myshopify domain does not.
+  shopifyShopId         String?
+  /// `shop.email` — the account owner's address.
+  storeOwnerEmail       String?
+  /// `shop.contactEmail` — the address the storefront publishes. Stored
+  /// separately from the owner's: they are different people on most stores,
+  /// and one mailbox cannot be both.
+  storeContactEmail     String?
+  addressLine1          String?
+  addressLine2          String?
+  addressCity           String?
+  addressProvinceCode   String?
+  addressPostalCode     String?
+  addressCountryCode    String?
+  /// Which fields the import actually produced a value for, which it found
+  /// empty in Shopify, and which a merchant has since edited. Without this a
+  /// blank box cannot say whether Shopify had nothing or nobody ever looked.
+  profileFieldSources   Json?                 @default("{}")
+  /// The last raw response, kept so the page can show why a field is missing
+  /// rather than showing an empty input and an apology.
+  shopifyProfileJson    Json?                 @default("{}")
+  profileRefreshedAt    DateTime?
+  profileRefreshError   String?
   productCategory       String
   markets               String                @default("[]")
   status                ApplicationStatus     @default(PENDING)
@@ -205,6 +243,12 @@ enum ApplicationStatus {
   NEEDS_INFO
   REJECTED
   SUSPENDED
+  /// Deliberately distinct from SUSPENDED. A deactivation revokes approved
+  /// access but invites the merchant to apply again; the application is shown
+  /// prefilled and a resubmission returns it to PENDING for a fresh owner
+  /// decision. A suspension is an owner action that the merchant is not asked
+  /// to resolve. Collapsing the two would make one control lie about itself.
+  DEACTIVATED
   BLOCKED
 }
 
@@ -231,6 +275,15 @@ model Seller {
   // about which control was used.
   blockedAt             DateTime?
   blockReason           String?
+  /// Deactivation is a third control, so it gets a third pair of columns for
+  /// the same reason block did: a suspension reason column holding a
+  /// deactivation reason is a record that lies about which control was used.
+  deactivatedAt         DateTime?
+  deactivationReason    String?
+  /// Bumped on every access-changing write. Deferred work carries the version
+  /// it was queued under and is cancelled if it no longer matches, so a job
+  /// created while a seller was approved cannot run after they were blocked.
+  accessVersion         Int           @default(1)
   createdAt             DateTime      @default(now())
   updatedAt             DateTime      @updatedAt
   installedAt           DateTime?
@@ -246,6 +299,8 @@ model Seller {
   bankAccounts          SellerBankAccount[]
   settings              SellerSettings?
   brandKit              SellerBrandKit?
+  contactMappings       ExternalContactMapping[]
+  jobs                  BackgroundJob[]
 
   @@index([status])
   @@index([shopDomain])
@@ -257,8 +312,63 @@ enum SellerStatus {
   NEEDS_INFO
   REJECTED
   SUSPENDED
+  /// Revoked-but-reapplicable. See ApplicationStatus.DEACTIVATED.
+  DEACTIVATED
   BLOCKED
   UNINSTALLED
+}
+
+/**
+ * The three Odoo records one approved seller maps onto. Each is a separate
+ * partner row with its own durable mapping, because a single "contact" record
+ * cannot carry a company's legal name and an individual's mobile at once
+ * without one of them being wrong.
+ */
+enum ContactRole {
+  COMPANY
+  CONTACT
+  URGENT_CONTACT
+}
+
+enum ContactSyncStatus {
+  /// Queued or being attempted. Not a failure: Odoo may simply be unreachable.
+  PENDING
+  SYNCED
+  FAILED
+  /// Deliberately not synced (e.g. no emergency contact was supplied).
+  NOT_REQUIRED
+}
+
+/**
+ * How far a product has got towards being archived in the seller's Shopify
+ * store. Archiving is a separate axis from the import status: a product can be
+ * fully IMPORTED and still PENDING archive, and that is exactly the state a
+ * just-blocked seller's catalog is in.
+ */
+enum ProductArchiveStatus {
+  NOT_APPLICABLE
+  PENDING
+  ARCHIVED
+  FAILED
+}
+
+/**
+ * A unit of deferred work.
+ *
+ * MoonVella had no queue at all before this: every action was synchronous, so a
+ * slow or unreachable third party made the owner's click fail. Approval must
+ * survive Odoo being down and blocking must survive Shopify being slow, so the
+ * work is recorded here and drained by a runner that can be retried.
+ */
+enum JobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  /// Abandoned because the world moved on — a seller's access changed, or the
+  /// owner blocked and then unblocked. Never a silent no-op: the reason is
+  /// written to lastError.
+  CANCELLED
 }
 
 enum SyncStatus {
@@ -1432,17 +1542,30 @@ model ExternalProductMapping {
   id                String    @id @default(cuid())
   productId         String
   product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+  /// "SHOPIFY" for a merchant's storefront copy, "ODOO" for the source catalog.
+  /// An ODOO row keeps the Odoo database name in `shopDomain`, which is the
+  /// tenant that owns the record — not a shop domain, but the same question
+  /// ("which system's copy is this?") with the same answer shape.
   provider          String    @default("SHOPIFY")
   shopDomain        String
   externalProductId String?
   importStatus      String    @default("NOT_IMPORTED")
   lastSyncedAt      DateTime?
   lastSyncError     String?
+  /// Archiving state in the merchant's Shopify store, tracked per product so
+  /// the owner gets real counts instead of a promise. Only ever ARCHIVED or
+  /// FAILED for a product this app imported; never set by a title or vendor
+  /// match.
+  archiveStatus     ProductArchiveStatus @default(NOT_APPLICABLE)
+  archiveAttempts   Int       @default(0)
+  archiveLastError  String?
+  archivedAt        DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
   @@unique([provider, shopDomain, productId])
   @@index([shopDomain])
+  @@index([archiveStatus])
 }
 
 /// The variant-level counterpart of ExternalProductMapping. The Shopify variant
@@ -1484,4 +1607,89 @@ model SellerBrandKit {
   brandColours   Json?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+/// Where one seller exists in Odoo.
+///
+/// One row per (seller, role). The uniqueness is the point: a retry, a
+/// reapplication or a second approval click updates THIS row rather than
+/// creating a second Odoo partner, which is the failure mode that turns a
+/// contact list into a duplicate list.
+///
+/// Nothing here is ever matched by email or tax id to decide whether to merge.
+/// The mapping is the authority; matching is only used to refuse a write that
+/// would collide with an unrelated record.
+model ExternalContactMapping {
+  id            String            @id @default(cuid())
+  sellerId      String
+  seller        Seller            @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  role          ContactRole
+  /// The Odoo res.partner id. Null until a write succeeds — a PENDING mapping
+  /// with a null id is a promise, not a record, and the interface says so.
+  odooPartnerId Int?
+  /// What the record was called when it was written, so a later run can say
+  /// "renamed from X" instead of silently overwriting.
+  odooName      String?
+  status        ContactSyncStatus @default(PENDING)
+  attempts      Int               @default(0)
+  lastError     String?
+  lastAttemptAt DateTime?
+  syncedAt      DateTime?
+  /// SHA-256 of the mapped field set. When it is unchanged, a retry is a no-op
+  /// and says so, rather than issuing a write that would churn Odoo's audit
+  /// trail on every reapplication.
+  payloadFingerprint String?
+
+  // --- identity, held here rather than in Odoo -------------------------
+  // The store's own identifiers. They are NOT written into the Odoo partner:
+  // `ref` is a reference field that already means something to whoever set it,
+  // and overloading it with a Shopify id would make the one field a reader
+  // trusts the one field that lies. Each identifier gets its own column here,
+  // on the record whose whole purpose is to be the durable link between the
+  // two systems.
+  /// The Shopify store display name at the time of the sync.
+  storeName          String?
+  /// `gid://shopify/Shop/…`. Survives a myshopify domain change.
+  shopifyShopId      String?
+  myshopifyDomain    String?
+  /// The resolved tag id used, so a later run can tell that the tag was
+  /// re-created under a different id and needs re-applying.
+  odooTagId          Int?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@unique([sellerId, role])
+  @@index([status])
+}
+
+/// Deferred work: see JobStatus for why this exists.
+model BackgroundJob {
+  id             String    @id @default(cuid())
+  /// "ODOO_CONTACT_SYNC" | "SHOPIFY_PRODUCT_ARCHIVE"
+  kind           String
+  sellerId       String?
+  seller         Seller?   @relation(fields: [sellerId], references: [id], onDelete: SetNull)
+  payload        Json?
+  status         JobStatus @default(PENDING)
+  attempts       Int       @default(0)
+  maxAttempts    Int       @default(5)
+  lastError      String?
+  /// When the job becomes eligible. A failure pushes this forward (backoff)
+  /// instead of spinning.
+  runAt          DateTime  @default(now())
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  /// The seller.accessVersion at queue time. A job whose version no longer
+  /// matches is cancelled, not run.
+  sellerAccessVersion Int?
+  /// Human-readable progress for the owner panel, e.g. archive counts.
+  result         Json?
+  /// Same key queued twice is one job. Prevents a double-clicked Block from
+  /// queueing two archive passes.
+  idempotencyKey String    @unique
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([status, runAt])
+  @@index([kind, status])
+  @@index([sellerId])
 }

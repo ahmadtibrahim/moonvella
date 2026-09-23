@@ -72,6 +72,11 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
       "Values are encrypted before they are stored and are never sent back to this page. " +
       "\"Connected\" appears only after MoonVella authenticates against Odoo with these " +
       "credentials. Leave a field blank to keep the value already saved. " +
+      "The consignment location and owner say WHOSE stock is sellable: an import reads the " +
+      "quantities held at that location for that owner and nothing else, so stock belonging " +
+      "to the company or to another supplier is never offered for sale. Both accept a name " +
+      "or a numeric id, and a name that matches more than one record is refused rather than " +
+      "guessed at. " +
       "READ-ONLY IS THE DEFAULT: \"live\" mode alone does not enable writes — they also " +
       "require ODOO_ALLOW_WRITES=yes in the deployment environment, which this page cannot " +
       "set, so a form here can never authorise writing to the ERP. The database is reached " +
@@ -92,6 +97,18 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
           { value: "live", label: "live" },
           { value: "disabled", label: "disabled" },
         ],
+      },
+      {
+        name: "ODOO_CONSIGNMENT_LOCATION",
+        label: "Consignment location",
+        secret: false,
+        placeholder: "stock location name or numeric id",
+      },
+      {
+        name: "ODOO_CONSIGNMENT_OWNER",
+        label: "Consignment owner",
+        secret: false,
+        placeholder: "partner name or numeric id",
       },
     ],
   },

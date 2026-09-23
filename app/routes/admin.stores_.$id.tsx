@@ -1,13 +1,18 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
+import { prisma } from "~/db.server";
 import { getSellerDetail } from "~/services/seller.server";
 import {
   blockSeller,
+  deactivateSeller,
   reactivateSeller,
   suspendSeller,
   unblockSeller,
 } from "~/services/application.server";
+import { JOB_KIND, describeJob, enqueueJob, jobKey, openJobsFor } from "~/services/jobs.server";
+import { archiveCounts, archiveWorklist, resetFailedArchives } from "~/services/productArchive.server";
+import { financialActionHold } from "~/services/odooContacts.server";
 import { BlockControl } from "~/components/store/BlockControl";
 import { getShopAnalytics } from "~/services/analytics.server";
 import {
@@ -33,6 +38,26 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const done = url.searchParams.get("done") || "";
 
+  /*
+   * The state of the seller's two integrations with the outside world.
+   *
+   * Both are read here rather than only after an action, because both are
+   * things that happen without anybody pressing anything on this page: a
+   * contact sync runs when an application is approved, and an archive run
+   * follows a block. An owner looking at a store needs to see what those did,
+   * including the failures, without having to go looking for them.
+   */
+  const [contactMappings, jobs, archives] = await Promise.all([
+    prisma.externalContactMapping.findMany({
+      where: { sellerId: id },
+      orderBy: { role: "asc" },
+    }),
+    openJobsFor({ sellerId: id }, 10),
+    archiveCounts(id),
+  ]);
+  const archiveList = archives.total > 0 ? await archiveWorklist(id, 25) : [];
+  const financialHold = await financialActionHold(id);
+
   return {
     done: DONE_MESSAGES[done] ?? "",
     seller: detail.seller,
@@ -41,6 +66,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     wholesaleRevenue: detail.wholesaleRevenue,
     history: detail.history,
     analytics,
+    contactMappings,
+    jobs: jobs.map((job) => ({ ...job, description: describeJob(job) })),
+    archives,
+    archiveList,
+    financialHold,
   };
 }
 
@@ -73,6 +103,12 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await blockSeller(id, actor, blockReason || reason || "Blocked by owner");
     } else if (intent === "unblock") {
       await unblockSeller(id, actor);
+    } else if (intent === "deactivate") {
+      await deactivateSeller(id, actor, reason || "Deactivated by owner");
+    } else if (intent === "retry-contact-sync") {
+      await retryContactSync(id);
+    } else if (intent === "retry-archives") {
+      await retryArchives(id);
     } else {
       return { error: "Unknown action." };
     }
@@ -83,8 +119,57 @@ export async function action({ request, params }: ActionFunctionArgs) {
   return redirect(`/admin/stores/${id}?done=${intent}`);
 }
 
+/**
+ * Queue the contact sync again, at the owner's request.
+ *
+ * The job carries the seller's CURRENT access version. Queueing it with a stale
+ * one would be self-defeating: the runner cancels jobs whose version no longer
+ * matches, so the retry would be refused before it ran and look like the button
+ * does nothing.
+ */
+async function retryContactSync(sellerId: string) {
+  const seller = await prisma.seller.findUnique({
+    where: { id: sellerId },
+    select: { accessVersion: true },
+  });
+  if (!seller) throw new Error("Seller not found");
+
+  await enqueueJob({
+    kind: JOB_KIND.ODOO_CONTACT_SYNC,
+    idempotencyKey: jobKey(JOB_KIND.ODOO_CONTACT_SYNC, sellerId),
+    sellerId,
+    sellerAccessVersion: seller.accessVersion,
+    payload: { sellerId },
+  });
+}
+
+/** Re-queue the archives that failed, then let the runner pick them up. */
+async function retryArchives(sellerId: string) {
+  const seller = await prisma.seller.findUnique({
+    where: { id: sellerId },
+    select: { accessVersion: true },
+  });
+  if (!seller) throw new Error("Seller not found");
+
+  // Refuses unless the store is blocked, which is the same rule the archive
+  // handler enforces: a store that is not blocked must not have its catalogue
+  // archived, however the button was reached.
+  await resetFailedArchives(sellerId);
+  await enqueueJob({
+    kind: JOB_KIND.SHOPIFY_ARCHIVE_PRODUCTS,
+    idempotencyKey: jobKey(JOB_KIND.SHOPIFY_ARCHIVE_PRODUCTS, sellerId),
+    sellerId,
+    sellerAccessVersion: seller.accessVersion,
+    payload: { sellerId },
+  });
+}
+
 const DONE_MESSAGES: Record<string, string> = {
-  suspend: "Store deactivated. It keeps its history and its orders are unaffected.",
+  suspend: "Store suspended. It keeps its history and its orders are unaffected.",
+  deactivate:
+    "Store deactivated. Approved access is revoked, the application is shown to the store again, and its orders and accounting history are untouched.",
+  "retry-contact-sync": "Contact sync queued. It will run on the next tick of the job runner.",
+  "retry-archives": "Failed archives queued again. They will run on the next tick of the job runner.",
   reactivate: "Store activated. It can sign in and order again.",
   block:
     "Store blocked. It has lost pricing, imports, order sync and its order history; MoonVella has kept all of them.",
@@ -164,6 +249,7 @@ function statusStyle(status: string): React.CSSProperties {
     NEEDS_INFO: { bg: "#dbeafe", color: "#1d4ed8" },
     REJECTED: { bg: "#fee2e2", color: "#dc2626" },
     SUSPENDED: { bg: "#fee2e2", color: "#dc2626" },
+    DEACTIVATED: { bg: "#ffedd5", color: "#b45309" },
     BLOCKED: { bg: "#7f1d1d", color: "#fef2f2" },
     UNINSTALLED: { bg: "#f1f5f9", color: "#64748b" },
   };
@@ -178,9 +264,47 @@ function statusStyle(status: string): React.CSSProperties {
   };
 }
 
+const ROLE_LABELS: Record<string, string> = {
+  COMPANY: "Company contact",
+  CONTACT: "Contact person",
+  URGENT_CONTACT: "Urgent orders line",
+};
+
+/** The same badge vocabulary for sync state and archive state. */
+function syncStyle(status: string): React.CSSProperties {
+  const map: Record<string, { bg: string; color: string }> = {
+    SYNCED: { bg: "#d1fae5", color: "#059669" },
+    ARCHIVED: { bg: "#d1fae5", color: "#059669" },
+    PENDING: { bg: "#fef3c7", color: "#b45309" },
+    FAILED: { bg: "#fee2e2", color: "#dc2626" },
+    NOT_REQUIRED: { bg: "#f1f5f9", color: "#64748b" },
+  };
+  const s = map[status] ?? map.NOT_REQUIRED;
+  return {
+    padding: "0.15rem 0.5rem",
+    borderRadius: 9999,
+    fontSize: "0.62rem",
+    fontWeight: 700,
+    background: s.bg,
+    color: s.color,
+  };
+}
+
 export default function AdminStoreDetail() {
-  const { seller, application, orderCount, wholesaleRevenue, history, analytics, done } =
-    useLoaderData<typeof loader>();
+  const {
+    seller,
+    application,
+    orderCount,
+    wholesaleRevenue,
+    history,
+    analytics,
+    done,
+    contactMappings,
+    jobs,
+    archives,
+    archiveList,
+    financialHold,
+  } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const isApproved = seller.status === "APPROVED";
   const isBlocked = seller.status === "BLOCKED";
@@ -616,16 +740,174 @@ export default function AdminStoreDetail() {
         </div>
       </div>
 
+      {/*
+        Odoo contact mapping. Three roles, each with its own record and its own
+        outcome, because they are three different writes: the company, the named
+        contact, and the urgent orders line. Showing them together as one
+        "synced" tick would hide which one actually failed.
+      */}
+      <div style={card}>
+        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
+          Odoo contact
+        </h2>
+        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          The company contact is written when an application is approved. Later approvals, retries
+          and reapplications update the same records — the mapping below is what makes that true.
+          {financialHold ? (
+            <>
+              {" "}
+              <strong style={{ color: "#b45309" }}>Financial actions are held for this store:</strong>{" "}
+              {financialHold}
+            </>
+          ) : (
+            " Financial actions are not held: the customer record exists in Odoo."
+          )}
+        </p>
+
+        {contactMappings.length === 0 ? (
+          <p style={{ fontSize: "0.8rem", color: "#64748b" }}>
+            No contact sync has been attempted for this store yet.
+          </p>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "0.75rem" }}>
+            {contactMappings.map((mapping) => (
+              <div key={mapping.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.6rem" }}>
+                <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: "0.7rem", fontWeight: 700, color: "#334155" }}>
+                    {ROLE_LABELS[mapping.role] ?? mapping.role}
+                  </span>
+                  <span style={syncStyle(mapping.status)}>{mapping.status}</span>
+                  {mapping.odooPartnerId ? (
+                    <span style={{ fontSize: "0.72rem", color: "#475569" }}>
+                      Odoo partner {mapping.odooPartnerId}
+                      {mapping.odooName ? ` — ${mapping.odooName}` : ""}
+                    </span>
+                  ) : null}
+                  {mapping.odooTagId ? (
+                    <span style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
+                      tag {mapping.odooTagId} applied
+                    </span>
+                  ) : null}
+                  <span style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
+                    {mapping.attempts} attempt(s)
+                    {mapping.syncedAt ? ` · synced ${fmtDate(mapping.syncedAt)}` : ""}
+                    {mapping.lastAttemptAt && !mapping.syncedAt
+                      ? ` · last tried ${fmtDate(mapping.lastAttemptAt)}`
+                      : ""}
+                  </span>
+                </div>
+                {mapping.lastError ? (
+                  <div style={{ fontSize: "0.72rem", color: "#b91c1c", marginTop: "0.3rem" }}>
+                    {mapping.lastError}
+                  </div>
+                ) : null}
+                <div style={{ fontSize: "0.68rem", color: "#94a3b8", marginTop: "0.3rem" }}>
+                  Store {mapping.storeName ?? "—"} · Shopify shop {mapping.shopifyShopId ?? "—"} ·{" "}
+                  {mapping.myshopifyDomain ?? "—"}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {jobs.length > 0 ? (
+          <div style={{ fontSize: "0.72rem", color: "#475569", marginBottom: "0.6rem" }}>
+            <div style={{ color: "#64748b", marginBottom: "0.2rem" }}>Queued work</div>
+            {jobs.map((job) => (
+              <div key={job.id}>
+                · <strong>{job.kind}</strong> — {job.description}
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <Form method="post">
+          <button type="submit" name="intent" value="retry-contact-sync" style={btn("#1d4ed8")}>
+            Sync contact now
+          </button>
+        </Form>
+      </div>
+
+      <div style={card}>
+        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
+          Catalogue archiving
+        </h2>
+        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.75rem", lineHeight: 1.5 }}>
+          When a store is blocked, the products MoonVella imported into its Shopify store are
+          archived — set aside, never deleted. Only products with a recorded import mapping are
+          touched; nothing is matched by title, vendor or tag. Products are not republished if the
+          block is later lifted.
+        </p>
+
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
+            gap: "0.6rem",
+            marginBottom: "0.75rem",
+          }}
+        >
+          {(
+            [
+              ["Archived", archives.archived, "#059669"],
+              ["Pending", archives.pending, "#b45309"],
+              ["Failed", archives.failed, "#dc2626"],
+              ["Imported products", archives.total, "#334155"],
+            ] as [string, number, string][]
+          ).map(([label, value, color]) => (
+            <div key={label} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.5rem" }}>
+              <div style={{ fontSize: "0.66rem", color: "#64748b" }}>{label}</div>
+              <div style={{ fontSize: "1rem", fontWeight: 700, color }}>{value}</div>
+            </div>
+          ))}
+        </div>
+
+        {archiveList.length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem", marginBottom: "0.75rem" }}>
+            {archiveList.map((item) => (
+              <div key={item.id} style={{ fontSize: "0.74rem", color: "#334155" }}>
+                <span style={syncStyle(item.status === "ARCHIVED" ? "SYNCED" : item.status === "FAILED" ? "FAILED" : "PENDING")}>
+                  {item.status}
+                </span>{" "}
+                {item.name}
+                <span style={{ color: "#94a3b8" }}>
+                  {" "}
+                  · {item.attempts} attempt(s)
+                  {item.lastError ? ` · ${item.lastError}` : ""}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        {isBlocked ? (
+          <Form method="post">
+            <button type="submit" name="intent" value="retry-archives" style={btn("#1d4ed8")}>
+              Retry failed archives
+            </button>
+          </Form>
+        ) : (
+          <p style={{ fontSize: "0.72rem", color: "#64748b" }}>
+            Archiving runs when a store is blocked, so there is nothing to retry while this store is{" "}
+            {seller.status}.
+          </p>
+        )}
+      </div>
+
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
           Store controls
         </h2>
         <p style={{ fontSize: "0.78rem", color: "#64748b", marginBottom: "0.85rem", lineHeight: 1.5 }}>
-          Deactivating pauses the store and signs it out; it keeps read access to what it already
-          sold, and Activating reverses it. Blocking refuses the store outright: no wholesale
-          pricing, no imports, no new orders, no product sync, and no order history either. Every
-          record it has stays here, with MoonVella. Unblocking returns it to the status it held
-          before it was blocked.
+          Three refusals, and they differ in who reopens the store. <strong>Suspending</strong>{" "}
+          pauses it and signs it out; it keeps read access to what it already sold, and Activating
+          reverses it — the store is not asked to do anything. <strong>Deactivating</strong> revokes
+          approved access too, but the store reopens it by applying again: the application is shown
+          prefilled and a resubmission returns to review. <strong>Blocking</strong> refuses the store
+          outright — no wholesale pricing, no imports, no new orders, no product sync and no order
+          history either — and archives the products MoonVella imported into its Shopify store. Every
+          record stays here, with MoonVella, in all three cases; unblocking returns the store to the
+          status it held before it was blocked, and never republishes its catalogue.
         </p>
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           {isApproved ? (
@@ -635,7 +917,7 @@ export default function AdminStoreDetail() {
                   htmlFor="suspension-reason"
                   style={{ display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" }}
                 >
-                  Reason for deactivating
+                  Reason (recorded against whichever control you use)
                 </label>
                 <input
                   id="suspension-reason"
@@ -644,7 +926,10 @@ export default function AdminStoreDetail() {
                 />
               </div>
               <button type="submit" name="intent" value="suspend" style={btn("#dc2626")}>
-                Deactivate store
+                Suspend store
+              </button>
+              <button type="submit" name="intent" value="deactivate" style={btn("#b45309")}>
+                Deactivate store (may reapply)
               </button>
             </>
           ) : isBlocked ? null : (

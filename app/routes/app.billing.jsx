@@ -1,6 +1,10 @@
 import React from "react";
 import { Link, useLoaderData, useActionData, useFetcher, Form } from "react-router";
-import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
+import {
+  withMerchantAccess,
+  AccessError,
+  requireMerchantAccess,
+} from "../services/seller.server";
 import { prisma } from "../db.server";
 import {
   getBillingSettings,
@@ -13,8 +17,8 @@ import {
 } from "../services/sellerBilling.server";
 import { isStripeConfigured } from "../services/payments.server";
 
-export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
   // Key presence, from the encrypted credential store or the environment. It is
   // not a claim that the key works — that is the authenticated probe behind
   // Settings' "Connected".
@@ -93,19 +97,19 @@ export const loader = async ({ request }) => {
     })),
     stripe: { configured: stripeConfigured, mode: stripeConfigured ? "real" : "simulated" },
   };
-};
+  });
 
 export const action = async ({ request }) => {
-  const context = await requireSellerContext(request);
-  if (!context.seller) return { error: "No seller account." };
-  if (!context.canStartNewBusiness) {
-    return {
-      error:
-        context.access === "BLOCKED"
-          ? BLOCKED_MESSAGE
-          : `Billing requires an approved seller (current: ${context.access}).`,
-    };
+  let context;
+  try {
+    context = await requireMerchantAccess(request, "BUSINESS");
+  } catch (error) {
+    if (error instanceof AccessError) {
+      return { error: error.message };
+    }
+    throw error;
   }
+  if (!context.seller) return { error: "No seller account." };
 
   const url = new URL(request.url);
   const form = await request.formData();

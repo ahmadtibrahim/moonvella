@@ -1,25 +1,34 @@
 import React from "react";
 import { useFetcher, useLoaderData } from "react-router";
-import { BLOCKED_MESSAGE, requireSellerContext } from "../services/seller.server";
+import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
 import { listCatalog } from "../services/catalog.server";
 
-export const loader = async ({ request }) => {
-  const context = await requireSellerContext(request);
-  const products = await listCatalog(context);
+/**
+ * The catalogue is a preview for anybody who is not blocked, and the list
+ * itself decides what each caller is allowed to see.
+ *
+ * `withMerchantAccess` is what makes a blocked store's direct visit to
+ * /app/catalog a refusal rather than a preview: the loader is the thing that
+ * would have fetched the products, so the guard goes in front of it rather than
+ * on top of the page it renders.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
+    const products = await listCatalog(context);
 
-  return {
-    access: context.access,
-    canViewWholesale: context.canViewWholesale,
-    canImport: context.canImport,
-    products,
-    // Sent as a value rather than read from the server module on the client:
-    // the sentence belongs to one constant, but it has to arrive serialized.
-    blockedMessage: BLOCKED_MESSAGE,
-  };
-};
+    return {
+      access: context.access,
+      canViewWholesale: context.canViewWholesale,
+      canImport: context.canImport,
+      products,
+      // Sent as a value rather than read from the server module on the client:
+      // the sentence belongs to one constant, but it has to arrive serialized.
+      blockedMessage: BLOCKED_MESSAGE,
+    };
+  });
 
 export const action = async ({ request }) => {
-  const { requireApprovedSeller, AccessError } = await import(
+  const { requireMerchantAccess, AccessError } = await import(
     "../services/seller.server"
   );
   const { authenticate } = await import("../shopify.server");
@@ -29,7 +38,10 @@ export const action = async ({ request }) => {
 
   let context;
   try {
-    context = await requireApprovedSeller(request);
+    // BUSINESS, not merely "approved": a blocked store is refused with the
+    // block sentence rather than a message about wholesale access that would
+    // describe a state it is not in.
+    context = await requireMerchantAccess(request, "BUSINESS");
   } catch (error) {
     if (error instanceof AccessError) {
       return { ok: false, error: error.message };
@@ -117,7 +129,11 @@ export default function CatalogPage() {
         ? "Your seller account is suspended. Wholesale pricing and importing are unavailable."
         : access === "REJECTED"
           ? "Your application was not approved. Wholesale pricing and importing are unavailable."
-          : "Your application is under review. Wholesale pricing and importing unlock after approval.";
+          : access === "DEACTIVATED"
+            ? "Your seller access has been deactivated. Wholesale pricing and importing are locked until MoonVella approves a new application."
+            : access === "NEEDS_INFO"
+              ? "MoonVella needs more information before deciding your application. Wholesale pricing and importing unlock after approval."
+              : "Your application is under review. Wholesale pricing and importing unlock after approval.";
 
   return (
     <s-page heading="Product Catalog">
@@ -137,7 +153,10 @@ export default function CatalogPage() {
           <div className="mv-section-card" style={{ marginBottom: "1.5rem" }}>
             <span
               className={`mv-badge ${
-                access === "SUSPENDED" || access === "REJECTED" || access === "BLOCKED"
+                access === "SUSPENDED" ||
+                access === "REJECTED" ||
+                access === "DEACTIVATED" ||
+                access === "BLOCKED"
                   ? "mv-badge-danger"
                   : "mv-badge-warning"
               }`}

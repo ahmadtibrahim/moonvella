@@ -1,4 +1,4 @@
-import { requireApprovedSeller, AccessError } from "../services/seller.server";
+import { requireMerchantAccess, AccessError } from "../services/seller.server";
 import { buildMarketingPack } from "../services/marketingPack.server";
 import { prisma } from "../db.server";
 
@@ -24,9 +24,12 @@ import { prisma } from "../db.server";
  * produced a side effect could be triggered by an image tag.
  */
 export async function loader({ request }) {
-  let context;
   try {
-    context = await requireApprovedSeller(request);
+    // BUSINESS rather than "approved": a blocked store is owed the block
+    // sentence, not a message about wholesale access that describes a state it
+    // is not in. A refusal here reaches the layout's error boundary, which
+    // renders the block card for exactly this message.
+    await requireMerchantAccess(request, "BUSINESS");
   } catch (error) {
     if (error instanceof AccessError) {
       throw new Response(error.message, { status: 403 });

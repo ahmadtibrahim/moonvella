@@ -88,14 +88,26 @@ function auditData(column: string | null | undefined): Record<string, unknown> {
   }
 }
 
-/** Numbered, and the numbering is enforced: a dropped check fails the suite. */
+/**
+ * Numbered, and the numbering is enforced: a dropped check fails the suite.
+ *
+ * A sub-number (10.1) may follow the step it belongs to without advancing the
+ * sequence. That is what lets a check be added to an existing step without
+ * renumbering every check after it, which would otherwise make the diff of a
+ * one-line addition unreviewable.
+ */
 function check(number: number, name: string, pass: boolean, detail = "") {
-  expected += 1;
   total += 1;
-  if (number !== expected) {
-    failures += 1;
-    console.log(`FAIL  check #${number} arrived out of order (expected #${expected})`);
-    return;
+  // `expected` counts checks already seen, so the next whole number is
+  // expected + 1; a sub-number belongs to the step just seen.
+  const isSubCheck = !Number.isInteger(number) && Math.floor(number) === expected;
+  if (!isSubCheck) {
+    if (number !== expected + 1) {
+      failures += 1;
+      console.log(`FAIL  check #${number} arrived out of order (expected #${expected + 1})`);
+      return;
+    }
+    expected += 1;
   }
   if (!pass) failures += 1;
   console.log(
@@ -344,8 +356,20 @@ async function main() {
     check(
       10,
       "The message the store is shown is exactly the one the owner specified",
-      BLOCKED_MESSAGE ===
-        "Your MoonVella partner access has been blocked. Contact MoonVella support.",
+      BLOCKED_MESSAGE === "This app is not available for your store.",
+      JSON.stringify(BLOCKED_MESSAGE)
+    );
+
+    /*
+     * The sentence is a promise about what the store is told, and it appears on
+     * more than one screen. The card the layout renders, the 403 a route's own
+     * guard throws, and the status page's blocked branch all read the same
+     * constant, so what can drift is not the string but the count of copies.
+     */
+    check(
+      10.1,
+      "The block sentence says nothing about why, and offers no next step",
+      !/because|reason|support|contact|appeal|violat/i.test(BLOCKED_MESSAGE),
       JSON.stringify(BLOCKED_MESSAGE)
     );
 

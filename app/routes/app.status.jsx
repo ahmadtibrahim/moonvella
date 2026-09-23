@@ -1,34 +1,31 @@
 import { Link, useLoaderData, useNavigate } from "react-router";
+import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
 
-export const loader = async ({ request }) => {
-  const url = new URL(request.url);
+/**
+ * The status page reads the application the seller context already resolved.
+ *
+ * It used to authenticate a second time and re-query the application itself,
+ * which meant two sources of truth for "what state is this store in" — the
+ * layout's answer and this page's answer, computed from the same row at two
+ * different moments. When the owner changed a status in between, the navigation
+ * and the page disagreed about it. One resolution per request removes the
+ * possibility.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async (context) => {
+    const application = context.application;
 
-  if (!url.searchParams.get("shop")) {
-    return { status: null, submittedAt: null, blockedMessage: null };
-  }
-
-  const { authenticate } = await import("../shopify.server");
-  const { session } = await authenticate.admin(request);
-  const { prisma } = await import("../db.server");
-  const { BLOCKED_MESSAGE } = await import("../services/seller.server");
-
-  const application = await prisma.merchantApplication.findUnique({
-    where: { shopDomain: session.shop },
-    select: { status: true, submittedAt: true },
+    return {
+      // "none" is its own answer. A store that has never applied was shown
+      // "Application Under Review", which is not a thing that was happening.
+      status: application ? application.status.toLowerCase() : "none",
+      submittedAt: application?.submittedAt
+        ? application.submittedAt.toISOString()
+        : null,
+      access: context.access,
+      blockedMessage: BLOCKED_MESSAGE,
+    };
   });
-
-  if (!application) {
-    return { status: null, submittedAt: null, blockedMessage: BLOCKED_MESSAGE };
-  }
-
-  return {
-    status: application.status.toLowerCase(),
-    submittedAt: application.submittedAt
-      ? application.submittedAt.toISOString()
-      : null,
-    blockedMessage: BLOCKED_MESSAGE,
-  };
-};
 
 const getStageConfig = (stage) => {
   switch (stage) {
@@ -46,6 +43,13 @@ const getStageConfig = (stage) => {
     // a blocked store that its application is still being looked at.
     case "blocked":
       return { label: "Blocked", badge: "mv-badge-danger" };
+    // Deactivated is a withdrawn approval, not a pending one: the owner turned
+    // access off and the store may apply again. Falling through to "Pending
+    // Review" would read as though nothing had happened.
+    case "deactivated":
+      return { label: "Access deactivated", badge: "mv-badge-warning" };
+    case "none":
+      return { label: "Not yet submitted", badge: "mv-badge-pending" };
     default:
       return { label: "Pending Review", badge: "mv-badge-pending" };
   }
@@ -69,7 +73,20 @@ export default function StatusPage() {
   const isApproved = applicationStatus === "approved";
   const isRejected = applicationStatus === "rejected";
   const isBlocked = applicationStatus === "blocked";
-  const isPending = applicationStatus === "pending";
+  // An application that needs more information is still in review — it just has
+  // a question outstanding. Grouping it with "pending" is what makes the review
+  // checklist show the truth instead of reporting every stage as finished.
+  const isNeedsInfo = applicationStatus === "needs_info";
+  const isPending = applicationStatus === "pending" || isNeedsInfo;
+  const isDeactivated = applicationStatus === "deactivated";
+  const isNotStarted = applicationStatus === "none";
+
+  /**
+   * The only date this page knows is the one the application recorded. It used
+   * to print "Completed on January 15, 2025" against every finished stage,
+   * which was a literal in the template — a date that was never true for any
+   * store. A stage now says whether it is done and nothing more.
+   */
   const submittedLabel = submittedAt
     ? `Submitted on ${new Date(submittedAt).toLocaleDateString(undefined, {
         year: "numeric",
@@ -78,13 +95,32 @@ export default function StatusPage() {
       })}`
     : "Not yet submitted";
 
+  // Review stages follow the real status. A store still waiting is at the first
+  // stage; anything decided has been through all of them.
+  const reviewStatus = isPending ? "in-progress" : "completed";
   const dynamicReviewStages = [
     { id: "connected", label: "Shopify store connected", status: "completed" },
-    { id: "contact", label: "Contact information received", status: "completed" },
-    { id: "website", label: "Website/store review", status: isPending ? "in-progress" : "completed" },
-    { id: "sales", label: "Shopify sales review", status: isPending ? "pending" : "completed" },
-    { id: "fit", label: "Product category fit", status: isPending ? "pending" : "completed" },
-    { id: "approval", label: "Final approval", status: isApproved ? "completed" : "pending" },
+    {
+      id: "contact",
+      label: "Contact information received",
+      status: submittedAt ? "completed" : "pending",
+    },
+    { id: "website", label: "Website/store review", status: reviewStatus },
+    {
+      id: "sales",
+      label: "Shopify sales review",
+      status: isPending ? "pending" : "completed",
+    },
+    {
+      id: "fit",
+      label: "Product category fit",
+      status: isPending ? "pending" : "completed",
+    },
+    {
+      id: "approval",
+      label: "Final approval",
+      status: isApproved ? "completed" : "pending",
+    },
   ];
 
   const getRejectionReason = () => {
@@ -132,7 +168,7 @@ export default function StatusPage() {
                       <span className={`mv-badge ${config.badge}`}>{config.text}</span>
                     </div>
                     <p className="mv-checklist-text" style={{ margin: 0, fontSize: '0.8125rem' }}>
-                      {stage.status === 'completed' && 'Completed on January 15, 2025'}
+                      {stage.status === 'completed' && 'Done'}
                       {stage.status === 'in-progress' && 'Under review by MoonVella team'}
                       {stage.status === 'pending' && 'Awaiting previous stage completion'}
                     </p>
@@ -190,6 +226,45 @@ export default function StatusPage() {
                   {blockedMessage}
                 </p>
               </>
+            ) : isDeactivated ? (
+              <>
+                <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>🔒</div>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>Seller access deactivated</h3>
+                <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
+                  MoonVella wholesale access for this store has been switched off. Your previous
+                  orders and billing history are still on file.
+                </p>
+                <button className="mv-btn mv-btn-primary" onClick={() => navigate("/app/application")}>
+                  Apply again
+                </button>
+                <p className="mv-page-subtitle" style={{ marginTop: '1rem', fontSize: '0.875rem' }}>
+                  Reapplying returns the application to review and needs MoonVella approval.
+                </p>
+              </>
+            ) : isNeedsInfo ? (
+              <>
+                <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>✋</div>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>More information needed</h3>
+                <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
+                  MoonVella has a question about your application before it can be decided. Open
+                  the application to update your details and resubmit.
+                </p>
+                <button className="mv-btn mv-btn-primary" onClick={() => navigate("/app/application")}>
+                  Update application
+                </button>
+              </>
+            ) : isNotStarted ? (
+              <>
+                <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>📝</div>
+                <h3 className="mv-section-title" style={{ marginBottom: '0.5rem' }}>No application yet</h3>
+                <p className="mv-page-subtitle" style={{ maxWidth: '500px', margin: '0 auto 1.5rem' }}>
+                  Your store is connected but has not applied for MoonVella wholesale access.
+                  Product browsing is available in the meantime.
+                </p>
+                <button className="mv-btn mv-btn-primary" onClick={() => navigate("/app/application")}>
+                  Start an application
+                </button>
+              </>
             ) : (
               <>
                 <div style={{ fontSize: '3rem', marginBottom: '1rem' }}>⏳</div>
@@ -219,7 +294,9 @@ export default function StatusPage() {
           </div>
         )}
 
-        {!isApproved && !isRejected && (
+        {/* Only while a review is actually running. A store that has not applied,
+            or whose access was turned off, is not mid-review. */}
+        {isPending && (
           <div className="mv-section-card">
             <h3 className="mv-section-title">What happens next?</h3>
             <ul className="mv-rules-list" style={{ maxWidth: '600px' }}>

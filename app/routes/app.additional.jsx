@@ -1,3 +1,14 @@
+import { withMerchantAccess } from "../services/seller.server";
+
+/**
+ * A static template page, but still a page under the merchant app: a blocked
+ * store must not be able to reach any route at all, including the ones with
+ * nothing on them. An unguarded route is also the one an attacker keeps after
+ * somebody adds data to it.
+ */
+export const loader = async ({ request }) =>
+  withMerchantAccess(request, "VIEW", async () => ({ ok: true }));
+
 export default function AdditionalPage() {
   return (
     <s-page heading="Additional page">
