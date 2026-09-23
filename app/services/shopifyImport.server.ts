@@ -251,6 +251,50 @@ export function retailPriceFor(
   return ((suggestedRetailCents * (100 + markupPercent)) / 100 / 100).toFixed(2);
 }
 
+/**
+ * The variants a store cannot be given a price for.
+ *
+ * A SHOPIFY LISTING NEEDS A PRICE, AND IT HAS TO BE THE SELLER'S. Suggested
+ * retail is optional in MoonVella — a product can be perfectly sellable there
+ * with none — but a store cannot be handed a variant with no price, and the two
+ * things a number could be borrowed from are both wrong:
+ *
+ *   • Zero is not "unset". It is a price, and a live one: it would list the
+ *     product as free and take orders for it.
+ *   • The wholesale price is what the seller pays MoonVella. Setting it as the
+ *     retail price would sell at cost, and it would also do it silently, which
+ *     is how a shop ends up losing money on every unit without anyone having
+ *     chosen to.
+ *
+ * So the answer is a refusal naming the variants, not a default. The override
+ * for one store (`customRetailPrice`) is used when it is set, including when it
+ * is set to something unusable — an explicit zero is a decision, and a decision
+ * to sell at zero is refused rather than quietly replaced by the catalogue
+ * figure.
+ */
+export function unpricedRetailVariants(
+  variants: { sku: string; name: string; suggestedRetailPrice: number }[],
+  customRetailPrice: number | null
+): { sku: string; name: string }[] {
+  return variants
+    .filter((variant) => {
+      const retail = customRetailPrice ?? variant.suggestedRetailPrice;
+      return !(retail > 0);
+    })
+    .map((variant) => ({ sku: variant.sku, name: variant.name }));
+}
+
+/** The refusal, in the seller's terms: what is missing and what to do about it. */
+export function retailPriceRefusal(unpriced: { sku: string; name: string }[]): string {
+  const who = unpriced.map((variant) => variant.sku).join(", ");
+  return (
+    `Import refused: ${unpriced.length} variant(s) have no retail price to sell at — ${who}. ` +
+    `A store must show a price for every variant, so MoonVella will not list these at zero and ` +
+    `will not use your wholesale cost as the retail price. Set a suggested retail price on the ` +
+    `product in MoonVella, or a custom retail price for this store, then import again.`
+  );
+}
+
 export function wholesaleCostFor(
   wholesaleCents: number,
   customWholesalePrice?: number | null
@@ -1060,6 +1104,26 @@ export async function importProductForSeller(
     options.customRetailPrice !== undefined
       ? options.customRetailPrice
       : existing?.customRetailPrice ?? null;
+
+  /*
+   * EVERY VARIANT MUST HAVE A RETAIL PRICE BEFORE ANYTHING IS SENT.
+   *
+   * Checked here rather than left to the price call because the price call
+   * cannot refuse — it formats a number, and given nothing it formats "0.00",
+   * which Shopify accepts. A store listed at zero takes real orders at zero.
+   *
+   * The seller's own custom price is carried forward from the stored record
+   * when this call does not pass one, so a re-sync of a store that already has
+   * a price never re-derives it from the catalogue: a retail price set for one
+   * store survives every later import of the same product.
+   */
+  const unpriced = unpricedRetailVariants(product.variants, customRetailPrice);
+  if (unpriced.length > 0) {
+    const message = retailPriceRefusal(unpriced);
+    await markImportFailed(sellerId, productId, message);
+    await setIntegrationState("product_import", { status: "FAILED", error: message });
+    return { ok: false, error: message };
+  }
 
   /*
    * WHICH IMAGES GO IS THE SELLER'S DECISION, NOT THIS FUNCTION'S.

@@ -14,11 +14,31 @@
  * refuses to write if it reports a blocker. What the owner approved is what the
  * import does, because it is literally the same read.
  *
- * PRICES. The approved source is the per-variant list price, which Odoo already
- * computes: `lst_price` is the template's `list_price` plus the variant's
- * attribute extras, and that composed figure is what a variant sells for. Both
- * halves are read and shown, so a surprising price can be traced to the
- * attribute that caused it instead of being taken on trust.
+ * PRICES COME FROM THE WHOLESALE PRICELIST, AND FROM NOWHERE ELSE. The owner's
+ * ruling is that Odoo is the pricing authority: the price MoonVella charges a
+ * seller is the fixed quantity-1 price on the "MoonVella Wholesale" pricelist
+ * selected in MoonVella's Odoo settings. It is not `lst_price`, it is not the
+ * template's `list_price`, and it is never the product's cost — all three are
+ * still readable in Odoo and all three would look like an answer, which is why
+ * the substitution this module used to make is called out and refused in
+ * `odooPricing.ts` rather than merely avoided here.
+ *
+ * The rule set is that module's, and the outcome is one of two things: a price,
+ * or a problem that blocks the import. There is no third "fall back to
+ * something" path. A product with no usable pricelist row is not imported at a
+ * guessed price; it is left alone and the owner is told which row to add.
+ *
+ * CAD ONLY, NO CONVERSION. Every price written here is CAD cents, and the
+ * selected pricelist must itself be a CAD pricelist — checked here, because it
+ * is a fact about the pricelist rather than about a row. A product whose Odoo
+ * company is in another currency is imported with a note: the storefront
+ * currency is recorded, the wholesale price is still CAD, and nothing is
+ * converted.
+ *
+ * SUGGESTED RETAIL IS NOT IMPORTED. It is MoonVella's own field, edited here,
+ * and an import neither writes it nor copies the wholesale price into it. On a
+ * re-import it is left exactly as it is, including when the wholesale price
+ * changes underneath it.
  *
  * STOCK IS READ, NEVER WRITTEN, AND NEVER INVENTED. Available quantity is the
  * quantity held at the configured consignment location for the configured
@@ -50,6 +70,14 @@ import {
   searchRead,
   type OdooRecord,
 } from "./odoo.server";
+import {
+  WHOLESALE_CURRENCY,
+  matchBasePrice,
+  normalizePricelistItems,
+  todayIso,
+  type OdooPricelistItem,
+  type OdooPricelistItemRow,
+} from "./odooPricing";
 import { checkProductCode } from "~/utils/productCode";
 
 const PRODUCT_TEMPLATE_MODEL = "product.template";
@@ -60,9 +88,12 @@ const ATTRIBUTE_VALUE_MODEL = "product.template.attribute.value";
 const ATTRIBUTE_MODEL = "product.attribute";
 const ATTRIBUTE_NAMED_VALUE_MODEL = "product.attribute.value";
 const CURRENCY_MODEL = "res.currency";
+const PRICELIST_MODEL = "product.pricelist";
+const PRICELIST_ITEM_MODEL = "product.pricelist.item";
 
 export const CONSIGNMENT_LOCATION_FIELD = "ODOO_CONSIGNMENT_LOCATION";
 export const CONSIGNMENT_OWNER_FIELD = "ODOO_CONSIGNMENT_OWNER";
+export const WHOLESALE_PRICELIST_FIELD = "ODOO_WHOLESALE_PRICELIST";
 
 export interface ImportBlocker {
   code: string;
@@ -71,10 +102,15 @@ export interface ImportBlocker {
   remedy: string;
 }
 
+/*
+ * `list_price` on the template and `lst_price` / `price_extra` on the variant
+ * are deliberately ABSENT from these reads. They are the fields the import used
+ * to price from, and leaving them in the read would leave them one line away
+ * from being used again. The wholesale pricelist is the only price source.
+ */
 interface OdooTemplateRow extends OdooRecord {
   name: string | false;
   default_code: string | false;
-  list_price: number;
   categ_id: [number, string] | false;
   company_id: [number, string] | false;
   description_sale: string | false;
@@ -84,9 +120,8 @@ interface OdooTemplateRow extends OdooRecord {
 interface OdooVariantRow extends OdooRecord {
   default_code: string | false;
   barcode: string | false;
+  /** The product's cost. Written to `costPrice`, never used as a price. */
   standard_price: number;
-  lst_price: number;
-  price_extra: number;
   active: boolean;
   product_tmpl_id: [number, string] | false;
   product_template_attribute_value_ids: number[];
@@ -103,11 +138,17 @@ interface OdooQuantRow extends OdooRecord {
 export interface PreviewVariant {
   odooVariantId: number;
   sku: string | null;
-  attributes: { attribute: string; value: string; priceExtra: number }[];
-  basePrice: number;
-  priceExtra: number;
-  /** The per-variant list price: base + attribute extras, as Odoo computes it. */
-  listPrice: number;
+  attributes: { attribute: string; value: string }[];
+  /**
+   * The quantity-1 price from the wholesale pricelist, and the row it came
+   * from. Null exactly when the variant carries a problem, so a null is never
+   * silently imported as a price.
+   */
+  wholesalePrice: number | null;
+  wholesaleCurrency: typeof WHOLESALE_CURRENCY | null;
+  /** The pricelist row the price was read from, so a figure can be traced. */
+  wholesaleItemId: number | null;
+  /** Cost as Odoo records it. Shown for context; never used as a price. */
   cost: number | null;
   onHand: number;
   reserved: number;
@@ -137,6 +178,18 @@ export interface OdooImportPreview {
   ok: boolean;
   connection: { url: string | null; database: string | null; mode: string | null };
   tag: { id: number; name: string } | null;
+  /**
+   * The pricelist every price in this preview came from. Null until it has been
+   * resolved, which is what the owner sees when it is missing or misconfigured.
+   */
+  pricelist: {
+    id: number | null;
+    name: string | null;
+    currency: string | null;
+    /** Rows read from the pricelist itself, before any of them matched. */
+    rows: number;
+    note: string;
+  } | null;
   consignment: {
     locationId: number | null;
     location: string | null;
@@ -162,6 +215,15 @@ export interface OdooImportPreview {
  * whichever one the database happened to return first, which is a stock figure
  * taken from the wrong shelf.
  */
+/**
+ * The label, as a stable code fragment: "Wholesale pricelist" becomes
+ * `WHOLESALE_PRICELIST`. A code with a space in it is not an identifier, and
+ * these are matched on.
+ */
+function codeFor(label: string): string {
+  return label.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
 async function resolveReference(
   model: string,
   value: string,
@@ -172,7 +234,7 @@ async function resolveReference(
   const trimmed = value.trim();
   if (!trimmed) {
     return {
-      code: `${label.toUpperCase()}_NOT_CONFIGURED`,
+      code: `${codeFor(label)}_NOT_CONFIGURED`,
       message: `${label} is not configured, so MoonVella does not know whose stock to read.`,
       remedy:
         `Set ${label} on the Odoo integration — the ${label.toLowerCase()} whose stock is ` +
@@ -189,7 +251,7 @@ async function resolveReference(
     const row = rows[0];
     if (!row) {
       return {
-        code: `${label.toUpperCase()}_MISSING`,
+        code: `${codeFor(label)}_MISSING`,
         message: `No ${label.toLowerCase()} with id ${trimmed} exists in Odoo.`,
         remedy: `Correct or clear ${label} on the Odoo integration.`,
       };
@@ -218,7 +280,7 @@ async function resolveReference(
   const matches = [...found.values()];
   if (matches.length === 0) {
     return {
-      code: `${label.toUpperCase()}_MISSING`,
+      code: `${codeFor(label)}_MISSING`,
       message:
         `No ${label.toLowerCase()} in Odoo matches "${trimmed}" on ` +
         `${lookup.map((item) => item.label).join(" or ")}.`,
@@ -227,7 +289,7 @@ async function resolveReference(
   }
   if (matches.length > 1) {
     return {
-      code: `${label.toUpperCase()}_AMBIGUOUS`,
+      code: `${codeFor(label)}_AMBIGUOUS`,
       message:
         `${matches.length} Odoo records match "${trimmed}" ` +
         `(ids ${matches
@@ -238,6 +300,91 @@ async function resolveReference(
   }
   const match = matches[0];
   return { id: match.id, name: nameOf(match, trimmed) };
+}
+
+/* -------------------------------------------------------------------------- */
+/* The wholesale pricelist                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Every column a price decision is made from, and nothing else. */
+const PRICELIST_ITEM_FIELDS = [
+  "id",
+  "applied_on",
+  "product_id",
+  "product_tmpl_id",
+  "min_quantity",
+  "date_start",
+  "date_end",
+  "compute_price",
+  "fixed_price",
+  "price_surcharge",
+  "percent_price",
+];
+
+/**
+ * The currency of a pricelist, by name ("CAD"), or null when Odoo holds none or
+ * it could not be read. Null is not "probably CAD": the caller refuses on it.
+ */
+async function pricelistCurrencyName(pricelistId: number): Promise<string | null> {
+  const [pricelist] = await searchRead<OdooRecord>(
+    PRICELIST_MODEL,
+    [["id", "=", pricelistId]],
+    ["id", "currency_id"],
+    { limit: 1 },
+  );
+  const currencyId = toId(pricelist?.currency_id);
+  if (currencyId === null) return null;
+  const [currency] = await searchRead<OdooRecord>(
+    CURRENCY_MODEL,
+    [["id", "=", currencyId]],
+    ["id", "name"],
+    { limit: 1 },
+  );
+  return text(currency?.name ?? null);
+}
+
+/**
+ * Every row of one pricelist, read in pages.
+ *
+ * `searchRead` returns 80 rows by default, and a truncated pricelist does not
+ * look truncated: the variants whose rows fell off the end simply have no
+ * price. That is a refusal rather than a wrong figure, but it is still the
+ * import telling the owner something untrue about their own pricelist — that a
+ * row they wrote is not there. So the read pages until a short page arrives,
+ * and refuses outright rather than pretending if it never does.
+ */
+async function readPricelistItems(
+  pricelistId: number,
+): Promise<{ rows: OdooPricelistItem[] } | ImportBlocker> {
+  const pageSize = 200;
+  // A guard against a pricelist so large that paging never terminates. At ten
+  // thousand rows something is wrong with the source, and the honest answer is
+  // to stop rather than to page forever inside a web request.
+  const maxRows = 10_000;
+  const rows: OdooPricelistItemRow[] = [];
+
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await searchRead<OdooPricelistItemRow>(
+      PRICELIST_ITEM_MODEL,
+      [["pricelist_id", "=", pricelistId]],
+      PRICELIST_ITEM_FIELDS,
+      { limit: pageSize, offset, order: "id asc" },
+    );
+    rows.push(...page);
+    if (page.length < pageSize) break;
+    if (rows.length >= maxRows) {
+      return {
+        code: "WHOLESALE_PRICELIST_TOO_LARGE",
+        message:
+          `The selected pricelist has more than ${maxRows} rows, so MoonVella stopped reading it ` +
+          `and will not import from a price list it has only partly seen.`,
+        remedy:
+          "Use a pricelist dedicated to MoonVella wholesale prices, or narrow this one, then try again.",
+      };
+    }
+  }
+
+  return { rows: normalizePricelistItems(rows) };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -295,6 +442,7 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
       mode,
     },
     tag: null,
+    pricelist: null,
     consignment: {
       locationId: null,
       location: null,
@@ -345,9 +493,10 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   }
   preview.tag = { id: tag.id, name: tag.name };
 
-  const [locationValue, ownerValue] = await Promise.all([
+  const [locationValue, ownerValue, pricelistValue] = await Promise.all([
     getCredential("odoo", CONSIGNMENT_LOCATION_FIELD),
     getCredential("odoo", CONSIGNMENT_OWNER_FIELD),
+    getCredential("odoo", WHOLESALE_PRICELIST_FIELD),
   ]);
 
   const location = await resolveReference(
@@ -381,6 +530,67 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
     preview.consignment.owner = owner.name;
   }
 
+  /*
+   * The pricing authority, resolved by the same name-or-id rule as the
+   * consignment pair and for the same reason: two pricelists called "MoonVella
+   * Wholesale" must stop the import rather than become whichever one Odoo
+   * returned first, because the difference is what every seller is charged.
+   */
+  const pricelist = await resolveReference(
+    PRICELIST_MODEL,
+    pricelistValue ?? "",
+    [{ field: "name", label: "name" }],
+    ["id", "name", "currency_id"],
+    "Wholesale pricelist",
+  );
+
+  let pricelistItems: OdooPricelistItem[] = [];
+  if ("code" in pricelist) {
+    blockers.push(pricelist);
+  } else {
+    preview.pricelist = {
+      id: pricelist.id,
+      name: pricelist.name,
+      currency: null,
+      rows: 0,
+      note: "",
+    };
+
+    /*
+     * CAD, CHECKED AT THE PRICELIST, because that is where a currency lives.
+     * A missing currency is a refusal too: "we could not read it" is not
+     * evidence that it is CAD, and importing a price whose unit nobody can name
+     * is how a seller gets billed in a currency they did not agree to.
+     */
+    const currencyName = await pricelistCurrencyName(pricelist.id);
+    preview.pricelist.currency = currencyName;
+    if (currencyName !== WHOLESALE_CURRENCY) {
+      blockers.push({
+        code: "WHOLESALE_PRICELIST_CURRENCY_NOT_CAD",
+        message:
+          `The "${pricelist.name}" pricelist is in ` +
+          `${currencyName ?? "a currency MoonVella could not read from it"}, and MoonVella bills ` +
+          `sellers in ${WHOLESALE_CURRENCY}.`,
+        remedy:
+          `Set that pricelist's currency to ${WHOLESALE_CURRENCY} in Odoo, or select a different ` +
+          `pricelist on the Odoo integration. MoonVella does not convert between currencies.`,
+      });
+    }
+
+    const items = await readPricelistItems(pricelist.id);
+    if ("code" in items) {
+      blockers.push(items);
+    } else {
+      pricelistItems = items.rows;
+      preview.pricelist.rows = items.rows.length;
+      preview.pricelist.note =
+        `Seller prices come from the "${pricelist.name}" pricelist (id ${pricelist.id}, ` +
+        `${currencyName ?? "currency unread"}): ${items.rows.length} row(s) read, and each variant ` +
+        `is priced by its own quantity-1 fixed price. Odoo's list price is not read at all, and the ` +
+        `product's cost is recorded for reference but is never charged to a seller.`;
+    }
+  }
+
   if (blockers.length > 0) return preview;
 
   const locationId = preview.consignment.locationId as number;
@@ -398,7 +608,8 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
       "id",
       "name",
       "default_code",
-      "list_price",
+      // No `list_price`: it is not a price MoonVella charges, and reading it
+      // would leave it a keystroke away from being used as one.
       "categ_id",
       "company_id",
       "description_sale",
@@ -427,9 +638,9 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
       "id",
       "default_code",
       "barcode",
+      // Cost, and only cost. `lst_price` and `price_extra` are the fields the
+      // price used to be composed from; they are not read at all now.
       "standard_price",
-      "lst_price",
-      "price_extra",
       "active",
       "product_template_attribute_value_ids",
       "product_tmpl_id",
@@ -445,11 +656,13 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   const attributeValueIds = [
     ...new Set(variants.flatMap((row) => row.product_template_attribute_value_ids ?? [])),
   ];
+  // Names only. `price_extra` used to be summed into the price; the wholesale
+  // pricelist prices the variant, so the attribute no longer contributes money.
   const attributeValues = attributeValueIds.length
     ? await searchRead<OdooRecord>(
         ATTRIBUTE_VALUE_MODEL,
         [["id", "in", attributeValueIds]],
-        ["id", "price_extra", "attribute_id", "product_attribute_value_id"],
+        ["id", "attribute_id", "product_attribute_value_id"],
       )
     : [];
   const attributeIds = [...new Set(attributeValues.map((row) => toId(row.attribute_id)))].filter(
@@ -579,6 +792,17 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   const variantBySku = new Map(skuOwners.map((row) => [row.sku, row.id]));
   const productByCode = new Map(codeOwners.map((row) => [row.productCode, row]));
 
+  /*
+   * One date for the whole read, and the date the pricelist windows are judged
+   * against. A per-variant `new Date()` could straddle midnight and price two
+   * variants of the same product on different days.
+   */
+  const today = todayIso();
+
+  // Deduplicated: a tier note is a fact about the pricelist, not about each
+  // variant that happens to carry tiers.
+  const tierNotes = new Set<string>();
+
   for (const template of templates) {
     const problems: string[] = [];
     const { code, source } = productCodeFor(template);
@@ -606,11 +830,23 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
 
     const currency =
       companyCurrency.get(toId(template.company_id) ?? -1) ?? null;
-    const currencyCode = currency ?? "CAD";
+    const currencyCode = currency ?? WHOLESALE_CURRENCY;
     if (!currency) {
       notes.push(
         `No currency could be read from Odoo for ${text(template.name) ?? template.id}; ` +
-          `CAD is assumed because that is this catalogue's currency.`,
+          `${WHOLESALE_CURRENCY} is recorded because that is the currency MoonVella bills in.`,
+      );
+    } else if (currency !== WHOLESALE_CURRENCY) {
+      /*
+       * A note, not a blocker. The storefront currency and the billing currency
+       * are different facts: the product is sold to shoppers in Odoo's company
+       * currency, and the seller is billed in CAD. Nothing is converted — the
+       * wholesale figure is the CAD figure from a CAD pricelist.
+       */
+      notes.push(
+        `${text(template.name) ?? template.id}: Odoo's company currency for this product is ` +
+          `${currency}, recorded as its storefront currency. The wholesale price is in ` +
+          `${WHOLESALE_CURRENCY} and no conversion is applied between them.`,
       );
     }
 
@@ -651,19 +887,24 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
           return {
             attribute: attributeId === null ? "attribute" : (attributeNames.get(attributeId) ?? "attribute"),
             value: valueId === null ? "value" : (valueNames.get(valueId) ?? "value"),
-            priceExtra: (row.price_extra as number) ?? 0,
           };
         });
 
-      const priceExtra = attributesForVariant.reduce((sum, item) => sum + item.priceExtra, 0);
-      const listPrice = variant.lst_price ?? (template.list_price ?? 0) + priceExtra;
-      const basePrice = template.list_price ?? 0;
-
-      if (!(listPrice > 0)) {
-        variantProblems.push(
-          "The per-variant list price in Odoo is zero, so the variant would be imported at no " +
-            "price. Set a price in Odoo and import again.",
-        );
+      /*
+       * The price, or the reason there is none. `matchBasePrice` never guesses:
+       * a variant with no row it can use comes back as a problem, the problem
+       * blocks the whole import, and nothing is written at a price nobody set.
+       */
+      const price = matchBasePrice(pricelistItems, {
+        variantId: variant.id,
+        templateId: template.id,
+        today,
+        pricelistName: preview.pricelist?.name ?? null,
+      });
+      if (price.kind === "problem") {
+        variantProblems.push(price.message);
+      } else if (price.note) {
+        tierNotes.add(price.note);
       }
 
       const stock = stockByVariant.get(variant.id) ?? { onHand: 0, reserved: 0 };
@@ -671,9 +912,9 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
         odooVariantId: variant.id,
         sku,
         attributes: attributesForVariant,
-        basePrice,
-        priceExtra,
-        listPrice,
+        wholesalePrice: price.kind === "priced" ? price.wholesale : null,
+        wholesaleCurrency: price.kind === "priced" ? price.currency : null,
+        wholesaleItemId: price.kind === "priced" ? price.itemId : null,
         cost: variant.standard_price ?? null,
         onHand: stock.onHand,
         reserved: stock.reserved,
@@ -706,15 +947,21 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
     });
   }
 
+  for (const note of tierNotes) notes.push(note);
+
   const totalVariants = preview.templates.reduce((sum, item) => sum + item.variants.length, 0);
   notes.push(
     `${preview.templates.length} tagged template(s), ${totalVariants} variant(s) read from Odoo. ` +
-      `Prices are the per-variant list price (template list price plus the variant's attribute ` +
-      `extras), and stock is what is held at the consignment location for the consignment owner.`,
+      `Every price is the fixed quantity-1 price on ${
+        preview.pricelist?.name ? `the "${preview.pricelist.name}" pricelist` : "the wholesale pricelist"
+      }, in ${WHOLESALE_CURRENCY}; Odoo's list price is not read at all, and the product's cost is ` +
+      `never charged. ` +
+      `Stock is what is held at the consignment location for the consignment owner.`,
   );
   notes.push(
-    "Nothing has been written to Odoo by this preview, and the import does not change Odoo " +
-      "inventory either: it reads quantities and writes MoonVella drafts.",
+    "Suggested retail is not imported: it is MoonVella's own field and a re-import leaves it " +
+      "as it is. Nothing has been written to Odoo by this preview, and the import does not change " +
+      "Odoo inventory either: it reads quantities and prices, and writes MoonVella drafts.",
   );
 
   preview.ok = preview.templates.every((item) => item.problems.length === 0);
@@ -761,7 +1008,15 @@ export interface ImportResult {
     productId: string;
     outcome: "CREATED" | "UPDATED";
     productCode: string;
-    variants: { odooVariantId: number; variantId: string; sku: string; price: number; available: number }[];
+    variants: {
+      odooVariantId: number;
+      variantId: string;
+      sku: string;
+      /** The wholesale price written, in whole units, and its currency. */
+      price: number;
+      priceCurrency: string;
+      available: number;
+    }[];
   }[];
 }
 
@@ -866,6 +1121,21 @@ export async function importOdooProducts(options: {
 
       for (const [index, variant] of template.variants.entries()) {
         const sku = variant.sku as string;
+        /*
+         * Unreachable: a variant with no resolved price carries a problem, and
+         * `importOdooProducts` refuses before this loop when any template has
+         * one. It is written out anyway because the alternative — multiplying a
+         * null by 100 — would write a price of zero into a catalogue, and that
+         * is the one mistake this whole module is arranged to prevent.
+         */
+        const wholesale = variant.wholesalePrice;
+        if (wholesale === null || !(wholesale > 0)) {
+          throw new PermanentJobError(
+            `The Odoo import stopped before writing: ${template.odooName} / ${sku} has no ` +
+              `wholesale price from the pricelist. Nothing was written for this template.`,
+          );
+        }
+
         const existingVariant = await tx.externalVariantMapping.findFirst({
           where: {
             provider: "ODOO",
@@ -878,13 +1148,17 @@ export async function importOdooProducts(options: {
         const variantFields = {
           name: variantName(template.odooName, variant),
           sku,
-          // The approved price source: the per-variant list price, in cents.
-          wholesalePrice: Math.round(variant.listPrice * 100),
-          // Odoo holds no suggested retail for these products. Setting it equal
-          // to the list price leaves the field populated with a real number —
-          // the source price — rather than a markup nobody agreed to, and the
-          // preview says so before the import runs.
-          suggestedRetailPrice: Math.round(variant.listPrice * 100),
+          // The approved price source: the fixed quantity-1 price from the
+          // selected wholesale pricelist, in CAD cents.
+          wholesalePrice: Math.round(wholesale * 100),
+          /*
+           * `suggestedRetailPrice` IS NOT HERE, and its absence is the point.
+           * It is MoonVella's own editorial field, so an update must not touch
+           * it — a figure edited here after the first import survives every
+           * later re-import, including one where the wholesale price moved. It
+           * is filled in only on create, where the column is required and the
+           * honest value is zero: "no suggested retail has been set".
+           */
           costPrice: variant.cost === null ? null : Math.round(variant.cost * 100),
           // Read, never written back, never defaulted.
           inventory: variant.available,
@@ -901,7 +1175,14 @@ export async function importOdooProducts(options: {
               data: variantFields,
             })
           : await tx.productVariant.create({
-              data: { ...variantFields, productId: product.id },
+              data: {
+                ...variantFields,
+                productId: product.id,
+                // Set once, at creation, and never again by an import. Zero
+                // means "nothing suggested yet", which is what the editor shows
+                // as empty — not a price, and certainly not the wholesale one.
+                suggestedRetailPrice: 0,
+              },
             });
 
         await tx.externalVariantMapping.upsert({
@@ -949,7 +1230,9 @@ export async function importOdooProducts(options: {
           odooVariantId: variant.odooVariantId,
           variantId: variantRow.id,
           sku,
-          price: variant.listPrice,
+          // What was charged, i.e. the wholesale price written above.
+          price: wholesale,
+          priceCurrency: WHOLESALE_CURRENCY,
           available: variant.available,
         });
         result.variantsWritten += 1;
@@ -981,6 +1264,15 @@ export async function importOdooProducts(options: {
       created: result.created,
       updated: result.updated,
       variants: result.variantsWritten,
+      // Which pricelist the prices came from, so a figure in the catalogue can
+      // be traced to the read that produced it without opening the products.
+      pricelist: preview.pricelist
+        ? {
+            id: preview.pricelist.id,
+            name: preview.pricelist.name,
+            currency: preview.pricelist.currency,
+          }
+        : null,
       templates: result.templates.map((item) => ({
         odooTemplateId: item.odooTemplateId,
         productCode: item.productCode,

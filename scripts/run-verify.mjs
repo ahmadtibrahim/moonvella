@@ -358,6 +358,19 @@ const CHECKS = [
     file: "scripts/verify-odoo-import.ts",
     requires: [],
   },
+  // The wholesale price matcher: which row of the "MoonVella Wholesale"
+  // pricelist prices a variant at quantity 1, and every case where the answer
+  // is a refusal instead. It is a PURE suite — no database, no network, no
+  // fixtures — because the module it tests is pure by design, and because the
+  // rules it encodes are about money and deserve tests that always run rather
+  // than tests that need a live Odoo. It follows odoo-import because it is the
+  // half of that import that can be checked here.
+  {
+    name: "pricing",
+    kind: "ts",
+    file: "scripts/verify-pricing.ts",
+    requires: [],
+  },
   // Phase A of the shipping work: origin mappings, packaging inheritance,
   // address validation and image selection. It builds its own fixtures and
   // removes them, because the deployed catalogue has no pillow products to lean

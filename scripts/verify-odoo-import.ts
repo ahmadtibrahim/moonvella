@@ -12,10 +12,17 @@
  *
  * The other half is the part that will run against a real Odoo, and it is
  * checked by reading the code rather than by calling it: that eligibility is the
- * mapped product tag and not a guess, that prices come from the per-variant list
- * price, that quantities are read at import time and never invented, that the
- * import writes drafts, that a re-import cannot blank MoonVella-added media, and
- * that nothing in this module writes to Odoo.
+ * mapped product tag and not a guess, that prices come from the selected
+ * wholesale pricelist and from nowhere else, that quantities are read at import
+ * time and never invented, that the import writes drafts, that a re-import
+ * cannot blank MoonVella-added media, and that nothing in this module writes to
+ * Odoo.
+ *
+ * The price rules themselves are not checked by reading code — they are checked
+ * by running them, exhaustively, in `verify-pricing.ts`. What is left for this
+ * suite is the wiring: that the pricelist setting is the one that is read, that
+ * the list price and the attribute extras are not read at all, that the
+ * pricelist has to be CAD, and that no import can write the retail column.
  *
  * WHAT IT DOES NOT DO. It makes no Odoo call, writes no product, and touches no
  * inventory. The figures the preview will report when Odoo is connected are
@@ -33,6 +40,7 @@ import { PrismaClient } from "@prisma/client";
 import {
   CONSIGNMENT_LOCATION_FIELD,
   CONSIGNMENT_OWNER_FIELD,
+  WHOLESALE_PRICELIST_FIELD,
   importOdooProducts,
   previewOdooImport,
   productCodeFor,
@@ -78,12 +86,23 @@ function stripComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 }
 
-/** The body of a `const <name> = { … };` literal, for a field-level check. */
+/**
+ * The body of a `const <name> = { … };` literal, for a field-level check.
+ *
+ * The closing brace is indented to match the declaration, and literals are
+ * nested here — `productFields` sits at six spaces, `variantFields` inside the
+ * variant loop at eight. The nearest closing brace of either shape is taken,
+ * because running to the end of the file would swallow the next literal and
+ * make a check about what a field does NOT contain pass for the wrong reason.
+ */
 function objectLiteral(source: string, name: string): string {
   const start = source.indexOf(`const ${name} = {`);
   if (start < 0) return "";
-  const end = source.indexOf("\n      };", start);
-  return end < 0 ? source.slice(start) : source.slice(start, end);
+  const candidates = [source.indexOf("\n      };", start), source.indexOf("\n        };", start)].filter(
+    (at) => at >= 0,
+  );
+  if (candidates.length === 0) return source.slice(start);
+  return source.slice(start, Math.min(...candidates));
 }
 
 async function main() {
@@ -411,18 +430,91 @@ async function main() {
   /* -------------------------------------------------------------------- */
   /* Prices come from the approved source                                  */
   /* -------------------------------------------------------------------- */
+  /*
+   * Odoo is the pricing authority, and the price is the fixed quantity-1 price
+   * on the "MoonVella Wholesale" pricelist selected in MoonVella's settings.
+   *
+   * `lst_price`, `list_price` and `price_extra` are all still readable in Odoo,
+   * all still arrive in a read if you ask for them, and all three look like an
+   * answer. So most of what follows is about what is NOT read: the substitution
+   * this module used to make — Odoo's list price written into both the
+   * wholesale and the retail column — cannot be made again without one of these
+   * checks failing.
+   */
   check(
     23,
-    "The price is the per-variant list price, and both halves of it are read so it can be explained",
-    /listPrice = variant\.lst_price \?\? \(template\.list_price \?\? 0\) \+ priceExtra/.test(source) &&
-      /basePrice = template\.list_price \?\? 0/.test(source),
-    "lst_price, with the template price and the attribute extras shown separately",
+    "The price source is the configured wholesale pricelist, resolved by name or id like the consignment fields",
+    WHOLESALE_PRICELIST_FIELD === "ODOO_WHOLESALE_PRICELIST" &&
+      /getCredential\("odoo", WHOLESALE_PRICELIST_FIELD\)/.test(source) &&
+      /resolveReference\(\s*PRICELIST_MODEL,/.test(source) &&
+      /"Wholesale pricelist"/.test(source),
+    `${WHOLESALE_PRICELIST_FIELD}, read through the same reference resolver`,
   );
   check(
+    23.1,
+    "No list price and no attribute price extra is read anywhere: what the price used to be composed from is gone",
+    !/lst_price/.test(source) && !/list_price/.test(source) && !/price_extra/.test(source),
+    "lst_price, list_price and price_extra appear nowhere outside comments",
+  );
+  check(
+    23.2,
+    "The price is decided by the pure matcher, and a variant it cannot price is a problem that blocks the import",
+    /const price = matchBasePrice\(/.test(source) &&
+      /if \(price\.kind === "problem"\)/.test(source) &&
+      /variantProblems\.push\(price\.message\)/.test(source) &&
+      // The cost is read and filed as a cost. It is never on a line that sets
+      // a wholesale price, which is what stops it becoming one.
+      !/wholesalePrice:[^\n]*(cost|standard_price)/.test(source) &&
+      /costPrice: variant\.cost === null/.test(source),
+    "matchBasePrice decides the price; the cost reaches costPrice and nothing else",
+  );
+  check(
+    23.3,
+    "The pricelist is read in pages, so a list longer than Odoo's default page is not silently truncated",
+    /const pageSize = 200/.test(source) &&
+      /limit: pageSize, offset, order: "id asc"/.test(source) &&
+      /WHOLESALE_PRICELIST_TOO_LARGE/.test(source),
+    "paged, and stopped rather than quietly cut short",
+  );
+  check(
+    23.4,
+    "The pricelist must be a CAD pricelist, and no currency is ever converted",
+    /currencyName !== WHOLESALE_CURRENCY/.test(source) &&
+      /WHOLESALE_PRICELIST_CURRENCY_NOT_CAD/.test(source) &&
+      /CURRENCY_MODEL,[\s\S]{0,90}\["id", "name"\]/.test(source) &&
+      !/"rate"/.test(source),
+    "currency read by name only; no rate is read because none is applied",
+  );
+  check(
+    23.5,
+    "And the write refuses a variant with no positive price, rather than rounding a null into a zero",
+    /const wholesale = variant\.wholesalePrice;/.test(source) &&
+      /if \(wholesale === null \|\| !\(wholesale > 0\)\)/.test(source) &&
+      /throw new PermanentJobError\(/.test(source),
+    "the last gate before a price reaches a catalogue",
+  );
+  check(
+    23.6,
+    "The preview shows the resolved price, its CAD currency and the row it came from, so the figure can be traced",
+    /wholesalePrice: price\.kind === "priced" \? price\.wholesale : null/.test(source) &&
+      /wholesaleCurrency: price\.kind === "priced" \? price\.currency : null/.test(source) &&
+      /wholesaleItemId: price\.kind === "priced" \? price\.itemId : null/.test(source),
+    "price, currency and pricelist row id carried into the preview",
+  );
+
+  const variantFields = objectLiteral(source, "variantFields");
+  check(
     24,
-    "A zero price stops the import instead of being written as a free product",
-    /listPrice > 0/.test(source) && /would be imported at no/.test(raw) && /price\. Set a price in Odoo/.test(raw),
-    "zero list price is a problem on the variant",
+    "An import never writes suggested retail: the editor's own field is not in the fields an import updates",
+    variantFields.length > 0 && !/suggestedRetailPrice/.test(variantFields),
+    variantFields.length ? `${variantFields.split("\n").length} lines, no suggestedRetailPrice` : "literal not found",
+  );
+  check(
+    24.1,
+    "It is supplied on create only, where the column requires a value, so a retail price edited here survives every re-import",
+    /data: variantFields,/.test(source) &&
+      /\.\.\.variantFields,[\s\S]{0,240}suggestedRetailPrice: 0,/.test(source),
+    "update writes variantFields; create adds the zero the column needs",
   );
   check(
     25,

@@ -199,7 +199,10 @@ async function main() {
       // the server refuses to render is a form that cannot complete an address.
       // Its safety comes from the referrer restriction, not from this store — and
       // the Address Validation call must use the server key, never this one.
-      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
+      // ODOO_WHOLESALE_PRICELIST names the pricelist the import reads prices
+      // from. It identifies a record rather than authenticating anything, so it
+      // is stored readable, exactly like the consignment pair beside it.
+      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER", "ODOO_WHOLESALE_PRICELIST", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
   );
 
   // 1. Encryption -------------------------------------------------------------

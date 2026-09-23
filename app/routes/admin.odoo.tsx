@@ -67,7 +67,10 @@ export default function AdminOdooImport() {
       <p style={{ color: "#64748b", fontSize: "0.82rem", marginBottom: "1.25rem", lineHeight: 1.6 }}>
         Reads the Odoo products carrying the <strong>MoonVella App</strong> product tag and writes
         them into this catalogue as <strong>drafts</strong>. Nothing is published by an import, and
-        nothing in Odoo is changed — inventory is read, never written.
+        nothing in Odoo is changed — inventory and prices are read, never written. Prices come from
+        the selected <strong>MoonVella Wholesale</strong> pricelist, at quantity 1, in CAD: never
+        from Odoo&apos;s list price and never from the product&apos;s cost. Suggested retail is not
+        imported — it stays MoonVella&apos;s own field.
       </p>
 
       {actionData && "error" in actionData && actionData.error ? (
@@ -123,7 +126,22 @@ export default function AdminOdooImport() {
               {preview.consignment.ownerId ? ` (owner ${preview.consignment.ownerId})` : ""}
             </strong>
           </div>
+          {/* The pricing authority, on the same card as the connection: what a
+              seller is charged is decided by this row and by nothing else. */}
+          <div>
+            Wholesale pricelist:{" "}
+            <strong>
+              {preview.pricelist?.name ?? "not configured"}
+              {preview.pricelist?.id ? ` (id ${preview.pricelist.id})` : ""}
+              {preview.pricelist?.currency ? ` · ${preview.pricelist.currency}` : ""}
+            </strong>
+          </div>
         </div>
+        {preview.pricelist?.note ? (
+          <p style={{ fontSize: "0.74rem", color: "#64748b", marginTop: "0.5rem" }}>
+            {preview.pricelist.note}
+          </p>
+        ) : null}
         {preview.consignment.note ? (
           <p style={{ fontSize: "0.74rem", color: "#64748b", marginTop: "0.5rem" }}>
             {preview.consignment.note}
@@ -146,7 +164,9 @@ export default function AdminOdooImport() {
           ))}
           <p style={{ fontSize: "0.75rem", color: "#78350f" }}>
             No stock or price figures are substituted while Odoo cannot be read. A number that looks
-            plausible but did not come from the source is worse than a missing one.
+            plausible but did not come from the source is worse than a missing one — so a variant
+            with no usable pricelist row stops the import rather than arriving at the list price,
+            at the product&apos;s cost, or at zero.
           </p>
         </div>
       ) : null}
@@ -160,7 +180,7 @@ export default function AdminOdooImport() {
               </h2>
               <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
                 Odoo template {template.odooTemplateId} · {template.odooCategory} ·{" "}
-                {template.currency}
+                storefront currency {template.currency}
               </div>
             </div>
             <div style={{ fontSize: "0.75rem", color: "#475569", textAlign: "right" }}>
@@ -206,7 +226,7 @@ export default function AdminOdooImport() {
                 <th style={th}>Variant</th>
                 <th style={th}>SKU</th>
                 <th style={th}>Attributes</th>
-                <th style={th}>List price</th>
+                <th style={th}>Wholesale (pricelist)</th>
                 <th style={th}>Cost</th>
                 <th style={th}>Available</th>
               </tr>
@@ -226,27 +246,29 @@ export default function AdminOdooImport() {
                   <td style={td}>
                     {variant.attributes.length
                       ? variant.attributes
-                          .map(
-                            (attribute) =>
-                              `${attribute.attribute}: ${attribute.value}` +
-                              (attribute.priceExtra
-                                ? ` (+${money(attribute.priceExtra, template.currency)})`
-                                : ""),
-                          )
+                          .map((attribute) => `${attribute.attribute}: ${attribute.value}`)
                           .join(", ")
                       : "—"}
                   </td>
+                  {/* The figure a seller is charged, and the pricelist row it
+                      came from so it can be traced rather than taken on trust.
+                      A variant with no usable row shows why instead of a
+                      number, because there is no number. */}
                   <td style={td}>
-                    {money(variant.listPrice, template.currency)}
-                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
-                      base {money(variant.basePrice, template.currency)}
-                      {variant.priceExtra
-                        ? ` + ${money(variant.priceExtra, template.currency)} in attributes`
-                        : ""}
-                    </div>
+                    {variant.wholesalePrice === null ? (
+                      <span style={{ color: "#b91c1c" }}>no price</span>
+                    ) : (
+                      money(variant.wholesalePrice, variant.wholesaleCurrency ?? "")
+                    )}
+                    {variant.wholesaleItemId ? (
+                      <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
+                        pricelist row {variant.wholesaleItemId}
+                      </div>
+                    ) : null}
                   </td>
                   <td style={td}>
                     {variant.cost === null ? "—" : money(variant.cost, template.currency)}
+                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>never charged</div>
                   </td>
                   <td style={td}>
                     <strong>{variant.available}</strong>

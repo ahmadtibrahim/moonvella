@@ -2,10 +2,13 @@
  * Phase 21 — the numbered acceptance suite for the product, variant, media,
  * document and marketing system.
  *
- * FIFTY-NINE CHECKS, IN NINE GROUPS. The numbering is not decoration: each
+ * SIXTY-FOUR CHECKS, IN TEN GROUPS. The numbering is not decoration: each
  * group corresponds to one promise the directive makes, and `check()` asserts
  * that the number it is handed is the next one, so a check cannot be dropped or
- * reordered without the suite failing on the numbering itself.
+ * reordered without the suite failing on the numbering itself. The first
+ * fifty-nine are the directive's; group J was added when Odoo became the
+ * pricing authority, and covers the two price rules that decide what may be
+ * listed — that suggested retail is optional, and that wholesale is not.
  *
  * WHAT THIS IS NOT. It is not a unit-test suite. Every check goes through the
  * same service functions the admin interface calls — the ones that already
@@ -59,6 +62,7 @@ import { permissionsFor, can } from "../app/services/permissions";
 import { checkProductCode, PRODUCT_CODE_HELP } from "../app/utils/productCode";
 import { isSafeEntryPath } from "../app/utils/zip";
 import { intakeOrder } from "../app/services/orderIntake.server";
+import { importProductForSeller } from "../app/services/shopifyImport.server";
 import { readObject, deleteObject } from "../app/services/storage.server";
 
 const prisma = new PrismaClient();
@@ -263,6 +267,10 @@ async function cleanup() {
   }
 
   await prisma.webhookEvent.deleteMany({ where: { shopDomain: SHOP } });
+  // The store-import checks leave a FAILED `product_import` state behind. It
+  // describes a fixture store that no longer exists, and a later suite reading
+  // the integration roster would see this run's refusal as the current state.
+  await prisma.integrationState.deleteMany({ where: { key: "product_import" } });
   await prisma.$disconnect();
 }
 
@@ -348,7 +356,7 @@ async function main() {
   // value is coerced to zero rather than refused — worth stating plainly,
   // because it means a $0.00 price is reachable by leaving a field empty. What
   // stops such a variant reaching a seller is the publication gate's "every
-  // active variant has both prices" check, not this function.
+  // active variant has a wholesale price" check, not this function.
   let moneyRejected = 0;
   for (const bad of [-1, "abc", NaN]) {
     const attempt = await refused(async () => validateMoney(bad, "Wholesale price"));
@@ -1346,10 +1354,169 @@ async function main() {
     missingValue === null ? "null" : String(missingValue)
   );
 
+  /* ======================================================================= */
+  console.log("\nJ. What a price has to be before a seller sees it");
+  /* ======================================================================= */
+  /*
+   * Two rules that live on opposite sides of the same question, checked here
+   * because between them they decide what may be sold and at what number.
+   *
+   * The first is that suggested retail is editorial: it is MoonVella's own
+   * suggestion, it is optional, and no import writes it. The gate must
+   * therefore not block on it — a product held back until somebody names a
+   * retail price is a product whose retail price gets filled in with the
+   * wholesale figure, which is the substitution the two fields exist to keep
+   * apart.
+   *
+   * The second is that wholesale is not optional, and no retail price rescues
+   * it. It is what the seller is charged, so a variant without one must stop
+   * the product rather than be listed at whatever number happens to be nearby.
+   */
+
+  // 60
+  const retailOptional = await createProduct(
+    { name: "Retail optional", productCode: `${CODE}-OPT`, category: "Test" },
+    owner
+  );
+  await addVariant(
+    retailOptional.id,
+    {
+      name: "One size",
+      sku: `${CODE}-OPT-1`,
+      wholesalePrice: 1800,
+      suggestedRetailPrice: 0,
+      inventory: 3,
+    },
+    owner
+  );
+  const optionalReport = await publicationReadiness(retailOptional.id);
+  const optionalPrices = optionalReport.checks.find((row) => row.key === "variant_prices");
+  check(
+    60,
+    "Suggested retail is optional: a variant priced at wholesale with no retail price does not block publication",
+    optionalPrices?.ok === true && /Suggested retail is optional/.test(optionalPrices?.detail ?? ""),
+    optionalPrices?.detail ?? "no variant_prices check"
+  );
+
+  // 61
+  // Deliberately given a generous retail price. If the gate ever fell back to
+  // it, this variant would publish and a seller would be charged nothing.
+  await addVariant(
+    retailOptional.id,
+    {
+      name: "No wholesale",
+      sku: `${CODE}-OPT-2`,
+      wholesalePrice: 0,
+      suggestedRetailPrice: 9900,
+      inventory: 3,
+    },
+    owner
+  );
+  const blockedReport = await publicationReadiness(retailOptional.id);
+  const blockedPrices = blockedReport.checks.find((row) => row.key === "variant_prices");
+  check(
+    61,
+    "Wholesale is not optional, and a retail price does not stand in for it: the variant is named as the blocker",
+    blockedPrices?.ok === false &&
+      (blockedPrices?.detail ?? "").includes(`${CODE}-OPT-2`) &&
+      !(blockedPrices?.detail ?? "").includes(`${CODE}-OPT-1`),
+    blockedPrices?.detail ?? "no variant_prices check"
+  );
+
+  /* ---------------------------------------------------------------------- */
+  /* A store must show a price for every variant it lists                   */
+  /* ---------------------------------------------------------------------- */
+  /*
+   * The Odoo import no longer writes suggested retail, so a store import can
+   * meet a product whose retail price nobody has set. The price the store shows
+   * is not MoonVella's to invent: a variant listed at zero takes real orders at
+   * zero, and a variant listed at the wholesale cost gives the seller's margin
+   * away. So the import refuses, names the variants, and says what to do.
+   *
+   * The admin passed below throws the moment it is called, which is what makes
+   * the first check a statement about Shopify too: a refusal that had already
+   * sent something would trip the sentinel instead of returning the message.
+   */
+  const sentinel = {
+    graphql: async () => {
+      throw new Error("SENTINEL: a Shopify call was attempted");
+    },
+  } as unknown as Parameters<typeof importProductForSeller>[0];
+
+  const storeFamily = await createProduct(
+    { name: "Store listing", productCode: `${CODE}-STR`, category: "Test" },
+    owner
+  );
+  await addVariant(
+    storeFamily.id,
+    {
+      name: "One size",
+      sku: `${CODE}-STR-1`,
+      wholesalePrice: 2400,
+      suggestedRetailPrice: 0,
+      inventory: 2,
+    },
+    owner
+  );
+
+  // 62
+  const refusedImport = await importProductForSeller(sentinel, seller.id, storeFamily.id);
+  check(
+    62,
+    "A store import is refused before it sends anything when a variant has no retail price",
+    refusedImport.ok === false &&
+      /Import refused/.test(refusedImport.error ?? "") &&
+      (refusedImport.error ?? "").includes(`${CODE}-STR-1`) &&
+      !/SENTINEL/.test(refusedImport.error ?? ""),
+    (refusedImport.error ?? "no error").slice(0, 120)
+  );
+
+  // 63
+  const refusedRow = await prisma.sellerProduct.findUnique({
+    where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
+  });
+  check(
+    63,
+    "And the refusal is recorded against the store, not only shown once and lost",
+    refusedRow?.importStatus === "FAILED" &&
+      (refusedRow?.lastImportError ?? "").includes(`${CODE}-STR-1`),
+    `${refusedRow?.importStatus} — ${(refusedRow?.lastImportError ?? "").slice(0, 60)}`
+  );
+
+  // 64
+  // The seller's own retail price for this store, set beforehand. It is the
+  // price the store is meant to show, so the import is not refused — and the
+  // sentinel is what proves the guard was passed rather than short-circuited.
+  await prisma.sellerProduct.update({
+    where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
+    data: { customRetailPrice: 6400, importStatus: "NEVER", lastImportError: null },
+  });
+  // The function reports a failed import rather than throwing — the sentinel's
+  // message comes back on the result, which is what "the guard was passed"
+  // looks like from here. A refusal would have returned its own message and
+  // never reached the client at all.
+  let sentinelReached = "";
+  try {
+    const result = await importProductForSeller(sentinel, seller.id, storeFamily.id);
+    sentinelReached = result.ok ? "the import reported success" : result.error ?? "";
+  } catch (error) {
+    sentinelReached = error instanceof Error ? error.message : String(error);
+  }
+  const keptRetail = await prisma.sellerProduct.findUnique({
+    where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
+  });
+  check(
+    64,
+    "A retail price the seller already set for this store is used instead, and survives the import attempt",
+    sentinelReached === "SENTINEL: a Shopify call was attempted" &&
+      keptRetail?.customRetailPrice === 6400,
+    `${sentinelReached || "the guard refused again"} / retail ${keptRetail?.customRetailPrice}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 59) {
+  if (total !== 64) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; the directive specifies 59`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive and 5 were added by the pricing wave`);
   }
 }
 

@@ -26,7 +26,15 @@ import {
 } from "~/services/integrationHealth.server";
 // Isomorphic on purpose: field definitions only, no server imports, so the form
 // and the store validate against the same list instead of two that drift.
-import { CREDENTIAL_INTEGRATIONS, type CredentialKey } from "~/services/integrationFields";
+import {
+  CREDENTIAL_INTEGRATIONS,
+  type CredentialKey,
+  type CredentialOption,
+} from "~/services/integrationFields";
+// Server-only, and used only to READ the choices a picker offers. Nothing it
+// returns is a credential, and a failure to read it falls back to the plain
+// text field rather than failing the page.
+import { listOdooPricelists } from "~/services/odoo.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   // Any signed-in user: everyone needs to be able to change their own password.
@@ -45,7 +53,32 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const credentialKeys = CREDENTIAL_KEYS as string[];
   const operationalKeys = OPERATIONAL_KEYS as string[];
 
+  /*
+   * A FEW FIELDS CHOOSE FROM WHAT THE PROVIDER ACTUALLY HOLDS. The wholesale
+   * pricelist is one: it can be typed as a name or an id, but a list read from
+   * Odoo is what stops a typo becoming a price list nobody can find.
+   *
+   * Read only when the Odoo integration ALREADY reports HEALTHY. Asking an
+   * unreachable Odoo would stall this page for the length of the connector's
+   * timeout to learn what the tile above already says, and the field falls back
+   * to text input either way — which accepts exactly what the picker offers.
+   */
+  const odooHealthy = states.some((state) => state.key === "odoo" && state.status === "HEALTHY");
+  const pricelists =
+    canSeeIntegrations && odooHealthy ? await listOdooPricelists() : null;
+
+  // Keyed by field, because an integration may later offer a picker for more
+  // than one of its fields.
+  const runtimeOptions: Record<string, CredentialOption[]> = {};
+  if (pricelists?.length) {
+    runtimeOptions["odoo:ODOO_WHOLESALE_PRICELIST"] = pricelists.map((row) => ({
+      value: String(row.id),
+      label: `${row.name} (id ${row.id})`,
+    }));
+  }
+
   return {
+    runtimeOptions,
     user: {
       name: user.name,
       email: user.email,
@@ -192,8 +225,14 @@ function statusColor(status: string): string {
 }
 
 export default function AdminSettings() {
-  const { user, permissions, credentialIntegrations, operationalIntegrations, canSeeIntegrations } =
-    useLoaderData<typeof loader>();
+  const {
+    user,
+    permissions,
+    credentialIntegrations,
+    operationalIntegrations,
+    canSeeIntegrations,
+    runtimeOptions,
+  } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const [searchParams] = useSearchParams();
@@ -279,7 +318,12 @@ export default function AdminSettings() {
               live provider calls until credentials are saved again.
             </p>
             {credentialIntegrations.map((i) => (
-              <DetailCard key={i.key} integration={i} isSubmitting={isSubmitting} />
+              <DetailCard
+                key={i.key}
+                integration={i}
+                isSubmitting={isSubmitting}
+                runtimeOptions={runtimeOptions}
+              />
             ))}
           </div>
 
@@ -294,7 +338,12 @@ export default function AdminSettings() {
               here whether or not anyone opens this page.
             </p>
             {operationalIntegrations.map((i) => (
-              <DetailCard key={i.key} integration={i} isSubmitting={isSubmitting} />
+              <DetailCard
+                key={i.key}
+                integration={i}
+                isSubmitting={isSubmitting}
+                runtimeOptions={runtimeOptions}
+              />
             ))}
           </div>
         </>
@@ -417,6 +466,8 @@ export default function AdminSettings() {
 interface DetailCardProps {
   integration: IntegrationStateView;
   isSubmitting: boolean;
+  /** Choices read live from the provider, keyed `"<integrationKey>:<fieldName>"`. */
+  runtimeOptions: Record<string, CredentialOption[]>;
 }
 
 /** Display names. A raw key like "shopify_fulfillment" is not a label. */
@@ -431,7 +482,7 @@ const INTEGRATION_LABEL: Record<string, string> = {
   product_import: "Product import",
 };
 
-function DetailCard({ integration, isSubmitting }: DetailCardProps) {
+function DetailCard({ integration, isSubmitting, runtimeOptions }: DetailCardProps) {
   // Taken from the row rather than a props name of "key", which React reserves.
   const key = integration.key;
 
@@ -471,7 +522,12 @@ function DetailCard({ integration, isSubmitting }: DetailCardProps) {
       {/* Credential forms belong to the integrations that hold secrets. An
           operational check has nothing to configure, so it never renders one. */}
       {isCredentialIntegrationKey(key) ? (
-        <CredentialsForm integrationKey={key} integration={integration} isSubmitting={isSubmitting} />
+        <CredentialsForm
+          integrationKey={key}
+          integration={integration}
+          isSubmitting={isSubmitting}
+          runtimeOptions={runtimeOptions}
+        />
       ) : null}
 
       {/* Action buttons. Saving and disconnecting live inside each credential
@@ -527,10 +583,12 @@ function CredentialsForm({
   integrationKey,
   integration,
   isSubmitting,
+  runtimeOptions,
 }: {
   integrationKey: CredentialKey;
   integration: IntegrationStateView;
   isSubmitting: boolean;
+  runtimeOptions: Record<string, CredentialOption[]>;
 }) {
   const spec = CREDENTIAL_INTEGRATIONS[integrationKey];
   const stateByName = new Map(integration.credentialFields.map((field) => [field.name, field]));
@@ -557,6 +615,23 @@ function CredentialsForm({
                 : "Not set";
             const statusTone = state?.problem ? "#dc2626" : state?.isSet ? "#059669" : "#94a3b8";
 
+            /*
+             * Live choices win over the static ones, and both are optional: a
+             * field with neither is a text input.
+             *
+             * The saved value is kept as an option even when the read did not
+             * return it. It can be a name where the list offers ids, or a
+             * pricelist that was renamed or hidden since it was saved — and a
+             * select whose value is not among its options silently shows the
+             * first one instead, so simply opening this form and saving would
+             * quietly repoint pricing at a different pricelist. It is offered
+             * back verbatim, labelled as what it is.
+             */
+            const options = runtimeOptions[`${integrationKey}:${field.name}`] ?? field.options;
+            const savedValue = state?.value ?? null;
+            const savedNotListed =
+              !!options && !!savedValue && !options.some((option) => option.value === savedValue);
+
             return (
               <div key={field.name}>
                 <label
@@ -568,14 +643,25 @@ function CredentialsForm({
                     {statusText}
                   </span>
                 </label>
-                {field.options ? (
+                {options ? (
                   <select
                     style={input}
                     id={`${integrationKey}-${field.name}`}
                     name={`secret_${field.name}`}
-                    defaultValue={state?.value ?? field.options[0]?.value}
+                    // An empty first option when nothing is saved, so that
+                    // saving this form does not silently choose for the
+                    // operator: the first entry in a list they have not read is
+                    // still a choice, and for a pricelist it is the price every
+                    // seller is charged.
+                    defaultValue={savedValue ?? ""}
                   >
-                    {field.options.map((option) => (
+                    {!savedValue ? <option value="">— not set —</option> : null}
+                    {savedNotListed && savedValue ? (
+                      <option value={savedValue}>
+                        {savedValue} — saved, and not in the list just read from Odoo
+                      </option>
+                    ) : null}
+                    {options.map((option) => (
                       <option key={option.value} value={option.value}>
                         {option.label}
                       </option>

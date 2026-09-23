@@ -22,12 +22,39 @@ function check(name: string, pass: boolean, detail = "") {
 const T0 = new Date(Date.now() - 3 * 60_000).toISOString();
 const T1 = new Date(Date.now() - 2 * 60_000).toISOString();
 const T2 = new Date(Date.now() - 60_000).toISOString();
+// The historical-money section sends several updates to one order, so each
+// needs its own `updated_at`: that is the version the webhook dedup keys on.
+const T3 = new Date(Date.now() - 45_000).toISOString();
+const T4 = new Date(Date.now() - 30_000).toISOString();
+const T5 = new Date(Date.now() - 15_000).toISOString();
+
+/**
+ * A product of this suite's own, for the checks that reprice a catalogue.
+ *
+ * Those checks need a wholesale price they can move. Moving one on the shared
+ * seed catalogue would reach outside this suite: every other suite leans on
+ * that catalogue, and a restore is not a fix — a run killed between the
+ * repricing and its cleanup would leave the seed changed, and an UPDATE moves
+ * the row in the heap, so even a correct restore has to be done by id rather
+ * than by re-finding "the first variant". A product created here has none of
+ * that: nothing else refers to it, and `cleanup()` removes it.
+ */
+const D2_CODE = "MV-OT-D2";
+const D2_SKU = "MV-OT-D2-1";
+const D2_VARIANT_ID = 222222;
 
 async function cleanup() {
   const seller = await prisma.seller.findUnique({ where: { shopDomain: SHOP } });
   if (seller) {
     const orders = await prisma.order.findMany({ where: { sellerId: seller.id }, select: { id: true } });
     const orderIds = orders.map((o) => o.id);
+    /*
+     * The order.intaken, order.updated and order.money_updated audit rows are
+     * left behind, as they always have been here: AuditLog is append-only by
+     * database trigger, so a delete would raise rather than tidy anything. Rows
+     * pointing at a removed fixture are the price of a trail that cannot be
+     * edited, and this suite pays it rather than asking for an exemption.
+     */
     await prisma.webhookEvent.deleteMany({ where: { shopDomain: SHOP } });
     await prisma.refundItem.deleteMany({ where: { refund: { orderId: { in: orderIds } } } });
     await prisma.refund.deleteMany({ where: { orderId: { in: orderIds } } });
@@ -40,6 +67,24 @@ async function cleanup() {
     await prisma.seller.delete({ where: { id: seller.id } });
   }
   await prisma.integrationState.deleteMany({ where: { key: { in: ["shopify_orders", "shopify_fulfillment"] } } });
+
+  /*
+   * The repricing fixture, removed rather than reset. Its code is fixed, so a
+   * run killed before it could tidy up is swept by the next one's opening
+   * cleanup instead of leaving a product behind. Nothing outside this suite
+   * refers to it, which is the point: the historical-money checks need a
+   * wholesale price they can move, and moving one on the shared seed catalogue
+   * would reach into every other suite in the run.
+   */
+  const d2ProductIds = (
+    await prisma.product.findMany({ where: { productCode: D2_CODE }, select: { id: true } })
+  ).map((row) => row.id);
+  if (d2ProductIds.length > 0) {
+    await prisma.sellerProductVariant.deleteMany({ where: { productVariant: { productId: { in: d2ProductIds } } } });
+    await prisma.sellerProduct.deleteMany({ where: { productId: { in: d2ProductIds } } });
+    await prisma.productVariant.deleteMany({ where: { productId: { in: d2ProductIds } } });
+    await prisma.product.deleteMany({ where: { id: { in: d2ProductIds } } });
+  }
 }
 
 type Payload = Parameters<typeof intakeOrder>[0]["payload"];
@@ -263,18 +308,221 @@ async function main() {
   });
   check("order with no MoonVella items creates no supplier order", noItems.ok === true && noItems.moonvellaItems === 0);
 
+  /* ------------------------------------------------------------------------ */
+  /* Historical money: a catalogue change does not reach back into an order    */
+  /* ------------------------------------------------------------------------ */
+  /*
+   * What this half proves. The wholesale price on a line is a snapshot of what
+   * the seller was charged, so repricing the catalogue must not reprice an
+   * order that already exists — while a line that genuinely arrives afterwards
+   * does take the price in force now. And once the seller has been charged, the
+   * money on the order stops moving altogether: a difference is computed and
+   * recorded as unbilled, and nothing is rewritten behind the invoice.
+   *
+   * The repricing happens on a product created here, never on the seed
+   * catalogue — the catalogue is shared with every other suite in the run.
+   */
+  const d2Product = await prisma.product.create({
+    data: {
+      name: "Order historical money (verify fixture)",
+      productCode: D2_CODE,
+      category: "Test",
+      currency: "CAD",
+      variants: {
+        create: [{ name: "One size", sku: D2_SKU, wholesalePrice: 1299, suggestedRetailPrice: 0, isDefault: true }],
+      },
+    },
+    include: { variants: true },
+  });
+  const d2Variant = d2Product.variants[0];
+  const d2Mapping = await prisma.sellerProduct.create({
+    data: {
+      sellerId: seller.id,
+      productId: d2Product.id,
+      shopifyProductId: "666666",
+      importedAt: new Date(),
+      isActive: true,
+    },
+  });
+  await prisma.sellerProductVariant.create({
+    data: {
+      sellerProductId: d2Mapping.id,
+      productVariantId: d2Variant.id,
+      shopifyProductId: "666666",
+      shopifyVariantId: String(D2_VARIANT_ID),
+      shopifyLocationId: "1",
+      syncStatus: "SUCCESS",
+      syncedAt: new Date(),
+    },
+  });
+
+  const d2WholesalePrice = d2Variant.wholesalePrice;
+  const d2OrderId = await createOrder(seller.id, 9006, D2_VARIANT_ID);
+  const d2Line = (id: number, quantity: number) => ({
+    id,
+    variant_id: D2_VARIANT_ID,
+    title: "MoonVella Item",
+    sku: D2_SKU,
+    quantity,
+    price: "49.00",
+  });
+
+  const repriced = d2WholesalePrice + 700;
+  await prisma.productVariant.update({
+    where: { id: d2Variant.id },
+    data: { wholesalePrice: repriced },
+  });
+
+  await intakeOrder({
+    topic: "ORDERS_UPDATED",
+    shop: SHOP,
+    payload: makePayload(9006, { updated_at: T3, line_items: [d2Line(1, 1), d2Line(5, 2)] }),
+  });
+
+  const afterReprice = await prisma.orderItem.findMany({ where: { orderId: d2OrderId } });
+  const keptLine = afterReprice.find((i) => i.shopifyLineItemId === "1");
+  const newLine = afterReprice.find((i) => i.shopifyLineItemId === "5");
+  check(
+    "repricing the catalogue does not reprice a line already on the order",
+    keptLine?.wholesalePrice === d2WholesalePrice,
+    `${keptLine?.wholesalePrice} vs ${d2WholesalePrice} (catalogue now ${repriced})`
+  );
+  check(
+    "a genuinely added line takes the catalogue price in force now",
+    newLine?.wholesalePrice === repriced,
+    `${newLine?.wholesalePrice} vs ${repriced}`
+  );
+
+  const d2Unbilled = await prisma.order.findUnique({ where: { id: d2OrderId } });
+  check(
+    "an unbilled order's totals follow its lines: the snapshot, plus the new line",
+    d2Unbilled?.moonvellaSubtotal === d2WholesalePrice + repriced * 2,
+    `${d2Unbilled?.moonvellaSubtotal} vs ${d2WholesalePrice + repriced * 2}`
+  );
+
+  const firstMoneyAudit = await prisma.auditLog.findFirst({
+    where: { entityType: "Order", entityId: d2OrderId, action: "order.money_updated" },
+    orderBy: { createdAt: "desc" },
+  });
+  const firstMoneyBefore = JSON.parse(firstMoneyAudit?.beforeData ?? "{}");
+  const firstMoneyAfter = JSON.parse(firstMoneyAudit?.afterData ?? "{}");
+  const origin = (after: { lines?: { id: string; priceSource: string }[] }, id: string) =>
+    after.lines?.find((line) => line.id === id)?.priceSource;
+  check(
+    "the money entry says where each line's price came from",
+    firstMoneyAudit !== null &&
+      origin(firstMoneyAfter, "1") === "SNAPSHOT" &&
+      origin(firstMoneyAfter, "5") === "CATALOGUE",
+    `line 1 ${origin(firstMoneyAfter, "1")}, line 5 ${origin(firstMoneyAfter, "5")}`
+  );
+  check(
+    "and it records both sides, so the change can be read without a second query",
+    firstMoneyBefore.totals?.moonvellaSubtotal === d2WholesalePrice &&
+      firstMoneyAfter.computedTotals?.moonvellaSubtotal === d2WholesalePrice + repriced * 2 &&
+      firstMoneyAfter.chargedTotalsKept === false,
+    `${firstMoneyBefore.totals?.moonvellaSubtotal} -> ${firstMoneyAfter.computedTotals?.moonvellaSubtotal}`
+  );
+
+  /* --- charged: the money stops, the difference is recorded ---------------- */
+  await prisma.order.update({
+    where: { id: d2OrderId },
+    data: { wholesalePaymentStatus: "SUCCEEDED" },
+  });
+  const chargedBefore = await prisma.order.findUnique({ where: { id: d2OrderId } });
+
+  const repricedAgain = d2WholesalePrice + 1500;
+  await prisma.productVariant.update({
+    where: { id: d2Variant.id },
+    data: { wholesalePrice: repricedAgain },
+  });
+  await intakeOrder({
+    topic: "ORDERS_UPDATED",
+    shop: SHOP,
+    payload: makePayload(9006, {
+      updated_at: T4,
+      fulfillment_status: "partial",
+      line_items: [d2Line(1, 1), d2Line(5, 2), d2Line(6, 1)],
+    }),
+  });
+
+  const chargedAfter = await prisma.order.findUnique({
+    where: { id: d2OrderId },
+    include: { items: true },
+  });
+  check(
+    "a charged order keeps the totals it was charged, though a line was added after it",
+    chargedAfter?.moonvellaSubtotal === chargedBefore?.moonvellaSubtotal &&
+      chargedAfter?.moonvellaTotal === chargedBefore?.moonvellaTotal,
+    `${chargedAfter?.moonvellaTotal} vs charged ${chargedBefore?.moonvellaTotal}`
+  );
+  check(
+    "and everything that is not money still updates, so the order tracks Shopify",
+    chargedAfter?.fulfillmentStatus === "PARTIAL" &&
+      chargedAfter?.items.length === 3,
+    `${chargedAfter?.fulfillmentStatus}, ${chargedAfter?.items.length} items`
+  );
+  check(
+    "the line added after the charge is on the order at the current price, not hidden",
+    chargedAfter?.items.find((i) => i.shopifyLineItemId === "6")?.wholesalePrice === repricedAgain,
+    `${chargedAfter?.items.find((i) => i.shopifyLineItemId === "6")?.wholesalePrice}`
+  );
+
+  const chargedAudit = await prisma.auditLog.findFirst({
+    where: { entityType: "Order", entityId: d2OrderId, action: "order.money_updated" },
+    orderBy: { createdAt: "desc" },
+  });
+  const chargedAfter2 = JSON.parse(chargedAudit?.afterData ?? "{}");
+  const expectedDifference =
+    (chargedAfter2.computedTotals?.moonvellaTotal ?? 0) - (chargedAfter2.totals?.moonvellaTotal ?? 0);
+  check(
+    "the difference is recorded as unbilled, and equals the gap it reports",
+    chargedAudit !== null &&
+      chargedAfter2.chargedTotalsKept === true &&
+      chargedAfter2.totals?.moonvellaTotal === chargedBefore?.moonvellaTotal &&
+      chargedAfter2.unbilledDifference === expectedDifference &&
+      expectedDifference > 0,
+    `unbilled ${chargedAfter2.unbilledDifference} = ${chargedAfter2.computedTotals?.moonvellaTotal} - ${chargedAfter2.totals?.moonvellaTotal}`
+  );
+  check(
+    "the added line is named, so the difference does not have to be reconstructed",
+    chargedAfter2.addedLines?.length === 1 && chargedAfter2.addedLines[0]?.id === "6",
+    JSON.stringify(chargedAfter2.addedLines ?? null)
+  );
+
+  /* --- and a routine update writes nothing at all -------------------------- */
+  const moneyAuditsBefore = await prisma.auditLog.count({
+    where: { entityType: "Order", entityId: d2OrderId, action: "order.money_updated" },
+  });
+  await intakeOrder({
+    topic: "ORDERS_UPDATED",
+    shop: SHOP,
+    payload: makePayload(9006, {
+      updated_at: T5,
+      financial_status: "paid",
+      line_items: [d2Line(1, 1), d2Line(5, 2), d2Line(6, 1)],
+    }),
+  });
+  const moneyAuditsAfter = await prisma.auditLog.count({
+    where: { entityType: "Order", entityId: d2OrderId, action: "order.money_updated" },
+  });
+  check(
+    "an update that changes no line and no total writes no money entry",
+    moneyAuditsAfter === moneyAuditsBefore,
+    `${moneyAuditsBefore} -> ${moneyAuditsAfter}`
+  );
+
   await cleanup();
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   await prisma.$disconnect();
   process.exit(failures ? 1 : 0);
 }
 
-async function createOrder(sellerId: string, id: number): Promise<string> {
+async function createOrder(sellerId: string, id: number, variantId = 111111): Promise<string> {
   const result = await intakeOrder({
     topic: "ORDERS_CREATE",
     shop: SHOP,
     payload: makePayload(id, {
-      line_items: [{ id: 1, variant_id: 111111, title: "MoonVella Item", sku: "MV-TEST", quantity: 1, price: "49.00" }],
+      line_items: [{ id: 1, variant_id: variantId, title: "MoonVella Item", sku: "MV-TEST", quantity: 1, price: "49.00" }],
     }),
   });
   const order = await prisma.order.findFirst({ where: { sellerId, shopifyOrderId: String(id) }, select: { id: true } });

@@ -147,16 +147,26 @@ export async function publicationReadiness(productId: string): Promise<Readiness
     tab: "variants",
   });
 
-  const unpriced = active.filter(
-    (variant) => variant.wholesalePrice <= 0 || variant.suggestedRetailPrice <= 0
-  );
+  /*
+   * WHOLESALE ONLY, AND THAT IS THE WHOLE RULE.
+   *
+   * Wholesale is what a seller is charged, so a product without it must not
+   * reach them. Suggested retail is a different field with a different owner:
+   * it is MoonVella's own editorial suggestion, it is optional, and it is not
+   * imported from Odoo — so it can legitimately be zero on a product that is
+   * perfectly sellable. Blocking on it would mean a catalogue that cannot be
+   * published until somebody names a retail price nobody requires, and the
+   * remedy people reach for under that pressure is to copy the wholesale figure
+   * into it, which is exactly the substitution this field was separated from.
+   */
+  const unpriced = active.filter((variant) => variant.wholesalePrice <= 0);
   checks.push({
     key: "variant_prices",
-    label: "Every active variant has both prices",
+    label: "Every active variant has a wholesale price",
     ok: unpriced.length === 0,
     detail: unpriced.length
-      ? `Missing a price: ${unpriced.map((v) => v.sku).join(", ")}.`
-      : "Wholesale and suggested retail, each above zero.",
+      ? `No wholesale price: ${unpriced.map((v) => v.sku).join(", ")}. This is what a seller is charged, so it cannot be blank.`
+      : "Each active variant is priced above zero. Suggested retail is optional and set by the editor, not by an import.",
     tab: "variants",
   });
 

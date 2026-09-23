@@ -77,6 +77,12 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
       "to the company or to another supplier is never offered for sale. Both accept a name " +
       "or a numeric id, and a name that matches more than one record is refused rather than " +
       "guessed at. " +
+      "THE WHOLESALE PRICELIST IS THE PRICING AUTHORITY: the price MoonVella charges a seller " +
+      "is the fixed quantity-1 price from that pricelist, and never Odoo's list price, the " +
+      "product's cost, or a quantity tier. It must be a CAD pricelist — MoonVella bills in CAD " +
+      "and converts nothing — and a variant with no usable row is flagged and left out of the " +
+      "import rather than priced by guesswork. Like the consignment pair it accepts a name or a " +
+      "numeric id, and an ambiguous name is refused. " +
       "READ-ONLY IS THE DEFAULT: \"live\" mode alone does not enable writes — they also " +
       "require ODOO_ALLOW_WRITES=yes in the deployment environment, which this page cannot " +
       "set, so a form here can never authorise writing to the ERP. The database is reached " +
@@ -109,6 +115,16 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
         label: "Consignment owner",
         secret: false,
         placeholder: "partner name or numeric id",
+      },
+      {
+        // Offered as a picker of the pricelists read from the connected Odoo,
+        // and as a plain text field when that read is unavailable — the same
+        // name-or-id rule the consignment fields use, because it is the same
+        // resolution. A name that matches more than one pricelist is refused.
+        name: "ODOO_WHOLESALE_PRICELIST",
+        label: "Wholesale pricelist",
+        secret: false,
+        placeholder: "pricelist name or numeric id",
       },
     ],
   },

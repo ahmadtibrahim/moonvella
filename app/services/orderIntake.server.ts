@@ -162,6 +162,13 @@ interface BuiltItems {
   retailTotal: number;
   lineDiscountTotal: number;
   lineTaxTotal: number;
+  /**
+   * Where each line's wholesale unit price came from, by Shopify line item id:
+   * the order's own recorded figure, or the catalogue as it stands now. Carried
+   * out of the build because it is the first thing an operator needs when a
+   * total moved — and the thing an audit entry has to say.
+   */
+  priceSource: Map<string, "SNAPSHOT" | "CATALOGUE">;
 }
 
 function cents(value: unknown): number {
@@ -244,20 +251,35 @@ function snapshotFor(variant: VariantSnapshotSource, chargedRetailCents: number)
 /**
  * Keep only line items mapped to a persisted MoonVella variant. Unrelated
  * products stay out of the supplier workflow.
+ *
+ * THE WHOLESALE UNIT PRICE IS A SNAPSHOT, NOT A LOOKUP. When `frozenUnitPrices`
+ * carries a figure for a line, that figure is used and the catalogue is not
+ * consulted at all — because the price on the line is what the seller was
+ * charged, and a pricelist edit, a catalogue correction or a repricing must not
+ * reach back into an order that has already been billed. A line the map does
+ * not know is genuinely new, and it takes the price in force now.
  */
-function buildItems(items: LineItem[], byVariant: Map<string, VariantMapping>): BuiltItems {
+function buildItems(
+  items: LineItem[],
+  byVariant: Map<string, VariantMapping>,
+  frozenUnitPrices?: Map<string, number>
+): BuiltItems {
   const moonvellaItems = items.filter((li) => li.variant_id && byVariant.has(String(li.variant_id)));
   let moonvellaSubtotal = 0;
   let retailTotal = 0;
   let lineDiscountTotal = 0;
   let lineTaxTotal = 0;
+  const priceSource = new Map<string, "SNAPSHOT" | "CATALOGUE">();
 
   const rows = moonvellaItems.map((li) => {
     const mapping = byVariant.get(String(li.variant_id))!;
     const variant = mapping.productVariant;
     const quantity = Number(li.quantity) || 0;
     const retailUnit = cents(li.price);
-    const wholesaleUnit = variant.wholesalePrice;
+    const lineKey = String(li.id ?? "");
+    const frozen = frozenUnitPrices?.get(lineKey);
+    const wholesaleUnit = frozen ?? variant.wholesalePrice;
+    priceSource.set(lineKey, frozen === undefined ? "CATALOGUE" : "SNAPSHOT");
     const lineDiscount = sumDiscounts(li);
     retailTotal += retailUnit * quantity;
     moonvellaSubtotal += wholesaleUnit * quantity;
@@ -277,7 +299,7 @@ function buildItems(items: LineItem[], byVariant: Map<string, VariantMapping>): 
     };
   });
 
-  return { rows, moonvellaSubtotal, retailTotal, lineDiscountTotal, lineTaxTotal };
+  return { rows, moonvellaSubtotal, retailTotal, lineDiscountTotal, lineTaxTotal, priceSource };
 }
 
 /**
@@ -642,20 +664,126 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
   }
 }
 
+/**
+ * The payment statuses that mean the seller has been charged, or is being
+ * charged right now.
+ *
+ * Past this line the money on the order is not a calculation any more — it is a
+ * figure the seller's statement already carries. MoonVella may still owe the
+ * seller a difference, or be owed one, but neither is something a webhook may
+ * settle by quietly rewriting the amount that was billed.
+ */
+const CHARGED_PAYMENT_STATUSES: ReadonlySet<string> = new Set([
+  "REQUIRES_ACTION",
+  "PROCESSING",
+  "SUCCEEDED",
+  "REFUNDED",
+  "PARTIALLY_REFUNDED",
+]);
+
+/**
+ * Reconcile an order that Shopify says has changed.
+ *
+ * WHAT THE LINES KEEP. Every line already on the order is rebuilt at the
+ * wholesale unit price recorded on that line, not at the price the catalogue
+ * asks for today. A repricing, a corrected pricelist or a variant reinstated
+ * under a new SKU must not reach back into an order and change what was billed;
+ * the snapshot on the line is the receipt.
+ *
+ * WHAT THE TOTALS KEEP. If the seller has been charged, the money aggregates on
+ * the order are left exactly as they were charged, and everything else — status,
+ * addresses, line detail, the Shopify timestamps — still updates. A line that
+ * genuinely arrived afterwards, or a quantity the customer really changed, is a
+ * difference between what was billed and what is owed: it is computed, recorded
+ * in the audit as an unbilled difference, and left for a person to bill or
+ * credit deliberately. Rewriting the stored total would make the invoice and
+ * the charge disagree in the one place nobody thinks to look.
+ *
+ * The key is Shopify's line item id, which is the same key the reconciliation
+ * below matches on — so a line is frozen exactly as reliably as it is found,
+ * and no more.
+ */
 async function handleUpdated(
   eventId: string,
   shop: string,
   order: {
     id: string;
-    items: { id: string; shopifyLineItemId: string }[];
+    items: {
+      id: string;
+      shopifyLineItemId: string;
+      wholesalePrice: number;
+      quantity: number;
+    }[];
     financialStatus: string | null;
     fulfillmentStatus: "PENDING" | "PROCESSING" | "SHIPPED" | "DELIVERED" | "CANCELLED" | "PARTIAL";
+    wholesalePaymentStatus: string;
+    moonvellaSubtotal: number;
+    moonvellaTax: number;
+    moonvellaShipping: number;
+    moonvellaDiscounts: number;
+    moonvellaTotal: number;
   },
   payload: OrderPayload,
   byVariant: Map<string, VariantMapping>
 ): Promise<IntakeResult> {
-  const built = buildItems(payload.line_items ?? [], byVariant);
+  const frozenUnitPrices = new Map(order.items.map((i) => [i.shopifyLineItemId, i.wholesalePrice]));
+  const built = buildItems(payload.line_items ?? [], byVariant, frozenUnitPrices);
   const amounts = computeAmounts(payload, built);
+  const charged = CHARGED_PAYMENT_STATUSES.has(order.wholesalePaymentStatus);
+
+  const storedLines = new Map(order.items.map((i) => [i.shopifyLineItemId, i]));
+  const incoming = new Set(built.rows.map((row) => row.shopifyLineItemId));
+  const addedLines = built.rows.filter((row) => !storedLines.has(row.shopifyLineItemId));
+  const removedLines = order.items.filter((item) => !incoming.has(item.shopifyLineItemId));
+  const quantityChanges = built.rows.flatMap((row) => {
+    const stored = storedLines.get(row.shopifyLineItemId);
+    if (!stored || stored.quantity === row.quantity) return [];
+    return [{ id: row.shopifyLineItemId, sku: row.sku, from: stored.quantity, to: row.quantity }];
+  });
+
+  const storedTotals = {
+    moonvellaSubtotal: order.moonvellaSubtotal,
+    moonvellaTax: order.moonvellaTax,
+    moonvellaShipping: order.moonvellaShipping,
+    moonvellaDiscounts: order.moonvellaDiscounts,
+    moonvellaTotal: order.moonvellaTotal,
+  };
+  const rebuiltTotals = {
+    moonvellaSubtotal: amounts.moonvellaSubtotal,
+    moonvellaTax: amounts.moonvellaTax,
+    moonvellaShipping: amounts.moonvellaShipping,
+    moonvellaDiscounts: amounts.moonvellaDiscounts,
+    moonvellaTotal: amounts.moonvellaTotal,
+  };
+  const totalsMoved = (Object.keys(storedTotals) as (keyof typeof storedTotals)[]).some(
+    (key) => storedTotals[key] !== rebuiltTotals[key]
+  );
+  const linesMoved = addedLines.length > 0 || removedLines.length > 0 || quantityChanges.length > 0;
+  /**
+   * Whether this event MOVED money, as opposed to leaving a difference standing.
+   *
+   * An unbilled order's money moves when its totals do, whatever the cause: a
+   * changed line, or an adjustment Shopify made on its own. A charged order's
+   * money cannot move, because it is not applied — what can move is the ground
+   * the obligation stands on, which is the lines.
+   *
+   * Its computed total is therefore left out of this test on purpose. A charged
+   * order with a standing difference would otherwise re-record the same
+   * discrepancy on every routine webhook, and an audit that repeats itself is
+   * an audit nobody reads. The consequence is stated rather than hidden: on a
+   * charged order, an adjustment-only change is not given an entry of its own.
+   * Every entry carries the full computed total beside the charged one, so
+   * whichever entry is written last is a complete statement of the difference.
+   */
+  const moneyMoved = linesMoved || (!charged && totalsMoved);
+  /**
+   * What a fresh charge would come to, less what was charged. It is the whole
+   * wholesale difference — the added lines, the changed quantities, and the tax
+   * and shipping those lines carry — because that is the invoice a person would
+   * have to raise, not just the subtotal.
+   */
+  const unbilledDifference = rebuiltTotals.moonvellaTotal - storedTotals.moonvellaTotal;
+
   let refundsCreated = 0;
 
   /*
@@ -673,7 +801,6 @@ async function handleUpdated(
     addressMateriallyDiffers(beforeUpdate?.shippingAddress, payload.shipping_address);
 
   await prisma.$transaction(async (tx) => {
-    const incoming = new Set(built.rows.map((row) => row.shopifyLineItemId));
     for (const row of built.rows) {
       const existing = order.items.find((i) => i.shopifyLineItemId === row.shopifyLineItemId);
       if (existing) {
@@ -694,7 +821,13 @@ async function handleUpdated(
     await tx.order.update({
       where: { id: order.id },
       data: {
-        ...amounts,
+        /*
+         * A charged order's money is left alone. Everything else on it — the
+         * statuses, the addresses, the timestamps — is still brought up to
+         * date, so the order tracks Shopify exactly as it did before; only the
+         * figures the seller has already been billed for are held.
+         */
+        ...(charged ? {} : amounts),
         ...(payload.financial_status
           ? {
               financialStatus: payload.financial_status,
@@ -728,12 +861,80 @@ async function handleUpdated(
         moonvellaShipping: amounts.moonvellaShipping,
         moonvellaDiscounts: amounts.moonvellaDiscounts,
         moonvellaTotal: amounts.moonvellaTotal,
+        // Whether the figures above are what the order now carries, or what a
+        // recompute would say while the charged totals were left in place. The
+        // money entry below says the same thing in full; this is here so the
+        // two entries can never be read apart.
+        moneyApplied: charged ? "KEPT_CHARGED_TOTALS" : "RECOMPUTED",
         items: built.rows.length,
         refundsCreated,
       },
     },
     prisma as never
   );
+
+  /*
+   * The money trail. Written only when something money-relevant actually moved:
+   * a webhook that changed an address or a fulfilment status leaves nothing
+   * here, because an audit padded with no-ops is an audit nobody reads.
+   *
+   * Both sides are recorded — the figures the order carried, line by line, and
+   * the figures the rebuild produced, line by line and flagged by origin. On a
+   * charged order the two disagree by design, and `unbilledDifference` is that
+   * disagreement stated in money: what a person would bill or credit if they
+   * decided the added item was the customer's to pay for. Nothing here bills
+   * it. The point is that the decision is visible, and cannot be made by
+   * accident.
+   */
+  if (moneyMoved) {
+    await recordAudit(
+      {
+        actorType: "WEBHOOK",
+        actorId: shop,
+        actorName: shop,
+        action: "order.money_updated",
+        entityType: AUDIT_ENTITY.ORDER,
+        entityId: order.id,
+        beforeData: {
+          totals: storedTotals,
+          lines: order.items.map((item) => ({
+            id: item.shopifyLineItemId,
+            wholesale: item.wholesalePrice,
+            quantity: item.quantity,
+          })),
+        },
+        afterData: {
+          // What the order carries now. Equal to the recompute unless the
+          // seller had already been charged.
+          totals: charged ? storedTotals : rebuiltTotals,
+          computedTotals: rebuiltTotals,
+          chargedTotalsKept: charged,
+          ...(charged ? { unbilledDifference } : {}),
+          lines: built.rows.map((row) => ({
+            id: row.shopifyLineItemId,
+            wholesale: row.wholesalePrice,
+            quantity: row.quantity,
+            // SNAPSHOT: the line kept the price it was billed at. CATALOGUE:
+            // the line is new, so it took the price in force today.
+            priceSource: built.priceSource.get(row.shopifyLineItemId) ?? "CATALOGUE",
+          })),
+          addedLines: addedLines.map((row) => ({
+            id: row.shopifyLineItemId,
+            sku: row.sku,
+            quantity: row.quantity,
+            wholesale: row.wholesalePrice,
+          })),
+          removedLines: removedLines.map((item) => ({
+            id: item.shopifyLineItemId,
+            quantity: item.quantity,
+            wholesale: item.wholesalePrice,
+          })),
+          quantityChanges,
+        },
+      },
+      prisma as never
+    );
+  }
 
   /*
    * A quote prices the parcels AND the destination that existed when it was
