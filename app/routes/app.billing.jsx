@@ -12,23 +12,14 @@ import {
   removePaymentMethod,
   stripeConfigured,
 } from "../services/sellerBilling.server";
-import {
-  createLinkToken,
-  exchangePublicToken,
-  storeBankAccount,
-  listBankAccounts,
-  disconnectBankAccount,
-  plaidConfigured,
-  plaidEnv,
-} from "../services/plaid.server";
 
 export const loader = async ({ request }) => {
   const context = await requireSellerContext(request);
   if (!context.seller) {
-    return { access: context.access, settings: null, methods: [], invoices: [], attempts: [], bankAccounts: [], plaid: { configured: plaidConfigured(), env: plaidEnv() }, stripe: { configured: stripeConfigured(), mode: stripeConfigured() ? "real" : "simulated" } };
+    return { access: context.access, settings: null, methods: [], invoices: [], attempts: [], stripe: { configured: stripeConfigured(), mode: stripeConfigured() ? "real" : "simulated" } };
   }
 
-  const [settings, methods, invoices, attempts, bankAccounts] = await Promise.all([
+  const [settings, methods, invoices, attempts] = await Promise.all([
     getBillingSettings(context.seller.id),
     listPaymentMethods(context.seller.id),
     prisma.wholesalePayment.findMany({
@@ -53,7 +44,6 @@ export const loader = async ({ request }) => {
       take: 25,
       select: { id: true, status: true, failureMessage: true, requiresAction: true, amount: true, createdAt: true },
     }),
-    listBankAccounts(context.seller.id),
   ]);
 
   return {
@@ -97,8 +87,6 @@ export const loader = async ({ request }) => {
       amount: a.amount,
       createdAt: a.createdAt,
     })),
-    bankAccounts,
-    plaid: { configured: plaidConfigured(), env: plaidEnv() },
     stripe: { configured: stripeConfigured(), mode: stripeConfigured() ? "real" : "simulated" },
   };
 };
@@ -159,34 +147,6 @@ export const action = async ({ request }) => {
       });
       return { ok: true, message: "Payment method removed." };
     }
-    if (intent === "plaid_link_token") {
-      return await createLinkToken(context.seller.id);
-    }
-    if (intent === "plaid_exchange") {
-      const publicToken = String(form.get("public_token") || "simulated");
-      const result = await exchangePublicToken(publicToken);
-      const first = result.accounts?.[0];
-      await storeBankAccount(context.seller.id, {
-        accessToken: result.accessToken,
-        itemId: result.itemId,
-        institutionName: result.institutionName,
-        accountName: first?.name ?? null,
-        accountMask: first?.mask ?? null,
-        accountType: first?.type ?? null,
-        accountSubtype: first?.subtype ?? null,
-        simulated: result.simulated,
-      });
-      return {
-        ok: true,
-        message: result.simulated
-          ? "Simulated bank account connected (test only — no real bank access)."
-          : "Bank account connected.",
-      };
-    }
-    if (intent === "plaid_disconnect") {
-      await disconnectBankAccount(context.seller.id, String(form.get("bankAccountId")));
-      return { ok: true, message: "Bank account disconnected." };
-    }
     return { error: "Unknown action." };
   } catch (error) {
     return { error: error instanceof Error ? error.message : "Operation failed." };
@@ -202,43 +162,15 @@ const label = { display: "block", fontSize: "0.72rem", color: "#64748b", marginB
 const input = { padding: "0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.85rem", boxSizing: "border-box" };
 
 export default function BillingPage() {
-  const { access, settings, methods, invoices, attempts, bankAccounts, plaid, stripe } = useLoaderData();
+  const { access, settings, methods, invoices, attempts, stripe } = useLoaderData();
   const actionData = useActionData();
   const setupFetcher = useFetcher();
-  const linkFetcher = useFetcher();
   const [mode, setMode] = React.useState(settings?.mode ?? "MANUAL");
 
   React.useEffect(() => {
     const url = setupFetcher.data?.setupUrl;
     if (url && !setupFetcher.data.simulated) window.location.href = url;
   }, [setupFetcher.data]);
-
-  React.useEffect(() => {
-    const data = linkFetcher.data;
-    if (!data?.linkToken || data.simulated) return;
-    const open = () => {
-      const w = window;
-      const handler = w.Plaid.create({
-        token: data.linkToken,
-        onSuccess: (publicToken) => {
-          const f = new FormData();
-          f.set("intent", "plaid_exchange");
-          f.set("public_token", publicToken);
-          linkFetcher.submit(f, { method: "post" });
-        },
-      });
-      handler.open();
-    };
-    if (document.getElementById("plaid-link-script")) {
-      open();
-      return;
-    }
-    const script = document.createElement("script");
-    script.id = "plaid-link-script";
-    script.src = "https://cdn.plaid.com/link/v2/stable/link-initialize.js";
-    script.onload = open;
-    document.body.appendChild(script);
-  }, [linkFetcher.data]);
 
   if (!settings) {
     return (
@@ -322,43 +254,6 @@ export default function BillingPage() {
                 <button type="submit" className="mv-btn mv-btn-secondary" style={{ fontSize: "0.75rem" }}>Save simulated method (test only)</button>
               </Form>
             ) : null}
-          </div>
-        </div>
-
-        <div style={card}>
-          <h3 className="mv-section-title">Bank account</h3>
-          <p style={{ fontSize: "0.8rem", color: "#64748b", marginBottom: "0.5rem" }}>
-            Connect your own bank account through Plaid. Bank linking does not charge you and never marks an invoice
-            paid or releases a shipment.{plaid?.configured ? ` Plaid environment: ${plaid.env}.` : " Plaid is not configured — simulated mode."}
-          </p>
-          {bankAccounts.length === 0 ? (
-            <p className="mv-page-subtitle">No bank account connected.</p>
-          ) : (
-            bankAccounts.map((b) => (
-              <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.6rem 0.75rem", marginBottom: "0.4rem", fontSize: "0.82rem" }}>
-                <span>
-                  {b.institutionName || "Bank"} · {b.accountName || "account"} •••• {b.accountMask || "----"} · {b.status}
-                </span>
-                <Form method="post" style={{ display: "inline" }}>
-                  <input type="hidden" name="intent" value="plaid_disconnect" />
-                  <input type="hidden" name="bankAccountId" value={b.id} />
-                  <button type="submit" className="mv-btn mv-btn-secondary" style={{ fontSize: "0.7rem", padding: "0.25rem 0.5rem" }}>Disconnect</button>
-                </Form>
-              </div>
-            ))
-          )}
-          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-            <linkFetcher.Form method="post">
-              <input type="hidden" name="intent" value="plaid_link_token" />
-              <button type="submit" className="mv-btn mv-btn-primary" disabled={linkFetcher.state !== "idle"}>
-                {linkFetcher.state !== "idle" ? "Opening…" : "Connect bank account"}
-              </button>
-            </linkFetcher.Form>
-            <Form method="post">
-              <input type="hidden" name="intent" value="plaid_exchange" />
-              <input type="hidden" name="public_token" value="simulated" />
-              <button type="submit" className="mv-btn mv-btn-secondary" style={{ fontSize: "0.75rem" }}>Connect simulated bank (test)</button>
-            </Form>
           </div>
         </div>
 

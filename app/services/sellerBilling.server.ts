@@ -1,10 +1,37 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
+import { assertNotDisabled, assertProviderId, requireStripeProvider } from "./stripeMode.server";
 
 const STRIPE_API = "https://api.stripe.com/v1";
 
-export function stripeConfigured(): boolean {
-  return !!process.env.STRIPE_SECRET_KEY;
+/**
+ * Exactly one slash between the API base URL and the endpoint path, whatever the
+ * caller passes.
+ *
+ * This join used to be `${STRIPE_API}${path}`, which reads correctly and is
+ * wrong: the base carries no trailing slash and no caller supplies a leading
+ * one, so every request went out as `/v1customers`, `/v1checkout/sessions`,
+ * `/v1setup_intents/…`. Stripe answers those with `Unrecognized request URL`,
+ * which is easy to misread as a bad key or a missing object.
+ *
+ * `payments.server.ts` was unaffected only because it hardcodes the slash into
+ * each template literal — which is precisely why Stripe authentication passed
+ * while these paths were dead, and why the defect survived so long.
+ *
+ * Normalising here rather than at each call site means a future caller cannot
+ * reintroduce it. The assertion afterwards is deliberate belt-and-braces: the
+ * failure mode is silent and misdiagnosable, so a malformed URL should stop the
+ * request loudly rather than produce a confusing response.
+ */
+export function stripeUrl(path: string): string {
+  const base = STRIPE_API.replace(/\/+$/, "");
+  const suffix = String(path ?? "").replace(/^\/+/, "");
+  if (!suffix) throw new Error("Stripe request path is empty.");
+  const url = `${base}/${suffix}`;
+  if (!url.startsWith("https://api.stripe.com/v1/")) {
+    throw new Error(`Refusing to send a malformed Stripe URL: ${url}`);
+  }
+  return url;
 }
 
 export async function getBillingSettings(sellerId: string) {
@@ -144,39 +171,57 @@ export async function getDefaultPaymentMethod(sellerId: string) {
   });
 }
 
-async function stripeForm(path: string, params: URLSearchParams, idempotencyKey?: string) {
-  const res = await fetch(`${STRIPE_API}${path}`, {
-    method: "POST",
+/**
+ * The one place a request leaves this module for Stripe. Both helpers below go
+ * through it, so neither the mode gate nor the URL join can be bypassed by a
+ * future caller.
+ *
+ * The mode gate is checked HERE rather than at each call site on purpose: a call
+ * site is a place someone can forget, and forgetting it means a real HTTP request
+ * to a live account. `requireStripeProvider` returns the key only when the mode
+ * permits the call, so there is no path that reads the key and skips the check.
+ */
+async function stripeRequest(
+  method: "GET" | "POST",
+  path: string,
+  options: { params?: URLSearchParams; idempotencyKey?: string } = {}
+) {
+  const { params, idempotencyKey } = options;
+  const { key } = await requireStripeProvider(`${method} /v1/${String(path).replace(/^\/+/, "")}`);
+  const res = await fetch(stripeUrl(path), {
+    method,
     headers: {
-      Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
-      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Bearer ${key}`,
+      ...(params ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
       ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
     },
-    body: params,
+    ...(params ? { body: params } : {}),
   });
   const json = await res.json();
   if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
   return json;
+}
+
+async function stripeForm(path: string, params: URLSearchParams, idempotencyKey?: string) {
+  return stripeRequest("POST", path, { params, idempotencyKey });
 }
 
 /** Read-only Stripe retrieve. Setup intent retrieval is a GET, not a POST. */
 async function stripeGet(path: string) {
-  const res = await fetch(`${STRIPE_API}${path}`, {
-    headers: { Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}` },
-  });
-  const json = await res.json();
-  if (!res.ok) throw new Error(json?.error?.message || `Stripe error ${res.status}`);
-  return json;
+  return stripeRequest("GET", path);
 }
 
 /** Provider-hosted setup so raw card details never touch our servers. */
 export async function createSetupSession(sellerId: string, returnUrl: string) {
-  if (!stripeConfigured()) {
+  const mode = await assertNotDisabled("create a payment-method setup session");
+  if (mode === "simulated") {
     return {
       simulated: true,
+      mode,
       url: `${returnUrl}?simulated_setup=1`,
       detail:
-        "Simulated payment-method setup (no STRIPE_SECRET_KEY). In real mode this returns a Stripe Checkout setup URL.",
+        "Simulated payment-method setup: Stripe is in simulated mode (no secret key resolves), so no " +
+        "provider session exists. In test mode this returns a real Stripe Checkout setup URL.",
     };
   }
   const seller = await prisma.seller.findUnique({ where: { id: sellerId } });
@@ -250,7 +295,8 @@ export async function savePaymentMethodFromSetupIntent(
   setupIntentId: string,
   actor?: BillingActor
 ) {
-  if (!stripeConfigured()) {
+  const mode = await assertNotDisabled("save a payment method from a setup intent");
+  if (mode === "simulated") {
     return upsertPaymentMethod(
       {
         sellerId,
@@ -265,7 +311,10 @@ export async function savePaymentMethodFromSetupIntent(
       true
     );
   }
-  const intent = await stripeGet(`setup_intents/${setupIntentId}`);
+  // A simulated id here means a simulated setup leaked into a provider call.
+  // Stripe would answer 404 and it would read like a missing object.
+  const intentId = assertProviderId(setupIntentId, "setup intent", "save a payment method");
+  const intent = await stripeGet(`setup_intents/${intentId}`);
   const pmId = String(intent.payment_method ?? "");
   if (!pmId) throw new Error("Setup intent has no payment method yet.");
   const pm = await stripeGet(`payment_methods/${pmId}`);
@@ -297,8 +346,12 @@ export async function persistPaymentMethodFromSetupIntent(
   fallbackCustomerId?: string | null,
   actor?: BillingActor & { actorType?: "MERCHANT" | "WEBHOOK" }
 ) {
-  if (!stripeConfigured()) throw new Error("Stripe is not configured.");
-  const intent = await stripeGet(`setup_intents/${setupIntentId}`);
+  const intentId = assertProviderId(
+    setupIntentId,
+    "setup intent",
+    "persist a payment method from a webhook event"
+  );
+  const intent = await stripeGet(`setup_intents/${intentId}`);
   const metadata = (intent.metadata ?? {}) as Record<string, unknown>;
   const sellerId = String(metadata.sellerId ?? fallbackSellerId ?? "");
   if (!sellerId) throw new Error("Setup intent is missing sellerId metadata.");
@@ -399,7 +452,8 @@ export async function chargeWholesaleOrder(
     return { ok: false, status: "REQUIRES_PAYMENT", error: "No saved payment method. Add one in Billing settings." };
   }
 
-  if (!stripeConfigured()) {
+  const mode = await assertNotDisabled("charge a wholesale order");
+  if (mode === "simulated") {
     // Simulated charge: records an attempt and leaves confirmation to a verified event.
     await prisma.paymentAttempt.create({
       data: {
@@ -426,11 +480,24 @@ export async function chargeWholesaleOrder(
     return { ok: true, status: "PROCESSING", paymentIntentId: payment.providerPaymentIntentId ?? undefined };
   }
 
+  // Both ids must be Stripe's own. A `sim_pm_…` reaching this line would mean a
+  // simulated method was used to attempt a real charge against a live account.
+  const customerId = assertProviderId(
+    method.stripeCustomerId ?? "",
+    "customer",
+    "charge a wholesale order"
+  );
+  const paymentMethodId = assertProviderId(
+    method.stripePaymentMethodId ?? "",
+    "payment method",
+    "charge a wholesale order"
+  );
+
   const params = new URLSearchParams({
     amount: String(payment.amount),
     currency: (payment.currency || "CAD").toLowerCase(),
-    customer: method.stripeCustomerId ?? "",
-    payment_method: method.stripePaymentMethodId ?? "",
+    customer: customerId,
+    payment_method: paymentMethodId,
     off_session: "true",
     confirm: "true",
     "metadata[orderId]": orderId,

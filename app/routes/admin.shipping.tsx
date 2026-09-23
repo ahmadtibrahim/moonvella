@@ -3,7 +3,11 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
-import { syncTrackingForShipment, voidShipment, trackingLabel } from "~/services/shipping.server";
+import { syncTrackingForShipment, voidShipment } from "~/services/shipping.server";
+// trackingLabel is rendered by the component below, so it must come from the
+// isomorphic module — importing it from shipping.server would pull server-only
+// code into the client bundle, which React Router refuses at build time.
+import { trackingLabel } from "~/services/shippingLogic";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
 
 const STATUSES = ["PENDING", "SHIPPED", "DELIVERED", "EXCEPTION", "CANCELLED"] as const;
@@ -74,6 +78,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
         serviceName: true,
         status: true,
         trackingStatus: true,
+        // The row gates its cancel control on this, and the search above matches
+        // on it; without it in the select the row cannot render that control.
+        providerShipmentId: true,
         sellerShippingCharge: true,
         quotedCarrierCost: true,
         bookedCost: true,
@@ -112,8 +119,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     exceptions,
     sellers,
     awaitingPrep,
-    mode: eshipperMode(),
-    account: maskedEshipperAccount(),
+    mode: await eshipperMode(),
+    account: await maskedEshipperAccount(),
     filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from },
     page,
     pageCount: Math.max(1, Math.ceil(total / PAGE_SIZE)),

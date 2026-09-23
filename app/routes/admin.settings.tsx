@@ -14,9 +14,19 @@ import {
   listIntegrationStates,
   refreshIntegration,
   clearIntegrationError,
+  saveIntegrationCredentials,
+  disconnectIntegration,
+  CREDENTIAL_KEYS,
+  OPERATIONAL_KEYS,
   INTEGRATION_KEYS,
   type IntegrationKey,
+  // A type-only specifier: erased at build time, so this module is named in one
+  // import statement while its server code still never reaches the client.
+  type IntegrationStateView,
 } from "~/services/integrationHealth.server";
+// Isomorphic on purpose: field definitions only, no server imports, so the form
+// and the store validate against the same list instead of two that drift.
+import { CREDENTIAL_INTEGRATIONS, type CredentialKey } from "~/services/integrationFields";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   // Any signed-in user: everyone needs to be able to change their own password.
@@ -26,6 +36,14 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // so it is gated separately. Someone without the permission never receives the
   // data — the section is absent from the payload, not merely hidden.
   const canSeeIntegrations = userCan(user, "settings.general");
+
+  // Grouped here, on the server, so the page renders two sections without the
+  // client bundle ever reaching into this server-only module for the key lists.
+  // Credentials are configured with secrets; operational checks report whether
+  // the Shopify scopes the connected app depends on are granted.
+  const states = canSeeIntegrations ? await listIntegrationStates() : [];
+  const credentialKeys = CREDENTIAL_KEYS as string[];
+  const operationalKeys = OPERATIONAL_KEYS as string[];
 
   return {
     user: {
@@ -38,7 +56,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     },
     permissions: [...permissionsFor(user.role)].sort(),
     canSeeIntegrations,
-    integrations: canSeeIntegrations ? await listIntegrationStates() : [],
+    credentialIntegrations: states.filter((s) => credentialKeys.includes(s.key)),
+    operationalIntegrations: states.filter((s) => operationalKeys.includes(s.key)),
   };
 }
 
@@ -61,7 +80,13 @@ export async function action({ request }: ActionFunctionArgs) {
     const key = String(formData.get("key") || "");
     if (!isIntegrationKey(key)) return { error: "Unknown integration." };
 
-    const auditActor = { actorId: user.id, actorName: user.name, ipAddress: ip, userAgent };
+    const auditActor = {
+      actorType: "ADMIN_USER" as const,
+      actorId: user.id,
+      actorName: user.name,
+      ipAddress: ip,
+      userAgent,
+    };
 
     if (intent === "refresh_integration") {
       const state = await refreshIntegration(key, auditActor);
@@ -74,18 +99,29 @@ export async function action({ request }: ActionFunctionArgs) {
     }
 
     if (intent === "save_credentials") {
-      const key = String(formData.get("key") || "");
-      const secrets = Object.fromEntries(
-        formData.entries().filter(([k]) => k.startsWith("secret_"))
+      // The values are forwarded to the store, which encrypts them before they
+      // reach the database. Only field NAMES are ever audited: a credential
+      // value must not appear in the audit log, in a response, or in an error.
+      const submitted = Object.fromEntries(
+        [...formData.entries()]
+          .filter(([field]) => String(field).startsWith("secret_"))
+          .map(([field, value]) => [String(field).slice("secret_".length), String(value)])
       );
-      // Remove the secret keys from form data before persisting
-      await saveIntegrationCredentials(key, secrets, auditActor);
-      return { success: `${key} credentials saved and re-checked: ${auditActor.actorId}.` };
+      try {
+        const state = await saveIntegrationCredentials(key, submitted, auditActor);
+        return { success: `${key} credentials saved and re-checked: ${state.status}.` };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "Could not save credentials." };
+      }
     }
 
     if (intent === "disconnect_integration") {
-      await disconnectIntegration(key, auditActor);
-      return { success: `${key} disconnected.` };
+      try {
+        await disconnectIntegration(key, auditActor);
+        return { success: `${key} disconnected. Provider operations are disabled.` };
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : "Could not disconnect." };
+      }
     }
   }
 
@@ -156,7 +192,7 @@ function statusColor(status: string): string {
 }
 
 export default function AdminSettings() {
-  const { user, permissions, integrations, canSeeIntegrations } =
+  const { user, permissions, credentialIntegrations, operationalIntegrations, canSeeIntegrations } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -227,25 +263,47 @@ export default function AdminSettings() {
       ) : null}
 
       {canSeeIntegrations ? (
-        <div style={card}>
-          <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1rem" }}>
-            Integration settings
-          </h2>
-          {integrations.map((i) => (
-            <div key={i.key} style={{ marginBottom: "1.5rem" }}>
-              <h3 style={{ fontSize: "0.9rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
-                {i.key}
-              </h3>
-              <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
-                {i.status}
-              </p>
-              <DetailCard key={i.key} integration={i} />
-            </div>
-          ))}
-        </div>
+        <>
+          <div style={card}>
+            <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
+              Integration credentials
+            </h2>
+            <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "1rem" }}>
+              These integrations hold secrets MoonVella uses to reach a provider.
+              Saved values are encrypted before they are written and are never sent
+              back to this page — a secret field shows only whether a value is set.
+              Saving also runs an authenticated check against the provider, so
+              &ldquo;Connected&rdquo; means the credentials were accepted, not merely
+              that something was typed. Disconnect deletes the stored credentials and
+              suppresses the deployment environment for that integration, which stops
+              live provider calls until credentials are saved again.
+            </p>
+            {credentialIntegrations.map((i) => (
+              <DetailCard key={i.key} integration={i} isSubmitting={isSubmitting} />
+            ))}
+          </div>
+
+          <div style={card}>
+            <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
+              System health
+            </h2>
+            <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "1rem" }}>
+              Operational checks, not credentials. Each reports whether the Shopify
+              scope the connected app depends on has actually been granted. Order
+              intake, fulfillment sync, analytics and product import keep recording
+              here whether or not anyone opens this page.
+            </p>
+            {operationalIntegrations.map((i) => (
+              <DetailCard key={i.key} integration={i} isSubmitting={isSubmitting} />
+            ))}
+          </div>
+        </>
       ) : null}
 
-      <DetailForm />
+      <div style={card}>
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1.5rem" }}>
+          Your Account
+        </h2>
 
         <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "1.5rem" }}>
           <div
@@ -356,21 +414,25 @@ export default function AdminSettings() {
   );
 }
 
-function statusColor(status: string): string {
-  if (status === "HEALTHY") return "#059669";
-  if (status === "FAILED") return "#dc2626";
-  if (status === "DELAYED") return "#b45309";
-  return "#64748b";
-}
-
 interface DetailCardProps {
-  key: IntegrationKey;
   integration: IntegrationStateView;
+  isSubmitting: boolean;
 }
 
-function DetailCard({ key, integration }: DetailCardProps) {
-  const credentialHints = DEFAULTS[key as keyof typeof DEFAULTS]?.credentialHints ?? "";
-  const [showCredentials, setShowCredentials] = React.useState(false);
+/** Display names. A raw key like "shopify_fulfillment" is not a label. */
+const INTEGRATION_LABEL: Record<string, string> = {
+  stripe: "Stripe",
+  eshipper: "eShipper",
+  odoo: "Odoo",
+  shopify_orders: "Shopify orders",
+  shopify_fulfillment: "Shopify fulfillment",
+  shopify_analytics: "Shopify analytics",
+  product_import: "Product import",
+};
+
+function DetailCard({ integration, isSubmitting }: DetailCardProps) {
+  // Taken from the row rather than a props name of "key", which React reserves.
+  const key = integration.key;
 
   return (
     <div style={{
@@ -381,25 +443,38 @@ function DetailCard({ key, integration }: DetailCardProps) {
       background: "white",
     }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-        <span style={{ fontWeight: 600, color: "#1e293b" }}>{key}</span>
-        <span style={{ fontSize: "0.7rem", color: statusColor(integration.status) }}>{integration.status}</span>
+        <span style={{ fontWeight: 600, color: "#1e293b" }}>{INTEGRATION_LABEL[key] ?? key}</span>
+        <span style={{ fontSize: "0.7rem", color: statusColor(integration.status) }}>
+          {/* A credential integration claims "Connected" only on HEALTHY, and
+              HEALTHY now only comes from an authenticated provider call. The
+              wording states the evidence rather than asserting a connection. */}
+          {integration.status === "HEALTHY" && isCredentialIntegrationKey(key)
+            ? "CONNECTED — VERIFIED"
+            : integration.status}
+        </span>
       </div>
       <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
         {integration.detail}
       </p>
 
-      {/* Credential fields */}
-      {key === "stripe" && (
-        <StripeCredentialForm showCredentials={showCredentials} setShowCredentials={setShowCredentials} />
-      )}
-      {key === "eshipper" && (
-        <EshipperCredentialForm showCredentials={showCredentials} setShowCredentials={setShowCredentials} />
-      )}
-      {key === "odoo" && (
-        <OdooCredentialForm showCredentials={showCredentials} setShowCredentials={setShowCredentials} />
-      )}
+      {/* A disconnected integration is a different state from one that was never
+          configured, and the difference matters: this one was switched off. */}
+      {integration.disconnectedAt ? (
+        <p style={{ fontSize: "0.75rem", color: "#b45309", marginBottom: "0.5rem" }}>
+          Disconnected {new Date(integration.disconnectedAt).toLocaleString()} — provider operations are
+          disabled, and the deployment environment is suppressed for this integration until credentials
+          are saved again.
+        </p>
+      ) : null}
 
-      {/* Action buttons */}
+      {/* Credential forms belong to the integrations that hold secrets. An
+          operational check has nothing to configure, so it never renders one. */}
+      {isCredentialIntegrationKey(key) ? (
+        <CredentialsForm integrationKey={key} integration={integration} isSubmitting={isSubmitting} />
+      ) : null}
+
+      {/* Action buttons. Saving and disconnecting live inside each credential
+          form, where the fields they submit actually are. */}
       <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
         <Form method="post">
           <input type="hidden" name="intent" value="refresh_integration" />
@@ -417,420 +492,141 @@ function DetailCard({ key, integration }: DetailCardProps) {
             </button>
           </Form>
         ) : null}
-        {integration.status !== "NOT_CONFIGURED" && (
-          <Form method="post">
-            <input type="hidden" name="intent" value="save_credentials" />
-            <input type="hidden" name="key" value={key} />
+      </div>
+
+      {/* Credential hints. Multi-line by design, hence pre-line. */}
+      {integration.credentialHints ? (
+        <p style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "0.3rem", whiteSpace: "pre-line" }}>
+          {integration.credentialHints}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+ * Credential forms — one per integration that holds secrets.
+ *
+ * Each is an ordinary <Form method="post">, so the action receives the fields,
+ * records that credentials were supplied and re-checks the integration. Nothing
+ * secret is ever rendered back: the only honest thing this page can say about a
+ * secret is whether the server-side check found it configured, and that is the
+ * status line on the card, not a value echoed into an input.
+ * --------------------------------------------------------------- */
+
+/**
+ * One credential form, rendered from the shared field spec.
+ *
+ * What each field shows is decided by the server, not here: a secret arrives
+ * with `value: null` and only `isSet`, so this component has no secret to leak
+ * even if it tried. Non-secret fields (a base URL, an account name) are
+ * prefilled from the saved value so an operator can see what they are changing.
+ */
+function CredentialsForm({
+  integrationKey,
+  integration,
+  isSubmitting,
+}: {
+  integrationKey: CredentialKey;
+  integration: IntegrationStateView;
+  isSubmitting: boolean;
+}) {
+  const spec = CREDENTIAL_INTEGRATIONS[integrationKey];
+  const stateByName = new Map(integration.credentialFields.map((field) => [field.name, field]));
+
+  return (
+    <div style={{ marginTop: "1rem" }}>
+      <details>
+        <summary style={{ cursor: "pointer", fontWeight: 600, color: "#082a4a" }}>
+          {spec.label} credentials
+        </summary>
+        <p style={{ fontSize: "0.7rem", color: "#64748b" }}>{spec.note}</p>
+
+        <Form method="post">
+          <input type="hidden" name="intent" value="save_credentials" />
+          <input type="hidden" name="key" value={integrationKey} />
+          {spec.fields.map((field) => {
+            const state = stateByName.get(field.name);
+            const statusText = state?.problem
+              ? state.problem
+              : state?.isSet
+                ? `Saved${state.fromEnvironment ? " (from the deployment environment)" : ""}${
+                    state.updatedAt ? ` ${new Date(state.updatedAt).toLocaleString()}` : ""
+                  }`
+                : "Not set";
+            const statusTone = state?.problem ? "#dc2626" : state?.isSet ? "#059669" : "#94a3b8";
+
+            return (
+              <div key={field.name}>
+                <label
+                  htmlFor={`${integrationKey}-${field.name}`}
+                  style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}
+                >
+                  {field.label}
+                  <span style={{ marginLeft: "0.4rem", fontWeight: 400, color: statusTone }}>
+                    {statusText}
+                  </span>
+                </label>
+                {field.options ? (
+                  <select
+                    style={input}
+                    id={`${integrationKey}-${field.name}`}
+                    name={`secret_${field.name}`}
+                    defaultValue={state?.value ?? field.options[0]?.value}
+                  >
+                    {field.options.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    style={input}
+                    id={`${integrationKey}-${field.name}`}
+                    name={`secret_${field.name}`}
+                    type={field.type ?? "text"}
+                    placeholder={state?.isSet ? "•••••• (leave blank to keep)" : field.placeholder}
+                    // A secret is never written into the DOM. A non-secret field
+                    // is prefilled so it can be edited without retyping.
+                    defaultValue={field.secret ? undefined : (state?.value ?? undefined)}
+                    autoComplete="off"
+                  />
+                )}
+              </div>
+            );
+          })}
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
             <button type="submit" style={smallButton} disabled={isSubmitting}>
               Save credentials
             </button>
+          </div>
+        </Form>
+
+        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
+          <Form method="post">
+            <input type="hidden" name="intent" value="refresh_integration" />
+            <input type="hidden" name="key" value={integrationKey} />
+            <button type="submit" style={smallButton} disabled={isSubmitting}>
+              Test connection
+            </button>
           </Form>
-        )}
-        {integration.status !== "NOT_CONFIGURED" && (
           <Form method="post">
             <input type="hidden" name="intent" value="disconnect_integration" />
-            <input type="hidden" name="key" value={key} />
+            <input type="hidden" name="key" value={integrationKey} />
             <button type="submit" style={smallButton} disabled={isSubmitting}>
               Disconnect
             </button>
           </Form>
-        )}
-      </div>
-
-      {/* Credential hints */}
-      {credentialHints && (
-        <p style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "0.3rem" }}>
-          {credentialHints}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function DetailForm() {
-  return null;
-}
-
-/* ---------------------------------------------------------------
- * Credential form components – each integrates with the matching
- * backend service (payments.server.ts, eshipper.server.ts, odoo.server.ts).
- * – Secrets are never returned to the browser; only masked indicators.
- * – but server-side, the .env values are wired to the providers.
- * --------------------------------------------------------------- */
-
-type CredentialFormProps = {
-  integration: IntegrationStateView;
-  onSave: (values: Record<string, string>) => Promise<void>;
-  onDisconnect: () => Promise<void>;
-};
-
-function StripeCredentialForm({
-  integration,
-  onSave,
-  onDisconnect,
-}: CredentialFormProps) {
-  const [secret, setSecret] = React.useState("");
-  const [publishable, setPublishable] = React.useState("");
-  const [webhook, setWebhook] = React.useState("");
-  const [show, setShow] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-
-  const handleSave = async () => {
-    setError(null);
-    setSaving(true);
-    try {
-      await onSave({
-        STRIPE_SECRET_KEY: secret,
-        STRIPE_PUBLISHABLE_KEY: publishable,
-        STRIPE_WEBHOOK_SECRET: webhook,
-      });
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || "Failed to save Stripe credentials");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    setError(null);
-    try {
-      await onDisconnect();
-    } catch (e: any) {
-      setError(e.message || "Failed to disconnect Stripe");
-    }
-  };
-
-  return (
-    <div style={{ marginTop: "1rem" }}>
-      <details>
-        <summary style={{ cursor: "pointer", fontWeight: 600, color: "#082a4a" }}>
-          Stripe credentials
-        </summary>
-        <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-          {" "}
-          {"Secrets are stored server-side only. Never returned to the browser."}
-        </p>
-        {show ? (
-          <>
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginBottom: "0.2rem" }}>
-              Secret key (test mode)
-            </label>
-            <input
-              style={input}
-              type="password"
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-              placeholder="sk_test_..."
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Publishable key
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={publishable}
-              onChange={(e) => setPublishable(e.target.value)}
-              placeholder="pk_test_..."
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Webhook signing secret
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={webhook}
-              onChange={(e) => setWebhook(e.target.value)}
-              placeholder="whsec_..."
-              autoComplete="off"
-            />
-          </>
-        ) : (
-          <>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              STRIPE_SECRET_KEY: masked indicator {"<strong>"}{secret.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              STRIPE_PUBLISHABLE_KEY: {"<strong>"}{publishable.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              STRIPE_WEBHOOK_SECRET: {"<strong>"}{webhook.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-          </>
-        )}
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-          <Form method="post">
-            <input type="hidden" name="intent" value="refresh_integration" />
-            <input type="hidden" name="key" value="stripe" />
-            <button type="submit" disabled={saving}>
-              Test connection
-            </button>
-          </Form>
-          <button onClick={handleDisconnect} disabled={saving} style={smallButton}>
-            Disconnect
-          </button>
         </div>
-        {error && <p style={{ color: "#dc2626", fontSize: "0.7rem", marginTop: "0.3rem" }}>{error}</p>}
       </details>
     </div>
   );
 }
 
-function EshipperCredentialForm({
-  integration,
-  onSave,
-  onDisconnect,
-}: CredentialFormProps) {
-  const [baseUrl, setBaseUrl] = React.useState("");
-  const [username, setUsername] = React.useState("");
-  const [password, setPassword] = React.useState("");
-  const [show, setShow] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
+/** The three credential keys, in the order the page presents them. */
+const CREDENTIAL_KEY_ORDER: CredentialKey[] = ["stripe", "eshipper", "odoo"];
 
-  const handleSave = async () => {
-    setError(null);
-    setSaving(true);
-    try {
-      await onSave({
-        ESHIPPER_BASE_URL: baseUrl,
-        ESHIPPER_USERNAME: username,
-        ESHIPPER_PASSWORD: password,
-      });
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || "Failed to save eShipper credentials");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    setError(null);
-    try {
-      await onDisconnect();
-    } catch (e: any) {
-      setError(e.message || "Failed to disconnect eShipper");
-    }
-  };
-
-  return (
-    <div style={{ marginTop: "1rem" }}>
-      <details>
-        <summary style={{ cursor: "pointer", fontWeight: 600, color: "#082a4a" }}>
-          eShipper credentials
-        </summary>
-        <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-          {" "}
-          {"Secrets are stored server-side only. Never returned to the browser."}
-        </p>
-        {show ? (
-          <>
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginBottom: "0.2rem" }}>
-              Base URL
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://ww2.eshipper.com"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Username
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="API user"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Password
-            </label>
-            <input
-              style={input}
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="API secret"
-              autoComplete="off"
-            />
-          </>
-        ) : (
-          <>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ESHIPPER_BASE_URL: {"<strong>"}{baseUrl.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ESHIPPER_USERNAME: {"<strong>"}{username.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ESHIPPER_PASSWORD: {"<strong>"}{password.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-          </>
-        )}
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-          <Form method="post">
-            <input type="hidden" name="intent" value="refresh_integration" />
-            <input type="hidden" name="key" value="eshipper" />
-            <button type="submit" disabled={saving}>
-              Test connection
-            </button>
-          </Form>
-          <button onClick={handleDisconnect} disabled={saving} style={smallButton}>
-            Disconnect
-          </button>
-        </div>
-        {error && <p style={{ color: "#dc2626", fontSize: "0.7rem", marginTop: "0.3rem" }}>{error}</p>}
-      </details>
-    </div>
-  );
-}
-
-function OdooCredentialForm({
-  integration,
-  onSave,
-  onDisconnect,
-}: CredentialFormProps) {
-  const [url, setUrl] = React.useState("");
-  const [database, setDatabase] = React.useState("");
-  const [username, setUsername] = React.useState("");
-  const [apiKey, setApiKey] = React.useState("");
-  const [mode, setMode] = React.useState("readonly");
-  const [saving, setSaving] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-
-  const handleSave = async () => {
-    setError(null);
-    setSaving(true);
-    try {
-      await onSave({
-        ODOO_URL: url,
-        ODOO_DATABASE: database,
-        ODOO_USERNAME: username,
-        ODOO_API_KEY: apiKey,
-        ODOO_MODE: mode,
-      });
-      setError(null);
-    } catch (e: any) {
-      setError(e.message || "Failed to save Odoo credentials");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleDisconnect = async () => {
-    setError(null);
-    try {
-      await onDisconnect();
-    } catch (e: any) {
-      setError(e.message || "Failed to disconnect Odoo");
-    }
-  };
-
-  return (
-    <div style={{ marginTop: "1rem" }}>
-      <details>
-        <summary style={{ cursor: "pointer", fontWeight: 600, color: "#082a4a" }}>
-          Odoo credentials
-        </summary>
-        <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-          {" "}
-          {"Secrets are stored server-side only. Never returned to the browser."}
-        </p>
-        {show ? (
-          <>
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginBottom: "0.2rem" }}>
-              Odoo URL
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="https://erp.premafirm.com"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Database
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={database}
-              onChange={(e) => setDatabase(e.target.value)}
-              placeholder="database name"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Username
-            </label>
-            <input
-              style={input}
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder="service account"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              API key
-            </label>
-            <input
-              style={input}
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="API key"
-              autoComplete="off"
-            />
-            <label style={{ display: "block", fontSize: "0.7rem", color: "#334155", marginTop: "0.5rem" }}>
-              Mode
-            </label>
-            <select
-              style={input}
-              value={mode}
-              onChange={(e) => setMode(e.target.value)}
-            >
-              <option value="readonly">readonly (read-only)</option>
-              <option value="live">live</option>
-              <option value="disabled">disabled</option>
-            </select>
-          </>
-        ) : (
-          <>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ODOO_URL: {"<strong>"}{url.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ODOO_DATABASE: {"<strong>"}{database.length > 0 ? "set" : "not set"}{"</strong>"}
-            </p>
-            <p style={{ fontSize: "0.7rem", color: "#64748b" }}>
-              ODOO_MODE: {"<strong>"}{mode}{"</strong>"}
-            </p>
-          </>
-        )}
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-          <Form method="post">
-            <input type="hidden" name="intent" value="refresh_integration" />
-            <input type="hidden" name="key" value="odoo" />
-            <button type="submit" disabled={saving}>
-              Test connection
-            </button>
-          </Form>
-          <button onClick={handleDisconnect} disabled={saving} style={smallButton}>
-            Disconnect
-          </button>
-        </div>
-        {error && <p style={{ color: "#dc2626", fontSize: "0.7rem", marginTop: "0.3rem" }}>{error}</p>}
-      </details>
-    </div>
-  );
+function isCredentialIntegrationKey(key: string): key is CredentialKey {
+  return (CREDENTIAL_KEY_ORDER as string[]).includes(key);
 }

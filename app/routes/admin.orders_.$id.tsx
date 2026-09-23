@@ -60,9 +60,9 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const shopifyFulfillment = await getIntegrationState("shopify_fulfillment");
   return {
     order,
-    mode: stripeMode(),
+    mode: await stripeMode(),
     shopifyFulfillment,
-    eshipper: { mode: eshipperMode(), account: maskedEshipperAccount() },
+    eshipper: { mode: await eshipperMode(), account: await maskedEshipperAccount() },
     billing: {
       mode: billing.mode,
       autoPayEnabled: billing.autoPayEnabled,
@@ -168,6 +168,19 @@ const input: React.CSSProperties = { padding: "0.5rem", border: "1px solid #cbd5
 const btn = (color: string): React.CSSProperties => ({ padding: "0.45rem 0.85rem", border: `1px solid ${color}`, borderRadius: 6, background: "white", color, fontSize: "0.72rem", fontWeight: 600, cursor: "pointer" });
 const th: React.CSSProperties = { padding: "0.4rem", fontSize: "0.68rem", color: "#64748b", textAlign: "left" };
 
+/**
+ * The provider mode is one of disabled | simulated | test | live. It used to be
+ * a boolean-ish "real | simulated" that rendered as "Stripe test" whatever the
+ * key was, which would have said "test" over a live key. Naming all four states
+ * is the point of the mode.
+ */
+const STRIPE_MODE_LABEL: Record<string, string> = {
+  test: "Stripe test (sandbox)",
+  live: "Stripe LIVE",
+  simulated: "simulated (no provider calls)",
+  disabled: "disabled (Disconnect)",
+};
+
 function money(cents: number, currency = "CAD") {
   return `${(cents / 100).toFixed(2)} ${currency}`;
 }
@@ -267,7 +280,7 @@ export default function AdminOrderDetail() {
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Wholesale payment</h2>
         <p style={{ fontSize: "0.82rem", color: "#64748b", marginBottom: "0.5rem" }}>
-          Provider mode: {mode === "real" ? "Stripe test" : "simulated (no key)"} · Billing mode: {billing.mode}
+          Provider mode: {STRIPE_MODE_LABEL[mode] ?? mode} · Billing mode: {billing.mode}
           {billing.autoPayEnabled ? " (auto-enabled)" : ""}
         </p>
         {order.wholesalePayment?.attempts?.length ? (

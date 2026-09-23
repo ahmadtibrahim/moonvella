@@ -3,24 +3,92 @@ import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import { persistPaymentMethodFromSetupIntent } from "./sellerBilling.server";
+import { redactSecrets, stripeSecretKey } from "./credentials.server";
+import { assertNotDisabled, stripeMode } from "./stripeMode.server";
 
 /**
  * Wholesale payment integration.
  *
- * Real mode uses the Stripe API (test mode) when STRIPE_SECRET_KEY is set.
- * Simulated mode (no key) records clearly-labelled local intents/events so the
- * internal logic can be tested without credentials. Simulated events never
- * represent a real charge.
+ * Real mode uses the Stripe API when a secret key resolves from the encrypted
+ * credential store (Settings) or, failing that, the environment. Simulated mode
+ * (no key) records clearly-labelled local intents/events so the internal logic
+ * can be tested without credentials. Simulated events never represent a real
+ * charge.
  */
 
 const STRIPE_API = "https://api.stripe.com/v1";
 
-export function isStripeConfigured(): boolean {
-  return !!process.env.STRIPE_SECRET_KEY;
+/**
+ * Configured means a secret key resolves from the encrypted store or the
+ * environment — nothing more. It is deliberately NOT a claim that the key works:
+ * that requires an authenticated call, which is what testStripeAuthentication
+ * below performs and what the Settings page reports as Connected.
+ *
+ * It is also NOT a mode. Whether provider calls are allowed, and whether they
+ * would move real money, is answered by `stripeMode()` — see stripeMode.server.ts.
+ * Presence alone used to be treated as "real mode", which put a live key on the
+ * same path as a sandbox key.
+ */
+export async function isStripeConfigured(): Promise<boolean> {
+  return (await stripeSecretKey()) !== null;
 }
 
-export function stripeMode(): "real" | "simulated" {
-  return isStripeConfigured() ? "real" : "simulated";
+/**
+ * The explicit mode: disabled | simulated | test | live. Re-exported so existing
+ * callers keep one import, but the resolution lives in stripeMode.server.ts where
+ * the live-mode gate is.
+ */
+export { stripeMode, type StripeMode } from "./stripeMode.server";
+
+export interface StripeAuthTest {
+  ok: boolean;
+  /** Stripe's own answer about the key: false means a test-mode key. */
+  livemode: boolean | null;
+  reason: string | null;
+}
+
+/**
+ * Authenticated, read-only probe: GET /v1/balance with the stored secret.
+ *
+ * This reads a balance. It creates no charge, no customer and no intent, so it
+ * is safe to run against any account, and it is the only thing allowed to
+ * justify showing "Connected" for Stripe.
+ */
+export async function testStripeAuthentication(): Promise<StripeAuthTest> {
+  const key = await stripeSecretKey();
+  if (!key) {
+    return { ok: false, livemode: null, reason: "No Stripe secret key is configured." };
+  }
+
+  try {
+    const res = await fetch(`${STRIPE_API}/balance`, {
+      headers: { Authorization: `Bearer ${key}` },
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      livemode?: boolean;
+      error?: { message?: string; type?: string };
+    };
+    if (!res.ok) {
+      return {
+        ok: false,
+        livemode: null,
+        // Stripe's message names the problem ("Invalid API Key provided…") and
+        // does not echo the key; redaction guards against that changing.
+        reason: redactSecrets(json?.error?.message || `Stripe rejected the key (HTTP ${res.status}).`),
+      };
+    }
+    return {
+      ok: true,
+      livemode: typeof json.livemode === "boolean" ? json.livemode : null,
+      reason: null,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      livemode: null,
+      reason: error instanceof Error ? error.message : "Could not reach Stripe.",
+    };
+  }
 }
 
 function mapStripeStatus(status: string): string {
@@ -53,6 +121,9 @@ async function createStripeIntent(
   orderId: string,
   idempotencyKey: string
 ): Promise<StripeIntent> {
+  const key = await stripeSecretKey();
+  if (!key) throw new Error("Stripe is not configured; no secret key resolves.");
+
   const params = new URLSearchParams({
     amount: String(amount),
     currency: currency.toLowerCase(),
@@ -62,7 +133,7 @@ async function createStripeIntent(
   const res = await fetch(`${STRIPE_API}/payment_intents`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
+      Authorization: `Bearer ${key}`,
       "Content-Type": "application/x-www-form-urlencoded",
       "Idempotency-Key": idempotencyKey,
     },
@@ -93,7 +164,8 @@ export async function createOrReuseWholesalePayment(orderId: string) {
 
   const idempotencyKey = `wholesale:${order.supplierReference ?? order.id}`;
 
-  if (!isStripeConfigured()) {
+  const mode = await assertNotDisabled("create a wholesale payment");
+  if (mode === "simulated") {
     const payment = await prisma.wholesalePayment.upsert({
       where: { orderId },
       create: {
@@ -122,7 +194,7 @@ export async function createOrReuseWholesalePayment(orderId: string) {
     await setIntegrationState("stripe", {
       status: "NOT_CONFIGURED",
       detail:
-        "Simulated mode: STRIPE_SECRET_KEY not set. Payment records are local simulations only and are not real charges.",
+        "Simulated mode: Stripe is in simulated mode, so no provider intent was created. Payment records are local simulations only, are not real charges, and are not bookable as shipments.",
     });
     return payment;
   }
@@ -156,7 +228,7 @@ export async function createOrReuseWholesalePayment(orderId: string) {
 
   await setIntegrationState("stripe", {
     status: "HEALTHY",
-    detail: `Stripe test mode connected. Payment intent ${intent.id}.`,
+    detail: `Stripe ${mode} mode accepted an authenticated request. Payment intent ${intent.id}.`,
   });
 
   return payment;
@@ -222,7 +294,8 @@ async function applySetupEvent(event: StripeEvent, object: Record<string, unknow
     return { matched: false, reason: "no_seller" };
   }
 
-  if (!isStripeConfigured()) {
+  const mode = await stripeMode();
+  if (mode === "simulated" || mode === "disabled") {
     await prisma.paymentEvent.create({
       data: {
         provider: "stripe",
@@ -230,11 +303,14 @@ async function applySetupEvent(event: StripeEvent, object: Record<string, unknow
         type: event.type,
         payload: JSON.stringify(event),
         status: "NOT_CONFIGURED",
-        errorMessage: "STRIPE_SECRET_KEY not set; cannot persist a real payment method from this event.",
+        errorMessage:
+          mode === "simulated"
+            ? "Stripe is in simulated mode; this event cannot describe a provider payment method, so nothing was saved."
+            : "Stripe is disconnected; this setup event is refused rather than simulated.",
         processedAt: new Date(),
       },
     });
-    return { matched: false, reason: "stripe_not_configured" };
+    return { matched: false, reason: mode === "simulated" ? "stripe_simulated" : "stripe_disabled" };
   }
 
   try {

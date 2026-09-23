@@ -6,6 +6,7 @@ import {
   verifyStripeSignature,
 } from "../app/services/payments.server";
 import { addManualShipment, advanceShipment } from "../app/services/fulfillment.server";
+import { forbidProviderCalls } from "./provider-guard";
 
 const prisma = new PrismaClient();
 const SHOP = "pay-test.myshopify.com";
@@ -34,6 +35,9 @@ async function cleanup() {
 }
 
 async function main() {
+  // Pinned to simulated mode by run-verify.mjs, and enforced here: this suite
+  // must not reach a provider. See scripts/provider-guard.ts.
+  forbidProviderCalls("verify-payments");
   await cleanup();
   const seller = await prisma.seller.create({
     data: {

@@ -85,7 +85,7 @@ function buildRateRequest(
  * and never a per-item rate we invented: when the order carries no confirmed
  * shipping charge, the allocation is null rather than a guess.
  */
-export {
+import {
   allocateSellerShippingCharge,
   trackingLabel,
   pickCheapestQuote,
@@ -93,6 +93,18 @@ export {
   normalizeTrackingState,
   coarseStatusFor,
 } from "./shippingLogic";
+
+// Re-exported so routes and suites that already import them from here keep
+// working. The import above is what puts them in this module's own scope; a bare
+// `export ... from` would not, and this file calls them below.
+export {
+  allocateSellerShippingCharge,
+  trackingLabel,
+  pickCheapestQuote,
+  pickFastestQuote,
+  normalizeTrackingState,
+  coarseStatusFor,
+};
 
 const TRACKING_STATE: Record<string, string> = {
   label_created: "LABEL_CREATED",
@@ -222,7 +234,7 @@ export async function getQuotesForOrder(orderId: string, actor: Actor) {
     action: "shipping.quotes_requested",
     entityType: AUDIT_ENTITY.ORDER,
     entityId: orderId,
-    afterData: { count: rates.length, mode: eshipperMode() },
+    afterData: { count: rates.length, mode: await eshipperMode() },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
@@ -305,8 +317,6 @@ export async function bookShipmentForOrder(
     })
     .filter((i) => i.quantity > 0);
 
-  if (toShip.length === 0) throw new Error("All items on this order have already been shipped.");
-
   const orderQuantity = order.items.reduce((s, i) => s + i.quantity, 0);
   const shipQuantity = toShip.reduce((s, i) => s + i.quantity, 0);
 
@@ -324,6 +334,12 @@ export async function bookShipmentForOrder(
   if (prior) {
     return { shipment: prior, sync: { pushed: false, reason: "duplicate_request" } };
   }
+
+  // Checked AFTER the idempotency lookup, deliberately. A repeat of the same
+  // request finds every item already shipped, so testing this first would turn
+  // the duplicate into an error instead of returning the shipment that request
+  // already created — the opposite of what the key above is for.
+  if (toShip.length === 0) throw new Error("All items on this order have already been shipped.");
 
   let shipment;
   try {
@@ -411,7 +427,12 @@ async function finalizeBooking(
   actor: Actor
 ) {
   const shipment = await prisma.shipment.findUniqueOrThrow({ where: { id: shipmentId } });
-  const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: { packages: true } });
+  // Items are included because the rate request needs the ordered quantity, and
+  // a Prisma result only carries relations that were asked for.
+  const order = await prisma.order.findUniqueOrThrow({
+    where: { id: orderId },
+    include: { packages: true, items: true },
+  });
 
   try {
     const booking = await bookShipment({
@@ -441,10 +462,13 @@ async function finalizeBooking(
       },
     });
 
+    // Resolved once: this now reads the credential store, and asking twice could
+    // in principle straddle a change made between the two calls.
+    const shippingMode = await eshipperMode();
     await setIntegrationState("eshipper", {
-      status: eshipperMode() === "real" ? "HEALTHY" : "NOT_CONFIGURED",
+      status: shippingMode === "real" ? "HEALTHY" : "NOT_CONFIGURED",
       detail:
-        eshipperMode() === "real"
+        shippingMode === "real"
           ? `Booked ${booking.carrier} ${booking.serviceName}.`
           : "Simulated booking (no eShipper credentials). Not a real label purchase.",
     });

@@ -1093,6 +1093,34 @@ model IntegrationState {
   lastError     String?
   detail        String?
   updatedAt     DateTime          @updatedAt
+  /**
+   * Set by an operator's Disconnect. While it is set, credential resolution
+   * refuses every source for this key — including the environment — so the
+   * provider cannot be reached again until someone saves credentials anew.
+   * Without this, disconnecting would only change a displayed status while the
+   * environment quietly kept the provider live.
+   */
+  disconnectedAt DateTime?
+}
+
+/**
+ * Operator-supplied provider credentials, stored encrypted at rest.
+ *
+ * `value` is always AES-256-GCM ciphertext (see services/credentials.server.ts);
+ * plaintext is never written to this table and never leaves the server. An
+ * absent row means "not configured here", which lets credential resolution fall
+ * back to the environment for deployments that configure providers that way.
+ */
+model IntegrationCredential {
+  id        String   @id @default(cuid())
+  key       String
+  field     String
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([key, field])
+  @@index([key])
 }
 
 model AnalyticsSnapshot {

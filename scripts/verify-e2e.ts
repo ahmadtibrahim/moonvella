@@ -34,6 +34,7 @@ import {
   chargeWholesaleOrder,
 } from "../app/services/sellerBilling.server";
 import { computeRankings } from "../app/services/rankings.server";
+import { forbidProviderCalls } from "./provider-guard";
 
 const prisma = new PrismaClient();
 
@@ -190,6 +191,9 @@ async function cleanup() {
 }
 
 async function main() {
+  // Pinned to simulated mode by run-verify.mjs, and enforced here: this suite
+  // must not reach a provider. See scripts/provider-guard.ts.
+  forbidProviderCalls("verify-e2e");
   // ---- (a) application approval -------------------------------------------
   const owner = await prisma.adminUser.create({
     data: { email: OWNER_EMAIL, passwordHash: "e2e-not-a-real-hash", name: "E2E Owner", role: "OWNER", isActive: true },

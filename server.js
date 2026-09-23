@@ -122,6 +122,30 @@ function isHostAgnostic(pathname) {
   );
 }
 
+/**
+ * Provider callbacks — Stripe and Shopify POST to these.
+ *
+ * They are served on BOTH hostnames because the provider is told one URL and
+ * cannot be asked to switch origin by surface: Stripe's dashboard registers a
+ * single endpoint, and it is the owner's Stripe account that receives these
+ * events, so the owner origin is where it belongs.
+ *
+ * The cross-surface rule exists to keep rendered owner pages off the merchant
+ * origin and vice versa. A callback is not a rendered page: it authenticates by
+ * its own HMAC signature rather than a session or cookie, it returns no
+ * surface-specific data, and it is already reachable unauthenticated on the
+ * merchant origin — so answering it here grants a caller nothing new. Refusing
+ * it here does not hide it; it only breaks the delivery.
+ */
+function isProviderCallback(pathname) {
+  return pathname.startsWith("/webhooks/");
+}
+
+/** Paths exempt from the host/surface split: rendered on both, or callbacks. */
+function isSurfaceNeutral(pathname) {
+  return isHostAgnostic(pathname) || isProviderCallback(pathname);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Static assets                                                              */
 /* -------------------------------------------------------------------------- */
@@ -261,7 +285,7 @@ const server = http.createServer(async (req, res) => {
     return html(res, 421, "Misdirected Request");
   }
 
-  if (shuttingDown && !isHostAgnostic(pathname)) {
+  if (shuttingDown && !isSurfaceNeutral(pathname)) {
     res.setHeader("Connection", "close");
     return html(res, 503, "Service restarting");
   }
@@ -293,7 +317,7 @@ const server = http.createServer(async (req, res) => {
 
   const pathSurface = surfaceForPath(pathname);
 
-  if (!isHostAgnostic(pathname)) {
+  if (!isSurfaceNeutral(pathname)) {
     if (hostSurface === "app" && pathSurface === "admin") {
       // The owner panel lives on its own origin; keep owner cookies off the
       // merchant host entirely.

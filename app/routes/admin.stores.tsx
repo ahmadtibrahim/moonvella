@@ -14,10 +14,8 @@ import {
 } from "~/services/application.server";
 import { BlockControl } from "~/components/store/BlockControl";
 import {
-  AccountingPreviewNotice,
-  MiniBalance,
-  SampleChip,
-  sampleBalances,
+  AccountingUnconnectedNotice,
+  UnconnectedChip,
 } from "~/components/store/accounting";
 
 /**
@@ -273,7 +271,7 @@ export default function AdminStores() {
         </div>
       </div>
 
-      <AccountingPreviewNotice currency="CAD" />
+      <AccountingUnconnectedNotice currency="CAD" />
 
       <div style={card}>
         <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.25rem" }}>
@@ -292,7 +290,6 @@ export default function AdminStores() {
           <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
             {sellers.map((seller) => {
               const isApproved = seller.status === "APPROVED";
-              const balances = sampleBalances(seller.id);
               return (
                 <div key={seller.id} style={rowStyle}>
                   <div style={{ flex: 1, minWidth: 200 }}>
@@ -321,20 +318,14 @@ export default function AdminStores() {
                     ) : null}
                   </div>
 
-                  {/* Drawn from the same sample ledger the store's own page
-                      shows, so the two cannot disagree. */}
+                  {/* Two balances used to be printed here, from a sample
+                      ledger that ignored the store it was handed — so every
+                      row in this list showed the same invented figures, in each
+                      store's own currency. There is no ledger to read, and a
+                      row that said "0.00" would read as "owes nothing", which
+                      is a claim this page cannot make. It says so instead. */}
                   <div style={{ display: "flex", gap: "1.25rem", alignItems: "center" }}>
-                    <MiniBalance
-                      label="Sales balance"
-                      amount={balances.sales}
-                      currency={seller.currency ?? "CAD"}
-                    />
-                    <MiniBalance
-                      label="Account balance"
-                      amount={balances.account}
-                      currency={seller.currency ?? "CAD"}
-                    />
-                    <SampleChip label="Sample" />
+                    <UnconnectedChip label="No ledger" />
                   </div>
                   <span
                     style={{

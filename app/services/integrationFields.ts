@@ -1,0 +1,117 @@
+/**
+ * The credential field definitions, in a module both sides may import.
+ *
+ * This file is deliberately isomorphic — no server imports, no `process.env`
+ * reads, no Prisma. The Settings page renders from it in the browser, and
+ * credentials.server.ts validates against it on the server, so a field can never
+ * be renderable but unsaveable, or saveable but unrenderable.
+ *
+ * `secret: true` marks a field whose VALUE may never leave the server: the
+ * Settings page learns only whether it is set. Fields marked `secret: false` are
+ * connection identifiers (a base URL, an account name), which are prefilled so an
+ * operator can see what they are editing without retyping it.
+ */
+
+export type CredentialKey = "stripe" | "eshipper" | "odoo";
+
+export interface CredentialOption {
+  value: string;
+  label: string;
+}
+
+export interface CredentialFieldSpec {
+  /** Environment-variable-shaped name; also the storage field name. */
+  name: string;
+  label: string;
+  secret: boolean;
+  type?: "text" | "password";
+  placeholder?: string;
+  options?: CredentialOption[];
+}
+
+export interface CredentialIntegrationSpec {
+  label: string;
+  /** Shown under the form. Says plainly what saving does, and what it does not. */
+  note: string;
+  fields: CredentialFieldSpec[];
+}
+
+export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegrationSpec> = {
+  stripe: {
+    label: "Stripe",
+    note:
+      "Values are encrypted before they are stored and are never sent back to this page. " +
+      "Leave a field blank to keep the value already saved. \"Connected\" appears only after " +
+      "an authenticated call to Stripe succeeds.",
+    fields: [
+      { name: "STRIPE_SECRET_KEY", label: "Secret key (test mode)", secret: true, type: "password", placeholder: "sk_test_…" },
+      { name: "STRIPE_PUBLISHABLE_KEY", label: "Publishable key", secret: false, placeholder: "pk_test_…" },
+      { name: "STRIPE_WEBHOOK_SECRET", label: "Webhook signing secret", secret: true, type: "password", placeholder: "whsec_…" },
+    ],
+  },
+  eshipper: {
+    label: "eShipper",
+    note:
+      "The confirmed test host is https://uu2.eshipper.com — it is recognised by name, so no " +
+      "\"sandbox\" in the hostname is required. Live bookings still require ESHIPPER_ENV=production " +
+      "in the deployment environment, which is deliberately not settable from this page. " +
+      "Authentication uses the documented AuthenticationRequest fields: the username is sent as " +
+      "\"principal\" and the password as \"credential\". Account ID is not part of authentication " +
+      "and is not sent with it. " +
+      "Leave a field blank to keep the value already saved.",
+    fields: [
+      { name: "ESHIPPER_BASE_URL", label: "Base URL", secret: false, placeholder: "https://uu2.eshipper.com" },
+      { name: "ESHIPPER_USERNAME", label: "Username (principal)", secret: false, placeholder: "API user" },
+      { name: "ESHIPPER_PASSWORD", label: "Password (credential)", secret: true, type: "password", placeholder: "API secret" },
+      { name: "ESHIPPER_ACCOUNT_ID", label: "Account ID (not used for authentication)", secret: false, placeholder: "optional" },
+    ],
+  },
+  odoo: {
+    label: "Odoo",
+    note:
+      "Values are encrypted before they are stored and are never sent back to this page. " +
+      "\"Connected\" appears only after MoonVella authenticates against Odoo with these " +
+      "credentials. Leave a field blank to keep the value already saved. " +
+      "READ-ONLY IS THE DEFAULT: \"live\" mode alone does not enable writes — they also " +
+      "require ODOO_ALLOW_WRITES=yes in the deployment environment, which this page cannot " +
+      "set, so a form here can never authorise writing to the ERP. The database is reached " +
+      "over JSON-RPC only, never as a PostgreSQL connection, and a database named Prod-db " +
+      "is refused unless a deployment sets ODOO_ALLOW_PROD_DB=yes. Use a dedicated service " +
+      "account — see the connection setup steps in the audit.",
+    fields: [
+      { name: "ODOO_URL", label: "Odoo URL", secret: false, placeholder: "https://erp.premafirm.com" },
+      { name: "ODOO_DATABASE", label: "Database", secret: false, placeholder: "database name" },
+      { name: "ODOO_USERNAME", label: "Username", secret: false, placeholder: "service account" },
+      { name: "ODOO_API_KEY", label: "API key", secret: true, type: "password", placeholder: "API key" },
+      {
+        name: "ODOO_MODE",
+        label: "Mode",
+        secret: false,
+        options: [
+          { value: "readonly", label: "readonly (read-only)" },
+          { value: "live", label: "live" },
+          { value: "disabled", label: "disabled" },
+        ],
+      },
+    ],
+  },
+};
+
+/**
+ * Every field name the store will accept, across all credential keys. The store
+ * resolves environment variables by name, so an unlisted name is rejected rather
+ * than silently read — otherwise the (permissive) save path would be a way to
+ * read any environment variable on the host.
+ */
+export const ALL_CREDENTIAL_FIELD_NAMES: string[] = Object.values(CREDENTIAL_INTEGRATIONS).flatMap(
+  (integration) => integration.fields.map((field) => field.name)
+);
+
+export function credentialFields(key: CredentialKey): CredentialFieldSpec[] {
+  return CREDENTIAL_INTEGRATIONS[key].fields;
+}
+
+/** True when the named field is stored but may never be rendered. */
+export function isSecretField(key: CredentialKey, field: string): boolean {
+  return credentialFields(key).some((spec) => spec.name === field && spec.secret);
+}

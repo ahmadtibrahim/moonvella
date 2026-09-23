@@ -25,6 +25,7 @@
  */
 
 import { systemAudit, AUDIT_ENTITY } from "./audit.server";
+import { getCredentials, redactSecrets } from "./credentials.server";
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -49,6 +50,14 @@ export interface OdooConfig {
  */
 const PROTECTED_DATABASE_NAMES = new Set(["prod-db"]);
 
+/**
+ * Deployment-only switches. These are read from the environment and are
+ * DELIBERATELY NOT storeable fields: a browser form must never be able to
+ * authorise writes to a real ERP, nor to unlock the production database guard.
+ *
+ *   ODOO_ALLOW_WRITES   — second key for writes. `live` mode alone is not enough.
+ *   ODOO_ALLOW_PROD_DB  — unlocks the Prod-db guard (guard 1).
+ */
 function readEnv(name: string): string | null {
   const raw = process.env[name];
   if (raw === undefined) return null;
@@ -57,38 +66,148 @@ function readEnv(name: string): string | null {
   return trimmed;
 }
 
-export function odooConfig(): OdooConfig | null {
-  const url = readEnv("ODOO_URL");
-  const database = readEnv("ODOO_DATABASE");
-  const username = readEnv("ODOO_USERNAME");
-  const apiKey = readEnv("ODOO_API_KEY");
-  if (!url || !database || !username || !apiKey) return null;
-
-  const timeoutRaw = Number(readEnv("ODOO_TIMEOUT_MS") ?? DEFAULT_TIMEOUT_MS);
-  const timeoutMs =
-    Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? timeoutRaw : DEFAULT_TIMEOUT_MS;
-
-  return { url: url.replace(/\/+$/, ""), database, username, apiKey, timeoutMs };
+function envFlag(name: string): boolean {
+  return (readEnv(name) ?? "").toLowerCase() === "yes";
 }
 
-export function odooConfigured(): boolean {
-  return odooConfig() !== null;
+/** Timeout stays deployment configuration; it is not a credential. */
+function timeoutMs(): number {
+  const raw = Number(readEnv("ODOO_TIMEOUT_MS") ?? DEFAULT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
 }
 
 /**
+ * Every credential comes from the encrypted store, which itself falls back to
+ * the environment — so a value saved in Settings takes effect without a
+ * deployment, and an operator's Disconnect suppresses the environment too.
+ *
+ * This is what makes the Settings form real rather than decorative. The previous
+ * version read `process.env` directly, so saving Odoo credentials on the
+ * Settings page changed nothing and the form said so in its own note.
+ *
+ * ODOO_MODE is resolved from the same place (it is a storeable field) but only
+ * ever *restricts*: turning writes ON additionally requires the deployment-only
+ * ODOO_ALLOW_WRITES=yes, so the form cannot grant write access on its own.
+ */
+interface OdooState {
+  config: OdooConfig | null;
+  mode: OdooMode;
+  /** Deployment-only opt-in, resolved separately from anything storeable. */
+  writesAllowed: boolean;
+}
+
+/**
+ * One store read for everything the connector decides from. Two reads would be
+ * two chances for the mode and the credentials to disagree.
+ */
+async function loadOdooState(): Promise<OdooState> {
+  const values = await getCredentials("odoo");
+  const url = values.ODOO_URL;
+  const database = values.ODOO_DATABASE;
+  const username = values.ODOO_USERNAME;
+  const apiKey = values.ODOO_API_KEY;
+
+  const config: OdooConfig | null =
+    url && database && username && apiKey
+      ? { url: url.replace(/\/+$/, ""), database, username, apiKey, timeoutMs: timeoutMs() }
+      : null;
+
+  const writesAllowed = envFlag("ODOO_ALLOW_WRITES");
+  return {
+    config,
+    mode: classifyOdooMode({
+      configured: config !== null,
+      mode: values.ODOO_MODE ?? null,
+      writesAllowed,
+    }),
+    writesAllowed,
+  };
+}
+
+export async function resolveOdooConfig(): Promise<OdooConfig | null> {
+  return (await loadOdooState()).config;
+}
+
+export async function odooConfigured(): Promise<boolean> {
+  return (await loadOdooState()).config !== null;
+}
+
+/**
+ * The connection identifiers, safe to display. Anything secret (the API key)
+ * is represented by whether it is set, never by its value. Used by Settings and
+ * by the integration panel so an operator can see WHICH Odoo is targeted.
+ */
+export async function maskedOdooConnection(): Promise<{
+  url: string | null;
+  database: string | null;
+  username: string | null;
+  apiKeySet: boolean;
+} | null> {
+  const values = await getCredentials("odoo");
+  if (!values.ODOO_URL && !values.ODOO_DATABASE) return null;
+  return {
+    url: values.ODOO_URL ?? null,
+    database: values.ODOO_DATABASE ?? null,
+    username: values.ODOO_USERNAME ?? null,
+    apiKeySet: !!values.ODOO_API_KEY,
+  };
+}
+
+export interface OdooModeInput {
+  configured: boolean;
+  /** Resolved ODOO_MODE, from the store or the environment. */
+  mode: string | null;
+  /** Deployment-only ODOO_ALLOW_WRITES=yes. Never storeable. */
+  writesAllowed: boolean;
+}
+
+/**
+ * The mode ladder, as a pure function.
+ *
+ * Split out from the store lookup deliberately: this is the rule that decides
+ * whether writes are possible at all, and it is the part worth testing against
+ * every combination without depending on what is configured on the host.
+ *
  * `disabled`  — no credentials, or explicitly turned off. Nothing is called.
  * `readonly`  — credentials present; reads allowed, writes refused.
  * `live`      — reads and writes allowed, still subject to the database guard.
  *
- * The default is NOT `live`. An operator must opt in explicitly, which means a
- * misconfigured environment fails closed rather than writing to a real ERP.
+ * Writes need TWO independent keys: ODOO_MODE=live (which an operator may set
+ * from Settings) AND ODOO_ALLOW_WRITES=yes (which only a deployment can set).
+ * A browser form therefore cannot turn on writing to a real ERP, and an
+ * unrecognised mode always falls back to readonly rather than to live.
  */
-export function odooMode(): OdooMode {
-  if (!odooConfigured()) return "disabled";
-  const raw = (readEnv("ODOO_MODE") ?? "readonly").toLowerCase();
-  if (raw === "live") return "live";
+export function classifyOdooMode(input: OdooModeInput): OdooMode {
+  if (!input.configured) return "disabled";
+  const raw = (input.mode ?? "readonly").trim().toLowerCase();
   if (raw === "disabled" || raw === "off" || raw === "none") return "disabled";
-  return "readonly";
+  if (raw !== "live") return "readonly";
+  return input.writesAllowed ? "live" : "readonly";
+}
+
+export async function odooMode(): Promise<OdooMode> {
+  return (await loadOdooState()).mode;
+}
+
+/**
+ * Why writes are refused, in the operator's terms. Returned rather than logged
+ * so Settings can show the missing switch instead of a bare refusal.
+ */
+export async function odooWriteBlockReason(): Promise<string | null> {
+  const state = await loadOdooState();
+  if (state.mode === "live") return null;
+  if (state.mode === "disabled") {
+    return "Odoo is not configured. Save the URL, database, username and API key in Settings.";
+  }
+  const requestedLive = (await getCredentials("odoo")).ODOO_MODE === "live";
+  if (requestedLive && !state.writesAllowed) {
+    return (
+      "ODOO_MODE is set to live, but writes also require ODOO_ALLOW_WRITES=yes in the " +
+      "deployment environment. That second switch is deliberately not settable from this page, " +
+      "so a browser form can never authorise writing to the ERP."
+    );
+  }
+  return 'ODOO_MODE is "readonly". Set it to "live" in Settings, and set ODOO_ALLOW_WRITES=yes in the deployment.';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -149,21 +268,43 @@ export function assertDatabaseAllowed(database: string): void {
 }
 
 /**
- * Guard 2. Throws unless the connector is permitted to mutate Odoo.
+ * Proof that the write check ran and passed.
+ *
+ * This exists so a missing `await` fails CLOSED. Resolving the mode now requires
+ * the credential store, so the check is asynchronous; an async guard whose
+ * result is not awaited is a guard that silently does nothing, which is exactly
+ * the failure this connector cannot afford. `executeKw` refuses any method that
+ * can mutate unless it is handed a permit, and a permit can only be produced by
+ * an awaited `assertWriteAllowed` — a forgotten `await` yields a Promise, which
+ * is not a permit, and the write is refused.
  */
-export function assertWriteAllowed(operation: string): void {
-  const mode = odooMode();
+const WRITE_PERMIT = Symbol("moonvella.odoo.write-permit");
+
+export interface OdooWritePermit {
+  readonly [WRITE_PERMIT]: true;
+  readonly operation: string;
+}
+
+export function isWritePermit(value: unknown): value is OdooWritePermit {
+  return typeof value === "object" && value !== null && WRITE_PERMIT in value;
+}
+
+/**
+ * Guard 2. Throws unless the connector is permitted to mutate Odoo, otherwise
+ * returns the permit the transport requires.
+ */
+export async function assertWriteAllowed(operation: string): Promise<OdooWritePermit> {
+  const mode = await odooMode();
   if (mode === "disabled") {
     throw new OdooWriteBlockedError(
       `Cannot ${operation}: Odoo is not configured.`,
     );
   }
   if (mode !== "live") {
-    throw new OdooWriteBlockedError(
-      `Cannot ${operation}: ODOO_MODE is "${mode}", not "live". Set ODOO_MODE=live ` +
-        `to permit Odoo writes.`,
-    );
+    const reason = await odooWriteBlockReason();
+    throw new OdooWriteBlockedError(`Cannot ${operation}: ${reason}`);
   }
+  return { [WRITE_PERMIT]: true, operation };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -267,7 +408,7 @@ export interface OdooIdentity {
  * returned here but still carries the credential, as Odoo's API requires.
  */
 export async function authenticate(): Promise<OdooIdentity> {
-  const config = odooConfig();
+  const config = await resolveOdooConfig();
   if (!config) throw new OdooNotConfiguredError();
   assertDatabaseAllowed(config.database);
 
@@ -313,7 +454,8 @@ export interface OdooHealth {
  * Safe to call from a health endpoint: never throws, never writes.
  */
 export async function checkOdooHealth(): Promise<OdooHealth> {
-  const config = odooConfig();
+  const state = await loadOdooState();
+  const config = state.config;
   if (!config) return { configured: false, mode: "disabled", ok: false };
 
   try {
@@ -321,7 +463,7 @@ export async function checkOdooHealth(): Promise<OdooHealth> {
   } catch (error) {
     return {
       configured: true,
-      mode: odooMode(),
+      mode: state.mode,
       ok: false,
       databaseBlocked: true,
       error: (error as Error).message,
@@ -332,7 +474,7 @@ export async function checkOdooHealth(): Promise<OdooHealth> {
     const identity = await authenticate();
     return {
       configured: true,
-      mode: odooMode(),
+      mode: state.mode,
       ok: true,
       uid: identity.uid,
       serverVersion: identity.serverVersion,
@@ -340,9 +482,86 @@ export async function checkOdooHealth(): Promise<OdooHealth> {
   } catch (error) {
     return {
       configured: true,
-      mode: odooMode(),
+      mode: state.mode,
       ok: false,
       error: (error as Error).message,
+    };
+  }
+}
+
+export interface OdooAuthTest {
+  /** True only when Odoo accepted the credentials and returned a uid. */
+  ok: boolean;
+  configured: boolean;
+  mode: OdooMode;
+  database: string | null;
+  username: string | null;
+  serverVersion: string | null;
+  databaseBlocked: boolean;
+  /**
+   * Whether this account may write, and why not when it may not. Reported as
+   * guidance, never as a promise: the Odoo-side permissions are a separate
+   * question from MoonVella's own switch.
+   */
+  writeBlockReason: string | null;
+  reason: string | null;
+}
+
+/**
+ * Authenticate against Odoo and stop there.
+ *
+ * This is what "Test connection" runs. It proves the four credentials resolve
+ * and that Odoo accepts them, without reading a record, creating an order, or
+ * posting anything to the ledger. A presence check ("all four fields are set")
+ * is a different and much weaker fact, and is not what Settings reports.
+ *
+ * Safe by construction: it only ever calls `common.authenticate` and
+ * `common.version`, both of which are read-only on Odoo's side.
+ */
+export async function testOdooConnection(): Promise<OdooAuthTest> {
+  const state = await loadOdooState();
+  const config = state.config;
+  const masked = await maskedOdooConnection();
+
+  const base = {
+    configured: config !== null,
+    mode: state.mode,
+    database: masked?.database ?? null,
+    username: masked?.username ?? null,
+    serverVersion: null as string | null,
+    databaseBlocked: false,
+    writeBlockReason: await odooWriteBlockReason(),
+  };
+
+  if (!config) {
+    return {
+      ...base,
+      ok: false,
+      reason:
+        "Odoo is not configured. Save the URL, database, username and API key below, " +
+        "then test again.",
+    };
+  }
+
+  try {
+    assertDatabaseAllowed(config.database);
+  } catch (error) {
+    return {
+      ...base,
+      ok: false,
+      databaseBlocked: true,
+      reason: (error as Error).message,
+    };
+  }
+
+  try {
+    const identity = await authenticate();
+    return { ...base, ok: true, serverVersion: identity.serverVersion, reason: null };
+  } catch (error) {
+    return {
+      ...base,
+      ok: false,
+      reason: error instanceof Error ? redactSecrets(error.message) : "Authentication failed.",
     };
   }
 }
@@ -353,13 +572,51 @@ export async function checkOdooHealth(): Promise<OdooHealth> {
 
 type Domain = unknown[];
 
+/**
+ * The methods this connector may call WITHOUT a write permit.
+ *
+ * An allowlist rather than a denylist, deliberately. A denylist of dangerous
+ * method names would silently permit every method nobody thought of — including
+ * ones added by an Odoo upgrade, and including the `_`-prefixed private methods
+ * Odoo refuses over RPC anyway. Here, an unlisted method is refused locally
+ * before any network call, so the connector's write surface is a closed set.
+ */
+const READ_METHODS = new Set([
+  "search_read",
+  "search_count",
+  "search",
+  "read",
+  "fields_get",
+  "name_get",
+  "name_search",
+]);
+
+/**
+ * One `execute_kw`. Requires a write permit for every method that is not on the
+ * read allowlist.
+ *
+ * This is the structural half of guard 2: `assertWriteAllowed` is async (it
+ * resolves the mode from the credential store), and an async guard whose result
+ * is not awaited does nothing at all. Handing the permit to the transport means
+ * a forgotten `await` produces a Promise instead of a permit and the call is
+ * refused — the mistake fails closed instead of silently writing.
+ */
 async function executeKw<T>(
   model: string,
   method: string,
   args: unknown[],
   kwargs: Record<string, unknown> = {},
+  permit?: OdooWritePermit,
 ): Promise<T> {
-  const config = odooConfig();
+  if (!READ_METHODS.has(method) && !isWritePermit(permit)) {
+    throw new OdooWriteBlockedError(
+      `Refusing ${model}.${method}: it is not a read method and no write permit was ` +
+        `supplied. Writes must go through a guarded function that awaits ` +
+        `assertWriteAllowed() first.`
+    );
+  }
+
+  const config = await resolveOdooConfig();
   if (!config) throw new OdooNotConfiguredError();
   assertDatabaseAllowed(config.database);
 
@@ -411,6 +668,8 @@ const PARTNER_MODEL = "res.partner";
 const PRODUCT_MODEL = "product.product";
 const SALE_ORDER_MODEL = "sale.order";
 const ACCOUNT_MOVE_MODEL = "account.move";
+/** Transient wizard that exposes the public Create-Invoice operation. */
+const INVOICE_WIZARD_MODEL = "sale.advance.payment.inv";
 
 export interface OdooPartner {
   id: number;
@@ -457,6 +716,11 @@ export interface OdooWritePreview {
  * Guard 3. Wraps a write so that, unless `confirm` is true, the caller receives
  * a description of the change instead of causing it. This mirrors the
  * preview-every-write behaviour used elsewhere in MoonVella.
+ *
+ * The permit from guard 2 is handed to `run` rather than dropped, and the
+ * transport will not perform a mutating call without it. The guard is therefore
+ * load-bearing at two independent points, and removing the `await` below breaks
+ * the write instead of bypassing the check.
  */
 async function guardedWrite<T>(
   operation: string,
@@ -464,39 +728,252 @@ async function guardedWrite<T>(
   method: string,
   payload: unknown,
   confirm: boolean,
-  run: () => Promise<T>,
+  run: (permit: OdooWritePermit) => Promise<T>,
 ): Promise<T | OdooWritePreview> {
   if (!confirm) {
     return { operation, model, method, payload, executed: false };
   }
-  assertWriteAllowed(operation);
-  const result = await run();
+  const permit = await assertWriteAllowed(operation);
+  const result = await run(permit);
   await systemAudit(`odoo.${operation}`, AUDIT_ENTITY.INTEGRATION, model, {
     afterData: { payload, result },
   });
   return result;
 }
 
+export interface PartnerWriteResult {
+  id: number;
+  /**
+   * `CREATED` when a new contact was written, `REUSED` when an existing one was
+   * matched and nothing was written. A caller that sees `REUSED` must not treat
+   * the partner as freshly synced — no field of it was updated.
+   */
+  outcome: "CREATED" | "REUSED";
+}
+
+export type PartnerWriteOutcome = PartnerWriteResult | OdooWritePreview;
+
+/** Raised instead of writing when a match is not certain enough to act on. */
+export class OdooPartnerReviewRequiredError extends OdooError {
+  constructor(
+    message: string,
+    readonly candidates: PartnerCandidate[],
+  ) {
+    super(message, "PARTNER_REVIEW_REQUIRED");
+    this.name = "OdooPartnerReviewRequiredError";
+  }
+}
+
+export interface PartnerCandidate {
+  id: number;
+  name: string;
+  email: string | false;
+  vat?: string | false;
+}
+
+export type PartnerAction = "CREATE" | "REUSE" | "REVIEW";
+
+export interface PartnerDecision {
+  action: PartnerAction;
+  /** Why, in the operator's terms. Shown when the answer is REVIEW. */
+  reason: string;
+  /** The one partner to reuse. Null unless the action is REUSE. */
+  partnerId: number | null;
+  /** Everyone the identifiers touched, for presentation. */
+  candidates: PartnerCandidate[];
+}
+
+const normaliseEmail = (value: string | false | undefined) => (value || "").trim().toLowerCase();
+/** Tax IDs are compared case- and space-insensitively; " 123 456 " is "123456". */
+const normaliseVat = (value: string | false | undefined) => (value || "").replace(/\s+/g, "").toUpperCase();
+
+/**
+ * Decide what to do about a partner, given everything Odoo already holds that
+ * matches one of its identifiers.
+ *
+ * Pure, and separated from the lookup, because this is the rule that decides
+ * whether a second record for the same company ever gets written — and it is the
+ * part worth testing against every combination without a live Odoo.
+ *
+ * The rule is deliberately conservative, and its default answer is REVIEW:
+ *
+ *   CREATE  nothing in Odoo carries either identifier. Safe to write.
+ *   REUSE   exactly one existing partner carries BOTH the tax ID and the email.
+ *           Nothing is written, which is what makes a repeated sync idempotent.
+ *   REVIEW  everything else. Two partners carrying different identifiers, an
+ *           email that matches but a tax ID that does not, or an email match
+ *           with no tax ID to corroborate it.
+ *
+ * Two things it must never do, and does not:
+ *
+ *   It never merges. Two rows that disagree on a tax ID are not "probably the
+ *   same company"; the disagreement is the finding, and it belongs to a person.
+ *
+ *   It never decides on email alone. Email is mutable and reused — a change of
+ *   accounts contact would look exactly like a new company, and creating a
+ *   duplicate for one is the failure this function exists to prevent. So a tax
+ *   ID match with a different email is REVIEW, not REUSE: the record is not
+ *   duplicated, and the contact change is not applied silently either. That is
+ *   the emergency-contact-update case, and a person confirms it.
+ */
+export function decidePartnerAction(
+  input: { name: string; email: string; vat?: string },
+  matches: PartnerCandidate[],
+): PartnerDecision {
+  const wantEmail = normaliseEmail(input.email);
+  const wantVat = normaliseVat(input.vat);
+
+  const byEmail = matches.filter((m) => wantEmail && normaliseEmail(m.email) === wantEmail);
+  const byVat = matches.filter((m) => wantVat && normaliseVat(m.vat) === wantVat);
+
+  const touched = new Map<number, PartnerCandidate>();
+  for (const m of [...byEmail, ...byVat]) touched.set(m.id, m);
+  const candidates = [...touched.values()];
+
+  if (candidates.length === 0) {
+    return {
+      action: "CREATE",
+      reason: `No partner in Odoo carries ${wantVat ? "this tax ID or this email" : "this email"}.`,
+      partnerId: null,
+      candidates: [],
+    };
+  }
+
+  if (candidates.length > 1) {
+    return {
+      action: "REVIEW",
+      reason:
+        `${candidates.length} existing partners carry one of these identifiers ` +
+        `(${candidates.map((c) => c.id).join(", ")}). MoonVella does not merge companies automatically; ` +
+        "a person must decide which is the same company, or that none is.",
+      partnerId: null,
+      candidates,
+    };
+  }
+
+  const match = candidates[0];
+  const vatAgrees = byVat.length === 1;
+  const emailAgrees = byEmail.length === 1;
+
+  if (vatAgrees && emailAgrees) {
+    return {
+      action: "REUSE",
+      reason: `Partner ${match.id} ("${match.name}") matches on both tax ID and email.`,
+      partnerId: match.id,
+      candidates,
+    };
+  }
+
+  if (vatAgrees && !emailAgrees) {
+    return {
+      action: "REVIEW",
+      reason:
+        `Partner ${match.id} ("${match.name}") matches on tax ID, but holds a different email ` +
+        `("${match.email || "none"}" rather than "${input.email}"). This is a contact change on an ` +
+        "existing company, so it is confirmed rather than applied — and it must not create a second record.",
+      partnerId: null,
+      candidates,
+    };
+  }
+
+  return {
+    action: "REVIEW",
+    reason:
+      `Partner ${match.id} ("${match.name}") matches on email alone` +
+      (wantVat
+        ? `, and its tax ID does not match "${input.vat}".`
+        : ", and no tax ID was supplied to corroborate it.") +
+      " An email address is not a stable identity, so it is not enough to reuse a record on.",
+    partnerId: null,
+    candidates,
+  };
+}
+
+/**
+ * The read half: everyone in Odoo carrying either identifier, then the pure
+ * decision above. Read-only — it searches and returns, and writes nothing.
+ */
+export async function resolvePartner(input: {
+  name: string;
+  email: string;
+  vat?: string;
+}): Promise<PartnerDecision> {
+  const email = normaliseEmail(input.email);
+  const vat = normaliseVat(input.vat);
+
+  // One query for "either identifier", rather than two, so a company that
+  // matches on both is returned once and the pure decision below sees a single
+  // row. Built from the leaves that actually exist: searching for
+  // `vat = ""` would match every partner with no tax ID recorded, and searching
+  // for nothing at all would return nothing and look like "no such company" —
+  // which is the answer that creates duplicates.
+  const leaves: unknown[][] = [];
+  if (email) leaves.push(["email", "=ilike", email]);
+  if (vat) leaves.push(["vat", "=ilike", vat]);
+  if (leaves.length === 0) return decidePartnerAction(input, []);
+
+  const domain: unknown[] = leaves.length === 1 ? leaves[0] : ["|", ...leaves];
+  const matches = await searchRead<PartnerCandidate>(
+    PARTNER_MODEL,
+    domain,
+    ["id", "name", "email", "vat"],
+    { limit: 20 },
+  );
+
+  return decidePartnerAction(input, matches);
+}
+
+/**
+ * Create a partner, or reuse the one that is certainly the same company.
+ *
+ * The previous version of this function wrote unconditionally: call it twice
+ * with the same details and Odoo held two companies, with no identifier to tell
+ * them apart afterwards. It now resolves first, and the resolution — not the
+ * caller — decides whether a write happens.
+ *
+ * The preview path is unchanged and performs no lookup: describing what would
+ * happen must not require reaching Odoo, or "preview" would be as fallible as
+ * the write it is previewing.
+ */
 export async function upsertPartner(
   input: { name: string; email: string; phone?: string; vat?: string },
   options: { confirm?: boolean } = {},
-): Promise<{ id: number } | OdooWritePreview> {
+): Promise<PartnerWriteOutcome> {
   return guardedWrite(
     "partner.create",
     PARTNER_MODEL,
     "create",
     input,
     options.confirm === true,
-    async () => {
-      const id = await executeKw<number>(PARTNER_MODEL, "create", [
-        {
-          name: input.name,
-          email: input.email,
-          ...(input.phone ? { phone: input.phone } : {}),
-          ...(input.vat ? { vat: input.vat } : {}),
-        },
-      ]);
-      return { id };
+    async (permit): Promise<PartnerWriteResult> => {
+      const decision = await resolvePartner(input);
+
+      if (decision.action === "REVIEW") {
+        throw new OdooPartnerReviewRequiredError(
+          `Refusing to write a partner for "${input.name}": ${decision.reason}`,
+          decision.candidates,
+        );
+      }
+
+      if (decision.action === "REUSE" && decision.partnerId !== null) {
+        return { id: decision.partnerId, outcome: "REUSED" };
+      }
+
+      const id = await executeKw<number>(
+        PARTNER_MODEL,
+        "create",
+        [
+          {
+            name: input.name,
+            email: input.email,
+            ...(input.phone ? { phone: input.phone } : {}),
+            ...(input.vat ? { vat: input.vat } : {}),
+          },
+        ],
+        {},
+        permit,
+      );
+      return { id, outcome: "CREATED" };
     },
   );
 }
@@ -533,7 +1010,9 @@ export async function createSaleOrder(
     "create",
     payload,
     options.confirm === true,
-    async () => ({ id: await executeKw<number>(SALE_ORDER_MODEL, "create", [payload]) }),
+    async (permit) => ({
+      id: await executeKw<number>(SALE_ORDER_MODEL, "create", [payload], {}, permit),
+    }),
   );
 }
 
@@ -551,38 +1030,185 @@ export async function confirmSaleOrder(
     "action_confirm",
     { id: orderId },
     options.confirm === true,
-    async () => {
-      await executeKw(SALE_ORDER_MODEL, "action_confirm", [[orderId]]);
+    async (permit) => {
+      await executeKw(SALE_ORDER_MODEL, "action_confirm", [[orderId]], {}, permit);
       return { confirmed: true };
     },
   );
 }
 
+export interface OdooInvoiceSummary {
+  id: number;
+  /** False while the invoice is a draft — Odoo 18 no longer uses "/". */
+  name: string | false;
+  state: string;
+  payment_state: string | false;
+  amount_total: number;
+  amount_residual: number;
+  invoice_origin: string | false;
+  company_id: [number, string] | false;
+}
+
+export interface SaleOrderLink {
+  id: number;
+  name: string;
+  company_id: [number, string] | false;
+  client_order_ref: string | false;
+  partner_id: [number, string] | false;
+}
+
+/**
+ * The invoices belonging to exactly ONE sale order, in one company.
+ *
+ * This replaces a lookup that asked for the most recent invoice in the whole
+ * database (`[["invoice_origin","!=",false]]`, `order: "id desc"`, `limit: 1`)
+ * and then reported its id as the invoice for this order. That query is wrong
+ * in a way that gets worse the busier the system is: on a database where any
+ * other invoice was created in between, it returns someone else's invoice — a
+ * different customer, a different company — and MoonVella would record that id
+ * against the MoonVella order. It cannot be made safe by tightening the limit,
+ * because the result is not merely imprecise, it is unrelated.
+ *
+ * The link below is the one Odoo itself uses to answer "which invoices came
+ * from this order" (`sale.advance.payment.inv.view_draft_invoices`, and
+ * `sale.order._search_invoice_ids`): the order line → invoice line relation
+ * `sale_order_line_invoice_rel`. It is a line-level link to the exact order, so
+ * it cannot match a different order's invoice, and `company_id` is included
+ * because an order and an invoice must agree on the company that owns them.
+ *
+ * `invoice_origin` is deliberately NOT used as the selector: it is a display
+ * string, and Odoo joins several order names into it with commas when invoices
+ * are grouped.
+ */
+export function invoiceDomainForSaleOrder(input: {
+  saleOrderId: number;
+  companyId?: number | null;
+}): unknown[] {
+  const domain: unknown[] = [
+    ["line_ids.sale_line_ids.order_id", "=", input.saleOrderId],
+    ["move_type", "=", "out_invoice"],
+  ];
+  if (typeof input.companyId === "number") {
+    domain.push(["company_id", "=", input.companyId]);
+  }
+  return domain;
+}
+
+export async function findInvoicesForSaleOrder(input: {
+  saleOrderId: number;
+  companyId?: number | null;
+}): Promise<OdooInvoiceSummary[]> {
+  const domain = invoiceDomainForSaleOrder(input);
+
+  return searchRead<OdooInvoiceSummary>(
+    ACCOUNT_MOVE_MODEL,
+    domain,
+    [
+      "id",
+      "name",
+      "state",
+      "payment_state",
+      "amount_total",
+      "amount_residual",
+      "invoice_origin",
+      "company_id",
+    ],
+    { order: "id asc" },
+  );
+}
+
+export interface CreateInvoiceResult {
+  /** Every invoice this order owns, oldest first. */
+  ids: number[];
+  /** The one the operator is most likely to act on: a draft, else the newest. */
+  id: number;
+  invoices: OdooInvoiceSummary[];
+}
+
+/**
+ * Invoices a confirmed sale order, using the only public workflow Odoo 18
+ * offers for it.
+ *
+ * The previous implementation called `sale.order._create_invoices` over RPC.
+ * Odoo refuses that outright: `odoo/service/model.py` `execute_cr` calls
+ * `get_public_method()` before dispatch, and it raises
+ * `AccessError: Private methods (such as 'sale.order._create_invoices') cannot
+ * be called remotely` for any name beginning with `_`. The call could therefore
+ * never have succeeded — not a misconfiguration, not a permission the operator
+ * could grant, but a method Odoo will not expose over JSON-RPC at all.
+ *
+ * The supported route is the same one the "Create Invoice" button uses:
+ * a `sale.advance.payment.inv` wizard (whose `create_invoices` IS public),
+ * seeded from the order through the context `active_ids`, then `create_invoices`
+ * on it. No custom Odoo module is needed for this operation — see the note in
+ * the audit about which operations DO need one.
+ */
 export async function createInvoiceFromSaleOrder(
   orderId: number,
   options: { confirm?: boolean } = {},
-): Promise<{ id: number } | OdooWritePreview> {
+): Promise<CreateInvoiceResult | OdooWritePreview> {
   return guardedWrite(
-    "account.move.create_from_sale_order",
-    ACCOUNT_MOVE_MODEL,
-    "_create_invoices",
-    { sale_order_id: orderId },
+    "sale.order.create_invoice",
+    INVOICE_WIZARD_MODEL,
+    "create_invoices",
+    { sale_order_id: orderId, advance_payment_method: "delivered" },
     options.confirm === true,
-    async () => {
-      await executeKw(SALE_ORDER_MODEL, "_create_invoices", [[orderId]]);
-      const invoices = await searchRead<{ id: number }>(
-        ACCOUNT_MOVE_MODEL,
-        [["invoice_origin", "!=", false]],
-        ["id"],
-        { limit: 1, order: "id desc" },
+    async (permit) => {
+      // Read the order first: the company is needed to scope the invoice lookup,
+      // and reading it here means a bad id fails before anything is created.
+      const [order] = await searchRead<SaleOrderLink>(
+        SALE_ORDER_MODEL,
+        [["id", "=", orderId]],
+        ["id", "name", "company_id", "client_order_ref", "partner_id"],
+        { limit: 1 },
       );
-      if (!invoices[0]) {
+      if (!order) {
         throw new OdooError(
-          "Odoo created no invoice for the sale order.",
+          `No sale order with id ${orderId} exists in Odoo.`,
+          "SALE_ORDER_NOT_FOUND",
+        );
+      }
+
+      const companyId =
+        Array.isArray(order.company_id) && typeof order.company_id[0] === "number"
+          ? order.company_id[0]
+          : null;
+
+      // Public workflow. The wizard takes the order from the context, not from
+      // the values — `sale_order_ids` defaults to `env.context['active_ids']`.
+      const wizardId = await executeKw<number>(
+        INVOICE_WIZARD_MODEL,
+        "create",
+        [{ advance_payment_method: "delivered" }],
+        {
+          context: {
+            active_model: SALE_ORDER_MODEL,
+            active_ids: [orderId],
+          },
+        },
+        permit,
+      );
+      await executeKw(INVOICE_WIZARD_MODEL, "create_invoices", [[wizardId]], {}, permit);
+
+      // Select by the order's identity, never by recency.
+      const invoices = await findInvoicesForSaleOrder({ saleOrderId: orderId, companyId });
+      if (invoices.length === 0) {
+        throw new OdooError(
+          `Odoo reported success but no invoice is linked to sale order ${order.name} ` +
+            `(id ${orderId})${companyId ? ` in company ${companyId}` : ""}. ` +
+            `The usual cause is that no order line is invoiceable yet — for a ` +
+            `delivery-based invoicing policy, nothing has been delivered.`,
           "NO_INVOICE_CREATED",
         );
       }
-      return { id: invoices[0].id };
+
+      // Prefer a draft (the one just created and still actionable); otherwise the
+      // newest. Reported explicitly rather than silently picking [0].
+      const draft = invoices.filter((invoice) => invoice.state === "draft");
+      const pool = draft.length ? draft : invoices;
+      const chosen = pool[pool.length - 1];
+
+      return { ids: invoices.map((invoice) => invoice.id), id: chosen.id, invoices };
     },
   );
 }
@@ -642,7 +1268,7 @@ export async function registerPayment(
     "create",
     input,
     options.confirm === true,
-    async () => {
+    async (permit) => {
       const wizardId = await executeKw<number>(
         "account.payment.register",
         "create",
@@ -654,10 +1280,15 @@ export async function registerPayment(
           },
         ],
         { context },
+        permit,
       );
-      await executeKw("account.payment.register", "action_create_payments", [
-        [wizardId],
-      ]);
+      await executeKw(
+        "account.payment.register",
+        "action_create_payments",
+        [[wizardId]],
+        {},
+        permit,
+      );
       return { id: wizardId };
     },
   );
@@ -671,18 +1302,19 @@ export async function registerPayment(
  * Human-readable state for the admin integration panel. Deliberately describes
  * the safety posture, because "configured" alone would hide the Prod-db guard.
  */
-export function describeOdooIntegration(): {
+export async function describeOdooIntegration(): Promise<{
   status: "NOT_CONFIGURED" | "OK" | "BLOCKED";
   message: string;
-} {
-  const config = odooConfig();
+}> {
+  const state = await loadOdooState();
+  const config = state.config;
   if (!config) {
     return {
       status: "NOT_CONFIGURED",
       message:
-        "Odoo is not configured. Set ODOO_URL, ODOO_DATABASE, ODOO_USERNAME and " +
-        "ODOO_API_KEY with a dedicated service account. MoonVella connects only over " +
-        "Odoo's JSON-RPC API and never to its PostgreSQL database.",
+        "Odoo is not configured. Save the URL, database, username and API key in " +
+        "Settings. MoonVella connects only over Odoo's JSON-RPC API and never to its " +
+        "PostgreSQL database.",
     };
   }
 
@@ -692,13 +1324,14 @@ export function describeOdooIntegration(): {
     return { status: "BLOCKED", message: (error as Error).message };
   }
 
-  const mode = odooMode();
   return {
     status: "OK",
     message:
-      `Odoo API configured for database "${config.database}" in ${mode} mode. ` +
-      (mode === "live"
+      `Odoo API configured for database "${config.database}" as "${config.username}" ` +
+      `in ${state.mode} mode. ` +
+      (state.mode === "live"
         ? "Writes are permitted and audited."
-        : "Writes are refused until ODOO_MODE=live."),
+        : "Writes are refused. Setting ODOO_MODE=live in Settings is not sufficient on " +
+          "its own — writes also require ODOO_ALLOW_WRITES=yes in the deployment environment."),
   };
 }

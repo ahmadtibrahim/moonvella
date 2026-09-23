@@ -12,6 +12,8 @@ import {
   voidShipment,
 } from "../app/services/shipping.server";
 import { applyStripeEvent } from "../app/services/payments.server";
+import { forbidProviderCalls } from "./provider-guard";
+import { installEshipperStub } from "./eshipper-stub";
 
 const prisma = new PrismaClient();
 const SHOP = "wholesale-test.myshopify.com";
@@ -84,6 +86,18 @@ async function makeOrder(sellerId: string, total = 2598) {
 }
 
 async function main() {
+  // Pinned to simulated mode by run-verify.mjs, and enforced here: this suite
+  // must not reach a provider. See scripts/provider-guard.ts.
+  forbidProviderCalls("verify-wholesale");
+  // Order matters: the guard wraps the real fetch first, and the stub then
+  // delegates everything that is not an eShipper URL back through it. So Stripe
+  // is still refused, eShipper never leaves the process, and a Stripe URL
+  // reaching this point is still a hard failure rather than a stub answer.
+  //
+  // This suite fetches quotes and BOOKS A SHIPMENT. Pointed at the real test
+  // host that spent sandbox credit to assert things like "a duplicate booking
+  // does not double-purchase" — a property of our code, not of eShipper.
+  const eshipper = installEshipperStub();
   await cleanup();
   const seller = await prisma.seller.create({
     data: {
@@ -107,6 +121,11 @@ async function main() {
   // Quotes
   const quotes = await getQuotesForOrder(order1.id, actor);
   check("quotes returned", quotes.length === 3, `${quotes.length}`);
+  check(
+    "quotes came from the stub, not the live provider",
+    eshipper.calls.some((c) => c.url.includes("/api/v2/quote")),
+    `${eshipper.calls.length} stubbed call(s)`
+  );
   const cheapest = [...quotes].sort((a, b) => a.totalAmount - b.totalAmount)[0];
   const fastestKnown = quotes.filter((q) => q.transitDays !== null).sort((a, b) => (a.transitDays! - b.transitDays!))[0];
   const unknown = quotes.find((q) => q.transitDays === null);

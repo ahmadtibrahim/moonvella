@@ -1,29 +1,95 @@
 import { prisma } from "~/db.server";
-import { recordAudit, AUDIT_ENTITY } from "./audit.server";
+import { recordAudit, AUDIT_ENTITY, type AuditActorType } from "./audit.server";
+import {
+  credentialFieldStates,
+  disconnectCredentials,
+  saveCredentials,
+  type CredentialFieldState,
+} from "./credentials.server";
+import type { CredentialKey } from "./integrationFields";
 
+/**
+ * Two different things share one key space, and the split is deliberate.
+ *
+ * A CREDENTIAL integration is one MoonVella holds secrets for, that an operator
+ * configures on the Settings page: Stripe, eShipper, Odoo. Those get a form.
+ *
+ * An OPERATIONAL check reports whether the Shopify scopes an already-connected
+ * app relies on are actually granted — orders, fulfillment, analytics, product
+ * import. Nothing is configured and no secret is held; the granted session scope
+ * IS the state. These keep recording, because they are how Orders, Shipping and
+ * product import stay observable. They belong in system health, not in a
+ * credential form, and retiring them would blind the pages that read them.
+ */
 export type IntegrationKey =
   | "stripe"
   | "eshipper"
-  | "odoo";
+  | "odoo"
+  | "shopify_analytics"
+  | "shopify_orders"
+  | "shopify_fulfillment"
+  | "product_import";
 
-const DEFAULTS: Record<IntegrationKey, { status: string; message: string; credentialHints: string }> = {
+/** Configured with credentials on the Settings page; each has a form. */
+export const CREDENTIAL_KEYS: IntegrationKey[] = ["stripe", "eshipper", "odoo"];
+
+/**
+ * Narrows an integration key to one the credential store serves. The credential
+ * store only knows these three; operational checks have nothing to save.
+ */
+export function isCredentialKey(key: IntegrationKey): key is CredentialKey {
+  return (CREDENTIAL_KEYS as string[]).includes(key);
+}
+
+/** Reported as system health. No form and no secret — the scope is the state. */
+export const OPERATIONAL_KEYS: IntegrationKey[] = [
+  "shopify_orders",
+  "shopify_fulfillment",
+  "shopify_analytics",
+  "product_import",
+];
+
+export const DEFAULTS: Record<
+  IntegrationKey,
+  { status: string; message: string; credentialHints?: string }
+> = {
   stripe: {
     status: "NOT_CONFIGURED",
     message:
-      "Stripe test key not configured. Set STRIPE_SECRET_KEY (test mode) to enable wholesale payment collection. Simulated mode records events locally only.",
-    credentialHints: "STRIPE_SECRET_KEY: test-mode secret key\nSTRIPE_PUBLISHABLE_KEY: (optional) publishable key for test environment\nSTRIPE_WEBHOOK_SECRET: webhook signing secret for order webhooks",
+      "Stripe is not configured. Save a test-mode secret key below to enable wholesale payment collection; Simulated mode records events locally only until then.",
+    credentialHints: "STRIPE_SECRET_KEY: test-mode secret key (stored encrypted)\nSTRIPE_PUBLISHABLE_KEY: (optional) publishable key for the test environment\nSTRIPE_WEBHOOK_SECRET: signing secret for POST /webhooks/stripe",
   },
   eshipper: {
     status: "NOT_CONFIGURED",
     message:
-      "eShipper not configured. Set ESHIPPER_BASE_URL, ESHIPPER_USERNAME, ESHIPPER_PASSWORD and rate/booking/label paths from the account docs for real quotes/booking. Simulated mode is active meanwhile.",
-    credentialHints: "ESHIPPER_BASE_URL: account API base URL\nESHIPPER_USERNAME: account username / API user\nESHIPPER_PASSWORD: account password / API secret\nESHIPPER_RATE_PATH: rate-quote path (from docs)\nESHIPPER_BOOK_PATH: booking path (from docs)\nESHIPPER_LABEL_PATH: label path (from docs)\nESHIPPER_TRACK_PATH: tracking path (from docs)\nESHIPPER_CANCEL_PATH: cancel/void path (from docs)",
+      "eShipper is not configured. Save the account base URL, username and password below to enable real quotes and bookings. The confirmed test host is https://uu2.eshipper.com. Simulated mode is active meanwhile.",
+    credentialHints: "ESHIPPER_BASE_URL: account API base URL — test host https://uu2.eshipper.com\nESHIPPER_USERNAME: account username / API user\nESHIPPER_PASSWORD: account password / API secret (stored encrypted)\nESHIPPER_ACCOUNT_ID: account identifier (optional, if issued)",
   },
   odoo: {
     status: "NOT_CONFIGURED",
     message:
       "Odoo is not configured. Set ODOO_URL, ODOO_DATABASE, ODOO_USERNAME and ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
     credentialHints: "ODOO_URL: Odoo instance URL (e.g. https://erp.premafirm.com)\nODOO_DATABASE: database name\nODOO_USERNAME: service account username\nODOO_API_KEY: service account API key\nODOO_MODE: readonly (default) or live\nODOO_ALLOW_PROD_DB: yes (only if connecting to Prod-db deliberately)",
+  },
+  shopify_analytics: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Permission required: read_reports. ShopifyQL sales/sessions/visitor analytics populate after this scope is granted and the app is reauthorized. No numbers are shown until then.",
+  },
+  shopify_orders: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Permission required: read_orders. Order intake is enabled once this scope is granted and the order webhooks are subscribed.",
+  },
+  shopify_fulfillment: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Permission required: write_merchant_managed_fulfillment_orders (see docs) to create Shopify fulfillments and sync tracking.",
+  },
+  product_import: {
+    status: "NOT_CONFIGURED",
+    message:
+      "Product import uses the already-granted write_products plus write_inventory, read_locations and write_files.",
   },
 };
 
@@ -41,12 +107,30 @@ export interface IntegrationStateView {
   status: string;
   message: string;
   detail: string;
+  /**
+   * Credential guidance, carried on the view so the Settings page can render it
+   * without importing this server-only module into the client bundle.
+   */
+  credentialHints: string;
   lastSuccessAt: Date | null;
   lastErrorAt: Date | null;
   lastError: string | null;
+  /**
+   * Per-field credential state — the only form in which credential information
+   * reaches the browser, and already stripped of secret values by the store.
+   * Empty for operational checks, which hold no credentials.
+   */
+  credentialFields: CredentialFieldState[];
+  /**
+   * When an operator disconnected this integration. Non-null means the provider
+   * is genuinely unreachable, including through the environment, until
+   * credentials are saved again.
+   */
+  disconnectedAt: Date | null;
 }
 
 export interface IntegrationActor {
+  actorType?: AuditActorType;
   actorId: string;
   actorName?: string | null;
   ipAddress?: string | null;
@@ -64,9 +148,12 @@ export async function getIntegrationState(
     status: row?.status ?? fallback.status,
     message: detail,
     detail,
+    credentialHints: fallback.credentialHints ?? "",
     lastSuccessAt: row?.lastSuccessAt ?? null,
     lastErrorAt: row?.lastErrorAt ?? null,
     lastError: row?.lastError ?? null,
+    credentialFields: isCredentialKey(key) ? await credentialFieldStates(key) : [],
+    disconnectedAt: row?.disconnectedAt ?? null,
   };
 }
 
@@ -89,34 +176,99 @@ export interface IntegrationCheckResult {
 export async function checkIntegration(
   key: IntegrationKey
 ): Promise<IntegrationCheckResult> {
+  // The operational checks read the granted session scope rather than probing a
+  // provider: the scope IS the state. A missing scope reports the exact
+  // permission to grant, not a generic failure.
+  const scope = SHOPIFY_SCOPE_BY_KEY[key];
+  if (scope) {
+    const session = await prisma.session.findFirst({
+      where: { scope: { contains: scope } },
+      orderBy: { expires: "desc" },
+      select: { shop: true },
+    });
+    return session
+      ? { status: "HEALTHY", detail: `${scope} granted for ${session.shop}.`, error: null }
+      : {
+          status: "NOT_CONFIGURED",
+          detail: `Permission required: ${scope}. Grant it and reauthorize the app.`,
+          error: null,
+        };
+  }
+
   switch (key) {
     case "stripe": {
-      const { isStripeConfigured } = await import("./payments.server");
-      return isStripeConfigured()
-        ? { status: "HEALTHY", detail: "STRIPE_SECRET_KEY is set (Stripe test mode).", error: null }
-        : {
-            status: "NOT_CONFIGURED",
-            detail: "STRIPE_SECRET_KEY not set. Simulated mode records local events only.",
-            error: null,
-          };
+      // An authenticated call, not a presence check. "A key is present" and "the
+      // key works" are different facts, and only the second one may be shown as
+      // Connected — a typo'd or revoked key is exactly what an operator runs
+      // this to find out.
+      const { testStripeAuthentication } = await import("./payments.server");
+      const result = await testStripeAuthentication();
+      if (result.ok) {
+        return {
+          status: "HEALTHY",
+          detail: result.livemode
+            ? "Authenticated against Stripe — but this is a LIVE key, not a test key. Wholesale payments would be real."
+            : "Authenticated against Stripe (test mode).",
+          error: null,
+        };
+      }
+      return {
+        status: result.reason?.startsWith("No Stripe secret key") ? "NOT_CONFIGURED" : "FAILED",
+        detail: result.reason ?? "Stripe authentication failed.",
+        error: result.reason?.startsWith("No Stripe secret key") ? null : (result.reason ?? null),
+      };
     }
     case "eshipper": {
-      const { eshipperMode } = await import("./eshipper.server");
-      return eshipperMode() === "real"
-        ? { status: "HEALTHY", detail: "eShipper credentials and endpoint paths are set.", error: null }
-        : {
-            status: "NOT_CONFIGURED",
-            detail: "eShipper credentials not set. Simulated quotes/booking are active.",
-            error: null,
-          };
+      // Authenticates and stops. No quote, no booking, nothing spent.
+      const { testEshipperAuthentication } = await import("./eshipper.server");
+      const result = await testEshipperAuthentication();
+      if (result.ok) {
+        const signals = Object.entries(result.accountSignals);
+        return {
+          status: "HEALTHY",
+          detail: [
+            `Authenticated against ${result.baseUrlHost ?? "the configured host"} (${result.environment} environment).`,
+            "No quote was requested and no shipment was booked.",
+            signals.length
+              ? `Account signals: ${signals.map(([name, value]) => `${name}=${value}`).join(", ")}.`
+              : "The provider reported no credit or balance figures, so testing credit cannot be established from authentication alone.",
+          ].join(" "),
+          error: null,
+        };
+      }
+      const unconfigured = result.environment === "unconfigured";
+      return {
+        status: unconfigured ? "NOT_CONFIGURED" : "FAILED",
+        detail: result.reason ?? "eShipper authentication failed.",
+        error: unconfigured ? null : (result.reason ?? null),
+      };
     }
     case "odoo": {
-      const { describeOdooIntegration } = await import("./odoo.server");
-      const described = describeOdooIntegration();
+      // A real authentication, matching how Stripe and eShipper are probed. It
+      // reads no record and posts nothing: `common.authenticate` and
+      // `common.version` are the only calls it makes. "The four fields are set"
+      // is a much weaker fact than "Odoo accepted them", and only the second may
+      // be shown as Connected.
+      const { testOdooConnection } = await import("./odoo.server");
+      const result = await testOdooConnection();
+      if (result.ok) {
+        return {
+          status: "HEALTHY",
+          detail: [
+            `Authenticated against Odoo database "${result.database}" as "${result.username}"`,
+            result.serverVersion ? `(server ${result.serverVersion}).` : ".",
+            "No record was read, no order was created and nothing was posted to the ledger.",
+            `MoonVella is in ${result.mode} mode.`,
+            result.writeBlockReason ?? "Writes are permitted and audited.",
+          ].join(" "),
+          error: null,
+        };
+      }
+      const unconfigured = !result.configured;
       return {
-        status: described.status === "OK" ? "HEALTHY" : described.status,
-        detail: described.message,
-        error: null,
+        status: unconfigured ? "NOT_CONFIGURED" : result.databaseBlocked ? "BLOCKED" : "FAILED",
+        detail: result.reason ?? "Odoo authentication failed.",
+        error: unconfigured ? null : (result.reason ?? null),
       };
     }
     default:
@@ -159,15 +311,24 @@ export async function clearIntegrationError(key: IntegrationKey, actor?: Integra
   return getIntegrationState(key);
 }
 
-/** Save integration credentials and re-check status. */
+/**
+ * Save credentials for an integration, then re-check it.
+ *
+ * The re-check is an authenticated call, so a saved-but-wrong credential lands
+ * as FAILED with the provider's own reason rather than a hopeful "Saved".
+ */
 export async function saveIntegrationCredentials(
   key: IntegrationKey,
   credentials: Record<string, string>,
   actor: IntegrationActor
 ) {
-  // Persist credentials server-side (outside the database, via .env or secure store)
-  // For now, we record the fact that credentials were provided and re-check status.
-  // The actual .env update must be done by the deployment pipeline, not this API.
+  if (!isCredentialKey(key)) {
+    throw new Error(`${key} is an operational check and holds no credentials.`);
+  }
+
+  const result = await saveCredentials(key, credentials);
+
+  // Field NAMES only. A credential value must never reach the audit log.
   await recordAudit({
     actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
@@ -175,21 +336,55 @@ export async function saveIntegrationCredentials(
     action: "integration.credentials_saved",
     entityType: AUDIT_ENTITY.INTEGRATION,
     entityId: key,
-    afterData: { credentialCount: Object.keys(credentials).length },
+    afterData: { savedFields: result.saved, unchangedFields: result.unchanged },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
-  // Re-check integration status with new credentials
+
+  await resetProviderState(key);
   return refreshIntegration(key, actor);
 }
 
-/** Disconnect an integration: reset status to NOT_CONFIGURED and stop provider operations. */
+/**
+ * Drop anything a provider module cached from the previous credentials. Without
+ * this, a saved change would take effect for new calls but a cached bearer token
+ * from the old account could still be reused.
+ */
+async function resetProviderState(key: IntegrationKey) {
+  if (key !== "eshipper") return;
+  const { resetEshipperToken } = await import("./eshipper.server");
+  resetEshipperToken();
+}
+
+/**
+ * Disconnect an integration, so that it stops operating rather than merely
+ * reporting that it has.
+ *
+ * Two things happen, and both are needed. The stored credentials are deleted,
+ * and a flag is set that suppresses the environment as well. Deleting alone
+ * would leave a provider configured through the environment fully live while the
+ * status line claimed otherwise.
+ *
+ * Credentials saved again later lift the flag, so this is reversible by the same
+ * operator who set it.
+ */
 export async function disconnectIntegration(key: IntegrationKey, actor: IntegrationActor) {
+  if (!isCredentialKey(key)) {
+    throw new Error(`${key} is an operational check and cannot be disconnected.`);
+  }
+
+  const before = await prisma.integrationState.findUnique({ where: { key } });
+  const { removed } = await disconnectCredentials(key);
+  await resetProviderState(key);
+
   await setIntegrationState(key, {
     status: "NOT_CONFIGURED",
-    detail: "Disconnected by operator. Provider operations disabled.",
+    detail:
+      "Disconnected by operator. Provider operations are disabled: stored credentials were deleted and the " +
+      "environment is suppressed for this integration until credentials are saved again.",
     error: null,
   });
+
   await recordAudit({
     actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
@@ -197,7 +392,9 @@ export async function disconnectIntegration(key: IntegrationKey, actor: Integrat
     action: "integration.disconnected",
     entityType: AUDIT_ENTITY.INTEGRATION,
     entityId: key,
-    beforeData: { status: (await prisma.integrationState.findUnique({ where: { key } }))?.status },
+    // Counts and names only — never a credential value.
+    beforeData: { status: before?.status ?? null, storedCredentialsRemoved: removed },
+    afterData: { status: "NOT_CONFIGURED", providerOperationsDisabled: true },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });

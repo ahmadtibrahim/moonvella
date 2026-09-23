@@ -31,10 +31,13 @@ import {
   bulkTrack,
   getReturnQuote,
   schedulePickup,
-  eshipperConfigured,
-  eshipperMode,
+  classifyEshipperEnvironment,
+  isRecognizedTestHost,
+  testEshipperAuthentication,
+  resetEshipperToken,
   type TrackingResult,
 } from "../app/services/eshipper.server";
+import { getCredential } from "../app/services/credentials.server";
 
 let failures = 0;
 let total = 0;
@@ -149,20 +152,71 @@ async function main() {
   check("allocation never exceeds the order charge", allocateSellerShippingCharge(1200, 4, 4) === 1200);
 
   // 6. Sandbox verification is explicit, not hostname text --------------------
-  process.env.ESHIPPER_BASE_URL = "https://sandbox.eshipper.example/api";
-  process.env.ESHIPPER_USERNAME = "ops@example.com";
-  process.env.ESHIPPER_PASSWORD = "not-a-real-secret";
-  delete process.env.ESHIPPER_ENV;
-  check("a 'sandbox' hostname alone does NOT enable real calls", eshipperConfigured() === false);
-  check("unset env reports simulated mode", eshipperMode() === "simulated");
+  // Classified from explicit inputs rather than from process.env: the decision
+  // under test is the rule itself, and reading the live environment would make
+  // this pass or fail according to what is configured on the host (including
+  // anything an operator has saved in Settings).
+  const creds = { username: "ops@example.com", password: "not-a-real-secret" };
+  check(
+    "a 'sandbox' hostname alone does NOT enable real calls",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://sandbox.eshipper.example/api", env: null }) === "unconfigured"
+  );
+  check(
+    "explicit sandbox env + sandbox host enables sandbox calls",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://sandbox.eshipper.example/api", env: "sandbox" }) === "test"
+  );
+  check(
+    "the production host is not live without an explicit production env",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://ww2.eshipper.com", env: null }) === "unconfigured"
+  );
+  check(
+    "explicit production env enables live calls",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://ww2.eshipper.com", env: "production" }) === "production"
+  );
+  check(
+    "the staging env value authorises nothing on its own",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://ww2.eshipper.com", env: "staging" }) === "unconfigured"
+  );
+  check(
+    "missing credentials are unconfigured whatever the host",
+    classifyEshipperEnvironment({ ...creds, password: null, baseUrl: "https://uu2.eshipper.com", env: "production" }) === "unconfigured"
+  );
 
+  // 6b. The confirmed test host is recognised by name, not by the word --------
+  // uu2.eshipper.com is this account's confirmed test host. It is matched
+  // exactly, so no "sandbox" in the URL is needed, while an arbitrary host still
+  // cannot authorise itself merely by containing the word.
+  check(
+    "confirmed test host enables calls with no ESHIPPER_ENV set",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://uu2.eshipper.com", env: null }) === "test"
+  );
+  check(
+    "a recognised test host is never reported as production, whatever ESHIPPER_ENV says",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://uu2.eshipper.com", env: "production" }) === "test"
+  );
+  check(
+    "the test host is recognised case-insensitively and with a path",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://UU2.EShipper.com/api", env: null }) === "test"
+  );
+  check("a lookalike host is not recognised", isRecognizedTestHost("https://uu2.eshipper.com.evil.example") === false);
+  check("the test host is only recognised over https", isRecognizedTestHost("http://uu2.eshipper.com") === false);
+  check(
+    "a lookalike host falls back to the env rules, not to trust",
+    classifyEshipperEnvironment({ ...creds, baseUrl: "https://uu2.eshipper.com.evil.example", env: null }) === "unconfigured"
+  );
+
+  // The mocked provider section below drives the real functions, which resolve
+  // credentials through the store. These environment values keep that path
+  // self-contained.
+  process.env.ESHIPPER_USERNAME = creds.username;
+  process.env.ESHIPPER_PASSWORD = creds.password;
+  process.env.ESHIPPER_BASE_URL = "https://sandbox.eshipper.example/api";
   process.env.ESHIPPER_ENV = "sandbox";
-  check("explicit sandbox env + sandbox host enables sandbox calls", eshipperConfigured() === true);
 
   // 7. Provider request mapping (MOCKED) -------------------------------------
   installFetch((url) => {
-    if (url.includes("/authenticate")) return { body: { token: "test-token", expiresIn: 3600 } };
-    if (url.includes("/refresh-token")) return { body: { token: "test-token", expiresIn: 3600 } };
+    if (url.includes("/authenticate")) return { body: { token: "test-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-1", refresh_expires_in: "7200" } };
+    if (url.includes("/refresh-token")) return { body: { token: "refreshed-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-2", refresh_expires_in: "7200" } };
     if (url.includes("/api/v2/quote")) return { body: { rates: [{ carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", total: 15.5, currency: "CAD", transitDays: 3, quoteId: "Q-1" }] } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/label")) return { body: { url: "https://labels.example/L.pdf", format: "PDF" } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/order-details")) return { body: { orderId: "O", details: { weight: 2 } } };
@@ -179,6 +233,39 @@ async function main() {
   check("getRates: POST /api/v2/quote", lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/quote"), `${lastCall().method} ${lastCall().url}`);
   check("getRates: provider quote id is preserved", rates[0]?.providerQuoteId === "Q-1", JSON.stringify(rates[0]?.providerQuoteId));
   check("getRates: request carries the packages", Array.isArray((lastCall().body as { packages?: unknown[] })?.packages));
+
+  // 7a. The authentication request is the DOCUMENTED one ----------------------
+  // POST /api/v2/authenticate takes AuthenticationRequest: required properties
+  // `principal` and `credential`. Sending username/password instead is a schema
+  // validation failure — HTTP 400 — which is exactly what the sandbox produced.
+  // `accountId` is not part of any documented authentication request.
+  // Asserted after the call that triggers it: authentication happens lazily,
+  // on the first operation, not when a credential is configured.
+  const authCall = calls.find((c) => c.url.includes("/api/v2/authenticate"));
+  const authBody = (authCall?.body ?? {}) as Record<string, unknown>;
+  // Compared against the credentials the adapter actually RESOLVED, not the
+  // environment fixtures set above: once an operator saves credentials in
+  // Settings they outrank the environment, so an assertion pinned to the
+  // fixture would fail for the wrong reason. Nothing here is printed — the
+  // detail line reports booleans only, because `credential` is the password.
+  const resolvedUsername = await getCredential("eshipper", "ESHIPPER_USERNAME");
+  const resolvedPassword = await getCredential("eshipper", "ESHIPPER_PASSWORD");
+  check("authenticate is called before the operation", !!authCall, authCall?.url ?? "not called");
+  check(
+    "authenticate sends the resolved username AS `principal`",
+    !!authBody.principal && authBody.principal === resolvedUsername,
+    `match=${authBody.principal === resolvedUsername}`
+  );
+  check(
+    "authenticate sends the resolved password AS `credential`",
+    !!authBody.credential && authBody.credential === resolvedPassword,
+    `match=${authBody.credential === resolvedPassword}`
+  );
+  check(
+    "authenticate sends exactly the two documented properties",
+    JSON.stringify(Object.keys(authBody).sort()) === JSON.stringify(["credential", "principal"]),
+    JSON.stringify(Object.keys(authBody).sort())
+  );
 
   const booking = await bookShipment({
     quote: { carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", providerQuoteId: "Q-1" },
@@ -229,6 +316,69 @@ async function main() {
       return true;
     }
   })());
+
+  // 8. The refresh request, and the response fields it depends on ------------
+  // POST /api/v2/refresh-token takes RefreshTokenDTO: required property
+  // `refresh_token`, and it is a DIFFERENT value from the bearer token. The
+  // only way to reach this path without a test hook is to let the issued token
+  // expire, which `expires_in: "1"` does on its own — no production code is
+  // modified to make this observable.
+  // Everything up to here shares one cached bearer token. Dropping it is what
+  // makes the renewal path reachable at all — with a live cached token, no
+  // operation ever asks the provider for a new one.
+  resetEshipperToken();
+  const before = calls.length;
+  installFetch((url) => {
+    if (url.includes("/authenticate"))
+      return { body: { token: "short-lived", expires_in: "1", token_type: "Bearer", refresh_token: "refresh-token-abc", refresh_expires_in: "7200" } };
+    if (url.includes("/refresh-token"))
+      return { body: { token: "renewed", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-token-def", refresh_expires_in: "7200" } };
+    if (url.includes("/api/v2/quote")) return { body: { rates: [] } };
+    return { status: 500, body: { error: "unexpected url" } };
+  });
+
+  await getRates(rateRequest); // authenticates, caches a token that expires at once
+  await getRates(rateRequest); // therefore renews before quoting
+  const refreshCall = calls.slice(before).find((c) => c.url.includes("/api/v2/refresh-token"));
+  const refreshBody = (refreshCall?.body ?? {}) as Record<string, unknown>;
+  check("an expired token is renewed via /api/v2/refresh-token", !!refreshCall, refreshCall?.url ?? "not called");
+  check("the renewal sends `refresh_token`", refreshBody.refresh_token === "refresh-token-abc", JSON.stringify(refreshBody));
+  check(
+    "the renewal sends NOT the bearer token",
+    refreshBody.refresh_token !== "short-lived" && !("token" in refreshBody)
+  );
+  check(
+    "the renewal sends exactly the documented property",
+    JSON.stringify(Object.keys(refreshBody)) === JSON.stringify(["refresh_token"]),
+    JSON.stringify(Object.keys(refreshBody))
+  );
+  check(
+    "the renewed bearer token is the one the provider issued",
+    (calls.slice(before).filter((c) => c.url.includes("/api/v2/quote")).pop()?.url ?? "").includes("/api/v2/quote")
+  );
+
+  // 9. A refusal reports the provider's own validation detail ---------------
+  // The failure path used to say only "failed (400)", which is why a schema
+  // error was indistinguishable from a wrong password.
+  installFetch(() => ({
+    status: 400,
+    body: {
+      type: "VALIDATION_ERROR",
+      code: "ESH-400-01",
+      message: "Request validation failed",
+      fieldErrors: [{ objectName: "AuthenticationRequest", field: "principal", message: "must not be blank" }],
+    },
+  }));
+  const failure = await testEshipperAuthentication();
+  check("a refusal is not reported as authenticated", failure.ok === false);
+  check("the refusal names the HTTP status", /HTTP 400/.test(failure.reason ?? ""), failure.reason ?? "");
+  check("the refusal carries the provider's message", /Request validation failed/.test(failure.reason ?? ""));
+  check("the refusal carries the provider's error code", /ESH-400-01/.test(failure.reason ?? ""));
+  check(
+    "the refusal names the offending FIELD and its message",
+    /principal: must not be blank/.test(failure.reason ?? ""),
+    failure.reason ?? ""
+  );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   console.log("NOTE: provider checks are MOCKED request-mapping checks. No real eShipper sandbox call was made.");

@@ -11,7 +11,7 @@ import {
 import { BlockControl } from "~/components/store/BlockControl";
 import { getShopAnalytics } from "~/services/analytics.server";
 import {
-  AccountingPreviewNotice,
+  AccountingUnconnectedNotice,
   BalancesPanel,
   CommunicationsPanel,
   LedgerPanel,
@@ -249,7 +249,7 @@ export default function AdminStoreDetail() {
         been paid, what was said about it — and the profile, the application and
         the connection settings are answers to questions asked less often.
       */}
-      <AccountingPreviewNotice currency={seller.currency ?? "CAD"} />
+      <AccountingUnconnectedNotice currency={seller.currency ?? "CAD"} />
       <BalancesPanel
         currency={seller.currency ?? "CAD"}
         liveOrders={orderCount}

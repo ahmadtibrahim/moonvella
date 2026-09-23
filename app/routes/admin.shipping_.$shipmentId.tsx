@@ -19,10 +19,11 @@ import {
   cancelPickupForShipment,
   getBillingReconciliation,
   reconcileCarrierInvoice,
-  trackingLabel,
-  pickCheapestQuote,
-  pickFastestQuote,
 } from "~/services/shipping.server";
+// Display-only helpers, imported from the isomorphic module: this route renders
+// them, so pulling them from shipping.server would drag server code into the
+// client bundle and fail the build.
+import { trackingLabel, pickCheapestQuote, pickFastestQuote } from "~/services/shippingLogic";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
@@ -145,7 +146,12 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     returnQuotes,
     selectedQuote,
     billing,
-    eshipper: { mode: eshipperMode(), account: maskedEshipperAccount(), state: eshipper.status, detail: eshipper.detail },
+    eshipper: {
+      mode: await eshipperMode(),
+      account: await maskedEshipperAccount(),
+      state: eshipper.status,
+      detail: eshipper.detail,
+    },
     shopifyFulfillment: { state: shopifyFulfillment.status, detail: shopifyFulfillment.detail },
     trackingEvents: shipment.trackingEvents,
   };
