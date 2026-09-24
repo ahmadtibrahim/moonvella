@@ -27,6 +27,19 @@ import {
 // The address entry aid. Every decision it makes lives in this typed module —
 // Google's components are read, the country is pinned, street2 cannot be
 // reached from a suggestion — and this page only assigns what comes back.
+import { localDateIn } from "~/services/shippingLogic";
+import {
+  DEFAULT_TIME_ZONE,
+  HOLIDAY_KINDS,
+  HOLIDAY_KIND_LABEL,
+  TIME_ZONE_CHOICES,
+  WEEKDAY_NAMES,
+  formatWorkingDays,
+  ontarioHolidaysForYears,
+  parseWorkingDays,
+  timeZoneLabel,
+  timeZoneIsDefault,
+} from "~/services/holidays";
 import { createAddressEntryAid } from "~/utils/placesEntryAid";
 import type { PickedAddress } from "~/utils/placesAddress";
 import {
@@ -104,6 +117,9 @@ const LOCATION_SELECT = {
   timeZone: true,
   pickupOpenTime: true,
   pickupCloseTime: true,
+  workingDays: true,
+  leadTimeDays: true,
+  sameDayDeadline: true,
   instructions: true,
   accessRequirements: true,
   // Read here because missingOriginFields() takes the whole location shape and
@@ -173,12 +189,43 @@ export async function loader({ request }: LoaderFunctionArgs) {
   // validation quota is not reachable from here.
   const browserKey = await browserKeyForPlaces();
 
+  /*
+   * THE CALENDAR AND THE EXCEPTIONS, SIDE BY SIDE.
+   *
+   * The statutory dates are COMPUTED here — this year and next, because a
+   * December proposal reaches into January — and shown so the owner can read
+   * what the system will exclude without having to trust it. The dock's own rows
+   * are read from the database and shown beneath, because those are what it can
+   * change.
+   *
+   * Both are passed as data rather than computed in the component: the component
+   * runs in the browser too, where the clock and the zone may not be the dock's,
+   * and a calendar that depended on the reader's machine would put two people
+   * looking at the same dock on different days.
+   */
+  const thisYear = Number(localDateIn(DEFAULT_TIME_ZONE, new Date()).slice(0, 4));
+  const statutory = ontarioHolidaysForYears([thisYear, thisYear + 1]);
+
+  const holidayRows = await prisma.locationHoliday.findMany({
+    orderBy: [{ date: "asc" }, { kind: "asc" }],
+  });
+
   return {
     isOwner: user.role === "OWNER",
     canManage: userCan(user, "shipping.manage"),
     editingId: url.searchParams.get("location") ?? "",
     isNew: url.searchParams.get("new") === "1",
     browserKey,
+    statutory,
+    holidays: holidayRows.map((row) => ({
+      id: row.id,
+      locationId: row.locationId,
+      date: row.date,
+      kind: row.kind,
+      name: row.name,
+      openTime: row.openTime,
+      closeTime: row.closeTime,
+    })),
     locations: withStatus,
   };
 }
@@ -247,6 +294,41 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
     return value;
   };
 
+  /**
+   * How much notice this dock needs, or nothing at all.
+   *
+   * BLANK IS NOT ZERO. Blank means no lead time is configured, and the proposal
+   * reads it as "any open day will do" rather than as "today, immediately" — a
+   * dock that has never been asked the question has not answered it. Negative
+   * notice is not a thing, so it is refused rather than stored.
+   */
+  const readLeadTime = () => {
+    const value = text("leadTimeDays");
+    if (value === "") return null;
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed) || parsed < 0) {
+      throw new Error("Lead time must be a whole number of days, 0 or more. Leave it blank for no lead time.");
+    }
+    return parsed;
+  };
+
+  /**
+   * A wall-clock time, or nothing at all.
+   *
+   * The shape is checked here rather than trusted to the browser: a time input
+   * is a convenience, not a guarantee, and a value like "10am" reaching the
+   * proposal would fail its own regex there and be silently treated as no cutoff
+   * — the deadline would disappear and every day would look available.
+   */
+  const readClock = (name: string) => {
+    const value = text(name);
+    if (value === "") return null;
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+      throw new Error(`${name === "sameDayDeadline" ? "The same-day deadline" : name} must be a time like 10:00.`);
+    }
+    return value;
+  };
+
   try {
     switch (intent) {
       case "save_location": {
@@ -271,6 +353,14 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
           timeZone: orNull("timeZone"),
           pickupOpenTime: orNull("pickupOpenTime"),
           pickupCloseTime: orNull("pickupCloseTime"),
+          // Checkbox days arrive as repeated `workingDays` values, one per ticked
+          // box; the service stores them as one comma-joined string. An empty
+          // result is KEPT rather than defaulted — "this dock works no days" is
+          // an answer, and quietly turning it into Monday-to-Friday is how a
+          // dock nobody can collect from starts offering collections again.
+          workingDays: formatWorkingDays(form.getAll("workingDays").map((v) => Number(v))),
+          leadTimeDays: readLeadTime(),
+          sameDayDeadline: readClock("sameDayDeadline"),
           pickupMode: readPickupMode(),
           instructions: orNull("instructions"),
           accessRequirements: orNull("accessRequirements"),
@@ -376,6 +466,96 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
         };
       }
 
+      /*
+       * A DATED EXCEPTION AT ONE DOCK.
+       *
+       * Three kinds, and the kind is not decoration: it decides whether the date
+       * is a closure, an opening or a different window. An unrecognised kind is
+       * refused rather than stored, because a row the proposal does not
+       * understand is a row that changes nothing while looking like it does —
+       * an operator would record a closure and watch the date stay on offer.
+       *
+       * The date is kept as the "YYYY-MM-DD" string a date input produces, and
+       * the shape is checked here as well as in the database so the message
+       * names the field rather than the constraint.
+       */
+      case "add_holiday": {
+        const locationId = text("locationId");
+        const date = text("date");
+        const kind = text("kind").toUpperCase();
+        const name = orNull("name");
+        const openTime = readClock("openTime");
+        const closeTime = readClock("closeTime");
+
+        if (!locationId) throw new Error("Choose the pickup location this date applies to.");
+        const location = await prisma.pickupLocation.findUnique({ where: { id: locationId }, select: { id: true, name: true } });
+        if (!location) throw new Error("That pickup location no longer exists.");
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("Choose a date.");
+        if (!HOLIDAY_KINDS.includes(kind as (typeof HOLIDAY_KINDS)[number])) {
+          throw new Error(`Unknown exception kind "${kind}".`);
+        }
+        if (kind === "SPECIAL_HOURS" && !openTime && !closeTime) {
+          throw new Error(
+            "Special hours need at least an opening or a closing time. To close the dock, record a closure instead.",
+          );
+        }
+
+        const created = await prisma.locationHoliday.upsert({
+          where: { locationId_date_kind: { locationId, date, kind } },
+          create: {
+            locationId,
+            date,
+            kind,
+            name,
+            // The times are dropped for the two closure kinds rather than
+            // stored and ignored: a closure with an opening time on it reads as
+            // a window to whoever finds the row next.
+            openTime: kind === "SPECIAL_HOURS" ? openTime : null,
+            closeTime: kind === "SPECIAL_HOURS" ? closeTime : null,
+          },
+          update: {
+            name,
+            openTime: kind === "SPECIAL_HOURS" ? openTime : null,
+            closeTime: kind === "SPECIAL_HOURS" ? closeTime : null,
+          },
+        });
+        await recordAudit({
+          actorType: "ADMIN_USER",
+          actorId: user.id,
+          actorName: user.name,
+          action: "origin.holiday_recorded",
+          entityType: AUDIT_ENTITY.PICKUP_LOCATION,
+          entityId: locationId,
+          afterData: { id: created.id, date, kind, name, openTime, closeTime },
+        });
+        return {
+          ok: true,
+          message: `${HOLIDAY_KIND_LABEL[kind] ?? kind} recorded for ${date} at ${location.name}.`,
+          editing: locationId,
+        };
+      }
+
+      case "remove_holiday": {
+        const id = text("id");
+        const before = await prisma.locationHoliday.findUnique({ where: { id } });
+        if (!before) throw new Error("That exception is already gone.");
+        await prisma.locationHoliday.delete({ where: { id } });
+        await recordAudit({
+          actorType: "ADMIN_USER",
+          actorId: user.id,
+          actorName: user.name,
+          action: "origin.holiday_removed",
+          entityType: AUDIT_ENTITY.PICKUP_LOCATION,
+          entityId: before.locationId,
+          beforeData: { id: before.id, date: before.date, kind: before.kind, name: before.name },
+        });
+        return {
+          ok: true,
+          message: `Removed the ${before.date} exception. The computed calendar applies to that date again.`,
+          editing: before.locationId,
+        };
+      }
+
       case "set_active": {
         const id = text("id");
         const active = text("active") === "true";
@@ -417,7 +597,7 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
 }
 
 export default function AdminOrigins() {
-  const { locations, isOwner, canManage, editingId, isNew, browserKey } =
+  const { locations, isOwner, canManage, editingId, isNew, browserKey, statutory, holidays } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const [params] = useSearchParams();
@@ -461,7 +641,13 @@ export default function AdminOrigins() {
       ) : null}
 
       {isNew || selected ? (
-        <LocationForm location={selected} canManage={canManage} browserKey={browserKey} />
+        <LocationForm
+          location={selected}
+          canManage={canManage}
+          browserKey={browserKey}
+          statutory={statutory}
+          holidays={holidays}
+        />
       ) : null}
 
       {locations.length === 0 ? (
@@ -764,10 +950,22 @@ function LocationForm({
   location,
   canManage,
   browserKey,
+  statutory,
+  holidays,
 }: {
   location: LocationRow | null;
   canManage: boolean;
   browserKey: string | null;
+  statutory: { date: string; name: string }[];
+  holidays: {
+    id: string;
+    locationId: string;
+    date: string;
+    kind: string;
+    name: string | null;
+    openTime: string | null;
+    closeTime: string | null;
+  }[];
 }) {
   const stored = (location ?? {}) as unknown as Record<string, unknown>;
   const value = (field: keyof OriginLocation): string => {
@@ -929,13 +1127,104 @@ function LocationForm({
           {field("province", "Province / state")}
           {field("postalCode", "Postal code")}
           {field("country", "Country code", "Two letters, e.g. CA.")}
-          {field(
-            "timeZone",
-            "Time zone",
-            "IANA name, e.g. America/Toronto. The window below is read in this zone."
-          )}
-          {field("pickupOpenTime", "Opens at", "HH:MM in the time zone above.")}
-          {field("pickupCloseTime", "Closes at")}
+          {/* A LIST, NOT A TEXT BOX. An IANA name typed by hand is one typo away
+              from a dock whose calendar is a different country's, and nothing on
+              this page would look wrong — the window would simply be read in a
+              zone nobody chose. The names shown are the owner's language
+              ("Toronto — Eastern Time"); the values stored are the IANA ids. */}
+          <Field
+            id="loc-timeZone"
+            label="Time zone"
+            hint="Searchable. The opening and closing times below, the working days and every pickup date are read in this zone, so daylight saving is handled for you."
+          >
+            <input
+              id="loc-timeZone"
+              name="timeZone"
+              list="loc-timeZone-list"
+              style={input}
+              defaultValue={value("timeZone") || DEFAULT_TIME_ZONE}
+              placeholder="Search, e.g. Toronto"
+              disabled={!canManage}
+            />
+            <datalist id="loc-timeZone-list">
+              {TIME_ZONE_CHOICES.map((choice) => (
+                <option key={choice.id} value={choice.id}>
+                  {choice.label}
+                </option>
+              ))}
+            </datalist>
+            <div style={helpText}>
+              Shown as: {timeZoneLabel(value("timeZone") || DEFAULT_TIME_ZONE)}. Toronto is Eastern
+              Time: EST in winter, EDT in summer, chosen automatically.
+              {location && timeZoneIsDefault(value("timeZone"))
+                ? " This dock has no zone of its own saved, so it is being read in Toronto's."
+                : ""}
+            </div>
+          </Field>
+          {field("pickupOpenTime", "Opens at", "A time in the zone above.")}
+          {field("pickupCloseTime", "Closes at", "A time in the zone above.")}
+          <Field
+            id="loc-leadTimeDays"
+            label="Notice needed (days)"
+            hint="How many days ahead a collection must be asked for. Leave blank for no notice requirement — that is not the same as zero."
+          >
+            <input
+              id="loc-leadTimeDays"
+              name="leadTimeDays"
+              type="number"
+              min={0}
+              step={1}
+              style={input}
+              defaultValue={value("leadTimeDays") ?? ""}
+              disabled={!canManage}
+            />
+          </Field>
+          <Field
+            id="loc-sameDayDeadline"
+            label="Same-day deadline"
+            hint="The time after which today can no longer be collected. Leave blank if this dock has no same-day cutoff."
+          >
+            <input
+              id="loc-sameDayDeadline"
+              name="sameDayDeadline"
+              type="time"
+              style={input}
+              defaultValue={value("sameDayDeadline") ?? ""}
+              disabled={!canManage}
+            />
+          </Field>
+          <Field
+            id="loc-workingDays"
+            label="Days this dock works"
+            hint="A pickup is only proposed on a ticked day that is not a statutory holiday or a closure below."
+          >
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
+              {WEEKDAY_NAMES.map((name, index) => {
+                const day = index + 1;
+                // A LOCATION THAT DOES NOT EXIST YET STILL HAS TO SHOW A WEEK,
+                // and the week it shows is Monday to Friday — the same default
+                // the column carries. An existing dock's own answer is used as
+                // it stands, INCLUDING an empty one: a dock that works no days
+                // has to come back with no boxes ticked, or the next save would
+                // silently give it a working week nobody chose.
+                const ticked = parseWorkingDays(
+                  location ? value("workingDays") : "1,2,3,4,5",
+                ).includes(day);
+                return (
+                  <label key={name} style={{ fontSize: "0.7rem", display: "flex", gap: "0.25rem", alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      name="workingDays"
+                      value={String(day)}
+                      defaultChecked={ticked}
+                      disabled={!canManage}
+                    />
+                    {name.slice(0, 3)}
+                  </label>
+                );
+              })}
+            </div>
+          </Field>
           <Field
             id="loc-pickupMode"
             label="How parcels leave this dock"
@@ -978,6 +1267,227 @@ function LocationForm({
         until every field marked * is filled in. The booking gate reads the same list of fields, so
         this list is the whole of the requirement.
       </p>
+
+      <HolidayPanel
+        location={location}
+        canManage={canManage}
+        statutory={statutory}
+        holidays={holidays}
+      />
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------------------- *
+ * The calendar, and where this dock differs from it.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * THE COMPUTED CALENDAR IS SHOWN, NOT JUST APPLIED.
+ *
+ * A proposal that silently excludes 25 December is indistinguishable from one
+ * that lost a date. So the dates the system computes are printed here in full —
+ * this year and next — with the ones this dock already answers for marked, and
+ * the dock's own rows sit underneath where they can be removed.
+ *
+ * The two halves cannot be edited into disagreement with each other either: the
+ * statutory list is computed on the server from the same function the proposal
+ * calls, so what is on screen is what will be excluded, and the only rows stored
+ * are the differences. A date cannot exist twice with two different meanings,
+ * because the computed half is not stored at all.
+ *
+ * THIS FORM IS SEPARATE FROM THE ONE ABOVE, deliberately. Adding a closure is
+ * not a field of the location — it is a row, and rows are added and removed one
+ * at a time. Folding it into `save_location` would mean a form submit that both
+ * rewrites the address and rewrites the calendar, and a validation failure on
+ * either would discard the other.
+ */
+function HolidayPanel({
+  location,
+  canManage,
+  statutory,
+  holidays,
+}: {
+  location: LocationRow | null;
+  canManage: boolean;
+  statutory: { date: string; name: string }[];
+  holidays: {
+    id: string;
+    locationId: string;
+    date: string;
+    kind: string;
+    name: string | null;
+    openTime: string | null;
+    closeTime: string | null;
+  }[];
+}) {
+  const [kind, setKind] = useState<string>("EXTRA_CLOSURE");
+  const mine = location ? holidays.filter((row) => row.locationId === location.id) : [];
+  const openOn = new Set(
+    mine.filter((row) => row.kind === "OPEN_ON_HOLIDAY").map((row) => row.date),
+  );
+  const years = [...new Set(statutory.map((h) => h.date.slice(0, 4)))];
+
+  const describe = (row: (typeof mine)[number]) => {
+    if (row.kind === "SPECIAL_HOURS") {
+      const window = [row.openTime, row.closeTime].filter(Boolean).join("–");
+      return window ? `open ${window}` : "special hours";
+    }
+    return row.name ?? "no note";
+  };
+
+  return (
+    <div style={{ marginTop: "1.5rem", borderTop: `1px solid ${LINE}`, paddingTop: "1rem" }}>
+      <h3 style={{ ...sectionTitle, fontSize: "1rem" }}>Holidays and closures</h3>
+      <p style={{ ...sectionNote, maxWidth: 780 }}>
+        The statutory calendar below is computed for Ontario, Canada — this year and next — and every
+        date on it is excluded from pickup proposals. Easter moves, so Good Friday and Victoria Day
+        are worked out from the calendar rather than remembered. Weekend holidays are not shifted to
+        the following Monday: if this dock closes that Monday too, record it as an extra closure and
+        it will be visible as a row.
+      </p>
+
+      {years.map((year) => (
+        <div key={year} style={{ marginTop: "0.75rem" }}>
+          <div style={{ ...label, marginBottom: "0.3rem" }}>{year} statutory holidays</div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
+              gap: "0.3rem 0.75rem",
+            }}
+          >
+            {statutory
+              .filter((holiday) => holiday.date.startsWith(year))
+              .map((holiday) => (
+                <div
+                  key={holiday.date}
+                  style={{ fontSize: "0.75rem", color: INK, display: "flex", gap: "0.4rem" }}
+                >
+                  <span style={{ color: MUTED, minWidth: "5.5rem" }}>{holiday.date}</span>
+                  <span>{holiday.name}</span>
+                  {openOn.has(holiday.date) ? (
+                    <span style={{ color: "#92400e", fontWeight: 600 }}>· you work this day</span>
+                  ) : null}
+                </div>
+              ))}
+          </div>
+        </div>
+      ))}
+
+      {!location ? (
+        <p style={{ ...helpText, marginTop: "0.9rem" }}>
+          Save this location first, then its own exceptions can be recorded here. The calendar above
+          already applies to it.
+        </p>
+      ) : (
+        <>
+          <div style={{ ...label, marginTop: "1.1rem", marginBottom: "0.3rem" }}>
+            This dock&apos;s own exceptions
+          </div>
+          {mine.length === 0 ? (
+            <p style={{ ...helpText, marginTop: 0 }}>
+              None recorded. This dock follows the whole calendar above and its working days.
+            </p>
+          ) : (
+            <ul style={{ listStyle: "none", padding: 0, margin: "0 0 0.6rem" }}>
+              {mine.map((row) => (
+                <li
+                  key={row.id}
+                  style={{
+                    display: "flex",
+                    gap: "0.5rem",
+                    alignItems: "baseline",
+                    flexWrap: "wrap",
+                    fontSize: "0.78rem",
+                    color: INK,
+                    padding: "0.3rem 0",
+                    borderBottom: `1px solid ${LINE}`,
+                  }}
+                >
+                  <span style={{ color: MUTED, minWidth: "5.5rem" }}>{row.date}</span>
+                  <span style={{ fontWeight: 600 }}>
+                    {HOLIDAY_KIND_LABEL[row.kind] ?? row.kind}
+                  </span>
+                  <span style={{ color: MUTED }}>{describe(row)}</span>
+                  {canManage ? (
+                    <Form method="post" style={{ marginLeft: "auto" }}>
+                      <input type="hidden" name="intent" value="remove_holiday" />
+                      <input type="hidden" name="id" value={row.id} />
+                      <button
+                        type="submit"
+                        style={{ ...btn(MUTED), padding: "0.15rem 0.5rem", fontSize: "0.72rem" }}
+                      >
+                        Remove
+                      </button>
+                    </Form>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {canManage ? (
+            <Form method="post">
+              <input type="hidden" name="locationId" value={location.id} />
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+                  gap: "0.6rem",
+                  alignItems: "end",
+                }}
+              >
+                <Field id="hol-date" label="Date">
+                  <input id="hol-date" name="date" type="date" style={input} required />
+                </Field>
+                <Field id="hol-kind" label="What happens">
+                  <select
+                    id="hol-kind"
+                    name="kind"
+                    style={input}
+                    value={kind}
+                    onChange={(event) => setKind(event.target.value)}
+                  >
+                    <option value="EXTRA_CLOSURE">Closed — extra closure</option>
+                    <option value="OPEN_ON_HOLIDAY">Open — we work this holiday</option>
+                    <option value="SPECIAL_HOURS">Different hours that day</option>
+                  </select>
+                </Field>
+                <Field id="hol-name" label="Note">
+                  <input id="hol-name" name="name" style={input} placeholder="Inventory count" />
+                </Field>
+                {/* The times are only offered for the kind that uses them. Shown
+                    for a closure they would be filled in and then ignored, and
+                    a closure carrying an opening time reads as a window to
+                    whoever finds the row next. */}
+                {kind === "SPECIAL_HOURS" ? (
+                  <>
+                    <Field id="hol-open" label="Opens at">
+                      <input id="hol-open" name="openTime" type="time" style={input} />
+                    </Field>
+                    <Field id="hol-close" label="Closes at">
+                      <input id="hol-close" name="closeTime" type="time" style={input} />
+                    </Field>
+                  </>
+                ) : null}
+                <div>
+                  <button type="submit" name="intent" value="add_holiday" style={btn(INK, { solid: true })}>
+                    Record
+                  </button>
+                </div>
+              </div>
+            </Form>
+          ) : null}
+
+          <p style={{ ...helpText, marginTop: "0.6rem" }}>
+            A pickup is proposed only on a ticked working day that is not a statutory holiday and has
+            no closure on it. Recording this dock as open on a holiday adds it back as a normal
+            working day — the standing opening and closing times still apply unless you record
+            different hours for it.
+          </p>
+        </>
+      )}
     </div>
   );
 }

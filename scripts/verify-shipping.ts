@@ -19,7 +19,14 @@ import {
   pickCheapestQuote,
   pickFastestQuote,
 } from "../app/services/shippingLogic";
-import { toCm, toKg, buildQuotePackagesForOrder } from "../app/services/packaging.server";
+import {
+  toCm,
+  toKg,
+  buildQuotePackagesForOrder,
+  parcelRowsToQuotePackages,
+  type StoredParcelRow,
+} from "../app/services/packaging.server";
+import { packagesForShipment } from "../app/services/shipping.server";
 import {
   getRates,
   bookShipment,
@@ -382,6 +389,173 @@ async function main() {
     "the refusal names the offending FIELD and its message",
     /principal: must not be blank/.test(failure.reason ?? ""),
     failure.reason ?? ""
+  );
+
+  // 10. EVERY parcel is in the request, in the units the provider is told -----
+  /*
+   * The owner's report was that only the first carton ever reached the carrier.
+   * Whether that was ever true, it is the failure that costs money and nobody
+   * notices: a two-parcel order quoted and labelled as one, with the second box
+   * either left on the dock or collected with no paperwork. So this drives a
+   * multi-parcel request through the real adapter and reads back the body it
+   * actually sent — every row, in order, with the figures converted to the units
+   * the request declares, and the totals a carrier would compute from them.
+   *
+   * STILL MOCKED: no provider answered this. It proves what WE send, not what
+   * eShipper accepts.
+   */
+  installFetch((url) => {
+    if (url.includes("/authenticate")) return { body: { token: "t", expires_in: "3600", token_type: "Bearer", refresh_token: "r", refresh_expires_in: "7200" } };
+    if (url.includes("/api/v2/quote")) return { body: { rates: [{ carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", total: 20, currency: "CAD", transitDays: 3, quoteId: "Q-2" }] } };
+    if (url.includes("/api/v2/ship/")) return { body: { shipmentId: "SHIP-2", carrier: "Canada Post", serviceName: "Expedited", trackingNumber: "TRK2", labelUrl: "https://labels/L2.pdf", cost: 20, currency: "CAD" } };
+    return { status: 500, body: { error: "unexpected url" } };
+  });
+  resetEshipperToken();
+
+  // A carton recorded in inches and pounds, and one in centimetres and kilograms:
+  // the two ways a parcel arrives, converted through the one conversion point and
+  // then sent.
+  const storedRows: StoredParcelRow[] = [
+    { id: "row-a", shipmentId: "ship-1", count: 1, length: 24, width: 18, height: 6, weight: 2.5, units: "in_lb" },
+    { id: "row-b", shipmentId: "ship-1", count: 2, length: 30, width: 20, height: 10, weight: 1, units: "cm_kg" },
+  ];
+  const converted = parcelRowsToQuotePackages(storedRows);
+  const multiRequest = { ...rateRequest, packages: converted.packages };
+  await getRates(multiRequest);
+  const sent = ((lastCall().body as { packages?: Record<string, unknown>[] })?.packages ?? []) as Record<string, unknown>[];
+  check(
+    "a two-parcel order sends BOTH parcels, not only the first",
+    sent.length === 2 && converted.refused.length === 0,
+    `${sent.length} parcel row(s) on the wire`,
+  );
+  check(
+    "each parcel keeps its own dimensions and count, and its own row order",
+    sent[0]?.length === 60.96 &&
+      sent[0]?.width === 45.72 &&
+      sent[0]?.height === 15.24 &&
+      sent[0]?.weight === 1.134 &&
+      sent[0]?.count === 1 &&
+      sent[1]?.length === 30 &&
+      sent[1]?.weight === 1 &&
+      sent[1]?.count === 2,
+    sent.map((p) => `${p.count}× ${p.length}×${p.width}×${p.height} ${p.weight}kg`).join(" | "),
+  );
+  check(
+    "the figures on the wire are centimetres and kilograms, whatever unit they were recorded in",
+    sent[0]?.length === 60.96 && sent[0]?.weight === 1.134,
+    `24in/2.5lb was sent as ${sent[0]?.length}/${sent[0]?.weight}`,
+  );
+  /*
+   * The unit TOKEN is asserted as "one token, on every row, and not empty"
+   * rather than pinned to a literal. What eShipper's documentation calls this
+   * value could not be established from this environment — the vendor's public
+   * material describes an XML request with unit-less numeric attributes and no
+   * unit field at all — so pinning a literal here would dress an unverified
+   * guess up as a verified one. What IS enforced is that no caller can send two
+   * rows with different readings, and that a row whose recorded unit cannot be
+   * converted never reaches this point (see verify-packaging). Confirming the
+   * token with eShipper is an open item, reported as such.
+   */
+  const tokens = new Set(sent.map((p) => String(p.units ?? "")));
+  check(
+    "every parcel carries the same, non-empty unit token (the token itself is unverified with the provider)",
+    tokens.size === 1 && !tokens.has("") && tokens.has("cm_kg"),
+    [...tokens].join(", ") || "(none)",
+  );
+  check(
+    "the totals a carrier reads from the request match the parcels it describes",
+    sent.reduce((sum, p) => sum + Number(p.count), 0) === 3 &&
+      Math.abs(sent.reduce((sum, p) => sum + Number(p.weight) * Number(p.count), 0) - (1.134 + 2)) < 1e-9,
+    `3 parcels, ${(1.134 + 2).toFixed(3)} kg`,
+  );
+
+  await bookShipment({
+    quote: { carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", providerQuoteId: "Q-2" },
+    rateRequest: multiRequest,
+  });
+  const bookedPackages = ((lastCall().body as { packages?: Record<string, unknown>[] })?.packages ?? []) as Record<string, unknown>[];
+  check(
+    "booking re-sends the same parcels: the label describes the boxes that were quoted",
+    bookedPackages.length === 2 &&
+      bookedPackages[0]?.length === 60.96 &&
+      bookedPackages[1]?.count === 2,
+    `${bookedPackages.length} parcel row(s) at booking`,
+  );
+
+  // 11. A shipment books its OWN cartons, not the whole order's ---------------
+  /*
+   * `packagesForShipment` is pure — it is handed the shipment and the order and
+   * returns what that box may be described as — so the scoping rules are checked
+   * here with plain objects, no database and no provider.
+   *
+   * THE DEFECT THIS PINS: every booking used to send the ORDER's whole parcel
+   * list, so an order packed into two boxes told the carrier that each box
+   * contained all of them — a price, a label and a customs declaration for goods
+   * that were not in it. The linked-carton branch is what fixes that, and the
+   * refusal below is what stops the other half of it: a set whose unit cannot be
+   * read is refused whole, because sending the readable half of a set is how a
+   * parcel goes missing without anyone deciding to leave it out.
+   */
+  const orderWithTwoBoxes = {
+    id: "order-1",
+    items: [
+      { id: "line-1", sku: "SKU-1", quantity: 1, variantId: "variant-1" },
+      { id: "line-2", sku: "SKU-2", quantity: 1, variantId: "variant-2" },
+    ],
+    packages: [
+      { id: "row-a", shipmentId: "ship-1", count: 1, length: 24, width: 18, height: 6, weight: 2.5, units: "in_lb" },
+      { id: "row-b", shipmentId: "ship-2", count: 1, length: 30, width: 20, height: 10, weight: 1, units: "cm_kg" },
+    ],
+  };
+  const forFirst = await packagesForShipment({ id: "ship-1", items: [] }, orderWithTwoBoxes);
+  const forSecond = await packagesForShipment({ id: "ship-2", items: [] }, orderWithTwoBoxes);
+  check(
+    "a shipment described by assigned cartons carries only its own",
+    forFirst.source === "linked" &&
+      forFirst.packages.length === 1 &&
+      forFirst.packages[0].length === 60.96 &&
+      forSecond.packages.length === 1 &&
+      forSecond.packages[0].length === 30,
+    `first ${forFirst.packages.map((p) => p.length).join(",")} / second ${forSecond.packages.map((p) => p.length).join(",")}`,
+  );
+  const unassigned = await packagesForShipment(
+    { id: "ship-9", items: [] },
+    { ...orderWithTwoBoxes, packages: orderWithTwoBoxes.packages.map((p) => ({ ...p, shipmentId: null })) },
+  );
+  check(
+    "cartons assigned to no box are described on the booking, and the operator is told to assign them",
+    unassigned.packages.length === 2 && unassigned.notes.some((n) => n.includes("Assign the cartons")),
+    unassigned.notes.join("; ") || "no note",
+  );
+  const unreadable = await packagesForShipment(
+    { id: "ship-3", items: [] },
+    {
+      ...orderWithTwoBoxes,
+      packages: [{ id: "row-mm", shipmentId: "ship-3", count: 1, length: 600, width: 400, height: 300, weight: 12, units: "mm_kg" }],
+    },
+  );
+  check(
+    "a carton in an unreadable unit refuses the shipment rather than being sent as written",
+    unreadable.packages.length === 0 && unreadable.missing.some((m) => m.includes("row-mm")),
+    unreadable.missing.join("; ") || "no reason given",
+  );
+  const nothingKnown = await packagesForShipment(
+    { id: "ship-4", items: [{ orderItemId: "line-gone", quantity: 1 }] },
+    { id: "order-2", items: [], packages: [] },
+  );
+  check(
+    "a line that is no longer on the order is refused by name, not skipped",
+    nothingKnown.packages.length === 0 && nothingKnown.missing.some((m) => m.includes("line-gone")),
+    nothingKnown.missing.join("; "),
+  );
+  const emptyBox = await packagesForShipment(
+    { id: "ship-5", items: [] },
+    { id: "order-3", items: [], packages: [] },
+  );
+  check(
+    "a box with nothing recorded and nothing to derive says so instead of booking nothing quietly",
+    emptyBox.packages.length === 0 && emptyBox.missing.length === 1,
+    emptyBox.missing.join("; "),
   );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);

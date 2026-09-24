@@ -31,6 +31,7 @@ export function PackagingValue({
   storedUnit,
   shownUnit,
   disabled = false,
+  error,
 }: {
   name: string;
   kind: MeasureKind;
@@ -40,20 +41,38 @@ export function PackagingValue({
   storedUnit: string;
   shownUnit: string;
   disabled?: boolean;
+  /** What is wrong with this figure, if this is the one that was refused. */
+  error?: string;
 }) {
   const shown = convertedDisplay(stored, storedUnit, shownUnit, kind);
+  const bad = Boolean(error);
   return (
-    <input
-      style={input}
-      name={name}
-      inputMode="decimal"
-      defaultValue={shown}
-      data-kind={kind}
-      data-original={shown}
-      data-stored={stored === null || stored === undefined ? "" : String(stored)}
-      data-stored-unit={storedUnit}
-      aria-label={label}
-      disabled={disabled}
-    />
+    <div>
+      {/* The unit travels with the control as well as with the column header.
+          The header answers "inches or centimetres?" for the table; this
+          answers it for a field somebody is looking at, which is the question
+          that was being asked when the unit dropdowns rendered blank. */}
+      <div style={{ display: "flex", alignItems: "center", gap: "0.2rem" }}>
+        <input
+          style={bad ? { ...input, borderColor: "#dc2626", background: "#fef2f2" } : input}
+          name={name}
+          inputMode="decimal"
+          defaultValue={shown}
+          data-kind={kind}
+          data-original={shown}
+          data-stored={stored === null || stored === undefined ? "" : String(stored)}
+          data-stored-unit={storedUnit}
+          aria-label={label}
+          aria-invalid={bad || undefined}
+          disabled={disabled}
+        />
+        <span style={{ fontSize: "0.62rem", color: bad ? "#b91c1c" : "#94a3b8" }}>{shownUnit}</span>
+      </div>
+      {error ? (
+        <p role="alert" style={{ color: "#b91c1c", fontSize: "0.62rem", margin: "0.15rem 0 0 0" }}>
+          {error}
+        </p>
+      ) : null}
+    </div>
   );
 }

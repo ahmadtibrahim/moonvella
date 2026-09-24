@@ -74,7 +74,24 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       seller: { storeName: order.seller.storeName },
     },
     items,
-    packages: order.packages,
+    /*
+     * `shipmentId` is the field that decides what a carrier is told. A carton
+     * carrying one is described by that shipment's booking; a carton carrying
+     * none is described by every shipment on the order that has no cartons of
+     * its own. It is rendered so the assignment can be read, made and corrected
+     * on this page — the alternative is an operator wondering why a box was
+     * priced for three cartons when it holds one.
+     */
+    packages: order.packages.map((p) => ({
+      id: p.id,
+      shipmentId: p.shipmentId,
+      count: p.count,
+      length: p.length,
+      width: p.width,
+      height: p.height,
+      weight: p.weight,
+      units: p.units,
+    })),
     shipments: order.shipments.map((s) => ({
       id: s.id,
       status: s.status,
@@ -83,6 +100,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       packedAt: s.packedAt,
       providerShipmentId: s.providerShipmentId,
       shopifyFulfillmentId: s.shopifyFulfillmentId,
+      attachedPackageIds: order.packages.filter((p) => p.shipmentId === s.id).map((p) => p.id),
       items: s.items.map((si) => {
         const item = order.items.find((i) => i.id === si.orderItemId);
         return { orderItemId: si.orderItemId, name: item?.name ?? si.orderItemId, sku: item?.sku ?? "", quantity: si.quantity };
@@ -159,8 +177,15 @@ export async function action({ request, params }: ActionFunctionArgs) {
         const qty = Number(value);
         if (qty > 0) allocations.push({ orderItemId: key.slice(4), quantity: qty });
       }
+      const selectedPackages = form.getAll("packageIds").map(String).filter(Boolean);
       await createPackingShipment(orderId, allocations, actor, {
         carrier: String(form.get("carrier") || "") || null,
+        // The cartons the operator ticked for this box. Passed only when at
+        // least one was ticked: ticking none is not a statement that the box is
+        // empty, it is the state every caller was in before these boxes existed,
+        // and the order's unassigned cartons are claimed by it — which is what a
+        // one-box order wants.
+        ...(selectedPackages.length > 0 ? { packageIds: selectedPackages } : {}),
       });
     } else if (intent === "mark_packed") {
       await markShipmentPacked(String(form.get("shipmentId")), actor);
@@ -220,7 +245,10 @@ export default function AdminPacking() {
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Items</h2>
-        <Form method="post">
+        {/* The id is what lets the carton tick-boxes in the card below submit
+            with THIS form: they are outside it in the document, and a carton is
+            a property of the box being created, not a separate action. */}
+        <Form method="post" id="packing-form">
           <input type="hidden" name="intent" value="create_shipment" />
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.75rem" }}>
             <thead>
@@ -268,20 +296,38 @@ export default function AdminPacking() {
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Consolidated parcel review</h2>
+        <p style={{ fontSize: "0.72rem", color: "#64748b", margin: 0, marginBottom: "0.5rem" }}>
+          Ticking a carton assigns it to the box being created. A carton assigned to a box is what
+          that box&apos;s carrier booking describes; an unassigned carton is described by every box
+          that has none of its own. Nothing is merged or moved by ticking &mdash; it only records
+          which parcels a booking is allowed to declare.
+        </p>
         {packages.length === 0 ? (
           <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No parcel dimensions recorded.</p>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.75rem" }}>
             <thead>
-              <tr><th style={th}>Count</th><th style={th}>Dimensions (cm)</th><th style={th}>Weight (kg)</th><th style={th}>Total weight</th><th style={th}></th></tr>
+              <tr><th style={th}>Add</th><th style={th}>Count</th><th style={th}>Dimensions (cm)</th><th style={th}>Weight (kg)</th><th style={th}>Total weight</th><th style={th}>Box</th><th style={th}></th></tr>
             </thead>
             <tbody>
               {packages.map((p) => (
                 <tr key={p.id} style={{ borderTop: "1px solid #f1f5f9", fontSize: "0.8rem" }}>
+                  <td style={{ padding: "0.4rem" }}>
+                    <input type="checkbox" form="packing-form" name="packageIds" value={p.id} aria-label={`Assign carton ${p.id} to the new box`} />
+                  </td>
                   <td style={{ padding: "0.4rem" }}>{p.count}</td>
                   <td style={{ padding: "0.4rem" }}>{p.length}×{p.width}×{p.height}</td>
                   <td style={{ padding: "0.4rem" }}>{p.weight}</td>
                   <td style={{ padding: "0.4rem" }}>{(p.weight * p.count).toFixed(2)}</td>
+                  <td style={{ padding: "0.4rem" }}>
+                    {p.shipmentId ? (
+                      <span style={{ fontSize: "0.7rem", color: "#0369a1" }}>
+                        in box {shipments.findIndex((s) => s.id === p.shipmentId) + 1 || "?"}
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: "0.7rem", color: "#94a3b8" }}>unassigned</span>
+                    )}
+                  </td>
                   <td style={{ padding: "0.4rem" }}>
                     <Form method="post">
                       <input type="hidden" name="intent" value="remove_package" />
@@ -322,6 +368,16 @@ export default function AdminPacking() {
                   <li key={si.orderItemId}>{si.quantity} × {si.name} ({si.sku})</li>
                 ))}
               </ul>
+              <div style={{ fontSize: "0.72rem", color: s.attachedPackageIds.length > 0 ? "#0369a1" : "#b45309", marginBottom: "0.3rem" }}>
+                {s.attachedPackageIds.length > 0
+                  ? `Cartons in this box: ${s.attachedPackageIds
+                      .map((id) => {
+                        const p = packages.find((row) => row.id === id);
+                        return p ? `${p.count}× ${p.length}×${p.width}×${p.height}` : id;
+                      })
+                      .join("; ")}`
+                  : "No carton assigned — a booking of this box would describe every carton on the order."}
+              </div>
               <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
                 {!s.packedAt ? (
                   <Form method="post">

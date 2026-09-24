@@ -605,7 +605,12 @@ function DetailCard({ integration }: DetailCardProps) {
             : integration.status}
         </span>
       </div>
-      <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
+      {/* Multi-line by design, hence pre-line — the same reason the credential
+          hints below use it. An integration that holds more than one credential
+          reports each one on its own line: Google's browser key and server key
+          fail independently and are fixed in different places, so an operator
+          must be able to read one verdict without the other running into it. */}
+      <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem", whiteSpace: "pre-line" }}>
         {integration.detail}
       </p>
 

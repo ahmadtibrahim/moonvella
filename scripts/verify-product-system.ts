@@ -54,6 +54,7 @@ import {
   listProductMedia,
   orderForVariant,
   inheritanceSummary,
+  DuplicateMediaError,
   type MediaAssetView,
 } from "../app/services/media.server";
 import { publicationReadiness } from "../app/services/publication.server";
@@ -63,7 +64,7 @@ import { checkProductCode, PRODUCT_CODE_HELP } from "../app/utils/productCode";
 import { isSafeEntryPath } from "../app/utils/zip";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import { importProductForSeller } from "../app/services/shopifyImport.server";
-import { readObject, deleteObject } from "../app/services/storage.server";
+import { readObject, deleteObject, objectExists } from "../app/services/storage.server";
 
 const prisma = new PrismaClient();
 
@@ -1513,10 +1514,132 @@ async function main() {
     `${sentinelReached || "the guard refused again"} / retail ${keptRetail?.customRetailPrice}`
   );
 
+  /* ======================================================================= */
+  console.log("\nI. What multi-file upload depends on");
+  /* ======================================================================= */
+  /*
+   * The batch uploader sends one request per file and has to decide, for each
+   * card on screen, whether that file is now ON the product (retire the card),
+   * or is still the operator's to retry (keep it, with its metadata). That
+   * decision is made from the error TYPE and two fields on it, so both are
+   * asserted here rather than left to a message string — a reworded sentence
+   * must not turn a duplicate into an endless retry.
+   *
+   * The last check is the one a person actually hits: the same file added twice
+   * to the product while being assigned to different variants. Deduplication is
+   * per product, so the second upload is refused even though the assignment
+   * differs — and the refusal says what to do instead, because the operator's
+   * intent (this file on that variant) is legitimate and reachable.
+   */
+  const batchBytes = pngBytes(220, 160, 0xe1);
+  const batchAssignment = [measured.id, second.id];
+  const mediaCountBefore = await prisma.mediaAsset.count({ where: { productId: family.id } });
+
+  // 65
+  const batchFirst = await upload(family.id, batchBytes, "batch-one.png", "image/png", {
+    category: "LIFESTYLE_IMAGE",
+    title: "Batch upload one",
+    altText: "First file of a batch",
+    variantIds: batchAssignment,
+  });
+  const batchSecond = await upload(family.id, pngBytes(220, 160, 0xe2), "batch-two.png", "image/png", {
+    category: "LIFESTYLE_IMAGE",
+    title: "Batch upload two",
+    altText: "Second file of a batch",
+  });
+  const batchRows = await prisma.mediaAsset.findMany({
+    where: { id: { in: [batchFirst.id, batchSecond.id] } },
+    select: { id: true, checksum: true, storageKey: true },
+  });
+  check(
+    65,
+    "Two files in one batch are two assets, each with its own bytes on disk",
+    batchRows.length === 2 &&
+      batchRows[0].checksum !== batchRows[1].checksum &&
+      (await objectExists(batchRows[0].storageKey)) &&
+      (await objectExists(batchRows[1].storageKey)),
+    `${batchRows.length} row(s), both objects present`
+  );
+
+  // 66
+  const assigned = await prisma.mediaAssetAssignment.findMany({
+    where: { assetId: batchFirst.id },
+    select: { variantId: true },
+  });
+  check(
+    66,
+    "A file's own variant selection is what it is attached to, not the previous file's",
+    batchAssignment.length > 0 &&
+      assigned.length === batchAssignment.length &&
+      assigned.every((row) => row.variantId !== null && batchAssignment.includes(row.variantId)),
+    `${assigned.length} of ${batchAssignment.length} selected variant(s) attached`
+  );
+
+  // 67
+  let duplicateError: unknown = null;
+  try {
+    await uploadMedia(
+      family.id,
+      fileOf(batchBytes, "batch-one-again.png", "image/png"),
+      { category: "LIFESTYLE_IMAGE", title: "The same file, second time" },
+      owner
+    );
+  } catch (error) {
+    duplicateError = error;
+  }
+  const duplicateTyped = duplicateError instanceof DuplicateMediaError;
+  check(
+    67,
+    "A repeated file is refused as a DuplicateMediaError carrying the asset it matched",
+    duplicateTyped &&
+      (duplicateError as DuplicateMediaError).assetId === batchFirst.id &&
+      /Batch upload one/.test((duplicateError as DuplicateMediaError).existingTitle),
+    duplicateTyped
+      ? `assetId matches=${(duplicateError as DuplicateMediaError).assetId === batchFirst.id}`
+      : String(duplicateError)
+  );
+
+  // 68
+  const afterDuplicate = await prisma.mediaAsset.count({ where: { productId: family.id } });
+  const originalStillThere = await prisma.mediaAsset.findUnique({
+    where: { id: batchFirst.id },
+    select: { storageKey: true },
+  });
+  check(
+    68,
+    "The refused copy stores nothing and the original's bytes are untouched",
+    afterDuplicate === mediaCountBefore + 2 &&
+      !!originalStillThere &&
+      (await objectExists(originalStillThere.storageKey)),
+    `${afterDuplicate} asset(s) on the product, original object present`
+  );
+
+  // 69
+  let secondDuplicate: unknown = null;
+  try {
+    await uploadMedia(
+      family.id,
+      fileOf(batchBytes, "batch-one-third.png", "image/png"),
+      { category: "LIFESTYLE_IMAGE", title: "Same bytes, different variants", variantIds: [] },
+      owner
+    );
+  } catch (error) {
+    secondDuplicate = error;
+  }
+  check(
+    69,
+    "Deduplication is per product, not per assignment, and the refusal says how to attach it instead",
+    secondDuplicate instanceof DuplicateMediaError &&
+      /attach the existing asset/i.test((secondDuplicate as DuplicateMediaError).message),
+    secondDuplicate instanceof DuplicateMediaError
+      ? (secondDuplicate as DuplicateMediaError).message
+      : String(secondDuplicate)
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 64) {
+  if (total !== 69) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive and 5 were added by the pricing wave`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave and 5 from the shipping-and-media wave`);
   }
 }
 

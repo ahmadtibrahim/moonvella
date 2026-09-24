@@ -25,7 +25,14 @@ import {
   type ReturnDetails,
   type PickupResult,
 } from "./eshipper.server";
-import { buildQuotePackagesForOrder } from "./packaging.server";
+import {
+  buildQuotePackagesForOrder,
+  parcelRowsToQuotePackages,
+  resolvePackagesForLines,
+  type PackageLineInput,
+  type QuotePackage,
+  type StoredParcelRow,
+} from "./packaging.server";
 import {
   carrierShipFrom,
   resolveOriginForLines,
@@ -34,6 +41,14 @@ import {
   type ShipmentOrigin,
 } from "./origins.server";
 import { normalizeClock } from "~/utils/originFields";
+import {
+  CARRIER_AVAILABILITY_CAVEAT,
+  MAX_PROPOSAL_SCAN,
+  proposePickupDates,
+  pickupDateReasons,
+  scheduleProblem,
+  type LocationSchedule,
+} from "./holidays";
 import { resolveFulfillmentOrders } from "./shopifyFulfillment.server";
 
 /**
@@ -586,6 +601,133 @@ export async function selectQuote(orderId: string, quoteId: string, actor: Actor
   return quote;
 }
 
+/**
+ * The parcels that belong to ONE shipment.
+ *
+ * WHAT THIS REPLACES, AND WHY IT WAS WRONG. Both booking paths used to send
+ * `order.packages` — EVERY parcel row on the order — to the carrier, whatever
+ * the shipment actually contained. On a single-shipment order that is the same
+ * thing. On a split order it is not: a shipment holding one carton of three was
+ * quoted, labelled and customs-declared for goods that were never in the box,
+ * and the operator had no way to see that had happened. The seller paid for the
+ * wrong thing and the box was described as something it was not.
+ *
+ * THREE SOURCES, AND THE ORDER THEY ARE TRIED IN IS NOT ARBITRARY:
+ *
+ *   `linked`  — parcel rows on the order that name THIS shipment. Set when a box
+ *               is packed (`createPackingShipment`). This is a person having said
+ *               which cartons are in this box, so it wins over everything.
+ *
+ *   `order`   — the order's own parcel rows, unchanged from the old behaviour.
+ *               It is second because it is WHAT THE QUOTE WAS PRICED FROM: the
+ *               rate request in `getQuotesForOrder` reads the same order rows,
+ *               and a booking that sent a different set would put a label on
+ *               goods the price was never about.
+ *
+ *   `derived` — the shipment's own lines through the resolver, used only when
+ *               the order has no parcel rows at all — the same condition under
+ *               which quoting derives them. The QUANTITY COMES FROM THE SHIPMENT
+ *               ITEM, not the order line: a carrier collects what is in the box,
+ *               so a shipment of 2 of 5 units is described as 2.
+ *
+ * The order that is NOT used here is worth stating: a shipment never prefers
+ * derived parcels over a parcel row a person entered, because the person is
+ * describing the box they are looking at and the resolver is describing a
+ * catalogue entry.
+ *
+ * `missing` non-empty means REFUSE. It is never partially usable: sending the
+ * parcels that could be resolved while another is undecidable is exactly the
+ * silent omission this whole module is arranged against.
+ */
+export interface ShipmentParcelSet {
+  packages: QuotePackage[];
+  source: "linked" | "derived" | "order";
+  notes: string[];
+  missing: string[];
+}
+
+export async function packagesForShipment(
+  /** The shipment, or a pending one that has not been created yet. */
+  shipment: { id: string; items: { orderItemId: string; quantity: number }[] },
+  order: {
+    id: string;
+    items: { id: string; sku: string; quantity: number; variantId: string | null }[];
+    packages: StoredParcelRow[];
+  },
+): Promise<ShipmentParcelSet> {
+  const notes: string[] = [];
+
+  // 1. Parcels a person put in this box.
+  const linked = order.packages.filter((row) => row.shipmentId === shipment.id);
+  if (linked.length > 0) {
+    const { packages, refused } = parcelRowsToQuotePackages(linked);
+    return { packages, source: "linked", notes, missing: refused };
+  }
+
+  // 2. The order's own parcel rows — what the quote was priced from.
+  if (order.packages.length > 0) {
+    const { packages, refused } = parcelRowsToQuotePackages(order.packages);
+    const unlinked = order.packages.filter((row) => !row.shipmentId).length;
+    if (unlinked === order.packages.length && order.packages.length > 1) {
+      /*
+       * Said out loud rather than left as an invisible default. On a single
+       * shipment this note is noise and is not written; on several it is the
+       * fact an operator needs — the cartons on this order have not been
+       * divided between the boxes, so every box is being described as all of
+       * them. Assigning them on the packing page is the fix, and the note says
+       * so where the person who can do it is already looking.
+       */
+      notes.push(
+        `None of this order's ${order.packages.length} cartons is assigned to a box, so every shipment on it ` +
+          `is described by the whole list. Assign the cartons to boxes on the packing page.`,
+      );
+    }
+    return { packages, source: "order", notes, missing: refused };
+  }
+
+  /*
+   * 3. Derived from what is in the box. A line on the shipment that is no longer
+   *    on the order cannot be derived, so it is refused by name rather than
+   *    skipped, and `resolvePackagesForLines` refuses internally to return a plan
+   *    that quietly dropped a line.
+   */
+  const byId = new Map(order.items.map((item) => [item.id, item]));
+  const lines: PackageLineInput[] = [];
+  const unknownLines: string[] = [];
+  for (const item of shipment.items) {
+    const line = byId.get(item.orderItemId);
+    if (!line) {
+      unknownLines.push(item.orderItemId);
+      continue;
+    }
+    lines.push({
+      orderItemId: line.id,
+      sku: line.sku,
+      quantity: item.quantity,
+      variantId: line.variantId,
+    });
+  }
+
+  const plan = lines.length > 0 ? await resolvePackagesForLines(lines) : null;
+  if (plan && plan.missing.length === 0 && plan.packages.length > 0) {
+    return { packages: plan.packages, source: "derived", notes, missing: [] };
+  }
+
+  const missing = [
+    ...(plan?.missing ?? []),
+    ...unknownLines.map((id) => `order line ${id} is not on this order`),
+  ];
+  return {
+    packages: [],
+    source: "derived",
+    notes,
+    missing:
+      missing.length > 0
+        ? missing
+        : ["this shipment has no cartons recorded and no lines to derive them from"],
+  };
+}
+
 const BOOKING_ERROR = "Booking failed after payment";
 
 /**
@@ -612,7 +754,11 @@ export async function bookShipmentForOrder(
       `Shipping cannot be booked: wholesale payment status is ${order.wholesalePaymentStatus}, not SUCCEEDED.`
     );
   }
-  if (order.packages.length === 0) throw new Error("Package dimensions and weight are required before booking.");
+  // No "are there any packages" guard here any more. It asked whether the ORDER
+  // had parcel rows, which is not the question: cartons derived from the booked
+  // lines are just as real, and the resolution below refuses the case where
+  // there is genuinely nothing — with the line that is missing, which this could
+  // not say.
 
   // Determine remaining quantities (supports partial shipments).
   const shipped: Record<string, number> = {};
@@ -652,6 +798,25 @@ export async function bookShipmentForOrder(
   // the duplicate into an error instead of returning the shipment that request
   // already created — the opposite of what the key above is for.
   if (toShip.length === 0) throw new Error("All items on this order have already been shipped.");
+
+  /*
+   * The cartons this booking will describe, resolved before the shipment row
+   * exists. `pending` is a shipment id that cannot match a stored row — every
+   * id in this database is a cuid — so the linked-carton branch is correctly
+   * skipped and the set is the one this booking is about. Doing it here rather
+   * than only in `finalizeBooking` means an order whose packaging is incomplete
+   * is refused with a reason, instead of leaving behind a shipment record for a
+   * purchase that could never have completed.
+   */
+  const parcels = await packagesForShipment({ id: "pending", items: toShip }, order);
+  if (parcels.missing.length > 0) {
+    throw new Error(
+      `Packaging incomplete for this booking: ${parcels.missing.join("; ")}. Complete the packaging before booking.`,
+    );
+  }
+  if (parcels.packages.length === 0) {
+    throw new Error("This order has no cartons to book. Record the parcel dimensions before booking.");
+  }
 
   // The lines being booked decide the dock, and the dock decides which quotes
   // are even eligible. Resolved before the shipment row exists because the
@@ -711,7 +876,10 @@ export async function bookShipmentForOrder(
         providerQuoteId: quote.providerQuoteId,
         quotedCarrierCost: quote.totalAmount,
         sellerShippingCharge: allocateSellerShippingCharge(order.moonvellaShipping, shipQuantity, orderQuantity),
-        packageCount: order.packages.reduce((s, p) => s + p.count, 0),
+        // The cartons resolved above for THIS booking, not every parcel row on
+        // the order. The two are the same number on a one-shipment order and
+        // differ on a split one, which is the whole point.
+        packageCount: parcels.packages.reduce((s, p) => s + p.count, 0),
         items: { create: toShip.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
       },
     });
@@ -751,8 +919,6 @@ export async function bookPreparedShipment(shipmentId: string, quoteId: string |
       `Shipping cannot be booked: wholesale payment status is ${order.wholesalePaymentStatus}, not SUCCEEDED.`
     );
   }
-  if (order.packages.length === 0) throw new Error("Package dimensions and weight are required before booking.");
-
   /*
    * The selected quote is looked up FOR THIS DOCK. An order with goods at two
    * docks has two sets of quotes, and `selected: true` is not unique across
@@ -859,6 +1025,23 @@ async function finalizeBooking(
   const shipFromAddress = carrierShipFrom(origin.snapshot);
 
   /*
+   * THE PARCELS OF THIS SHIPMENT, NOT OF THE ORDER. Resolved before the claim so
+   * a set that cannot be described is refused while the shipment is still
+   * untouched — and so the operator is told which line is incomplete rather than
+   * discovering it from a carrier error after a label was bought.
+   */
+  const parcels = await packagesForShipment(shipment, order);
+  if (parcels.missing.length > 0) {
+    throw new Error(
+      `Packaging incomplete for this shipment: ${parcels.missing.join("; ")}. ` +
+        `Complete the packaging before booking.`,
+    );
+  }
+  if (parcels.packages.length === 0) {
+    throw new Error("This shipment has no cartons to book. Record a parcel before booking it.");
+  }
+
+  /*
    * Claimed before anything is sent, and every path to the provider goes
    * through here, so this is the single place a second booking can be stopped.
    * Two operators with the shipment page open both pressing Book produce one
@@ -881,7 +1064,7 @@ async function finalizeBooking(
         serviceName: quote.serviceName,
         providerQuoteId: quote.providerQuoteId,
       },
-      rateRequest: buildRateRequest(order, order.packages, shipFromAddress),
+      rateRequest: buildRateRequest(order, parcels.packages, shipFromAddress),
     });
 
     const updated = await prisma.shipment.update({
@@ -911,7 +1094,7 @@ async function finalizeBooking(
          */
         originLocationId: origin.location.id,
         originSnapshot: origin.snapshot as never,
-        packageSnapshot: order.packages.map((p) => ({
+        packageSnapshot: parcels.packages.map((p) => ({
           count: p.count,
           length: p.length,
           width: p.width,
@@ -953,6 +1136,15 @@ async function finalizeBooking(
         trackingNumber: booking.trackingNumber,
         bookedCost: booking.bookedCost,
         quotedCarrierCost: quote.totalAmount,
+        /*
+         * Which cartons were declared, and where they came from. Written into
+         * the audit rather than kept in memory because the interesting case is
+         * the one an operator will have to explain later: a shipment described
+         * by the whole order's parcel list rather than by its own contents.
+         */
+        packageSource: parcels.source,
+        packages: parcels.packages.length,
+        ...(parcels.notes.length > 0 ? { packageNotes: parcels.notes.join(" ") } : {}),
       },
       ipAddress: actor.ipAddress,
       userAgent: actor.userAgent,
@@ -2150,6 +2342,46 @@ function defaultPickupWindow(snapshot: OriginSnapshot): string {
   return `${normalizeClock(open)}-${normalizeClock(close)}`;
 }
 
+/**
+ * The dock's calendar as it stood when the shipment's origin was frozen.
+ *
+ * A MISSING KEY IS NOT "NO RESTRICTIONS", and it is not "works no days" either.
+ * Every snapshot taken before this build lacks these keys entirely; reading a
+ * missing `workingDays` as empty would say the dock never works and refuse every
+ * date, while reading a missing cutoff as null — which is what it is — says no
+ * deadline was configured. So the week falls back to the column's own default,
+ * which is what the dock's schedule WAS when the snapshot was written, and the
+ * two cutoffs stay null because null is genuinely their unanswered value.
+ */
+async function scheduleFromSnapshot(snapshot: OriginSnapshot): Promise<LocationSchedule> {
+  const pickup = snapshot.pickup as Partial<OriginSnapshot["pickup"]>;
+  /*
+   * THE DATED EXCEPTIONS ARE READ LIVE, THE REST IS FROZEN.
+   *
+   * That looks inconsistent and is deliberate. Working days, lead time and the
+   * same-day deadline are the dock's STANDING arrangements — how it normally
+   * runs — and those are frozen so changing them next month cannot invalidate a
+   * collection arranged under them.
+   *
+   * A dated exception is the opposite kind of fact: it says what will actually
+   * happen on one specific day, and a closure recorded this morning is news
+   * about a day that has not happened yet. Freezing exceptions at booking time
+   * would mean a dock that closes for a power cut on Thursday still gets a truck
+   * sent on Thursday, because the label was bought on Monday.
+   */
+  const exceptions = await prisma.locationHoliday.findMany({
+    where: { locationId: snapshot.locationId },
+    select: { date: true, kind: true, name: true, openTime: true, closeTime: true },
+  });
+  return {
+    timeZone: pickup.timeZone ?? null,
+    workingDays: pickup.workingDays ?? "1,2,3,4,5",
+    leadTimeDays: pickup.leadTimeDays ?? null,
+    sameDayDeadline: pickup.sameDayDeadline ?? null,
+    exceptions,
+  };
+}
+
 /** Today's date where the dock is, not where the server is. */
 function todayAt(timeZone: string | null): string {
   const now = new Date();
@@ -2258,7 +2490,21 @@ function pickupPackages(raw: unknown, packageCount: number | null): PickupParcel
  */
 export async function schedulePickupForShipment(
   shipmentId: string,
-  data: { pickupDate: string; pickupTimeWindow?: string; notes?: string; oneOffAtRegularDock?: boolean },
+  data: {
+    pickupDate: string;
+    pickupTimeWindow?: string;
+    notes?: string;
+    oneOffAtRegularDock?: boolean;
+    /**
+     * Step over the dock's own calendar for this one date.
+     *
+     * Offered for the cases the calendar cannot know — a dock opening specially,
+     * or a date the carrier has already agreed. Recorded on the audit entry with
+     * the reasons it overrode, so the exception is a fact on the record rather
+     * than a rule somebody learned to work around.
+     */
+    overrideClosedDay?: boolean;
+  },
   actor: Actor
 ): Promise<PickupResult & { pickupStatus: string }> {
   const shipment = await prisma.shipment.findUnique({
@@ -2317,6 +2563,40 @@ export async function schedulePickupForShipment(
   const window = data.pickupTimeWindow?.trim() || defaultPickupWindow(origin.snapshot);
   const dateProblem = pickupDateProblem(data.pickupDate, origin.snapshot.pickup.timeZone);
   if (dateProblem) throw new Error(dateProblem);
+
+  /*
+   * THE DOCK'S OWN CALENDAR, APPLIED BEFORE THE CARRIER IS ASKED.
+   *
+   * A date is checked against the same proposal the page offers. Refusing a
+   * closed day here rather than only hiding it on screen is the point: the form
+   * is a convenience and the request is the fact, and a date posted by hand — or
+   * by a page open since yesterday — must not put a truck outside a locked gate.
+   *
+   * THE OVERRIDE EXISTS BECAUSE THE SYSTEM DOES NOT KNOW EVERYTHING. A dock can
+   * open specially for one collection, or a carrier can have agreed a date this
+   * calendar excludes; refusing that outright would make the rule an obstacle
+   * rather than a guard. So the check can be stepped over — deliberately, with
+   * the reason recorded on the audit entry — and never silently.
+   *
+   * The whole schedule is judged from the SHIPMENT'S FROZEN ORIGIN, so a dock
+   * whose hours were changed after the label was bought does not retroactively
+   * make a legitimate request invalid.
+   */
+  const schedule = await scheduleFromSnapshot(origin.snapshot);
+  const reasons = pickupDateReasons(data.pickupDate, schedule, requestedAt);
+  if (reasons.length > 0 && !data.overrideClosedDay) {
+    const next = proposePickupDates(schedule, requestedAt, {
+      count: 1,
+      standing: { open: origin.snapshot.pickup.openTime, close: origin.snapshot.pickup.closeTime },
+    });
+    throw new Error(
+      `${origin.snapshot.name} cannot be collected from on ${data.pickupDate}: ${reasons.join("; ")}. ` +
+        `The next date this dock's calendar allows is ${next.days[0]?.date ?? `more than ${MAX_PROPOSAL_SCAN} days away`}. ` +
+        `${CARRIER_AVAILABILITY_CAVEAT} ` +
+        `If the dock is opening specially for this collection, or the carrier has already agreed the date, ` +
+        `confirm it as an exception and the reason will be recorded.`,
+    );
+  }
 
   let booking: PickupResult;
   try {
@@ -2393,12 +2673,111 @@ export async function schedulePickupForShipment(
       scheduledDate: booking.scheduledDate,
       confirmation: booking.confirmationNumber ?? null,
       requestedAt,
+      /*
+       * An override is written down, with what it overrode. A collection on a
+       * day this dock's calendar excludes is either a real arrangement or a
+       * mistake, and the only way anyone can tell which later is if the reasons
+       * the system gave are kept beside the decision to proceed.
+       */
+      ...(reasons.length > 0
+        ? { overrodeCalendar: true, overrodeReasons: reasons.join("; ") }
+        : {}),
     },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
 
   return { ...booking, pickupStatus: updated.pickupStatus ?? "SCHEDULED" };
+}
+
+export interface ShipmentPickupPlan {
+  /** The dock the plan was computed for, or null when the shipment has no origin. */
+  origin: { name: string; code: string; timeZone: string | null } | null;
+  /** The dates that may be asked for, soonest first. Empty when there is no origin. */
+  days: {
+    date: string;
+    /** The window on that date, from the dock's hours and any special hours. */
+    window: { open: string | null; close: string | null } | null;
+    /** The earliest instant a carrier may be asked to come. Sent as an ISO string. */
+    availableFrom: string;
+  }[];
+  /** Why each sooner date was not offered, so the page can explain the gap. */
+  excluded: { date: string; reasons: string[] }[];
+  /** The dock's own local date and time when this was worked out. */
+  localNow: { date: string; time: string } | null;
+  /** The window this dock's standing hours imply, for pre-filling the field. */
+  suggestedWindow: string | null;
+  /** Set when the dock could not be proposed to at all, with the reason. */
+  problem: string | null;
+  caveat: string;
+  /** True when the plan came from the shipment's frozen origin rather than the live dock. */
+  fromSnapshot: boolean;
+}
+
+/**
+ * The dates this shipment may actually be collected on, and why not the others.
+ *
+ * READ BY THE PAGE, ENFORCED BY `schedulePickupForShipment`. Both go through
+ * `pickupDateReasons`, so a date offered here is a date the booking accepts;
+ * anything else would be a page that invites an action the server then refuses.
+ *
+ * Nothing here asserts that a CARRIER will come — see `CARRIER_AVAILABILITY_CAVEAT`,
+ * which travels with the plan and is printed under it. This is one dock's opening
+ * calendar and nothing more.
+ */
+export async function pickupPlanForShipment(shipmentId: string): Promise<ShipmentPickupPlan> {
+  const empty: ShipmentPickupPlan = {
+    origin: null,
+    days: [],
+    excluded: [],
+    localNow: null,
+    suggestedWindow: null,
+    problem: null,
+    caveat: CARRIER_AVAILABILITY_CAVEAT,
+    fromSnapshot: true,
+  };
+
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    include: { items: true, order: { include: { items: true } } },
+  });
+  if (!shipment) return empty;
+
+  const stored = snapshotFromStored(shipment.originSnapshot);
+  const origin = stored ? { snapshot: stored, live: false as const } : await liveOriginForShipment(shipment);
+  if (!origin) return empty;
+
+  const schedule = await scheduleFromSnapshot(origin.snapshot);
+  const standing = { open: origin.snapshot.pickup.openTime, close: origin.snapshot.pickup.closeTime };
+  const problem = scheduleProblem(schedule);
+  const now = new Date();
+  const proposal = proposePickupDates(schedule, now, { count: 8, standing });
+
+  // The window the form starts with. Only when both ends are recorded: half a
+  // window is not a window, and the field is left for the operator to fill.
+  const suggestedWindow =
+    standing.open && standing.close
+      ? `${normalizeClock(standing.open)}-${normalizeClock(standing.close)}`
+      : null;
+
+  return {
+    origin: {
+      name: origin.snapshot.name,
+      code: origin.snapshot.code,
+      timeZone: origin.snapshot.pickup.timeZone ?? null,
+    },
+    days: proposal.days.map((day) => ({
+      date: day.date,
+      window: day.window,
+      availableFrom: day.availableFrom.toISOString(),
+    })),
+    excluded: proposal.excluded,
+    localNow: proposal.localNow,
+    suggestedWindow,
+    problem,
+    caveat: proposal.caveat,
+    fromSnapshot: !origin.live,
+  };
 }
 
 /**

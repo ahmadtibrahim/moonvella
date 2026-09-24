@@ -250,6 +250,19 @@ const CHECKS = [
   // stubbed fetch, so this proves the calls WE build and never claims a real
   // sandbox booking. Needs no session and no credentials.
   { name: "shipping", kind: "ts", file: "scripts/verify-shipping.ts" },
+  // The dock's own calendar: statutory dates, working days, both cutoffs, the
+  // proposal and the refusals it produces. Entirely pure — the module is handed
+  // a dock, its dated exceptions and a moment — so this needs no database, no
+  // session and no fixture, and it can pin a clock to a date in the future or
+  // across a daylight-saving transition without waiting for one.
+  { name: "pickup", kind: "ts", file: "scripts/verify-pickup.ts" },
+  // Media is verified inside `product-system` (checks 65-69 cover what a
+  // multi-file batch depends on: two files to two assets, per-file variant
+  // assignment, the typed duplicate refusal and its two fields, and that a
+  // refused copy stores nothing). It is not a separate suite because it is not
+  // a separate concern — it is the same upload path, and splitting it would
+  // mean a second fixture creating products and writing objects to test the
+  // same function.
   // The only suite allowed to reach Stripe. It creates REAL sandbox objects and
   // uses the ids Stripe returns; a simulated id handed to a provider call is
   // asserted to fail. It runs against the verify clone, so the objects it makes

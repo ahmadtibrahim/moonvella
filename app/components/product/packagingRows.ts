@@ -61,6 +61,150 @@ function isMeasureKind(value: string | undefined): value is MeasureKind {
 }
 
 /**
+ * One field of one carton row, and what is wrong with it.
+ *
+ * A structural copy of the service's own problem type rather than an import of
+ * it: the service is a `.server` module and this one is bundled to the browser.
+ * The two are kept in step by the route, which is the only thing that carries
+ * one to the other — if a field is added there and not here, the editor stops
+ * placing that message under its control, which is a visible failure.
+ */
+export interface PackagingProblem {
+  /** Which row, by its index in the submission. -1 for a problem with the save itself. */
+  index: number;
+  /** The column name: `length`, `width`, `height`, `grossWeight`, `declaredValue`. */
+  field: string;
+  message: string;
+}
+
+/** One submitted row, as the form sent it — every figure a string, as typed. */
+export interface PackagingRowValues {
+  label: string;
+  packageType: string;
+  presetId: string | null;
+  length: string;
+  width: string;
+  height: string;
+  dimensionUnit: string;
+  grossWeight: string;
+  weightUnit: string;
+  unitsPerPackage: string;
+  packagesPerUnit: string;
+  description: string | null;
+  declaredValue: string | null;
+  shipsSeparately: boolean;
+  consolidatable: boolean;
+}
+
+/**
+ * A refused save, and the rows to put back on the screen.
+ *
+ * THIS IS THE HALF OF THE PACKAGING FAILURE THAT IS EASIEST TO MISS. The page
+ * is rendered from the loader, and the loader reads the database — so a refusal
+ * that only returned a message re-drew the form from the values that were
+ * stored BEFORE the operator typed, and one missing weight cost them every
+ * number they had entered. Nothing said so; the form simply came back full of
+ * the old figures. `values` is the submission itself, put back at the indexes
+ * it came from.
+ */
+export interface RefusedPackaging {
+  problems: PackagingProblem[];
+  values: PackagingRowValues[] | null;
+}
+
+/**
+ * The fields an editor row must offer, whichever of the two sources it has.
+ *
+ * A stored row and a refused submission disagree about almost everything: the
+ * stored row's measurements are numbers in the row's own unit, and the
+ * submission's are the strings that were on screen. They agree on the NAMES,
+ * which is what lets the table draw either one without a conditional in every
+ * cell — and the type difference is deliberate, because widening every length
+ * to `string` would mean converting on the way in for the stored case and then
+ * converting back on the way out.
+ */
+export interface EditorRowFields {
+  /** Stable within one render; not the row's database id when it has one. */
+  id: string;
+  label: string | null;
+  packageType: string;
+  description: string | null;
+  length: number | string;
+  width: number | string;
+  height: number | string;
+  dimensionUnit: string;
+  grossWeight: number | string;
+  weightUnit: string;
+  unitsPerPackage: number;
+  packagesPerUnit: number;
+  /** In cents, as stored. */
+  declaredValue: number | null;
+  shipsSeparately: boolean;
+  consolidatable: boolean;
+  presetId: string | null;
+}
+
+/**
+ * A refused submission, in the shape the table already draws.
+ *
+ * WHAT COMES BACK IS WHAT WAS ON SCREEN, which is why feeding it through the
+ * same inputs round-trips. The echo is the submission as `preservePackagingRows`
+ * left it: a row nobody touched carries the figure it is STORED with and that
+ * figure's unit, and a row that was edited carries what was typed and the unit
+ * it was typed in. Both are what the row was showing, so redrawing them through
+ * `PackagingValue` produces the same table, with the operator's correction one
+ * keystroke away.
+ */
+export function refusedEditorRows(values: PackagingRowValues[]): EditorRowFields[] {
+  return values.map((value, index) => ({
+    id: `refused-${index}`,
+    label: value.label || null,
+    packageType: value.packageType || "carton",
+    description: value.description,
+    length: value.length,
+    width: value.width,
+    height: value.height,
+    dimensionUnit: value.dimensionUnit,
+    grossWeight: value.grossWeight,
+    weightUnit: value.weightUnit,
+    unitsPerPackage: Number(value.unitsPerPackage) || 1,
+    packagesPerUnit: Number(value.packagesPerUnit) || 1,
+    declaredValue:
+      value.declaredValue === null || String(value.declaredValue).trim() === ""
+        ? null
+        : Math.round(Number(value.declaredValue) * 100),
+    shipsSeparately: value.shipsSeparately,
+    consolidatable: value.consolidatable,
+    presetId: value.presetId,
+  }));
+}
+
+/**
+ * The problems belonging to one row, by field.
+ *
+ * The row's own problems are drawn under the control they name; the ones with
+ * index -1 are about the save rather than a row, and belong to the banner.
+ */
+export function problemsForRow(problems: PackagingProblem[], index: number): PackagingProblem[] {
+  return problems.filter((problem) => problem.index === index);
+}
+
+/**
+ * What was said about ONE column of ONE row, ready to draw under that control.
+ *
+ * The problems carrying index -1 are about the save rather than a row — "no rows
+ * arrived at all" — and have no control to sit under, so they are never found
+ * here; the route draws those in its banner.
+ */
+export function fieldError(
+  problems: PackagingProblem[],
+  index: number,
+  field: string,
+): string | undefined {
+  return problemsForRow(problems, index).find((problem) => problem.field === field)?.message;
+}
+
+/**
  * The unit this row is being SHOWN in, which is the unit an edited row is
  * stored in. It is on the row rather than read from anywhere else so that a
  * form opened before the preference changed still submits what its labels say.

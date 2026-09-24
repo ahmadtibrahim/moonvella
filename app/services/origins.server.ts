@@ -108,6 +108,13 @@ const ORIGIN_SELECT = {
   timeZone: true,
   pickupOpenTime: true,
   pickupCloseTime: true,
+  // The schedule travels with the origin because the snapshot does: a shipment
+  // booked in March has to be readable in August, after the dock's hours have
+  // changed, and the only way that stays true is if the dock's answers were
+  // copied onto the shipment at the time it was made.
+  workingDays: true,
+  leadTimeDays: true,
+  sameDayDeadline: true,
   instructions: true,
   accessRequirements: true,
   pickupMode: true,
@@ -377,6 +384,61 @@ export async function saveOriginMappings(
   });
 
   return { product: change.productLocationId, variants: change.variantOverrides.length };
+}
+
+/**
+ * Remove the per-variant pickup overrides named, and nothing else.
+ *
+ * A SEPARATE OPERATION FROM `saveOriginMappings`, on purpose. That function
+ * writes the product's own default AND the variant overrides in one call, and a
+ * caller that only wants to clear overrides has no value to put in the product
+ * slot — passing null there to mean "I am not saying" would silently unmap the
+ * product. So this narrows the reach instead: it can only ever set these
+ * variants' mappings to null, it refuses any variant that is not part of the
+ * product, and it touches no other column.
+ *
+ * CLEARING IS NOT THE SAME AS IGNORING. The overrides removed are read first and
+ * written to the audit entry, because the whole reason a variant-level mapping
+ * was removed from the screen is that it must not quietly keep deciding where a
+ * parcel ships from — and equally must not quietly vanish. An operator who needs
+ * one back can read what it was.
+ */
+export async function clearOriginOverrides(
+  productId: string,
+  variantIds: string[],
+  actor: { actorId: string; actorName?: string | null },
+): Promise<{ cleared: { variantId: string; was: string | null }[] }> {
+  const wanted = [...new Set(variantIds.filter(Boolean))];
+  if (wanted.length === 0) return { cleared: [] };
+
+  const variants = await prisma.productVariant.findMany({
+    where: { id: { in: wanted }, productId },
+    select: { id: true, pickupLocationId: true },
+  });
+  const foundIds = new Set(variants.map((row) => row.id));
+  const stray = wanted.find((id) => !foundIds.has(id));
+  if (stray) throw new OriginMappingError("One of those variants is not part of this product.");
+
+  const withOverride = variants.filter((row) => row.pickupLocationId !== null);
+  if (withOverride.length === 0) return { cleared: [] };
+
+  await prisma.productVariant.updateMany({
+    where: { id: { in: withOverride.map((row) => row.id) } },
+    data: { pickupLocationId: null },
+  });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName ?? null,
+    action: "origin.overrides_cleared",
+    entityType: AUDIT_ENTITY.PRODUCT,
+    entityId: productId,
+    beforeData: { overrides: withOverride },
+    afterData: { overrides: withOverride.map((row) => ({ variantId: row.id, locationId: null })) },
+  });
+
+  return { cleared: withOverride.map((row) => ({ variantId: row.id, was: row.pickupLocationId })) };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -705,6 +767,17 @@ export interface OriginSnapshot {
     timeZone: string | null;
     openTime: string | null;
     closeTime: string | null;
+    /**
+     * The week the dock worked on the day this snapshot was taken, and the
+     * notice it asked for, so a pickup proposed months later is judged against
+     * the dock's answers AT THE TIME rather than the ones it happens to have
+     * now. Additive: snapshots already stored do not carry these keys, and a
+     * reader that finds them missing must read that as "not recorded", never as
+     * "no restrictions". See `scheduleFromSnapshot`.
+     */
+    workingDays?: string | null;
+    leadTimeDays?: number | null;
+    sameDayDeadline?: string | null;
     instructions: string | null;
     accessRequirements: string | null;
   };
@@ -749,6 +822,9 @@ export function snapshotOrigin(location: OriginLocation): OriginSnapshot {
       timeZone: location.timeZone,
       openTime: location.pickupOpenTime,
       closeTime: location.pickupCloseTime,
+      workingDays: location.workingDays,
+      leadTimeDays: location.leadTimeDays,
+      sameDayDeadline: location.sameDayDeadline,
       instructions: location.instructions,
       accessRequirements: location.accessRequirements,
     },

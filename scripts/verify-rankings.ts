@@ -12,6 +12,21 @@ function check(name: string, pass: boolean, detail = "") {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
+/**
+ * How many sellers the unfiltered export is supposed to return.
+ *
+ * Read from the database rather than hard-coded to the two this suite creates.
+ * The export lists EVERY seller whose orders count — that is the product
+ * behaviour, and the check below confirms it — so assuming the catalog holds
+ * nobody but these two made the suite fail on the clone for a reason that has
+ * nothing to do with rankings: the clone is a copy of the deployed database and
+ * carries the sellers that are really in it. The assertion keeps its teeth
+ * because the count still has to match exactly, whichever sellers exist.
+ */
+async function qualifyingSellerCount() {
+  return prisma.seller.count({ where: { status: { in: ["APPROVED", "SUSPENDED", "BLOCKED"] } } });
+}
+
 async function cleanup() {
   for (const shop of [SHOP_A, SHOP_B]) {
     const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
@@ -127,7 +142,12 @@ async function main() {
   check("Totals: net retail = 15700", result.totals.netRetail === 15700, String(result.totals.netRetail));
   check("Totals: units = 3", result.totals.unitsSold === 3, String(result.totals.unitsSold));
   check("Sellers with history = 2", result.totals.sellers === 2, String(result.totals.sellers));
-  check("Total rows = 2", result.totalRows === 2, String(result.totalRows));
+  const sellerRows = await qualifyingSellerCount();
+  check(
+    "Total rows = every seller whose orders count, not just these two",
+    result.totalRows === sellerRows,
+    `${result.totalRows} row(s), ${sellerRows} qualifying seller(s) in this database`,
+  );
   check("hasHistory set for A", rowA.hasHistory === true);
   check("No dropped currencies yet", result.droppedCurrencyOrders === 0, String(result.droppedCurrencyOrders));
 
@@ -155,7 +175,11 @@ async function main() {
   // CSV exports the full filtered/sorted set, not just a page
   const csv = toCsv(result.rows, result.currency);
   check("CSV contains both sellers", csv.includes("Rank Seller A") && csv.includes("Rank Seller B"));
-  check("CSV has header + 2 rows", csv.split("\n").length === 3, `${csv.split("\n").length} line(s)`);
+  check(
+    "CSV has a header and one row per sold-to seller",
+    csv.split("\n").length === sellerRows + 1,
+    `${csv.split("\n").length} line(s) for ${sellerRows} seller(s)`,
+  );
 
   // Currency separation
   await makeOrder(a.id, "#A-EUR", "EUR", [{ price: 1000, wholesale: 100, qty: 1 }]);

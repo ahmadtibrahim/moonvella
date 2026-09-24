@@ -17,6 +17,7 @@ import {
 import {
   listProductMedia,
   uploadMedia,
+  DuplicateMediaError,
   attachMediaToVariants,
   updateMedia,
   setMediaApproval,
@@ -31,12 +32,14 @@ import { previewMarketingPack } from "~/services/marketingPack.server";
 import {
   getProductPackages,
   listPresetsForChoice,
+  PackageValidationError,
   resolvePackagesForVariant,
   saveProductPackages,
   saveVariantPackages,
   copyVariantPackaging,
 } from "~/services/packaging.server";
 import {
+  clearOriginOverrides,
   missingOriginFields,
   resolveOriginForVariant,
   saveOriginMappings,
@@ -134,6 +137,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
      */
     preview: url.searchParams.get("preview") === "1",
     /**
+     * Which packaging a redirect just saved, so the page can say so.
+     *
+     * Named rather than merely "saved": a confirmation with no subject is the
+     * kind of message an operator learns to ignore, and this one has to answer
+     * "did my carton go in" at a glance.
+     */
+    savedPackaging: savedPackagingLabel(url.searchParams.get("saved")),
+    /**
      * What this person may do, resolved from their role. Used to decide which
      * controls are drawn — never as the control itself, which is the check in
      * the action and in the service behind it.
@@ -174,27 +185,76 @@ type LoadedProduct = NonNullable<Awaited<ReturnType<typeof getProduct>>>;
 function packageRows(form: FormData, unitsPref: UnitPreference) {
   const view = unitsView(unitsPref);
   const at = (name: string, index: number) => String(form.getAll(name)[index] ?? "");
-  return form.getAll("pkg_length").map((_, index) => ({
-    label: at("pkg_label", index),
-    packageType: at("pkg_packageType", index) || "carton",
-    presetId: at("pkg_presetId", index) || null,
-    length: at("pkg_length", index),
-    width: at("pkg_width", index),
-    height: at("pkg_height", index),
-    dimensionUnit: at("pkg_dimUnit", index) || view.dimensionUnit,
-    grossWeight: at("pkg_weight", index),
-    weightUnit: at("pkg_weightUnit", index) || view.weightUnit,
-    unitsPerPackage: at("pkg_unitsPerPackage", index) || "1",
-    packagesPerUnit: at("pkg_packagesPerUnit", index) || "1",
-    description: at("pkg_description", index) || null,
-    declaredValue: at("pkg_declaredValue", index) || null,
-    shipsSeparately: form.get(`pkg_shipsSeparately_${index}`) === "true",
-    // Defaults to allowed when the control is absent entirely, so a form that
-    // predates the column cannot silently forbid consolidation.
-    consolidatable: form.has(`pkg_consolidatable_${index}`)
-      ? form.get(`pkg_consolidatable_${index}`) === "true"
-      : true,
-  }));
+  return form.getAll("pkg_length").map((_, index) => {
+    const shipsSeparately = form.get(`pkg_shipsSeparately_${index}`) === "true";
+    return {
+      label: at("pkg_label", index),
+      packageType: at("pkg_packageType", index) || "carton",
+      presetId: at("pkg_presetId", index) || null,
+      length: at("pkg_length", index),
+      width: at("pkg_width", index),
+      height: at("pkg_height", index),
+      dimensionUnit: at("pkg_dimUnit", index) || view.dimensionUnit,
+      grossWeight: at("pkg_weight", index),
+      weightUnit: at("pkg_weightUnit", index) || view.weightUnit,
+      unitsPerPackage: at("pkg_unitsPerPackage", index) || "1",
+      packagesPerUnit: at("pkg_packagesPerUnit", index) || "1",
+      description: at("pkg_description", index) || null,
+      declaredValue: at("pkg_declaredValue", index) || null,
+      shipsSeparately,
+      // A CARTON THAT SHIPS SEPARATELY IS NEVER MERGED, applied here as well as
+      // in the service. Two reasons for the second copy: what this function
+      // returns is echoed back to the form on a refusal, so it has to be the
+      // value that would be stored; and a form is not the only thing that can
+      // post to an action. A checkbox that is off submits nothing, so absence
+      // means off — which is also the column default, and the safe reading: "we
+      // were not told this may be merged" is not permission to merge it.
+      consolidatable: shipsSeparately
+        ? false
+        : form.get(`pkg_consolidatable_${index}`) === "true",
+    };
+  });
+}
+
+/** The two intents that save packaging rows, and so can be handed back to a form. */
+const PACKAGING_INTENTS = new Set(["save_packaging", "save_product_packages"]);
+
+/** The intents whose success is announced on the page they return to. */
+const SAVED_INTENTS = new Set([...PACKAGING_INTENTS, "clear_origin_overrides"]);
+
+/**
+ * The sentence to show after a save, from the redirect's own marker.
+ *
+ * It states what a reader of the page below can check for themselves — the
+ * cartons and the mapping drawn there are read back from the database — rather
+ * than asserting that all is well.
+ */
+function savedPackagingLabel(saved: string | null): string | null {
+  if (saved === "save_packaging") {
+    return "Variant packaging saved. The cartons below are what is stored, and what a shipping quote will use.";
+  }
+  if (saved === "save_product_packages") {
+    return "Product packaging defaults saved. Variants with no packaging of their own inherit these.";
+  }
+  if (saved === "clear_origin_overrides") {
+    return "Overrides cleared. The variants below now inherit the product's pickup location, which is what the column shows.";
+  }
+  return null;
+}
+
+/**
+ * How many rows the form says it drew, or nothing if it does not say.
+ *
+ * This is the difference between "the operator removed every carton and saved"
+ * and "the cartons never arrived", and it is the only thing that tells them
+ * apart — see `assertClearWasIntended` in the service, which is where the
+ * refusal lives so that no caller can skip it.
+ */
+function drawnRows(form: FormData): number | undefined {
+  const stated = form.get("pkg_rowCount");
+  if (stated === null) return undefined;
+  const parsed = Number(stated);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 /**
@@ -273,7 +333,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   const productId = String(params.id);
   const form = await request.formData();
-  const intent = String(form.get("intent") || "");
+  let intent = String(form.get("intent") || "");
   const tab = readTab(String(form.get("tab") || ""));
 
   const text = (name: string) => String(form.get(name) || "");
@@ -486,6 +546,68 @@ export async function action({ request, params }: ActionFunctionArgs) {
         break;
       }
 
+      /*
+       * ONE FILE PER REQUEST, AND AN ANSWER PER FILE.
+       *
+       * The batch uploader sends each file on its own, so this intent exists to
+       * be answered in JSON rather than with a redirect: a redirect would throw
+       * away the outcome of every other file in the queue, and the uploader
+       * could not tell which of ten files needed retrying. It is deliberately
+       * separate from `media_upload`, which stays exactly as it is — an older
+       * bundle in a browser tab still posts to that one, and it still works.
+       *
+       * EVERY OUTCOME IS A 200 WITH `ok` IN THE BODY, including the refusals.
+       * A non-2xx would be handled by the browser's XHR error path, where the
+       * body is often not readable, and "this file is a duplicate" would arrive
+       * as "upload failed" — the one message that would have the uploader retry
+       * a file that can never succeed.
+       */
+      case "media_upload_batch": {
+        const file = form.get("file");
+        if (!(file instanceof File) || file.size === 0) {
+          return Response.json({ ok: false, error: "No file arrived with this request. Choose it again." });
+        }
+        try {
+          const asset = await uploadMedia(
+            productId,
+            file,
+            {
+              category: (optional("category") ?? "PRODUCT_IMAGE") as never,
+              subtype: optional("subtype"),
+              title: optional("title"),
+              altText: optional("altText"),
+              variantIds: variantScope(),
+              documentType: optional("documentType"),
+              version: optional("version"),
+              effectiveDate: optional("effectiveDate"),
+              language: optional("language"),
+              downloadAllowed: form.get("downloadAllowed") !== "false",
+              instructions: optional("instructions"),
+              templateUrl: optional("templateUrl"),
+            },
+            actor
+          );
+          return Response.json({ ok: true, assetId: asset.id, title: asset.title });
+        } catch (error) {
+          // A duplicate is a refusal the uploader must NOT offer to retry, and
+          // the existing asset is named so the file can be retired with a link
+          // to what it duplicates instead of looking like a failure.
+          if (error instanceof DuplicateMediaError) {
+            return Response.json({
+              ok: false,
+              duplicate: true,
+              assetId: error.assetId,
+              title: error.existingTitle,
+              error: error.message,
+            });
+          }
+          return Response.json({
+            ok: false,
+            error: error instanceof Error ? error.message : "That file could not be stored.",
+          });
+        }
+      }
+
       case "document_supersede": {
         const file = form.get("file");
         if (!(file instanceof File) || file.size === 0) {
@@ -560,7 +682,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
       /* Shipping and packaging — a separate feature, kept working          */
       /* ---------------------------------------------------------------- */
       case "save_packaging":
-        await saveVariantPackages(text("variantId"), packageRows(form, unitsPref));
+        await saveVariantPackages(text("variantId"), packageRows(form, unitsPref), {
+          drawnRows: drawnRows(form),
+        });
         break;
 
       case "copy_packaging":
@@ -574,7 +698,9 @@ export async function action({ request, params }: ActionFunctionArgs) {
        * row refused as a set rather than filtered — lives in one place.
        */
       case "save_product_packages":
-        await saveProductPackages(productId, packageRows(form, unitsPref));
+        await saveProductPackages(productId, packageRows(form, unitsPref), {
+          drawnRows: drawnRows(form),
+        });
         break;
 
       case "save_origin": {
@@ -597,22 +723,73 @@ export async function action({ request, params }: ActionFunctionArgs) {
         break;
       }
 
+      /*
+       * REMOVING AN OVERRIDE IS ITS OWN INTENT.
+       *
+       * It could have been folded into `save_origin`, and that is exactly what
+       * must not happen: that intent also writes the product's default, so a
+       * form posted just to clear one variant would carry no product location
+       * and unmap the product as a side effect. This intent can only set the
+       * named variants back to null — see `clearOriginOverrides`, which refuses
+       * a variant that is not part of this product and audits what it removed.
+       */
+      case "clear_origin_overrides": {
+        const variantIds = form.getAll("variantId").map(String).filter(Boolean);
+        if (variantIds.length === 0) throw new Error("No variant override was selected to clear.");
+        await clearOriginOverrides(productId, variantIds, { actorId: user.id, actorName: user.name });
+        intent = "clear_origin_overrides";
+        break;
+      }
+
       default:
         throw new Error("Unknown action.");
     }
   } catch (error) {
+    /*
+     * A refused packaging save comes back holding what was refused.
+     *
+     * The page is rendered from the loader, and the loader reads the database.
+     * So a refusal used to re-render the form from what was stored BEFORE the
+     * operator typed — one missing weight cost them every number on the page,
+     * and the form gave no sign it had done it. The echo is the submission
+     * itself, parsed by the same function the save uses, so what comes back is
+     * exactly what was sent, in the units it was sent in.
+     */
+    if (error instanceof PackageValidationError) {
+      return {
+        error: error.message,
+        tab,
+        packageErrors: error.details,
+        packageValues: PACKAGING_INTENTS.has(intent) ? packageRows(form, unitsPref) : null,
+        // Which editor gets the echo back. A variant's rows belong to one
+        // variant, and the page holds an editor per variant — so a variant save
+        // that somehow arrived without one is treated as the product-level
+        // editor's business rather than as every variant's.
+        packageVariantId: intent === "save_packaging" ? text("variantId") || null : null,
+      };
+    }
     return {
       error: error instanceof Error ? error.message : "Operation failed.",
       tab,
+      packageErrors: null,
+      packageValues: null,
+      packageVariantId: null,
     };
   }
 
-  // Back to the tab the form was on, so a save does not move the reader.
-  return redirect(`/admin/products/${productId}?tab=${tab}`);
+  /*
+   * Back to the tab the form was on, so a save does not move the reader — and
+   * carrying what was saved, so the page can say so. A redirect lands on a page
+   * that looks identical to the one the button was pressed on, which makes a
+   * save that worked and a save that silently did nothing impossible to tell
+   * apart. That is how the reported failure stayed invisible.
+   */
+  const saved = SAVED_INTENTS.has(intent) ? `&saved=${intent}` : "";
+  return redirect(`/admin/products/${productId}?tab=${tab}${saved}`);
 }
 
 export default function AdminProductDetail() {
-  const { product, presets, media, readiness, pack, shipping, tab, can, preview, units } =
+  const { product, presets, media, readiness, pack, shipping, tab, can, preview, units, savedPackaging } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
@@ -657,6 +834,32 @@ export default function AdminProductDetail() {
           }}
         >
           {actionData.error}
+          {/* Where the refusal was a packaging row, say which control to fix
+              rather than leaving the operator to find it in the wall of text. */}
+          {actionData.packageErrors?.length ? (
+            <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.1rem" }}>
+              {actionData.packageErrors.slice(0, 6).map((problem) => (
+                <li key={`${problem.index}-${problem.field}`}>{problem.message}</li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {/* A save that worked has to look different from one that did nothing.
+          See `savedPackagingLabel`. */}
+      {savedPackaging ? (
+        <div
+          role="status"
+          style={{
+            ...card,
+            background: "#f0fdf4",
+            borderColor: "#bbf7d0",
+            color: "#166534",
+            fontSize: "0.85rem",
+          }}
+        >
+          {savedPackaging}
         </div>
       ) : null}
 
@@ -702,6 +905,15 @@ export default function AdminProductDetail() {
           presets={presets}
           canEditCost={can.cost}
           units={units}
+          refused={
+            actionData?.packageVariantId === null || actionData?.packageVariantId === undefined
+              ? null
+              : {
+                  variantId: actionData.packageVariantId,
+                  problems: actionData.packageErrors ?? [],
+                  values: actionData.packageValues ?? null,
+                }
+          }
         />
       ) : null}
       {tab === "shipping" && shipping ? (
@@ -713,6 +925,11 @@ export default function AdminProductDetail() {
           presets={presets}
           canManage={can.manage}
           units={units}
+          refused={
+            !actionData?.packageVariantId && actionData?.packageValues
+              ? { problems: actionData.packageErrors ?? [], values: actionData.packageValues }
+              : null
+          }
         />
       ) : null}
       {tab === "media" ? <MediaTab product={product} media={media} /> : null}

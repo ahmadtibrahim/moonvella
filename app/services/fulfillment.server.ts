@@ -190,11 +190,11 @@ export async function createPackingShipment(
   orderId: string,
   allocations: PackingAllocation[],
   actor: Actor,
-  opts?: { carrier?: string | null; serviceName?: string | null }
+  opts?: { carrier?: string | null; serviceName?: string | null; packageIds?: string[] }
 ) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { items: true, shipments: { include: { items: true } } },
+    include: { items: true, shipments: { include: { items: true } }, packages: true },
   });
   if (!order) throw new Error("Order not found.");
 
@@ -216,6 +216,39 @@ export async function createPackingShipment(
     throw new Error("Enter a quantity to pack. All selected quantities are already packed.");
   }
 
+  /*
+   * WHICH CARTONS ARE IN THIS BOX, decided at the moment the box is made.
+   *
+   * A packing shipment has always held a set of line items and no description
+   * of the parcel, so booking it fell back to the ORDER's parcel list — every
+   * carton on the order, including the ones this box does not contain, priced
+   * and labelled as though it did. That was invisible on an order packed in one
+   * go and wrong on every order packed in two.
+   *
+   * The caller may name the cartons (`packageIds`), which the packing page does
+   * when an operator picks them. When it does not — every existing caller, and
+   * the ordinary one-box order — the order's cartons that belong to no box yet
+   * are claimed by this one. Unassigned means unassigned: a carton already
+   * linked to another shipment is left where it is, so a second box never
+   * silently re-declares the first box's contents.
+   *
+   * THIS IS A LABEL, NOT A CARRIER DECISION. Linking a carton to a shipment does
+   * not merge, split or move anything; it records which parcels this booking
+   * will be allowed to describe.
+   */
+  const named = opts?.packageIds ? new Set(opts.packageIds) : null;
+  const claimed = order.packages
+    .filter((p) => (named ? named.has(p.id) : p.shipmentId === null))
+    .map((p) => p.id);
+  if (named) {
+    const unknown = [...named].filter((id) => !order.packages.some((p) => p.id === id));
+    if (unknown.length > 0) {
+      throw new Error(
+        `${unknown.length} selected carton(s) do not belong to this order. Reload the page and select again.`,
+      );
+    }
+  }
+
   const shipment = await prisma.shipment.create({
     data: {
       orderId,
@@ -227,6 +260,13 @@ export async function createPackingShipment(
     include: { items: true },
   });
 
+  if (claimed.length > 0) {
+    await prisma.orderPackage.updateMany({
+      where: { id: { in: claimed }, orderId },
+      data: { shipmentId: shipment.id },
+    });
+  }
+
   await recordAudit({
     actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
@@ -234,7 +274,7 @@ export async function createPackingShipment(
     action: "shipment.packing_created",
     entityType: AUDIT_ENTITY.SHIPMENT,
     entityId: shipment.id,
-    afterData: { orderId, allocations: clean },
+    afterData: { orderId, allocations: clean, packageIds: claimed },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });

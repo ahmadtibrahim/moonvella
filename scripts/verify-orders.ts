@@ -192,6 +192,32 @@ async function main() {
   check("customer payment status captured", order?.paymentStatus === "PAID", order?.paymentStatus);
   check("fulfillment request created PENDING", order?.fulfillmentRequest?.status === "PENDING");
   check("wholesale payment created REQUIRES_PAYMENT", order?.wholesalePayment?.status === "REQUIRES_PAYMENT");
+  /*
+   * THE SELLER'S BILL SAYS WHAT IT IS MADE OF.
+   *
+   * These three figures existed as columns and were never written, so a bill was
+   * an amount with no parts — and the shipping the seller owed was invisible on
+   * the record until the shipment reconciliation happened to show it. The
+   * shipping figure is the SELLER'S OWN charge (the Shopify shipping lines scaled
+   * to MoonVella's share, the same 1361 the order carries), deliberately not the
+   * carrier's cost: what the carrier charges MoonVella is not the seller's bill.
+   *
+   * `amount` is asserted unchanged alongside them. It is what the seller pays;
+   * filling in the breakdown must not move the total.
+   */
+  check(
+    "the seller's bill records its shipping line from the seller's own charge, never the carrier's",
+    order?.wholesalePayment?.shippingAmount === order?.moonvellaShipping &&
+      order?.wholesalePayment?.shippingAmount === 1361,
+    `payment=${order?.wholesalePayment?.shippingAmount} order=${order?.moonvellaShipping}`,
+  );
+  check(
+    "and its subtotal and tax, with the amount it charges unchanged",
+    order?.wholesalePayment?.subtotal === order?.moonvellaSubtotal &&
+      order?.wholesalePayment?.taxAmount === order?.moonvellaTax &&
+      order?.wholesalePayment?.amount === order?.moonvellaSubtotal,
+    `subtotal=${order?.wholesalePayment?.subtotal} tax=${order?.wholesalePayment?.taxAmount} amount=${order?.wholesalePayment?.amount}`,
+  );
   check("shipping address persisted", !!order?.shippingAddress, order?.shippingAddress ?? "null");
   check("moonvellaTax from line-level tax allocation", order?.moonvellaTax === 1274, `${order?.moonvellaTax}`);
   check("moonvellaDiscounts from line-level discount", order?.moonvellaDiscounts === 980, `${order?.moonvellaDiscounts}`);

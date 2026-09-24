@@ -107,6 +107,39 @@ function objectLiteral(source: string, name: string): string {
   return source.slice(start, Math.min(...candidates));
 }
 
+/* ------------------------------------------------------------------------ */
+/* The connection this suite needs to be absent, and how it is made absent   */
+/* ------------------------------------------------------------------------ */
+/**
+ * "No Odoo connection" used to be a fact about this environment. It is not one
+ * any more: the deployment IS connected — credentials are stored encrypted in
+ * the database, and the clone is a copy of the deployed database — so the state
+ * these checks are written for has to be established by the suite rather than
+ * assumed. Assuming it is what made check 7 read as a failure of the import
+ * when the import was behaving exactly as specified.
+ *
+ * So the stored odoo rows are snapshotted, removed for the length of the run,
+ * and put back by `cleanup()` — the same pattern verify-odoo.ts uses for the
+ * same reason. Two further guards mean nothing can reach the real ERP even
+ * while they are present for the rest of the suite: the ODOO_* environment is
+ * blanked by the runner, and the production-database guard refuses "Prod-db"
+ * outright, by name, before any call is made.
+ */
+async function readOdooStore() {
+  return {
+    state: await prisma.integrationState.findMany({ where: { key: "odoo" } }),
+    creds: await prisma.integrationCredential.findMany({ where: { key: "odoo" } }),
+  };
+}
+
+async function clearOdooStore() {
+  await prisma.integrationCredential.deleteMany({ where: { key: "odoo" } });
+  await prisma.integrationState.deleteMany({ where: { key: "odoo" } });
+}
+
+/** Non-null only between the snapshot above and the restore in cleanup(). */
+let odooStoreSnapshot: Awaited<ReturnType<typeof readOdooStore>> | null = null;
+
 async function main() {
   const raw = readFileSync(SOURCE_PATH, "utf8");
   const source = stripComments(raw);
@@ -176,6 +209,8 @@ async function main() {
   /* -------------------------------------------------------------------- */
   /* The connection is not ready, and the import says so                   */
   /* -------------------------------------------------------------------- */
+  odooStoreSnapshot = await readOdooStore();
+  await clearOdooStore();
   const configured = await odooConfigured();
   check(
     7,
@@ -267,13 +302,20 @@ async function main() {
       /not connected/.test(messageOf(importError)),
     messageOf(importError).slice(0, 130) || "no error",
   );
+  // "Written" is the claim, so the comparison is against the counts read before
+  // the call — not against zero. The clone is a copy of the deployed database,
+  // which carries the mappings a real Odoo catalogue sync produced, and an
+  // import that refuses correctly leaves those exactly where they were. Reading
+  // zero as the pass condition tested the database's contents rather than this
+  // code, and reported a working refusal as a failure because the deployment had
+  // imported something at some point.
   check(
     15,
     "And the refusal is total: no product, no mapping and no variant mapping was written",
     afterImport.products === before.products &&
-      afterImport.odooProducts === 0 &&
-      afterImport.odooVariants === 0,
-    `products ${before.products}->${afterImport.products}, odoo mappings ${afterImport.odooProducts}/${afterImport.odooVariants}`,
+      afterImport.odooProducts === before.odooProducts &&
+      afterImport.odooVariants === before.odooVariants,
+    `products ${before.products}->${afterImport.products}, odoo mappings ${before.odooProducts}->${afterImport.odooProducts}/${before.odooVariants}->${afterImport.odooVariants}`,
   );
   check(
     16,
@@ -819,6 +861,30 @@ async function cleanup() {
   await prisma.product.deleteMany({ where: { productCode: { startsWith: CODE } } });
   await prisma.externalProductMapping.deleteMany({ where: { shopDomain: ODOO_DB } });
   await prisma.externalVariantMapping.deleteMany({ where: { shopDomain: ODOO_DB } });
+  await restoreOdooStore();
+}
+
+/**
+ * Put the stored odoo connection back. The snapshot is cleared first so that
+ * this is a no-op if the suite never got as far as removing the rows, and so a
+ * second call (cleanup runs on the success path and again if main throws) does
+ * not create a second copy of it.
+ */
+async function restoreOdooStore() {
+  const snapshot = odooStoreSnapshot;
+  if (!snapshot) return;
+  odooStoreSnapshot = null;
+  if (snapshot.creds.length === 0 && snapshot.state.length === 0) return;
+  await clearOdooStore();
+  for (const row of snapshot.creds) {
+    await prisma.integrationCredential.create({ data: { ...row, updatedAt: undefined } });
+  }
+  for (const row of snapshot.state) {
+    await prisma.integrationState.create({ data: { ...row, updatedAt: undefined } });
+  }
+  console.log(
+    `\nrestored ${snapshot.creds.length} stored odoo credential(s) and ${snapshot.state.length} state row(s).`,
+  );
 }
 
 main().catch(async (error) => {

@@ -441,6 +441,24 @@ export async function chargeWholesaleOrder(
       await prisma.sellerBillingSettings.update({ where: { sellerId: order.sellerId }, data: { holdForReview: true } });
       return { ok: false, status: "REQUIRES_PAYMENT", heldForReview: true, error: "Order total exceeds the authorized maximum; held for review." };
     }
+    /*
+     * THIS GUARD NOW ACTUALLY RUNS, AND IT DID NOT BEFORE.
+     *
+     * `shippingAmount` used to be null on every payment row, so this compared 0
+     * against the limit and let everything through — a seller who set a maximum
+     * shipping charge had a limit that could never be reached and never held
+     * anything. The column is now written when the bill is made (see
+     * `orderIntake.server.ts`), so an order whose seller shipping charge is over
+     * the seller's own limit is HELD FOR REVIEW instead of charged automatically.
+     *
+     * Holding is the safe direction and the one the setting asks for: nothing is
+     * charged, an operator is told why, and a person decides. The seller can
+     * still pay it manually.
+     *
+     * Rows written before the column was populated keep their null and read as
+     * zero here, exactly as they did — an old order is not retroactively held
+     * for a limit it was never measured against.
+     */
     if (settings.maxShippingCharge && (payment.shippingAmount ?? 0) > settings.maxShippingCharge) {
       await prisma.sellerBillingSettings.update({ where: { sellerId: order.sellerId }, data: { holdForReview: true } });
       return { ok: false, status: "REQUIRES_PAYMENT", heldForReview: true, error: "Shipping exceeds the authorized maximum; held for review." };

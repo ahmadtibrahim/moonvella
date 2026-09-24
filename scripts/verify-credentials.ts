@@ -884,6 +884,153 @@ async function main() {
       !/PRICELIST/.test(stripComments(settingsSource)) &&
         !/product\.pricelist/.test(stripComments(readSource("app/services/odoo.server.ts")))
     );
+
+    // 19. Google holds TWO credentials, and the check answers for each --------
+    //
+    // The defect this covers: `checkIntegration` had no `google` case, so Test
+    // connection fell to the default and answered "No check is available for
+    // this integration" while both fields showed as saved. Presence was never
+    // the question. The two keys are used on opposite sides of the network, fail
+    // for unrelated reasons, and are fixed in different consoles, so one verdict
+    // cannot name which one to replace — and a half-broken integration must not
+    // be reported whole.
+    //
+    // Google is stubbed here, and that is the suite's design rather than a gap
+    // in it: what is checked is the SHAPE of the answer — one line per
+    // credential, the failing one identifiable, Google's own words carried
+    // through — not whether Google accepts a particular key. Only a live call
+    // can say that, and no suite makes one.
+    const GOOGLE_BROWSER_CANARY = "AIzaSyBROWSERCANARYVERIFY0000000000000000";
+    const GOOGLE_SERVER_CANARY = "AIzaSyBSERVERCANARYVERIFY0000000000000000";
+    await saveCredentials("google", {
+      GOOGLE_MAPS_BROWSER_KEY: GOOGLE_BROWSER_CANARY,
+      GOOGLE_MAPS_SERVER_KEY: GOOGLE_SERVER_CANARY,
+    });
+
+    const googleAnswers = (status: number, body: unknown) => () => ({ status, body });
+    const placesOk = googleAnswers(200, {
+      suggestions: [{ placePrediction: { placeId: "verify-pid", text: { text: "994 Westport Cres" } } }],
+    });
+    const validationOk = googleAnswers(200, {
+      result: { verdict: { validationGranularity: "PREMISE" } },
+    });
+
+    installFetch((url) =>
+      url.includes("addressvalidation.googleapis.com") ? validationOk() : placesOk()
+    );
+    const googleHealthy = await checkIntegration("google");
+    const healthyLines = googleHealthy.detail.split("\n");
+    check(
+      "the Google check answers for the browser key and the server key separately",
+      healthyLines.length === 2 &&
+        /^Browser autocomplete:/.test(healthyLines[0]) &&
+        /^Server Address Validation:/.test(healthyLines[1]),
+      `${healthyLines.length} line(s)`
+    );
+    check("both keys accepted is HEALTHY", googleHealthy.status === "HEALTHY", googleHealthy.status);
+    check(
+      "and a pass claims only what was checked: a referrer and a verdict, never a rendered form",
+      /referrer/.test(healthyLines[0]) && /validateAddress/.test(healthyLines[1]) &&
+        !/autocomplete works/i.test(googleHealthy.detail)
+    );
+
+    // A refused browser key kills autocomplete on that host and touches nothing
+    // else. The server key's own line must survive it intact — that is the whole
+    // reason the answer is two lines.
+    installFetch((url) =>
+      url.includes("addressvalidation.googleapis.com")
+        ? validationOk()
+        : {
+            status: 403,
+            body: {
+              error: {
+                status: "PERMISSION_DENIED",
+                message: "Requests from referer https://app.moonvella.com/ are blocked.",
+              },
+            },
+          }
+    );
+    const browserRefused = await checkIntegration("google");
+    const refusedLines = browserRefused.detail.split("\n");
+    check(
+      "a refused browser key does not disturb the server key's verdict",
+      browserRefused.status === "FAILED" &&
+        /^Browser autocomplete: FAILED/.test(refusedLines[0]) &&
+        /^Server Address Validation: HEALTHY/.test(refusedLines[1]),
+      refusedLines.map((line) => line.slice(0, 30)).join(" | ")
+    );
+    check(
+      "and Google's own words are carried through rather than replaced by a summary",
+      browserRefused.detail.includes("Requests from referer https://app.moonvella.com/ are blocked."),
+      "referrer refusal quoted"
+    );
+
+    // A refused server key is the state the owner was in. Google's message is
+    // asserted because it is the part that names the real cause — a key that
+    // does not exist reads nothing like an API that is disabled on a key that
+    // does, and the two have different fixes.
+    installFetch((url) =>
+      url.includes("addressvalidation.googleapis.com")
+        ? {
+            status: 400,
+            body: {
+              error: {
+                status: "INVALID_ARGUMENT",
+                message: "API key not valid. Please pass a valid API key.",
+              },
+            },
+          }
+        : placesOk()
+    );
+    const serverRefused = await checkIntegration("google");
+    const serverLine = serverRefused.detail.split("\n")[1] ?? "";
+    check(
+      "a refused server key is FAILED and quotes Google's reason",
+      serverRefused.status === "FAILED" &&
+        /^Server Address Validation: FAILED/.test(serverLine) &&
+        serverRefused.detail.includes("API key not valid. Please pass a valid API key."),
+      serverLine.slice(0, 70)
+    );
+    check(
+      "and it states that the value is present but not accepted, rather than calling it unset",
+      /present, \d+ characters/.test(serverLine) && !/NOT SET/.test(serverLine)
+    );
+    check(
+      "and the card renders those two lines as lines, not as one run-on sentence",
+      /whiteSpace: "pre-line"/.test(cardBody)
+    );
+
+    // 20. A Google value of the wrong KIND is refused before it is stored -----
+    //
+    // The Google Cloud console shows a project's API keys, its OAuth client ID
+    // and its OAuth client secret on pages reached from one another, and the
+    // client ID is the longest, most key-shaped string on the credentials
+    // screen. Stored, it produces "saved", a live call, and Google's generic
+    // `API key not valid` — which names neither the field nor the mistake.
+    const oauthClientId = "665069123456-abcdefghijklmnopqrstuvwxyz012345.apps.googleusercontent.com";
+    let googleWrongKind: string | null = null;
+    try {
+      await saveIntegrationCredentials(
+        "google",
+        { GOOGLE_MAPS_SERVER_KEY: oauthClientId },
+        { actorType: "ADMIN_USER", actorId: "verify-credentials", actorName: "Verification" }
+      );
+    } catch (error) {
+      googleWrongKind = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "an OAuth client ID is refused in a Google API-key field, and named as such",
+      /OAuth client ID/.test(googleWrongKind ?? ""),
+      (googleWrongKind ?? "(nothing was refused)").slice(0, 80)
+    );
+    check(
+      "and the refusal quotes no part of the value",
+      !!googleWrongKind && !googleWrongKind.includes(oauthClientId)
+    );
+    check(
+      "and a refused save writes nothing: the stored key is the one that was already there",
+      (await getCredential("google", "GOOGLE_MAPS_SERVER_KEY")) === GOOGLE_SERVER_CANARY
+    );
   } finally {
     await restore(snap);
     const restoredRows = await prisma.integrationCredential.count({ where: { key: { in: [...TOUCHED_KEYS] } } });

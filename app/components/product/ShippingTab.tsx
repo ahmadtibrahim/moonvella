@@ -15,8 +15,17 @@ import {
   EmptyState,
 } from "~/components/product/ui";
 import { convertedDisplay, type UnitsView } from "~/utils/measurementUnits";
-import { fillPackagingRow, preservePackagingRows } from "./packagingRows";
+import {
+  fieldError,
+  fillPackagingRow,
+  preservePackagingRows,
+  refusedEditorRows,
+  type EditorRowFields,
+  type RefusedPackaging,
+} from "./packagingRows";
 import { PackagingValue } from "./PackagingValue";
+import { DeclaredValueInput } from "./DeclaredValueInput";
+import { PackagingFlags } from "./PackagingFlags";
 
 /**
  * Where a product is collected from, and how it is packed.
@@ -107,6 +116,7 @@ export default function ShippingTab({
   presets,
   canManage,
   units,
+  refused = null,
 }: {
   product: { id: string; name: string; pickupLocationId: string | null };
   variants: ShippingVariant[];
@@ -116,6 +126,8 @@ export default function ShippingTab({
   canManage: boolean;
   /** The admin's unit preference: what every carton row is shown in. */
   units: UnitsView;
+  /** A refused packaging-defaults save, and which row and column it named. */
+  refused?: RefusedPackaging | null;
 }) {
   const unmapped = variants.filter((variant) => variant.originSource === "missing");
   const inheritingCartons = variants.filter((variant) => variant.packageSource !== "variant");
@@ -167,7 +179,42 @@ export default function ShippingTab({
               </p>
             </div>
 
-            <h3 style={{ ...sectionTitle, marginTop: "1.5rem" }}>Variants</h3>
+            {canManage ? (
+              <div style={{ marginTop: "0.9rem" }}>
+                <button type="submit" name="intent" value="save_origin" style={btn(INK, { solid: true })}>
+                  Save location mapping
+                </button>
+              </div>
+            ) : null}
+          </Form>
+        )}
+      </div>
+
+      {/*
+        THE VARIANTS, READ-ONLY, WITH THEIR OVERRIDES MARKED.
+
+        Every variant inherits the product's pickup location, and that is now the
+        only way a location is chosen for goods: a second selector per variant
+        was a second answer to the same question, and the one on the variant won
+        silently. Nothing was deleted to get here — a variant that already had
+        its own location keeps it and still ships from it — so the overrides that
+        exist are shown in amber, one row each, with a Clear button, rather than
+        being quietly dropped or quietly kept.
+
+        The table sits outside the form above because clearing one override must
+        not resubmit the product's default alongside it: a form that posts both
+        can lose the default, and a mapping lost as a side effect of tidying up a
+        variant is a bug nobody would look for here.
+      */}
+      <div style={card}>
+        <h3 style={sectionTitle}>Variants</h3>
+        <p style={sectionNote}>
+          All of these inherit the product&apos;s pickup location. An override recorded on a variant
+          before this page changed is kept and still decides where that variant ships from, and is
+          listed here so it cannot go unnoticed.
+        </p>
+        {locations.length === 0 ? null : (
+          <>
             <table
               style={{
                 width: "100%",
@@ -179,7 +226,7 @@ export default function ShippingTab({
               <thead>
                 <tr style={{ textAlign: "left", color: FAINT }}>
                   <th style={{ padding: "0.3rem" }}>Variant</th>
-                  <th style={{ padding: "0.3rem" }}>Location</th>
+                  <th style={{ padding: "0.3rem" }}>Where it ships from</th>
                   <th style={{ padding: "0.3rem" }}>Readiness</th>
                 </tr>
               </thead>
@@ -190,22 +237,45 @@ export default function ShippingTab({
                       <div style={{ color: INK, fontWeight: 600 }}>{variant.name}</div>
                       <code style={{ fontSize: "0.72rem", color: MUTED }}>{variant.sku}</code>
                     </td>
-                    <td style={{ padding: "0.35rem", maxWidth: 260 }}>
-                      <input type="hidden" name="originVariantId" value={variant.id} />
-                      <select
-                        name="originLocationId"
-                        style={input}
-                        defaultValue={variant.pickupLocationId ?? ""}
-                        disabled={!canManage}
-                        aria-label={`Pickup location for ${variant.name}`}
-                      >
-                        <option value="">Inherit from the product</option>
-                        {locations.map((location) => (
-                          <option key={location.id} value={location.id}>
-                            {optionLabel(location)}
-                          </option>
-                        ))}
-                      </select>
+                    <td style={{ padding: "0.35rem", maxWidth: 320 }}>
+                      {variant.pickupLocationId ? (
+                        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
+                          <span
+                            style={{
+                              background: "#fffbeb",
+                              border: "1px solid #fde68a",
+                              color: "#92400e",
+                              borderRadius: 999,
+                              padding: "0.1rem 0.5rem",
+                              fontSize: "0.7rem",
+                              fontWeight: 600,
+                            }}
+                          >
+                            Override set on this variant — {variant.originName ?? "an unknown location"}
+                          </span>
+                          {canManage ? (
+                            <Form method="post">
+                              <input type="hidden" name="tab" value="shipping" />
+                              <input type="hidden" name="productId" value={product.id} />
+                              <input type="hidden" name="intent" value="clear_origin_overrides" />
+                              <input type="hidden" name="variantId" value={variant.id} />
+                              <button
+                                type="submit"
+                                style={{ ...btn("#92400e"), padding: "0.1rem 0.5rem", fontSize: "0.68rem" }}
+                              >
+                                Clear
+                              </button>
+                            </Form>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <span style={{ color: MUTED }}>
+                          Inherits the product default
+                          {product.pickupLocationId
+                            ? ` (${locations.find((l) => l.id === product.pickupLocationId)?.name ?? "set"})`
+                            : " — none set yet"}
+                        </span>
+                      )}
                     </td>
                     <td style={{ padding: "0.35rem", fontSize: "0.75rem" }}>
                       {variant.originReady ? (
@@ -226,14 +296,28 @@ export default function ShippingTab({
               </tbody>
             </table>
 
-            {canManage ? (
-              <div style={{ marginTop: "0.9rem" }}>
-                <button type="submit" name="intent" value="save_origin" style={btn(INK, { solid: true })}>
-                  Save location mapping
+            {canManage && variants.some((variant) => variant.pickupLocationId) ? (
+              <Form method="post" style={{ marginTop: "0.9rem" }}>
+                <input type="hidden" name="tab" value="shipping" />
+                <input type="hidden" name="productId" value={product.id} />
+                <input type="hidden" name="intent" value="clear_origin_overrides" />
+                {variants
+                  .filter((variant) => variant.pickupLocationId)
+                  .map((variant) => (
+                    <input key={variant.id} type="hidden" name="variantId" value={variant.id} />
+                  ))}
+                <button type="submit" style={btn("#92400e")}>
+                  Clear all {variants.filter((variant) => variant.pickupLocationId).length} override
+                  {variants.filter((variant) => variant.pickupLocationId).length === 1 ? "" : "s"}
                 </button>
-              </div>
+                <p style={helpText}>
+                  Every one of these variants then inherits the product default above. The overrides
+                  removed are kept on the product&apos;s history, so what each one was can still be
+                  read afterwards.
+                </p>
+              </Form>
             ) : null}
-          </Form>
+          </>
         )}
 
         {unmapped.length > 0 ? (
@@ -260,6 +344,7 @@ export default function ShippingTab({
         presets={presets}
         canManage={canManage}
         units={units}
+        refused={refused}
       />
 
       <div style={card}>
@@ -330,21 +415,52 @@ function PackagingDefaults({
   presets,
   canManage,
   units,
+  refused,
 }: {
   packages: ProductPackageRow[];
   presets: ShippingPreset[];
   canManage: boolean;
   units: UnitsView;
+  /** A refused save: the rows it was carrying, and the messages about them. */
+  refused: RefusedPackaging | null;
 }) {
-  const [rows, setRows] = useState<(ProductPackageRow | null)[]>(() =>
-    packages.length ? packages : [null]
-  );
+  const [rows, setRows] = useState<(EditorRowFields | null)[]>(() => {
+    // A stored row and a refused submission are the same table drawn from two
+    // sources; `EditorRowFields` is the shape they agree on. A null element is
+    // the blank row a product with no defaults starts from.
+    const stored: EditorRowFields[] = packages.length ? [...packages] : [];
+    return stored.length ? stored : [null];
+  });
   // A name per row that survives its neighbours being removed. It starts past
   // the rows that are already on screen — a saved row's id, or the `new-0` an
   // empty table begins with — so a row added later can never take a name that
   // is already in use.
   const nextKey = useRef(packages.length > 0 ? packages.length : 1);
   const [keys, setKeys] = useState<string[]>(() => rows.map((row, index) => row?.id ?? `new-${index}`));
+
+  /*
+   * A REFUSAL PUTS THE SUBMISSION BACK ON THE SCREEN.
+   *
+   * This table's rows live in state, so a refusal that arrives while it is open
+   * usually finds the operator's own figures already sitting in it. That is not
+   * something to rely on. Whether React keeps this component's state across an
+   * action response is an implementation detail of the router, and the failure
+   * mode if it ever changes is silent: one missing weight, and every number the
+   * operator typed is replaced by what was stored before they started, with no
+   * sign that anything was lost. So the echo is applied as well, and the table
+   * is correct whichever way the router behaves.
+   *
+   * Applied ONCE PER REFUSAL, during render, using the pattern React documents
+   * for state that has to follow a prop. Comparing against the last refusal seen
+   * rather than against `refused` directly is what keeps it from re-seeding on
+   * every render — which would undo the operator's next keystroke, and would be
+   * a worse bug than the one this fixes.
+   */
+  const [seenRefusal, setSeenRefusal] = useState<RefusedPackaging | null>(null);
+  if (refused !== seenRefusal) {
+    setSeenRefusal(refused);
+    if (refused?.values?.length) setRows(refusedEditorRows(refused.values));
+  }
 
   const addRow = () => {
     setKeys((current) => [...current, `new-${nextKey.current}`]);
@@ -369,6 +485,14 @@ function PackagingDefaults({
         <input type="hidden" name="tab" value="shipping" />
         {/* The unit this table was drawn in — see the variant editor. */}
         <input type="hidden" name="units" value={units.preference} />
+        {/* How many rows this table is showing right now. The save replaces the
+            whole set, so rows that arrive are rows that will exist — and a form
+            arriving with none at all would otherwise read as "delete every
+            carton". The action refuses that unless this field agrees the table
+            really was empty. Here it never can be: the last row's remove button
+            is disabled, so a product's defaults cannot be emptied by accident or
+            on purpose. See `assertClearWasIntended` in the service. */}
+        <input type="hidden" name="pkg_rowCount" value={rows.length} />
 
         {/* A carton row has a lot of columns and the table must not force the
             whole page sideways at a narrower window. */}
@@ -391,6 +515,27 @@ function PackagingDefaults({
               <th style={{ padding: "0.3rem" }}>Ships separately</th>
               <th style={{ padding: "0.3rem" }}>May consolidate</th>
               <th style={{ padding: "0.3rem" }} />
+            </tr>
+            {/* WHAT THE THREE SETTINGS MEAN, said once above the boxes that set
+                them. The pair on the right are one decision: a carton that
+                travels on its own is never merged, so the second box goes grey
+                while the first is on. */}
+            <tr style={{ color: FAINT, fontSize: "0.66rem" }}>
+              <td style={{ padding: "0.2rem" }} colSpan={8}>
+                One row per carton. <strong>Units/pkg</strong> is how many sold units go in this
+                carton; a row that says 2 makes two cartons per unit sold, each with the
+                measurements on that row.
+              </td>
+              <td style={{ padding: "0.2rem" }} colSpan={2}>
+                &nbsp;
+              </td>
+              <td style={{ padding: "0.2rem" }}>
+                <strong>Own box.</strong> Not merged with anything else.
+              </td>
+              <td style={{ padding: "0.2rem" }}>
+                <strong>May share</strong> a parcel with other cartons.
+              </td>
+              <td style={{ padding: "0.2rem" }} />
             </tr>
           </thead>
           <tbody>
@@ -477,6 +622,7 @@ function PackagingDefaults({
                       storedUnit={row?.dimensionUnit ?? units.dimensionUnit}
                       shownUnit={units.dimensionUnit}
                       disabled={!canManage}
+                      error={fieldError(refused?.problems ?? [], index, dimension)}
                     />
                   </td>
                 ))}
@@ -489,6 +635,7 @@ function PackagingDefaults({
                     storedUnit={row?.weightUnit ?? units.weightUnit}
                     shownUnit={units.weightUnit}
                     disabled={!canManage}
+                    error={fieldError(refused?.problems ?? [], index, "grossWeight")}
                   />
                 </td>
                 <td style={{ padding: "0.2rem" }}>
@@ -502,37 +649,25 @@ function PackagingDefaults({
                   />
                 </td>
                 <td style={{ padding: "0.2rem" }}>
-                  <input
-                    style={input}
-                    name="pkg_declaredValue"
-                    inputMode="decimal"
-                    defaultValue={row?.declaredValue === null || row?.declaredValue === undefined ? "" : (row.declaredValue / 100).toFixed(2)}
-                    aria-label={`Carton ${index + 1} declared value`}
+                  <DeclaredValueInput
+                    cents={row?.declaredValue}
+                    index={index}
                     disabled={!canManage}
+                    error={fieldError(refused?.problems ?? [], index, "declaredValue")}
                   />
                 </td>
                 {/* Named per row: an unchecked box submits nothing, so a shared
-                    name would shift every row after the first one that is off. */}
-                <td style={{ padding: "0.2rem", textAlign: "center" }}>
-                  <input
-                    type="checkbox"
-                    name={`pkg_shipsSeparately_${index}`}
-                    value="true"
-                    defaultChecked={row?.shipsSeparately ?? false}
-                    aria-label={`Carton ${index + 1} ships separately`}
-                    disabled={!canManage}
-                  />
-                </td>
-                <td style={{ padding: "0.2rem", textAlign: "center" }}>
-                  <input
-                    type="checkbox"
-                    name={`pkg_consolidatable_${index}`}
-                    value="true"
-                    defaultChecked={row?.consolidatable ?? true}
-                    aria-label={`Carton ${index + 1} may be consolidated`}
-                    disabled={!canManage}
-                  />
-                </td>
+                    name would shift every row after the first one that is off.
+                    A NEW CARTON TRAVELS ALONE — the fallbacks here match the
+                    column defaults in the database. The pair is drawn by one
+                    component because the second box is a consequence of the
+                    first: see `PackagingFlags`. */}
+                <PackagingFlags
+                  index={index}
+                  shipsSeparately={row?.shipsSeparately ?? true}
+                  consolidatable={row?.consolidatable ?? false}
+                  disabled={!canManage}
+                />
                 <td style={{ padding: "0.2rem" }}>
                   <button
                     type="button"
@@ -554,7 +689,11 @@ function PackagingDefaults({
                     are, because the admin's unit decides what every row shows
                     and only the unit a row is SAVED in needs submitting. */}
                 <td style={{ display: "none" }}>
-                  <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
+                  <input
+                    type="hidden"
+                    name="pkg_packagesPerUnit"
+                    defaultValue={row?.packagesPerUnit ?? 1}
+                  />
                   <input
                     type="hidden"
                     name="pkg_dimUnit"

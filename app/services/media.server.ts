@@ -203,6 +203,29 @@ export function inheritanceSummary(assets: MediaAssetView[]): {
 /* Upload                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The bytes are already on this product.
+ *
+ * A refusal to store the file, but not a failure of the upload: the asset the
+ * uploader wanted exists, and the useful thing to show is which one. Carried as
+ * a type as well as a message so a batch caller can retire the file with a link
+ * to the existing asset instead of offering a retry that would refuse again
+ * every time it was pressed.
+ */
+export class DuplicateMediaError extends Error {
+  readonly assetId: string;
+  readonly existingTitle: string;
+
+  constructor(assetId: string, existingTitle: string) {
+    super(
+      `This file is already on the product as "${existingTitle}". Attach the existing asset to more variants instead of uploading it again.`,
+    );
+    this.name = "DuplicateMediaError";
+    this.assetId = assetId;
+    this.existingTitle = existingTitle;
+  }
+}
+
 export interface UploadMediaInput {
   category: MediaCategory;
   subtype?: string | null;
@@ -266,9 +289,16 @@ export async function uploadMedia(
   });
   if (duplicate) {
     await deleteObject(stored.key);
-    throw new Error(
-      `This file is already on the product as "${duplicate.title}". Attach the existing asset to more variants instead of uploading it again.`
-    );
+    /*
+     * TYPED, NOT JUST A MESSAGE. A batch uploader sends many files and has to
+     * tell one outcome from another to decide what to keep on screen: a
+     * duplicate is a file that IS on the product (so the card can be retired
+     * with a link to it), while a rejection is a file that is not (so the card
+     * stays and offers a retry). Reading that off a message string would break
+     * the moment the sentence was reworded, and the reworded version would look
+     * like a failure to retry forever.
+     */
+    throw new DuplicateMediaError(duplicate.id, duplicate.title);
   }
 
   let asset: string;

@@ -19,8 +19,17 @@ import {
   helpText,
 } from "./ui";
 import { convertedDisplay, storedToDisplay, type UnitsView } from "~/utils/measurementUnits";
-import { fillPackagingRow, preservePackagingRows } from "./packagingRows";
+import {
+  fieldError,
+  fillPackagingRow,
+  preservePackagingRows,
+  refusedEditorRows,
+  type EditorRowFields,
+  type RefusedPackaging,
+} from "./packagingRows";
 import { PackagingValue } from "./PackagingValue";
+import { DeclaredValueInput } from "./DeclaredValueInput";
+import { PackagingFlags } from "./PackagingFlags";
 
 /**
  * Variants — the things that are actually sold.
@@ -125,12 +134,22 @@ export default function VariantsTab({
   presets,
   canEditCost,
   units,
+  refused = null,
 }: {
   product: Product;
   presets: Preset[];
   canEditCost: boolean;
   /** The admin's unit preference, resolved by the route and rendered here. */
   units: UnitsView;
+  /**
+   * A packaging save that was refused, and the rows it was carrying.
+   *
+   * The page around this tab is drawn from the loader, and the loader reads the
+   * database — so without this the form came back holding the figures that were
+   * stored BEFORE the operator typed, and one blank weight cost them the whole
+   * carton they had just measured. See `./packagingRows`.
+   */
+  refused?: (RefusedPackaging & { variantId: string }) | null;
 }) {
   const [params] = useSearchParams();
   // Which variant's editor is open. Held in the URL so a half-finished edit
@@ -205,6 +224,7 @@ export default function VariantsTab({
             canEditCost={canEditCost}
             presets={presets}
             units={units}
+            refused={refused && refused.variantId === variant.id ? refused : null}
           />
         )
       )}
@@ -222,12 +242,14 @@ function VariantCard({
   canEditCost,
   presets,
   units,
+  refused,
 }: {
   variant: Variant;
   currency: string;
   canEditCost: boolean;
   presets: Preset[];
   units: UnitsView;
+  refused: RefusedPackaging | null;
 }) {
   const carton = variant.packages[0] ?? null;
   const margin =
@@ -340,7 +362,7 @@ function VariantCard({
         </a>
       </div>
 
-      <PackagingEditor variant={variant} presets={presets} units={units} />
+      <PackagingEditor variant={variant} presets={presets} units={units} refused={refused} />
     </div>
   );
 }
@@ -376,17 +398,34 @@ function Fact({ label: text, value }: { label: string; value: string }) {
  * A PACK FILLS IN THE BOX, NOT THE PARCEL. Choosing one copies the three
  * dimensions and leaves the gross weight alone, because the weight of a shipment
  * is a fact about what is inside the box and that differs for every variant.
+ *
+ * The refusal messages come back naming a row and a column, which is what lets
+ * each sentence sit under the control that has to change rather than in a list
+ * at the top of the page — see `fieldError` in `./packagingRows`.
  */
 function PackagingEditor({
   variant,
   presets,
   units,
+  refused,
 }: {
   variant: Variant;
   presets: Preset[];
   units: UnitsView;
+  refused: RefusedPackaging | null;
 }) {
-  const rows = variant.packages.length ? variant.packages : [null];
+  /*
+   * WHICH ROWS THE TABLE DRAWS, and why a refused save changes the answer.
+   *
+   * With nothing refused the rows are what is stored. With a refusal they are
+   * what was SUBMITTED — the same figures, at their own indexes, in the unit the
+   * operator was reading them in. The two shapes are different types on purpose
+   * (see `./packagingRows`), which is why the table reads each name once and
+   * never branches per cell.
+   */
+  const stored = variant.packages.length ? variant.packages : [null];
+  const rows: (EditorRowFields | null)[] =
+    refused?.values?.length ? refusedEditorRows(refused.values) : stored;
 
   return (
     <details
@@ -410,6 +449,13 @@ function PackagingEditor({
             own labels were written in even if the preference changed elsewhere
             while the page sat open. */}
         <input type="hidden" name="units" value={units.preference} />
+        {/* HOW MANY ROWS THIS TABLE SHOWED. The save replaces the whole set, so
+            the number of rows that arrive IS the number of rows that will exist
+            afterwards — and a form that arrives with no rows at all therefore
+            reads as "delete every carton", which is how a save the operator
+            never intended became a wipe. The action refuses that combination
+            unless this field says the table really was empty. */}
+        <input type="hidden" name="pkg_rowCount" value={rows.length} />
 
         <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem", marginTop: "0.5rem" }}>
@@ -429,6 +475,26 @@ function PackagingEditor({
               <th style={{ padding: "0.3rem" }}>Declared value</th>
               <th style={{ padding: "0.3rem" }}>Ships separately</th>
               <th style={{ padding: "0.3rem" }}>May consolidate</th>
+            </tr>
+            {/* WHAT THE THREE SETTINGS MEAN, said once above the boxes that set
+                them. The pair on the right are one decision: a carton that
+                travels on its own is never merged, so the second box goes grey
+                while the first is on. */}
+            <tr style={{ color: FAINT, fontSize: "0.66rem" }}>
+              <td style={{ padding: "0.2rem" }} colSpan={8}>
+                One row per carton. <strong>Units/pkg</strong> is how many sold units go in this
+                carton; a row that says 2 makes two cartons per unit sold, each with the
+                measurements on that row.
+              </td>
+              <td style={{ padding: "0.2rem" }} colSpan={2}>
+                &nbsp;
+              </td>
+              <td style={{ padding: "0.2rem" }}>
+                <strong>Own box.</strong> Not merged with anything else.
+              </td>
+              <td style={{ padding: "0.2rem" }}>
+                <strong>May share</strong> a parcel with other cartons.
+              </td>
             </tr>
           </thead>
           <tbody>
@@ -476,6 +542,7 @@ function PackagingEditor({
                       stored={row ? row[dimension] : null}
                       storedUnit={row?.dimensionUnit ?? units.dimensionUnit}
                       shownUnit={units.dimensionUnit}
+                      error={fieldError(refused?.problems ?? [], index, dimension)}
                     />
                   </td>
                 ))}
@@ -487,6 +554,7 @@ function PackagingEditor({
                     stored={row ? row.grossWeight : null}
                     storedUnit={row?.weightUnit ?? units.weightUnit}
                     shownUnit={units.weightUnit}
+                    error={fieldError(refused?.problems ?? [], index, "grossWeight")}
                   />
                 </td>
                 <td style={{ padding: "0.2rem" }}>
@@ -499,39 +567,25 @@ function PackagingEditor({
                   />
                 </td>
                 <td style={{ padding: "0.2rem" }}>
-                  <input
-                    style={input}
-                    name="pkg_declaredValue"
-                    inputMode="decimal"
-                    defaultValue={
-                      row?.declaredValue === null || row?.declaredValue === undefined
-                        ? ""
-                        : (row.declaredValue / 100).toFixed(2)
-                    }
-                    aria-label={`Carton ${index + 1} declared value`}
+                  <DeclaredValueInput
+                    cents={row?.declaredValue}
+                    index={index}
+                    error={fieldError(refused?.problems ?? [], index, "declaredValue")}
                   />
                 </td>
                 {/* Named per row: an unchecked box submits nothing at all, so a
                     shared name would shift every row after the first one that is
-                    off and silently reassign their values. */}
-                <td style={{ padding: "0.2rem", textAlign: "center" }}>
-                  <input
-                    type="checkbox"
-                    name={`pkg_shipsSeparately_${index}`}
-                    value="true"
-                    defaultChecked={row?.shipsSeparately ?? false}
-                    aria-label={`Carton ${index + 1} ships separately`}
-                  />
-                </td>
-                <td style={{ padding: "0.2rem", textAlign: "center" }}>
-                  <input
-                    type="checkbox"
-                    name={`pkg_consolidatable_${index}`}
-                    value="true"
-                    defaultChecked={row?.consolidatable ?? true}
-                    aria-label={`Carton ${index + 1} may be consolidated`}
-                  />
-                </td>
+                    off and silently reassign their values. The pair is drawn by
+                    one component because the second box is a consequence of the
+                    first — see `PackagingFlags`. */}
+                <PackagingFlags
+                  index={index}
+                  // A NEW CARTON TRAVELS ALONE. The fallbacks are the defaults
+                  // for a row that does not exist yet, and they match the
+                  // column defaults in the database: one item, its own box.
+                  shipsSeparately={row?.shipsSeparately ?? true}
+                  consolidatable={row?.consolidatable ?? false}
+                />
                 {/* Inside a cell: an input that is a direct child of a `<tr>` is
                     invalid markup and browsers move it out of the table.
 
@@ -542,7 +596,11 @@ function PackagingEditor({
                     stored in when nothing was touched, and the unit on screen
                     when something was. `packagingRows` moves them. */}
                 <td style={{ display: "none" }}>
-                  <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
+                  <input
+                    type="hidden"
+                    name="pkg_packagesPerUnit"
+                    defaultValue={row?.packagesPerUnit ?? 1}
+                  />
                   <input
                     type="hidden"
                     name="pkg_dimUnit"
@@ -592,7 +650,8 @@ function PackSelect({
   units,
   index,
 }: {
-  row: Variant["packages"][number] | null;
+  /** Stored or refused — both agree on this one field (see `./packagingRows`). */
+  row: EditorRowFields | null;
   presets: Preset[];
   units: UnitsView;
   index: number;

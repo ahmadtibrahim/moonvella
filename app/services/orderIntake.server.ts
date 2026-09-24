@@ -606,11 +606,34 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
         data: { orderId: created.id, status: "PENDING" },
       });
 
+      /*
+       * THE THREE LINES OF THE SELLER'S BILL, recorded when the bill is made.
+       *
+       * `amount` is untouched: it is what the seller is charged, and changing it
+       * would change a price. What is new is that the bill now says what it is
+       * made of, so the shipping the seller owes is visible on the record rather
+       * than only in the shipment reconciliation.
+       *
+       * `shippingAmount` IS THE SELLER'S OWN SHIPPING CHARGE — the Shopify
+       * shipping lines, scaled to MoonVella's share of the order by the same
+       * ratio the rest of the bill uses. It is the zone-based price the seller
+       * agreed to, and it is deliberately not the carrier's cost: what the
+       * carrier charges MoonVella is MoonVella's business, and substituting it
+       * here would hand the seller the carrier's bill instead of their own.
+       *
+       * Rows created before this keep their nulls. A null shipping amount means
+       * "this bill was written before the line existed", which is true, and
+       * which the auto-pay guard below already reads as zero — so no backfill is
+       * needed and none is done.
+       */
       await tx.wholesalePayment.create({
         data: {
           orderId: created.id,
           sellerId: seller.id,
           amount: built.moonvellaSubtotal,
+          subtotal: built.moonvellaSubtotal,
+          shippingAmount: amounts.moonvellaShipping,
+          taxAmount: amounts.moonvellaTax,
           currency: payload.currency ?? "CAD",
           provider: "stripe",
           status: "REQUIRES_PAYMENT",

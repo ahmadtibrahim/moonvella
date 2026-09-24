@@ -693,10 +693,19 @@ model VariantPackage {
   /// packer may not combine with another parcel. Distinct from
   /// ProductVariant.shipsSeparately, which is about the ITEM; this is about the
   /// BOX, and one item can ship as two boxes where only one is indivisible.
-  shipsSeparately Boolean          @default(false)
+  ///
+  /// DEFAULTS TO TRUE: a new box travels on its own until somebody says
+  /// otherwise. The opposite default meant every carton added silently claimed
+  /// it could be merged with any other.
+  shipsSeparately Boolean          @default(true)
   /// Whether this parcel may be merged into another parcel of the same ship
   /// group during packing. Advisory to the packer; it never merges on its own.
-  consolidatable  Boolean          @default(true)
+  ///
+  /// DEFAULTS TO FALSE, and it can never be true while `shipsSeparately` is:
+  /// the two are contradictory, the application refuses the pair on every
+  /// write, and a CHECK constraint in the database refuses it too. A box is
+  /// merged only when somebody has decided it may be.
+  consolidatable  Boolean          @default(false)
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 
@@ -735,8 +744,10 @@ model ProductPackage {
   sortOrder       Int              @default(0)
   description     String?
   declaredValue   Int?
-  shipsSeparately Boolean          @default(false)
-  consolidatable  Boolean          @default(true)
+  /// See VariantPackage: new boxes travel on their own, and never claim a
+  /// permission to be merged at the same time.
+  shipsSeparately Boolean          @default(true)
+  consolidatable  Boolean          @default(false)
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 
@@ -1104,6 +1115,10 @@ model Shipment {
   /// same reason as the origin, so a later packaging edit cannot retroactively
   /// change what was sent.
   packageSnapshot         Json?
+  /// The parcels this shipment was actually booked with, when the operator
+  /// linked them. `packageSnapshot` remains the frozen evidence of what was
+  /// sent; this is the live link back to the rows the seller's order carries.
+  packages                OrderPackage[]          @relation("ShipmentPackages")
   items                   ShipmentItem[]
   trackingEvents          ShipmentTrackingEvent[]
   createdAt               DateTime                @default(now())
@@ -1437,13 +1452,26 @@ model OrderPackage {
   order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
   count     Int      @default(1)
   length    Float
-  width     Float
+  width    Float
   height    Float
   weight    Float
   units     String   @default("cm_kg")
-  createdAt DateTime @default(now())
+  /// The shipment this package was booked on, when one took it.
+  ///
+  /// NULL means "on the order, not yet on a booking" — which is the state of
+  /// every row written before this column existed, and stays legal afterwards.
+  /// A shipment reads its OWN parcels from here rather than being handed the
+  /// whole order's list, so a split order cannot tell a carrier about a box
+  /// that is not in the one being booked.
+  ///
+  /// ON DELETE SET NULL, not CASCADE: losing a shipment record must not delete
+  /// the description of a parcel that was measured and may still be shipped.
+  shipmentId String?
+  shipment   Shipment? @relation("ShipmentPackages", fields: [shipmentId], references: [id], onDelete: SetNull)
+  createdAt  DateTime  @default(now())
 
   @@index([orderId])
+  @@index([shipmentId])
 }
 
 model PaymentEvent {
@@ -2054,6 +2082,32 @@ model PickupLocation {
   /// still wins, and a product with a genuinely different origin keeps saying so.
   isDefault Boolean @default(false)
 
+  /// The weekdays this dock works, as ISO numbers joined with commas — 1 is
+  /// Monday, 7 is Sunday. `'1,2,3,4,5'` is the default and `''` is a real
+  /// answer meaning this dock is never open.
+  ///
+  /// A STRING, not a set of booleans and not an array, because it is one
+  /// calendar fact about one place and it is read and written as one value by
+  /// one form. See `holidays.server.ts` for the parser, and for why a pickup
+  /// proposal is built from these and not from `pickupOpenTime`.
+  workingDays String @default("1,2,3,4,5")
+
+  /// How many days' notice a collection at this dock needs. NULL means no lead
+  /// time is configured — not zero, and not "impossible".
+  leadTimeDays Int?
+
+  /// "HH:MM" in this dock's own `timeZone`: the time after which today can no
+  /// longer be collected. NULL means no same-day cutoff is configured.
+  ///
+  /// Separate from `leadTimeDays` because they are separate facts — a dock with
+  /// a 10:00 same-day deadline still has to be open that day, and a dock with a
+  /// two-day lead time may have no same-day option at all.
+  sameDayDeadline String?
+
+  /// Dated exceptions to this dock's normal week and to the computed statutory
+  /// calendar. Only the DIFFERENCES are stored; see `LocationHoliday`.
+  holidays LocationHoliday[]
+
   /// How parcels leave this dock by default: NEEDED (call a truck), REGULAR (a
   /// standing collection already comes here), DROPOFF (handed in at the
   /// carrier's depot, so no collection is involved).
@@ -2085,6 +2139,45 @@ model PickupLocation {
   @@index([isActive])
   @@index([odooDatabase, odooLocationId])
   @@index([isDefault])
+}
+
+/// A DATED EXCEPTION at one dock — a day it is open when the calendar says
+/// closed, closed when the calendar says open, or open for different hours.
+///
+/// WHY THIS TABLE IS SMALL AND NOT A CALENDAR. The statutory calendar is
+/// COMPUTED from the year (`holidays.server.ts`), so it is correct for any year
+/// without anybody typing it in and it cannot be half-entered. Storing it would
+/// mean two sources for one date, and the day they disagreed the proposal would
+/// silently use whichever it happened to read first. What is stored here is only
+/// what the computation cannot know: the owner's own decisions about this dock.
+///
+/// `date` IS A CALENDAR STRING, "YYYY-MM-DD", and never a timestamp. A closure
+/// on 2026-12-25 is a fact about a DATE, not about an instant; as a timestamp it
+/// would be the 24th in one zone and the 26th in another, and the closure would
+/// fall on the wrong day for whoever read it. The form writes what a date input
+/// gives it, which is already this string.
+model LocationHoliday {
+  id         String        @id @default(cuid())
+  locationId String
+  location   PickupLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  /// "YYYY-MM-DD", in the dock's own local calendar.
+  date       String
+  /// OPEN_ON_HOLIDAY · EXTRA_CLOSURE · SPECIAL_HOURS
+  kind       String
+  /// What to call it on screen: "Inventory count", "Open for the truck".
+  name       String?
+  /// "HH:MM" in the dock's zone. Ignored for the two closure kinds; this is the
+  /// entire content of SPECIAL_HOURS.
+  openTime   String?
+  closeTime  String?
+  createdAt  DateTime      @default(now())
+
+  /// One row per date per kind. A dock may be open on a holiday AND have special
+  /// hours that day, but it may not record the same closure twice — a duplicate
+  /// is two rows that can be deleted independently, which is how a closure comes
+  /// back by accident.
+  @@unique([locationId, date, kind])
+  @@index([locationId, date])
 }
 
 /// The verdict of an address check, for both origin and delivery addresses.

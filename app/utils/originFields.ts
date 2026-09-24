@@ -54,6 +54,34 @@ export interface OriginLocation {
   timeZone: string | null;
   pickupOpenTime: string | null;
   pickupCloseTime: string | null;
+  /**
+   * Which weekdays this dock works, as ISO numbers 1 = Monday to 7 = Sunday,
+   * joined with commas. Empty means it works no days.
+   *
+   * NOT a required field, and the empty string is a real answer rather than a
+   * missing one — a location kept for records has no week. The column carries a
+   * Monday-to-Friday default, so a dock that has never been asked the question
+   * is assumed to work a normal week rather than to be permanently closed,
+   * which would quietly remove it from every proposal.
+   */
+  workingDays: string;
+  /**
+   * How many days' notice a collection needs, or null for no requirement.
+   *
+   * NULL IS NOT ZERO. Zero would mean "a carrier can come today", which is a
+   * promise nobody at this dock has made. Null says the question has not been
+   * answered, and the proposal reads it as imposing no minimum — so an
+   * unanswered field cannot make a date look available that a real lead time
+   * would have excluded.
+   */
+  leadTimeDays: number | null;
+  /**
+   * "HH:MM" in `timeZone`, after which today can no longer be collected, or null
+   * for no same-day cutoff. Separate from `leadTimeDays` because they are
+   * separate facts: a dock with a two-day lead time has no same-day option at
+   * all, whatever this field says.
+   */
+  sameDayDeadline: string | null;
   instructions: string | null;
   accessRequirements: string | null;
   /**

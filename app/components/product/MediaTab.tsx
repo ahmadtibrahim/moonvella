@@ -18,6 +18,7 @@ import {
   LINE,
   helpText,
 } from "./ui";
+import BatchUploader from "./BatchUploader";
 // Type-only: nothing from the server module reaches the client bundle.
 import type { MediaAssetView } from "~/services/media.server";
 
@@ -112,6 +113,23 @@ export default function MediaTab({
   return (
     <>
       <CoveragePanel product={product} media={media} />
+
+      {/*
+        The batch uploader comes first because it is the one an operator
+        reaches for with a folder of photographs, and the single-file form
+        below is unchanged for the one-off — including its redirect-based
+        answer, which a browser tab holding an older bundle still posts to.
+      */}
+      <BatchUploader
+        categories={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({ value, label }))}
+        variants={product.variants.map((variant) => ({
+          id: variant.id,
+          name: variant.name,
+          sku: variant.sku,
+          isActive: variant.isActive,
+        }))}
+        defaultCategory="WHITE_BACKGROUND_IMAGE"
+      />
 
       <UploadPanel product={product} />
 

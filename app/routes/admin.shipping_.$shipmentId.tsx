@@ -18,6 +18,7 @@ import {
   bookReturnForOrder,
   schedulePickupForShipment,
   cancelPickupForShipment,
+  pickupPlanForShipment,
   getBillingReconciliation,
   reconcileCarrierInvoice,
 } from "~/services/shipping.server";
@@ -42,6 +43,7 @@ import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server"
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
 import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
+import { MAX_PROPOSAL_SCAN } from "~/services/holidays";
 
 const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
   "packed",
@@ -223,12 +225,20 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     remaining: i.quantity - (allocated[i.id] || 0),
   }));
 
-  const [quotes, returnQuotes, billing, eshipper, shopifyFulfillment] = await Promise.all([
+  const [quotes, returnQuotes, billing, eshipper, shopifyFulfillment, pickupPlan] = await Promise.all([
     prisma.shippingQuote.findMany({ where: { orderId: order.id, provider: "eshipper" }, orderBy: { totalAmount: "asc" } }),
     prisma.shippingQuote.findMany({ where: { orderId: order.id, provider: "eshipper-return" }, orderBy: { totalAmount: "asc" } }),
     getBillingReconciliation(shipmentId),
     getIntegrationState("eshipper"),
     getIntegrationState("shopify_fulfillment"),
+    /*
+     * WHICH DATES A TRUCK MAY BE ASKED FOR. Computed here rather than in the
+     * component because the component also runs in the browser, where the clock
+     * is the reader's and not the dock's — a proposal computed there would offer
+     * one person a different set of dates from another, and neither would match
+     * what the action accepts.
+     */
+    pickupPlanForShipment(shipmentId),
   ]);
 
   const selectedQuote = quotes.find((q) => q.selected) ?? null;
@@ -321,6 +331,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       detail: eshipper.detail,
     },
     shopifyFulfillment: { state: shopifyFulfillment.status, detail: shopifyFulfillment.detail },
+    pickupPlan,
     trackingEvents: shipment.trackingEvents,
     // Deciding that a booking which timed out did not happen is a judgement
     // about money and about whether a second label may be bought. It is not a
@@ -468,6 +479,10 @@ export async function action({ request, params }: ActionFunctionArgs) {
           pickupDate: String(form.get("pickupDate") || ""),
           pickupTimeWindow: String(form.get("pickupTimeWindow") || ""),
           notes: String(form.get("notes") || "") || undefined,
+          // The tick-box that steps over the dock's own calendar. Read as
+          // present-or-absent rather than as a value, because an unticked
+          // checkbox posts nothing at all.
+          overrideClosedDay: form.get("overrideClosedDay") === "true",
         },
         actor
       );
@@ -699,7 +714,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1052,15 +1067,96 @@ export default function AdminShipmentDetail() {
         {shipment.pickupLastError ? (
           <p style={{ fontSize: "0.7rem", color: "#dc2626", marginBottom: "0.5rem" }}>{shipment.pickupLastError}</p>
         ) : null}
+        {/*
+          THE DATES THE DOCK CAN ACTUALLY BE COLLECTED FROM, LISTED.
+
+          A bare date field asks the operator to know the dock's week, its
+          holidays and its cutoff by heart, and to get it right every time; the
+          dates below are that answer worked out, with the reasons the nearer
+          dates were left out. It is the same function the action applies, so a
+          date offered here is a date the booking accepts.
+        */}
+        {pickupPlan.problem ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginBottom: "0.5rem" }}>
+            {pickupPlan.problem}
+          </p>
+        ) : pickupPlan.days.length === 0 ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginBottom: "0.5rem" }}>
+            {pickupPlan.origin
+              ? `No date could be proposed for ${pickupPlan.origin.name} within the next ${MAX_PROPOSAL_SCAN} days. `
+              : "This shipment has no collection address recorded, so no date can be proposed. "}
+            Enter a date by hand if the dock has arranged something outside its usual calendar.
+          </p>
+        ) : (
+          <fieldset style={{ border: "none", padding: 0, margin: "0 0 0.5rem" }}>
+            <legend style={{ ...label, marginBottom: "0.3rem" }}>
+              Next available dates for {pickupPlan.origin?.name ?? "this dock"}
+              {pickupPlan.localNow ? ` — it is ${pickupPlan.localNow.time} on ${pickupPlan.localNow.date} there` : ""}
+            </legend>
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.15rem" }}>
+              {pickupPlan.days.map((day, index) => (
+                <label key={day.date} style={{ fontSize: "0.75rem", display: "flex", gap: "0.4rem", alignItems: "baseline" }}>
+                  <input type="radio" name="pickupDate" value={day.date} defaultChecked={index === 0} />
+                  <span style={{ fontWeight: index === 0 ? 600 : 400 }}>
+                    {day.date}
+                    {index === 0 ? " (soonest)" : ""}
+                  </span>
+                  {day.window?.open && day.window?.close ? (
+                    <span style={{ color: "#64748b" }}>open {day.window.open}–{day.window.close}</span>
+                  ) : null}
+                </label>
+              ))}
+            </div>
+            {pickupPlan.excluded.length > 0 ? (
+              <details style={{ marginTop: "0.35rem" }}>
+                <summary style={{ fontSize: "0.7rem", color: "#64748b", cursor: "pointer" }}>
+                  Why the {pickupPlan.excluded.length} earlier date(s) were left out
+                </summary>
+                <ul style={{ margin: "0.25rem 0 0 1rem", padding: 0, fontSize: "0.68rem", color: "#64748b" }}>
+                  {pickupPlan.excluded.slice(0, 10).map((day) => (
+                    <li key={day.date}>
+                      {day.date} — {day.reasons.join("; ")}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            ) : null}
+          </fieldset>
+        )}
+
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           <input type="hidden" name="intent" value="schedule_pickup" />
+          {/*
+            A date is still typeable, because a carrier can agree something this
+            calendar does not know. When the date falls on a day the dock's own
+            calendar excludes the action refuses it and names the reasons, and
+            the exception below is what steps over that — deliberately, and on
+            the audit entry.
+          */}
           <label style={label}>Pickup date<br /><input type="date" name="pickupDate" style={input} required /></label>
-          <label style={label}>Time window<br /><input name="pickupTimeWindow" placeholder="09:00-17:00" style={input} /></label>
+          <label style={label}>
+            Time window<br />
+            <input
+              name="pickupTimeWindow"
+              style={input}
+              placeholder={pickupPlan.suggestedWindow ?? "09:00-17:00"}
+            />
+          </label>
           <label style={label}>Notes<br /><input name="notes" style={input} /></label>
+          <label style={{ ...label, maxWidth: 260 }}>
+            <input type="checkbox" name="overrideClosedDay" value="true" />{" "}
+            Schedule anyway (confirmed with carrier)
+          </label>
           <button type="submit" style={btn("#0369a1")} disabled={!shipment.providerShipmentId}>
             {shipment.pickupStatus === "SCHEDULED" ? "Schedule another pickup" : "Schedule pickup"}
           </button>
         </Form>
+        <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.35rem" }}>
+          {pickupPlan.caveat}
+          {pickupPlan.fromSnapshot
+            ? " The dock's hours here are the ones recorded when this shipment's label was bought."
+            : ""}
+        </p>
         <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", marginTop: "0.5rem" }}>
           <input type="hidden" name="intent" value="cancel_pickup" />
           <label style={label}>

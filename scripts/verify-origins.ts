@@ -331,14 +331,49 @@ async function originChecks() {
 
   const { product, variants } = await createProductWithVariants(["Standard", "King"]);
 
-  const unmapped = await resolveOriginForVariant(variants[0].id);
+  // Resolution walks variant -> product -> the DESIGNATED DEFAULT dock, so what
+  // an unmapped variant answers depends on whether any location currently
+  // carries isDefault. A live database has one: the Odoo sync keeps a pickup
+  // location in step with the Premafirm Inc. warehouse, and that dock answers
+  // here before the "missing" branch can. Asserting only the missing branch
+  // would therefore pass on an empty database and fail everywhere else, which
+  // reads as a defect in the application when it is a defect in the check.
+  //
+  // So BOTH branches are pinned, by controlling isDefault instead of assuming
+  // it: with no dock designated the variant must resolve to nothing and name
+  // the missing pickup location; with one designated it must resolve to that
+  // dock and say the source is "default". Whatever was designated before is put
+  // back, so no later check sees a changed default.
+  const ambientDefaults = (
+    await prisma.pickupLocation.findMany({ where: { isDefault: true }, select: { id: true } })
+  ).map((row) => row.id);
+  let noDefault: Awaited<ReturnType<typeof resolveOriginForVariant>> | undefined;
+  let designated: Awaited<ReturnType<typeof resolveOriginForVariant>> | undefined;
+  try {
+    await prisma.pickupLocation.updateMany({ where: { isDefault: true }, data: { isDefault: false } });
+    noDefault = await resolveOriginForVariant(variants[0].id);
+
+    await prisma.pickupLocation.update({ where: { id: dockA.id }, data: { isDefault: true } });
+    designated = await resolveOriginForVariant(variants[0].id);
+  } finally {
+    await prisma.pickupLocation.update({ where: { id: dockA.id }, data: { isDefault: false } });
+    if (ambientDefaults.length) {
+      await prisma.pickupLocation.updateMany({
+        where: { id: { in: ambientDefaults } },
+        data: { isDefault: true },
+      });
+    }
+  }
   check(
-    "1  an unmapped variant resolves to NO location and says a pickup location is required",
-    unmapped.location === null &&
-      unmapped.ready === false &&
-      unmapped.source === "missing" &&
-      (unmapped.reason ?? "").includes("Pickup location required"),
-    `source=${unmapped.source} ready=${unmapped.ready}`
+    "1  unmapped: NO location when no default dock is designated, the designated dock when one is",
+    noDefault?.location === null &&
+      noDefault?.ready === false &&
+      noDefault?.source === "missing" &&
+      (noDefault?.reason ?? "").includes("Pickup location required") &&
+      designated?.location?.id === dockA.id &&
+      designated?.source === "default" &&
+      designated?.ready === true,
+    `no default: source=${noDefault?.source} ready=${noDefault?.ready} reason=${noDefault?.reason ?? "-"} | designated: source=${designated?.source} ready=${designated?.ready} id=${designated?.location?.id ?? "-"}`
   );
 
   await prisma.product.update({ where: { id: product.id }, data: { pickupLocationId: dockA.id } });

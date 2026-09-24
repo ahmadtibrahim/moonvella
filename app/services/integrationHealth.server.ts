@@ -35,8 +35,8 @@ export type IntegrationKey =
 export const CREDENTIAL_KEYS: IntegrationKey[] = ["stripe", "eshipper", "odoo", "google"];
 
 /**
- * Narrows an integration key to one the credential store serves. The credential
- * store only knows these three; operational checks have nothing to save.
+ * Narrows an integration key to one the credential store serves. These are the
+ * keys that hold secrets; operational checks have nothing to save.
  */
 export function isCredentialKey(key: IntegrationKey): key is CredentialKey {
   return (CREDENTIAL_KEYS as string[]).includes(key);
@@ -289,6 +289,23 @@ export async function checkIntegration(
         error: unconfigured ? null : (result.reason ?? null),
       };
     }
+    case "google": {
+      // TWO CREDENTIALS, TWO PROBES, TWO LINES. Google is the one integration
+      // here that holds a public key and a secret key for the same provider, and
+      // they fail independently: a browser key that Google refuses kills
+      // autocomplete and nothing else, and a server key that Google refuses
+      // stops every address verdict. Collapsing them into one verdict would name
+      // neither the credential to replace nor the screen that breaks, so the
+      // check reports each on its own line and only calls the integration
+      // FAILED when Google actually refused something.
+      //
+      // Both are real calls. Places Autocomplete is the same request the page
+      // makes, built by the same function, carrying the referrer that origin
+      // would send; Address Validation is a real validation. That is the
+      // difference between this check and reading the store.
+      const { checkGoogle } = await import("./googleHealth.server");
+      return checkGoogle();
+    }
     default:
       return { status: "NOT_CONFIGURED", detail: "No check is available for this integration.", error: null };
   }
@@ -385,19 +402,42 @@ export async function saveIntegrationCredentials(
  * The values a provider will refuse to authenticate, caught while they are still
  * in the operator's hands.
  *
- * Only the Stripe secret field has a wrong KIND today — a key that is valid,
- * issued by the same provider, and simply not a secret — so the check is written
- * as a lookup on that one field rather than as a general rule that would have to
- * guess what every other provider's values look like. Returns the sentence to
- * show, or null when nothing is wrong. Never returns or logs the value.
+ * Two providers have a wrong KIND of value an operator actually reaches for, and
+ * both mistakes are made on the provider's own console page, with the correct
+ * value visible on the same screen:
+ *
+ *   * Stripe's secret field is next to the publishable key, which is a valid
+ *     Stripe value that cannot authenticate anything.
+ *   * Either Google key field is next to the project's OAuth client ID, which is
+ *     the longest and most key-shaped thing on the credentials screen and is not
+ *     an API key at all.
+ *
+ * Each is written as a lookup on the fields that have this failure rather than
+ * as a general rule that would have to guess what every other provider's values
+ * look like. Returns the sentence to show, or null when nothing is wrong. Never
+ * returns or logs the value.
  */
 async function rejectWrongKindValues(
   key: CredentialKey,
   credentials: Record<string, string>
 ): Promise<string | null> {
-  if (key !== "stripe") return null;
-  const { stripeKeyKindProblem } = await import("./stripeMode.server");
-  return stripeKeyKindProblem(credentials.STRIPE_SECRET_KEY ?? null);
+  if (key === "stripe") {
+    const { stripeKeyKindProblem } = await import("./stripeMode.server");
+    return stripeKeyKindProblem(credentials.STRIPE_SECRET_KEY ?? null);
+  }
+  if (key === "google") {
+    const { googleKeyKindProblem } = await import("./googleHealth.server");
+    for (const field of ["GOOGLE_MAPS_BROWSER_KEY", "GOOGLE_MAPS_SERVER_KEY"]) {
+      // Only a field the operator actually submitted. A blank field means "keep
+      // what is saved", and the saved value was accepted when it was saved.
+      const submitted = credentials[field];
+      if (submitted === undefined) continue;
+      const problem = googleKeyKindProblem(field, submitted);
+      if (problem) return problem;
+    }
+    return null;
+  }
+  return null;
 }
 
 /**

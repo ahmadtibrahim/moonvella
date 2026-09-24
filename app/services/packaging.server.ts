@@ -108,6 +108,35 @@ export interface PackageRowInput {
 const REQUIRED_NUMERIC_FIELDS = ["length", "width", "height", "grossWeight"] as const;
 
 /**
+ * One field of one submitted row, and what is wrong with it.
+ *
+ * The index and the field are what let the editor put the message under the
+ * control that produced it; the message is what the operator reads. Both are
+ * carried because neither is derivable from the other — the message names the
+ * carton the way a person does, and the editor needs to know which row it is in.
+ */
+export interface PackageProblem {
+  index: number;
+  field: string;
+  message: string;
+}
+
+/**
+ * What a field is called in front of an operator.
+ *
+ * The column names are not words: "grossWeight is required" names a database
+ * column to somebody who is looking at a form, and the fix has to be obvious
+ * from the sentence.
+ */
+const FIELD_LABEL: Record<string, string> = {
+  length: "Length",
+  width: "Width",
+  height: "Height",
+  grossWeight: "Gross weight",
+  declaredValue: "Declared value",
+};
+
+/**
  * Field-level validation, returning every problem rather than the first.
  *
  * A row of zeros is rejected rather than stored. Zero is what an unfilled
@@ -121,20 +150,33 @@ const REQUIRED_NUMERIC_FIELDS = ["length", "width", "height", "grossWeight"] as 
  * reverse.
  */
 export function validatePackageRow(row: PackageRowInput, index: number): string[] {
-  const problems: string[] = [];
+  return packageProblems(row, index).map((problem) => problem.message);
+}
+
+/**
+ * The same validation, addressed to the field that failed.
+ *
+ * `validatePackageRow` above is this function's messages alone, kept because a
+ * screen that only has to refuse does not care which control to blame. A screen
+ * that has to show the operator where to type does, so the editor is handed the
+ * whole problem.
+ */
+export function packageProblems(row: PackageRowInput, index: number): PackageProblem[] {
+  const problems: PackageProblem[] = [];
   const name = row.label ? String(row.label) : `package ${index + 1}`;
+  const described = (field: string) => `${name}: ${FIELD_LABEL[field] ?? field}`;
 
   for (const field of REQUIRED_NUMERIC_FIELDS) {
     const raw = row[field];
     if (raw === undefined || raw === null || String(raw).trim() === "") {
-      problems.push(`${name}: ${field} is required`);
+      problems.push({ index, field, message: `${described(field)} is required` });
       continue;
     }
     const value = Number(raw);
     if (!Number.isFinite(value)) {
-      problems.push(`${name}: ${field} is not a number`);
+      problems.push({ index, field, message: `${described(field)} is not a number` });
     } else if (value <= 0) {
-      problems.push(`${name}: ${field} must be greater than zero`);
+      problems.push({ index, field, message: `${described(field)} must be greater than zero` });
     }
   }
 
@@ -142,7 +184,7 @@ export function validatePackageRow(row: PackageRowInput, index: number): string[
   if (declared !== undefined && declared !== null && String(declared).trim() !== "") {
     const value = Number(declared);
     if (!Number.isFinite(value) || value < 0) {
-      problems.push(`${name}: declared value cannot be negative`);
+      problems.push({ index, field: "declaredValue", message: `${described("declaredValue")} cannot be negative` });
     }
   }
 
@@ -154,6 +196,7 @@ function packageData(row: PackageRowInput, sortOrder: number) {
     row.declaredValue === undefined || row.declaredValue === null || String(row.declaredValue).trim() === ""
       ? null
       : Math.round(Number(row.declaredValue) * 100);
+  const { shipsSeparately, consolidatable } = packageFlags(row);
   return {
     label: row.label ? String(row.label) : null,
     packageType: row.packageType ? String(row.packageType) : "carton",
@@ -168,21 +211,94 @@ function packageData(row: PackageRowInput, sortOrder: number) {
     packagesPerUnit: Math.max(1, Number(row.packagesPerUnit || 1)),
     description: row.description ? String(row.description) : null,
     declaredValue: declared,
-    shipsSeparately: row.shipsSeparately === true || row.shipsSeparately === "true",
-    // Consolidation defaults to allowed, so a row that predates the column and a
-    // row that has never been asked both behave the way they always did.
-    consolidatable: !(row.consolidatable === false || row.consolidatable === "false"),
+    shipsSeparately: shipsSeparately,
+    consolidatable: consolidatable,
     sortOrder,
+  };
+}
+
+/**
+ * The two flags, made incapable of contradicting each other.
+ *
+ * "This box travels on its own" and "this box may be merged with another" are
+ * opposites, and a row holding both is a row no packer can obey. The page
+ * prevents the pair from being entered — checking the first unchecks and
+ * disables the second — but a page is not a guarantee: a stale document, a
+ * hand-written form or a direct call all reach this function, and the rules
+ * that matter have to hold wherever the row came from.
+ *
+ * SHIPS-SEPARATELY WINS. It is the stronger statement and the safer reading:
+ * the cost of honouring it wrongly is one parcel travelling alone, and the cost
+ * of ignoring it is two parcels the seller said must not be combined arriving
+ * as one. The database carries the same rule as a CHECK constraint, so a row
+ * that contradicts itself cannot be written even by something that does not go
+ * through here.
+ */
+function packageFlags(row: PackageRowInput): { shipsSeparately: boolean; consolidatable: boolean } {
+  const shipsSeparately = row.shipsSeparately === true || row.shipsSeparately === "true";
+  if (shipsSeparately) return { shipsSeparately: true, consolidatable: false };
+  // A row that does not travel alone may be merged, and defaults to being
+  // mergeable: that is the ordinary box, and it is what the column meant before
+  // this rule existed.
+  return {
+    shipsSeparately: false,
+    consolidatable: !(row.consolidatable === false || row.consolidatable === "false"),
   };
 }
 
 export class PackageValidationError extends Error {
   readonly problems: string[];
-  constructor(problems: string[]) {
+  readonly details: PackageProblem[];
+  constructor(details: PackageProblem[]) {
+    const problems = details.map((problem) => problem.message);
     super(`Packaging is incomplete: ${problems.join("; ")}`);
     this.name = "PackageValidationError";
     this.problems = problems;
+    this.details = details;
   }
+}
+
+/**
+ * What the form that sent these rows said about itself.
+ *
+ * `drawnRows` is the number of rows the page had on it when it was submitted —
+ * a hidden field the editors render, and the only way to tell "the operator
+ * removed every row and saved" apart from "the rows never arrived".
+ */
+export interface SavePackagesOptions {
+  drawnRows?: number;
+}
+
+/**
+ * Refuse a save that would delete every row without anybody asking it to.
+ *
+ * Both saves are whole-set replaces, so an empty submission is a delete of the
+ * entire set. That is a legitimate operation — the product's packaging editor
+ * can remove its last default row — but only when the form that sent it had no
+ * rows to send. A form that drew rows and submitted none has lost them on the
+ * way, and the difference between those two cases is the only thing standing
+ * between a stale page and a variant that quietly has no packaging.
+ *
+ * A form that cannot say how many rows it drew is treated as having drawn some,
+ * because the two mistakes do not cost the same: refusing a legitimate clear
+ * costs one retry, and allowing an accidental one costs the packaging. This is
+ * the case the deployed build was in — a bundle from before the hidden field
+ * existed posted a form whose packaging controls were not in it at all, and the
+ * replace deleted the rows and reported success.
+ */
+function assertClearWasIntended(submitted: number, drawnRows: number | undefined) {
+  if (submitted > 0 || drawnRows === 0) return;
+
+  throw new PackageValidationError([
+    {
+      index: -1,
+      field: "pkg_rowCount",
+      message:
+        drawnRows === undefined
+          ? "No carton rows arrived with this save, and the page could not say how many it showed. Nothing has been changed — reload the page and try again."
+          : `This save carried no carton rows, but the page showed ${drawnRows}. Nothing has been changed — reload the page and try again.`,
+    },
+  ]);
 }
 
 /**
@@ -194,9 +310,14 @@ export class PackageValidationError extends Error {
  * quoting then failed somewhere else entirely. Throwing here keeps the failure
  * next to its cause.
  */
-export async function saveVariantPackages(variantId: string, rows: PackageRowInput[]) {
-  const problems = rows.flatMap((row, index) => validatePackageRow(row, index));
+export async function saveVariantPackages(
+  variantId: string,
+  rows: PackageRowInput[],
+  options: SavePackagesOptions = {}
+) {
+  const problems = rows.flatMap((row, index) => packageProblems(row, index));
   if (problems.length > 0) throw new PackageValidationError(problems);
+  assertClearWasIntended(rows.length, options.drawnRows);
 
   await prisma.$transaction([
     prisma.variantPackage.deleteMany({ where: { variantId } }),
@@ -207,9 +328,14 @@ export async function saveVariantPackages(variantId: string, rows: PackageRowInp
   return rows.length;
 }
 
-export async function saveProductPackages(productId: string, rows: PackageRowInput[]) {
-  const problems = rows.flatMap((row, index) => validatePackageRow(row, index));
+export async function saveProductPackages(
+  productId: string,
+  rows: PackageRowInput[],
+  options: SavePackagesOptions = {}
+) {
+  const problems = rows.flatMap((row, index) => packageProblems(row, index));
   if (problems.length > 0) throw new PackageValidationError(problems);
+  assertClearWasIntended(rows.length, options.drawnRows);
 
   await prisma.$transaction([
     prisma.productPackage.deleteMany({ where: { productId } }),
@@ -618,11 +744,39 @@ export interface QuotePackage {
  */
 export async function buildQuotePackagesForOrder(order: {
   items: { sku: string; quantity: number; variantId: string | null }[];
-  packages?: { count: number; length: number; width: number; height: number; weight: number; units: string }[];
+  packages?: {
+    id?: string;
+    shipmentId?: string | null;
+    count: number;
+    length: number;
+    width: number;
+    height: number;
+    weight: number;
+    units: string;
+  }[];
 }): Promise<{ packages: QuotePackage[]; missing: string[]; source: "manual" | "variant" | "product" }> {
   if (order.packages && order.packages.length > 0) {
-    return {
-      packages: order.packages.map((p) => ({
+    /*
+     * THROUGH THE SAME CONVERSION THE BOOKING USES, not around it.
+     *
+     * These rows used to be handed to the provider exactly as they were stored,
+     * including the unit label beside the four numbers — a label the carrier does
+     * not read. A row recorded in inches and pounds was therefore QUOTED as
+     * though those numbers were centimetres and kilograms: the seller was shown a
+     * price for a parcel less than half the size of the one that would later be
+     * labelled, and the two documents disagreed without either of them being
+     * wrong in isolation. The booking path had already been taught to convert
+     * (`parcelRowsToQuotePackages`); this is the other half of the same order, and
+     * leaving it behind meant a quote and a label could describe different boxes.
+     *
+     * A row whose unit label is not one this system converts is refused with the
+     * reason rather than sent, so the failure lands on the order desk as a
+     * sentence about the parcel instead of as a wrong price from a carrier.
+     */
+    const { packages, refused } = parcelRowsToQuotePackages(
+      order.packages.map((p) => ({
+        id: p.id ?? "(parcel row)",
+        shipmentId: p.shipmentId ?? null,
         count: p.count,
         length: p.length,
         width: p.width,
@@ -630,9 +784,8 @@ export async function buildQuotePackagesForOrder(order: {
         weight: p.weight,
         units: p.units,
       })),
-      missing: [],
-      source: "manual",
-    };
+    );
+    return { packages, missing: refused, source: "manual" };
   }
 
   const missing: string[] = [];
@@ -678,54 +831,223 @@ export async function buildQuotePackagesForOrder(order: {
  * instead of being written out twice.
  */
 
-export interface PackageSnapshotRow extends QuotePackage {
-  packageType: string;
-  label: string | null;
-  description: string | null;
-  shipsSeparately: boolean;
-  consolidatable: boolean;
-  /** Which order lines, and how many of each, this package carries. */
-  lines: { orderItemId: string; sku: string; quantity: number }[];
+/**
+ * A parcel row stored against an ORDER, as the database holds it.
+ *
+ * `units` is the row's own record of what its four numbers mean. It is stored
+ * with the figures precisely so those figures never have to be guessed at, and
+ * this is the one place that record is read.
+ */
+export interface StoredParcelRow {
+  id: string;
+  /** The shipment this parcel belongs to, or null while it is unassigned. */
+  shipmentId: string | null;
+  count: number;
+  length: number;
+  width: number;
+  height: number;
+  weight: number;
+  units: string;
 }
 
 /**
- * Freeze the packages a shipment was quoted with.
+ * What a set of stored parcel rows amounts to in the units a carrier bills in,
+ * or the reasons none of it can be sent.
  *
- * A quotation is an offer against a described parcel. If the packaging is
- * edited afterwards the offer no longer describes anything real, so the rows
- * that were sent are stored beside the quote rather than recomputed from the
- * current state — otherwise a later reproduction of the same quote would use
- * different dimensions and nobody could explain the difference in price.
+ * THE ROWS ARE NOT SENT VERBATIM, AND THAT IS THE WHOLE POINT. A carrier reads a
+ * bare number as centimetres and kilograms; an order parcel row that was stored
+ * in inches and pounds would therefore be quoted and labelled as a carton less
+ * than half the size it is, and nothing anywhere would report a problem. So the
+ * unit a row carries is either one this function knows how to convert, or the
+ * row is refused and named.
  *
- * Quantity is allocated by order line, and the allocation is exact: every unit
- * of every line appears in exactly one package row. `packagesPerUnit` is how a
- * seller describes "one sold unit ships as two parcels", so it multiplies here
- * and nowhere else.
+ * `cm_kg` is this application's own label for centimetres and kilograms and is
+ * what every writer stores, so the ordinary case is a pass-through. `in_lb` is
+ * converted. EVERYTHING ELSE IS REFUSED — a blank, a typo, a unit somebody adds
+ * later without teaching this function about it — because the alternative to
+ * refusing is inventing a unit, and an invented unit is a wrong label.
+ *
+ * A non-empty `refused` means the caller must not send any of it: the parcels
+ * are a set, and sending the readable half of a set is how a package goes
+ * missing from a booking without anyone deciding to leave it out.
  */
-export async function snapshotQuotePackages(
-  items: { orderItemId: string; sku: string; quantity: number; variantId: string | null }[],
+export function parcelRowsToQuotePackages(rows: StoredParcelRow[]): {
+  packages: QuotePackage[];
+  refused: string[];
+} {
+  const packages: QuotePackage[] = [];
+  const refused: string[] = [];
+
+  for (const row of rows) {
+    // The stored label is the row's own word for its numbers; the converters
+    // speak in single units, so this is where the two vocabularies meet. It is
+    // deliberately a two-branch map with no other way through: a label that is
+    // not one of these does not reach a converter at all.
+    const unit = String(row.units ?? "").trim().toLowerCase();
+    if (unit !== "cm_kg" && unit !== "in_lb") {
+      refused.push(
+        `parcel ${row.id} is recorded in "${row.units}", which is not a unit this system converts ` +
+          `(expected "cm_kg" or "in_lb") — correct the parcel before it is sent to a carrier`,
+      );
+      continue;
+    }
+    const dimensionUnit = unit === "in_lb" ? "in" : "cm";
+    const weightUnit = unit === "in_lb" ? "lb" : "kg";
+    const number = (value: number, kind: "length" | "weight") => {
+      const raw = Number(value);
+      if (!Number.isFinite(raw)) return null;
+      return kind === "length" ? round2(toCm(raw, dimensionUnit)) : round3(toKg(raw, weightUnit));
+    };
+
+    const length = number(row.length, "length");
+    const width = number(row.width, "length");
+    const height = number(row.height, "length");
+    const weight = number(row.weight, "weight");
+    if (length === null || width === null || height === null || weight === null) {
+      refused.push(`parcel ${row.id} has a measurement that is not a number`);
+      continue;
+    }
+
+    packages.push({
+      // A parcel count of zero is not a parcel. The floor of 1 matches what the
+      // writers already enforce, so this only catches a hand-edited row.
+      count: Math.max(1, Math.floor(Number(row.count) || 1)),
+      length,
+      width,
+      height,
+      weight,
+      units: "cm_kg",
+    });
+  }
+
+  return { packages, refused };
+}
+
+export interface LinePackageRow extends QuotePackage {
+  packageType: string;
+  label: string | null;
+  description: string | null;
+  declaredValue: number | null;
+  shipsSeparately: boolean;
+  consolidatable: boolean;
+  /**
+   * Which order line this parcel group describes, and THE WHOLE QUANTITY of it.
+   *
+   * The quantity is the line's own, not a share of it, and that is not an
+   * oversight: when one sold unit needs two different boxes, both boxes carry
+   * the whole order line between them — the unit is not split across them, it
+   * is packed in both. The row that says which ITEMS are inside a given box is
+   * `unitsPerPackage`, and it is the packer's instruction rather than a
+   * quantity this module divides up.
+   */
+  lines: { orderItemId: string; sku: string; quantity: number }[];
+  /** The packaging row this came from, so the packing page can point back at it. */
+  sourcePackageId: string;
+}
+
+/**
+ * What one order line's packaging amounts to, in parcels.
+ *
+ * `parcelsPerUnit` is the number of boxes ONE sold unit needs, which is the sum
+ * of its packaging rows' `packagesPerUnit` — two differently-sized boxes each
+ * needed once per unit is two parcels per unit, exactly as one row that says
+ * "two of these per unit" is. `parcels` is that multiplied by the line's
+ * quantity, and it is the number a carrier books.
+ */
+export interface LinePackagePlanEntry {
+  orderItemId: string;
+  sku: string;
+  quantity: number;
+  parcelsPerUnit: number;
+  parcels: number;
+  source: "variant" | "product";
+}
+
+export interface LinePackagePlan {
+  /** Every parcel group, already converted to the units a carrier bills in. */
+  packages: LinePackageRow[];
+  /** Every line that contributed parcels, and how many it contributed. */
+  covered: LinePackagePlanEntry[];
+  /**
+   * Lines that contributed NOTHING, with the reason. A caller that books an
+   * order while this is non-empty is booking around a parcel the seller is
+   * expecting to be collected.
+   */
+  missing: string[];
+}
+
+export interface PackageLineInput {
+  orderItemId: string;
+  sku: string;
+  quantity: number;
+  variantId: string | null;
+}
+
+/**
+ * Turn order lines into the parcels a carrier will be told about.
+ *
+ * ONE CONVERSION POINT. A stored row keeps the unit it was entered in; this is
+ * where those figures become centimetres and kilograms, once, and the rounded
+ * result is what is sent and never written back. Two callers converting in two
+ * places is how the same carton ends up 60.96 cm on a quote and 61 cm on a
+ * booking.
+ *
+ * NOTHING IS SILENTLY DROPPED, and that is enforced rather than intended. A
+ * line with no packaging goes into `missing`; a line with packaging must appear
+ * in `covered` with every one of its boxes; and the assertion at the end fails
+ * loudly if a line that was asked about ends up in neither. The failure this
+ * prevents is the quiet one — a quote that is cheap because the second parcel
+ * was never in it, and a pickup request for a box nobody described.
+ *
+ * The ORDER of the rows is the order of the lines and then the order of each
+ * variant's packaging rows, which is stable for a given order, so a stored
+ * package snapshot and a freshly derived plan of an unchanged order agree
+ * element for element.
+ */
+export async function resolvePackagesForLines(
+  items: PackageLineInput[],
   options: { includeInherited?: boolean } = {}
-): Promise<{ packages: PackageSnapshotRow[]; missing: string[] }> {
-  const missing: string[] = [];
-  const packages: PackageSnapshotRow[] = [];
+): Promise<LinePackagePlan> {
+  const uncovered: { orderItemId: string; reason: string }[] = [];
+  const packages: LinePackageRow[] = [];
+  const covered: LinePackagePlanEntry[] = [];
 
   for (const item of items) {
+    if (item.quantity <= 0) continue;
+    const refuse = (reason: string) => uncovered.push({ orderItemId: item.orderItemId, reason });
+
     if (!item.variantId) {
-      missing.push(`${item.sku}: no variant mapping`);
+      refuse(`${item.sku}: no variant mapping`);
       continue;
     }
+
     const resolved = await resolvePackagesForVariant(item.variantId);
+    if (resolved.source === "none" || resolved.packages.length === 0) {
+      refuse(`${item.sku}: packaging incomplete`);
+      continue;
+    }
     if (resolved.source === "product" && options.includeInherited === false) {
-      missing.push(`${item.sku}: packaging incomplete`);
+      refuse(`${item.sku}: packaging incomplete`);
       continue;
     }
-    if (resolved.packages.length === 0) {
-      missing.push(`${item.sku}: packaging incomplete`);
-      continue;
-    }
+    // Read once and narrowed here rather than trusted later: `none` with rows
+    // present would mean the resolver contradicts itself, and it is better for
+    // that to be impossible to express than to be handled.
+    const source: "variant" | "product" = resolved.source === "product" ? "product" : "variant";
+
+    const parcelsPerUnit = resolved.packages.reduce(
+      (sum, p) => sum + Math.max(1, p.packagesPerUnit),
+      0
+    );
+
     for (const p of resolved.packages) {
       packages.push({
-        count: item.quantity * p.packagesPerUnit,
+        count: item.quantity * Math.max(1, p.packagesPerUnit),
+        // CONVERTED ONCE, ROUNDED ONCE, AND THIS IS THE ONLY ROUNDING. The
+        // stored value keeps the unit it was entered in, so entering 24 in and
+        // reading 24 in back is exact; the rounding below happens on the way
+        // out to a provider that bills in centimetres, and the rounded figure
+        // is never written back over the stored one.
         length: round2(toCm(p.length, p.dimensionUnit)),
         width: round2(toCm(p.width, p.dimensionUnit)),
         height: round2(toCm(p.height, p.dimensionUnit)),
@@ -734,18 +1056,97 @@ export async function snapshotQuotePackages(
         packageType: p.packageType,
         label: p.label,
         description: p.description,
+        declaredValue: p.declaredValue,
         shipsSeparately: p.shipsSeparately,
         consolidatable: p.consolidatable,
-        lines: [
-          {
-            orderItemId: item.orderItemId,
-            sku: item.sku,
-            quantity: item.quantity * p.packagesPerUnit,
-          },
-        ],
+        lines: [{ orderItemId: item.orderItemId, sku: item.sku, quantity: item.quantity }],
+        sourcePackageId: p.id,
       });
+    }
+
+    covered.push({
+      orderItemId: item.orderItemId,
+      sku: item.sku,
+      quantity: item.quantity,
+      parcelsPerUnit,
+      parcels: item.quantity * parcelsPerUnit,
+      source,
+    });
+  }
+
+  assertPlanCoversItems(items, packages, covered, uncovered);
+  return { packages, covered, missing: uncovered.map((u) => u.reason) };
+}
+
+/**
+ * A line is either accounted for in parcels or refused with a reason. Never
+ * neither, and never both.
+ *
+ * This is the "do not silently omit a package" guarantee written as a check
+ * rather than as a comment. It is a cheap comparison over data already in hand,
+ * and it runs on every plan, so the day somebody adds a `continue` to the loop
+ * above without adding a `missing.push`, the failure is a thrown error at the
+ * call site instead of a shipment with one parcel fewer than the seller sold.
+ */
+function assertPlanCoversItems(
+  items: PackageLineInput[],
+  packages: LinePackageRow[],
+  covered: LinePackagePlanEntry[],
+  uncovered: { orderItemId: string; reason: string }[]
+) {
+  const shippable = items.filter((item) => item.quantity > 0);
+  const accounted = new Set([
+    ...covered.map((entry) => entry.orderItemId),
+    ...uncovered.map((entry) => entry.orderItemId),
+  ]);
+
+  // 1. EVERY line asked about is either carried or refused, exactly once.
+  for (const item of shippable) {
+    const times = Number(covered.some((c) => c.orderItemId === item.orderItemId)) +
+      uncovered.filter((u) => u.orderItemId === item.orderItemId).length;
+    if (times === 0) {
+      throw new Error(
+        `Packaging plan is incomplete: order line ${item.sku} contributed no parcel and no reason. ` +
+          `Refusing to quote or book a shipment that does not describe what was sold.`
+      );
+    }
+    if (times > 1) {
+      throw new Error(
+        `Packaging plan is inconsistent: order line ${item.sku} is accounted for ${times} times.`
+      );
+    }
+  }
+  for (const id of accounted) {
+    if (!shippable.some((item) => item.orderItemId === id)) {
+      throw new Error(`Packaging plan is inconsistent: unknown order line ${id}.`);
     }
   }
 
-  return { packages, missing };
+  // 2. A covered line has the parcels it claims, and every parcel reaches a
+  //    covered line. The two halves of the plan have to agree.
+  const withParcels = new Map<string, number>();
+  for (const row of packages) {
+    for (const line of row.lines) {
+      withParcels.set(line.orderItemId, (withParcels.get(line.orderItemId) ?? 0) + row.count);
+    }
+  }
+  for (const entry of covered) {
+    const parcels = withParcels.get(entry.orderItemId) ?? 0;
+    if (parcels !== entry.parcels) {
+      throw new Error(
+        `Packaging plan is inconsistent: line ${entry.sku} is reported as ${entry.parcels} parcel(s) ` +
+          `but describes ${parcels}.`
+      );
+    }
+    if (entry.parcels <= 0) {
+      throw new Error(`Packaging plan is inconsistent: line ${entry.sku} covers no parcels.`);
+    }
+  }
+  for (const id of withParcels.keys()) {
+    if (!covered.some((entry) => entry.orderItemId === id)) {
+      throw new Error(
+        `Packaging plan is inconsistent: order line ${id} has parcel rows but is not reported as covered.`
+      );
+    }
+  }
 }
