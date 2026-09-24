@@ -286,11 +286,34 @@ async function main() {
       packSelect.startsWith("<select"),
       packSelect.slice(0, 60)
     );
+    /**
+     * The form states how many carton rows it drew. That number is what tells
+     * an operator who removed every carton from a page whose cartons never
+     * arrived — the two submits are identical otherwise, and the second one used
+     * to delete the packaging it could not see.
+     */
+    const rowCountTag = tagWithAttribute(variants.html, 'name="pkg_rowCount"');
+    check(
+      "The form says how many carton rows it drew, so an empty submit is not read as a wipe",
+      rowCountTag.startsWith("<input") &&
+        /type="hidden"/.test(rowCountTag) &&
+        /value="\d+"/.test(rowCountTag),
+      rowCountTag.slice(0, 60)
+    );
 
     await post(`/admin/products/${product.id}`, cookie, {
       intent: "save_packaging",
       tab: "variants",
       variantId: variant.id,
+      // The count a browser sends with this one row. Stating it is what lets a
+      // submit that arrives with no rows be told from a page that had none: the
+      // save is a whole-set replace, so the two are the same request otherwise,
+      // and the second one is how a variant silently lost its packaging. A
+      // payload that does not state a count is read as having drawn rows, which
+      // refuses the empty case rather than trusting it. NOTE this suite cannot
+      // run in this environment (it needs the owner's password), so this pin has
+      // not been executed here.
+      pkg_rowCount: "1",
       pkg_label: "Carton",
       pkg_packageType: "carton",
       pkg_presetId: "",
