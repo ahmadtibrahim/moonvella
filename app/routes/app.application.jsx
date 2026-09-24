@@ -6,6 +6,19 @@ import {
   asAccessResponse,
   requireMerchantAccess,
 } from "../services/seller.server";
+/*
+ * Where each fact is stored, and what the form starts with. Shared with the
+ * suite that checks them: the list is the one authority for the write, the read
+ * and the refresh, and the seed is a plain function so the field values the page
+ * renders can be asserted without a browser.
+ */
+import {
+  ADDRESS_FIELDS,
+  IMPORTED_FIELDS,
+  STORED_FIELDS,
+  importedColumns,
+  seedFormState,
+} from "../utils/applicationFields";
 
 const PRODUCT_CATEGORIES = [
   "Bedding & Bath",
@@ -22,44 +35,6 @@ const CANADIAN_MARKETS = [
   "Western Canada",
   "Atlantic Canada",
   "Northern / Remote",
-];
-
-/**
- * The business address, as separate columns.
- *
- * It used to be one free-text box. A single string cannot be mapped onto Odoo's
- * street / street2 / city / zip / state / country without guessing where one
- * ends and the next begins, so the guess would land in the customer record as
- * fact. Five columns and a country code can be mapped exactly, and a country
- * code is what `res.country` is resolved against.
- */
-const ADDRESS_FIELDS = [
-  { key: "addressLine1", label: "Street 1", required: true },
-  { key: "addressLine2", label: "Street 2", required: false },
-  { key: "addressCity", label: "City", required: true },
-  { key: "addressProvinceCode", label: "Province / State", required: true },
-  { key: "addressPostalCode", label: "Postal / ZIP code", required: true },
-  { key: "addressCountryCode", label: "Country code", required: true },
-];
-
-/**
- * The imported store facts, in the order the page shows them.
- *
- * This list is what makes "every imported field explains itself" checkable: the
- * loader returns a note for each key named here, and the page renders the note
- * under the value. A key added here without a note renders an empty
- * explanation, which the suite treats as a failure.
- */
-const IMPORTED_FIELDS = [
-  { key: "storeName", label: "Store display name" },
-  { key: "shopifyShopId", label: "Shopify shop ID" },
-  { key: "myshopifyDomain", label: "myshopify domain" },
-  { key: "storefrontUrl", label: "Storefront URL" },
-  { key: "storeOwnerEmail", label: "Store owner email" },
-  { key: "storeContactEmail", label: "Public store contact email" },
-  { key: "countryCode", label: "Country" },
-  { key: "currency", label: "Currency" },
-  { key: "plan", label: "Shopify plan" },
 ];
 
 function safeParseArray(value) {
@@ -140,32 +115,18 @@ export async function loader({ request }) {
         where: { shopDomain: context.shop },
         create: {
           shopDomain: context.shop,
-          storeName: imported.profile.storeName || context.shop,
-          shopifyShopId: imported.profile.shopifyShopId,
-          storeOwnerEmail: imported.profile.storeOwnerEmail,
-          storeContactEmail: imported.profile.storeContactEmail,
-          addressLine1: imported.profile.addressLine1,
-          addressLine2: imported.profile.addressLine2,
-          addressCity: imported.profile.addressCity,
-          addressProvinceCode: imported.profile.addressProvinceCode,
-          addressPostalCode: imported.profile.addressPostalCode,
-          addressCountryCode: imported.profile.addressCountryCode,
+          // Every imported value that has a column, from the one list that says
+          // which is which. The fields are no longer named here one by one: the
+          // last time they were, four of them were left out and the page showed
+          // blank boxes for facts Shopify had answered.
+          ...importedColumns(imported.profile, context.shop),
           profileFieldSources: imported.sources,
           shopifyProfileJson: imported.raw ?? {},
           profileRefreshedAt: new Date(),
           profileRefreshError: null,
         },
         update: {
-          storeName: imported.profile.storeName || context.shop,
-          shopifyShopId: imported.profile.shopifyShopId,
-          storeOwnerEmail: imported.profile.storeOwnerEmail,
-          storeContactEmail: imported.profile.storeContactEmail,
-          addressLine1: imported.profile.addressLine1,
-          addressLine2: imported.profile.addressLine2,
-          addressCity: imported.profile.addressCity,
-          addressProvinceCode: imported.profile.addressProvinceCode,
-          addressPostalCode: imported.profile.addressPostalCode,
-          addressCountryCode: imported.profile.addressCountryCode,
+          ...importedColumns(imported.profile, context.shop),
           profileFieldSources: imported.sources,
           shopifyProfileJson: imported.raw ?? {},
           profileRefreshedAt: new Date(),
@@ -223,8 +184,11 @@ export async function loader({ request }) {
     // A `.server` module cannot be reached from client code in this build.
     apiVersion: SHOP_API_VERSION,
     imported: {
+      // Read by column, not by the import's own name for the fact: four of the
+      // nine are stored under a different one, which is what made them render
+      // blank while their sources said "SHOPIFY".
       values: Object.fromEntries(
-        IMPORTED_FIELDS.map((f) => [f.key, row?.[f.key] ?? null]),
+        IMPORTED_FIELDS.map((f) => [f.key, row?.[f.column] ?? null]),
       ),
       sources: Object.fromEntries(
         IMPORTED_FIELDS.map((f) => [f.key, storedSources[f.key] ?? "IMPORT_FAILED"]),
@@ -328,7 +292,22 @@ export async function action({ request }) {
     const data = {};
     const onlyField = intent === "clear_field" ? str(formData, "field") : null;
 
-    for (const [key, value] of Object.entries(imported.profile)) {
+    /*
+     * Written by column, from the same list the page reads.
+     *
+     * This loop used to copy every key of the imported profile straight into
+     * `data`, so it asked the database to set `myshopifyDomain`, `storefrontUrl`,
+     * `countryCode`, `plan` and `shopOwnerName` — five names that are not columns.
+     * Prisma refuses the whole query over the first unknown argument, so
+     * "Refresh from Shopify" failed every time it was pressed. The button a
+     * merchant reaches for when a field looks wrong was the one control on the
+     * page that could not work.
+     */
+    for (const field of STORED_FIELDS) {
+      const key = field.key;
+      // The identity column is the session's, not the response's.
+      if (field.identity) continue;
+
       /*
        * A field the merchant typed is theirs. Refreshing is not a reason to
        * overwrite an answer somebody gave deliberately — the note under an
@@ -339,15 +318,13 @@ export async function action({ request }) {
       const overridden = storedSources[key] === "MERCHANT";
       if (overridden && onlyField !== key) continue;
 
-      data[key] = value;
+      data[field.column] = imported.profile[key];
       nextSources[key] = imported.sources[key];
     }
 
-    // Identity columns the import owns outright.
+    // `storeName` is NOT NULL and keeps its own fallback chain: the import, then
+    // what is already stored, then the shop domain.
     data.storeName = imported.profile.storeName || existing?.storeName || shop;
-    data.shopifyShopId = imported.profile.shopifyShopId;
-    data.storeOwnerEmail = imported.profile.storeOwnerEmail;
-    data.storeContactEmail = imported.profile.storeContactEmail;
     data.profileFieldSources = nextSources;
     data.shopifyProfileJson = imported.raw ?? {};
     data.profileRefreshedAt = new Date();
@@ -584,29 +561,12 @@ export default function ApplicationPage() {
     }
   }, [refreshed, shopify]);
 
-  const [formData, setFormData] = React.useState(() => ({
-    contactName: application?.contactName ?? "",
-    phone: application?.phone ?? "",
-    urgentPhone: application?.urgentPhone ?? "",
-    urgentContactName: application?.urgentContactName ?? "",
-    // Prefilled from the store's own email as a convenience. It stays a field
-    // the applicant can change: the person MoonVella should call about this
-    // account is often not the mailbox the storefront publishes.
-    //
-    // `||`, not `??`, for the two below: a draft row answers these with an empty
-    // string, and an empty answer has to fall back the same way a missing row
-    // does — otherwise a store would be shown an empty email box where a new
-    // one is offered its own store email, and a category select with a value
-    // matching no option.
-    email: application?.email || imported.values.storeOwnerEmail || "",
-    legalBusinessName: application?.legalBusinessName ?? "",
-    gstHstNumber: application?.gstHstNumber ?? "",
-    productCategory: application?.productCategory || "Bedding & Bath",
-    markets:
-      application?.markets && application.markets.length
-        ? application.markets
-        : ["Ontario"],
-  }));
+  // Seeded by a function the suite calls too, so what the form starts with is
+  // checkable without a browser — the prefill under the contact email is a
+  // promise the page makes in writing, and it is asserted rather than assumed.
+  const [formData, setFormData] = React.useState(() =>
+    seedFormState(application, imported),
+  );
 
   // The address is editable state so a merchant can complete a field Shopify
   // left blank. Seeded from whatever the last import (or their own edit) put
@@ -914,7 +874,7 @@ export default function ApplicationPage() {
                   onChange={(e) => handleChange("email", e.target.value)}
                   aria-invalid={!!fieldErrors.email}
                 />
-                <SourceNote note="Prefilled from your store email for convenience. Enter the address of the person named above if that is somebody else." />
+                <SourceNote note="Prefilled from your Shopify store's own email address for convenience. Enter the address of the person named above if that is somebody else." />
                 {fieldErrors.email && (
                   <p style={{ color: "var(--danger-red)", fontSize: "0.75rem", marginTop: "0.25rem" }}>
                     {fieldErrors.email}

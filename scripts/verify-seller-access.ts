@@ -37,8 +37,16 @@
  */
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { PrismaClient } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import { resolveSellerContext, BLOCKED_MESSAGE } from "~/services/seller.server";
+import {
+  ADDRESS_FIELDS,
+  IMPORTED_FIELDS,
+  STORED_FIELDS,
+  importedColumns,
+  seedFormState,
+} from "~/utils/applicationFields";
+import type { ProfileFieldKey, ProfileFieldSource, ShopProfile } from "~/services/shopProfile.server";
 import {
   approveApplication,
   blockSeller,
@@ -61,10 +69,40 @@ const SHOP_BLOCKED = `vsa-blocked-${suffix.toLowerCase()}.myshopify.com`;
 const SHOPS = [SHOP_PENDING, SHOP_APPROVED, SHOP_REJECTED, SHOP_DEACTIVATED, SHOP_BLOCKED];
 /** The store of §6, which opens the page and submits nothing until check 24. */
 const SHOP_DRAFT = `vsa-draft-${suffix.toLowerCase()}.myshopify.com`;
+/** The store of §7, whose row is written from an import and read back. */
+const SHOP_PROFILE = `vsa-profile-${suffix.toLowerCase()}.myshopify.com`;
 /** Everything this suite writes, for `cleanup()`. The draft has a seller by the
  * end of §6, so it has to be swept like the rest — a store left behind here is
  * visible to the suites that count the roster. */
-const ALL_SHOPS = [...SHOPS, SHOP_DRAFT];
+const ALL_SHOPS = [...SHOPS, SHOP_DRAFT, SHOP_PROFILE];
+
+/**
+ * A complete answer from Shopify, of the shape `fetchShopProfile` returns.
+ *
+ * Every field is distinct on purpose: the check that reads the row back can
+ * only tell "the storefront URL landed in storeUrl" from "something landed
+ * somewhere" if no two values are equal, and the four fields this section
+ * exists for are exactly the ones whose names differ between the import and the
+ * column.
+ */
+const SAMPLE_PROFILE: ShopProfile = {
+  shopifyShopId: "gid://shopify/Shop/778899",
+  storeName: "Profile Fields Store",
+  myshopifyDomain: SHOP_PROFILE,
+  storefrontUrl: "https://profile-fields.example",
+  storeOwnerEmail: "owner@profile-fields.invalid",
+  storeContactEmail: "hello@profile-fields.invalid",
+  shopOwnerName: "Profile Owner",
+  countryCode: "CA",
+  currency: "CAD",
+  plan: "Shopify Plus",
+  addressLine1: "1 Field Way",
+  addressLine2: "Unit 9",
+  addressCity: "Toronto",
+  addressProvinceCode: "ON",
+  addressPostalCode: "M5V 1A1",
+  addressCountryCode: "CA",
+};
 
 /**
  * When the claim-time fixture is due, and the clock the runner is given.
@@ -154,6 +192,66 @@ async function makeStore(shop: string, label: string, status: "PENDING" | "APPRO
 /** The four permissions, as a compact string, for failure messages. */
 function flags(context: Awaited<ReturnType<typeof resolveSellerContext>>) {
   return `wholesale=${context.canViewWholesale} import=${context.canImport} orders=${context.canViewOrders} newBusiness=${context.canStartNewBusiness}`;
+}
+
+/**
+ * A `sources` map covering every field the page stores.
+ *
+ * The import's own map is exhaustive by construction — every field answers, even
+ * if the answer is "Shopify had nothing" — so a fixture has to be too. A missing
+ * key would read as IMPORT_FAILED and quietly change what the check is testing.
+ */
+function sourcesFor(
+  fields: Array<{ key: string }>,
+  source: ProfileFieldSource,
+): Record<ProfileFieldKey, ProfileFieldSource> {
+  return Object.fromEntries(fields.map((field) => [field.key, source])) as Record<
+    ProfileFieldKey,
+    ProfileFieldSource
+  >;
+}
+
+/**
+ * The Refresh action's write, reproduced (`app/routes/app.application.jsx`).
+ *
+ * Copied rather than called, because the route is a `.jsx` module inside a Remix
+ * build and cannot be imported by a script. It is copied faithfully — write by
+ * column, never the identity field, never a value the merchant has typed over —
+ * so a change to the page's loop that breaks one of those three has to be made
+ * here as well, in a file the failure names.
+ *
+ * The one branch not reproduced is `clear_field`, which is the merchant asking
+ * for Shopify's value back on a field they had overridden; it bypasses the
+ * MERCHANT guard for the single named field.
+ */
+async function applyRefresh(profile: ShopProfile, source: ProfileFieldSource, shop: string) {
+  const existing = await prisma.merchantApplication.findUnique({ where: { shopDomain: shop } });
+  const storedSources = (existing?.profileFieldSources ?? {}) as Record<string, string>;
+  const nextSources: Record<string, string> = { ...storedSources };
+  const data: Record<string, string | null> = {};
+
+  for (const field of STORED_FIELDS) {
+    const key = field.key;
+    // The identity column is the session's, not the response's.
+    if (field.identity) continue;
+    // A field the merchant typed is theirs.
+    if (storedSources[key] === "MERCHANT") continue;
+    data[field.column] = profile[key as keyof ShopProfile];
+    nextSources[key] = source;
+  }
+
+  // `storeName` is NOT NULL and keeps its own fallback chain.
+  data.storeName = profile.storeName || existing?.storeName || shop;
+
+  return prisma.merchantApplication.update({
+    where: { shopDomain: shop },
+    data: {
+      ...data,
+      profileFieldSources: nextSources,
+      profileRefreshedAt: new Date(),
+      profileRefreshError: null,
+    } as unknown as Prisma.MerchantApplicationUncheckedUpdateInput,
+  });
 }
 
 async function main() {
@@ -639,6 +737,205 @@ async function main() {
         pendingQueries.every((query) => /submittedAt: \{ not: null \}/.test(query)),
       `${pendingQueries.length} pending quer${pendingQueries.length === 1 ? "y" : "ies"} found, ` +
         `${pendingQueries.filter((q) => !/submittedAt: \{ not: null \}/.test(q)).length} without the filter`,
+    );
+
+    /*
+     * §7 — WHERE EACH IMPORTED FACT IS STORED.
+     *
+     * The shop domain, storefront URL, country, currency and plan rendered blank
+     * while `profileFieldSources` said "SHOPIFY" against every one of them, which
+     * is the shape of a bug that survives review: the import looked successful
+     * and the explanation looked correct. The cause was that the page used the
+     * import's own name for each fact as though it were the column name, and four
+     * of the nine are not (`myshopifyDomain` → `shopDomain`, `storefrontUrl` →
+     * `storeUrl`, `countryCode` → `country`, `plan` → `shopifyPlan`). One list now
+     * holds both names, and the checks below exercise it the way the page does:
+     * write a row from an import, read it back through the loader's own
+     * expression, and press Refresh.
+     *
+     * The samples are all distinct, because a check that reads values back can
+     * only tell "the storefront URL landed in storeUrl" from "something landed
+     * somewhere" if no two of them are equal.
+     */
+    const modelColumns = new Set<string>(Object.values(Prisma.MerchantApplicationScalarFieldEnum));
+    const importedValues = importedColumns(SAMPLE_PROFILE, SHOP_PROFILE);
+    const unknownColumns = STORED_FIELDS.map((field) => field.column).filter(
+      (column) => !modelColumns.has(column),
+    );
+    const notCarried = IMPORTED_FIELDS.filter(
+      (field) => !field.identity && importedValues[field.column] !== SAMPLE_PROFILE[field.key as keyof ShopProfile],
+    );
+    // The address list states that an address fact's import name and its column
+    // are the same word. The refresh loop depends on that and would fail quietly
+    // if it stopped being true: `undefined` means "leave this column alone" to
+    // Prisma, so a drifted key would skip the field rather than throw.
+    const addressDrift = ADDRESS_FIELDS.filter((field) => field.key !== field.column);
+    check(
+      26,
+      "Each imported fact is written by a column the table has, under that column and not the import's name for it",
+      unknownColumns.length === 0 &&
+        !("shopDomain" in importedValues) &&
+        notCarried.length === 0 &&
+        addressDrift.length === 0 &&
+        Object.keys(importedValues).length === IMPORTED_FIELDS.length - 1,
+      `${Object.keys(importedValues).length} columns written` +
+        `${unknownColumns.length ? `; not columns: ${unknownColumns.join(", ")}` : ""}` +
+        `${notCarried.length ? `; not carried: ${notCarried.map((f) => f.key).join(", ")}` : ""}` +
+        `${addressDrift.length ? `; address keys off their column: ${addressDrift.map((f) => f.key).join(", ")}` : ""}`,
+    );
+
+    // The loader's write, reproduced: the imported profile, the session's shop
+    // for the identity column, and nothing else.
+    let profileWriteError = "";
+    let storedProfile = null;
+    try {
+      storedProfile = await prisma.merchantApplication.create({
+        data: {
+          // The imported columns first, then the two the import is not allowed to
+          // speak for: the identity column comes from the authenticated session,
+          // and the sources map from the import as a whole. `importedColumns`
+          // writes neither, so this order says which wins if it ever does.
+          ...(importedValues as unknown as Prisma.MerchantApplicationUncheckedCreateInput),
+          shopDomain: SHOP_PROFILE,
+          profileFieldSources: sourcesFor(STORED_FIELDS, "SHOPIFY"),
+        },
+      });
+    } catch (error) {
+      profileWriteError = error instanceof Error ? error.message : String(error);
+    }
+
+    // The loader's read, reproduced: by column, and then labelled with the
+    // import's name for the fact, which is the only name the page knows.
+    const readBack = Object.fromEntries(
+      IMPORTED_FIELDS.map((field) => [
+        field.key,
+        (storedProfile as unknown as Record<string, string | null> | null)?.[field.column] ?? null,
+      ]),
+    ) as Record<string, string | null>;
+    const blankOnRead = IMPORTED_FIELDS.filter((field) => !readBack[field.key]).map(
+      (field) => field.label,
+    );
+    check(
+      27,
+      "Every imported field reads back non-empty, the five that rendered blank included",
+      profileWriteError === "" && blankOnRead.length === 0,
+      profileWriteError || (blankOnRead.length ? `blank: ${blankOnRead.join(", ")}` : "all nine read back"),
+    );
+
+    /*
+     * Refresh, as the action performs it. It used to copy the raw profile into
+     * the update, asking the database to set `myshopifyDomain`, `storefrontUrl`,
+     * `countryCode`, `plan` and `shopOwnerName` — five names it does not have.
+     * Prisma refuses the first unknown argument and the whole query with it, so
+     * the button a merchant presses when a field looks wrong failed every time.
+     */
+    const REFRESHED: ShopProfile = {
+      ...SAMPLE_PROFILE,
+      storefrontUrl: "https://refreshed.example",
+      countryCode: "US",
+      currency: "USD",
+      plan: "Basic",
+      // Deliberately another store: a refresh must not let the response decide
+      // which row this is.
+      myshopifyDomain: "someone-elses-store.myshopify.com",
+    };
+
+    let refreshError = "";
+    try {
+      await applyRefresh(REFRESHED, "SHOPIFY", SHOP_PROFILE);
+    } catch (error) {
+      refreshError = error instanceof Error ? error.message : String(error);
+    }
+
+    // The negative control: the write the old loop built is refused. Without
+    // this the check above would pass just as well on a database that accepted
+    // any argument at all.
+    let rawKeyError = "";
+    try {
+      await prisma.merchantApplication.update({
+        where: { shopDomain: SHOP_PROFILE },
+        data: { myshopifyDomain: REFRESHED.myshopifyDomain } as unknown as Prisma.MerchantApplicationUncheckedUpdateInput,
+      });
+    } catch (error) {
+      rawKeyError = error instanceof Error ? error.message : String(error);
+    }
+
+    const refreshed = await prisma.merchantApplication.findUnique({ where: { shopDomain: SHOP_PROFILE } });
+    check(
+      28,
+      "Refresh from Shopify writes every imported field by column, and no longer throws on a name the table does not have",
+      refreshError === "" &&
+        refreshed?.storeUrl === REFRESHED.storefrontUrl &&
+        refreshed?.country === REFRESHED.countryCode &&
+        refreshed?.currency === REFRESHED.currency &&
+        refreshed?.shopifyPlan === REFRESHED.plan &&
+        /Unknown argument/.test(rawKeyError),
+      refreshError ||
+        `storeUrl ${refreshed?.storeUrl}, country ${refreshed?.country}, currency ${refreshed?.currency}, ` +
+          `plan ${refreshed?.shopifyPlan}; the raw-key write was refused`,
+    );
+
+    check(
+      29,
+      "A refresh that answered with another store's domain left this row's identity alone",
+      refreshed?.shopDomain === SHOP_PROFILE && REFRESHED.myshopifyDomain !== SHOP_PROFILE,
+      `row is ${refreshed?.shopDomain}, the response said ${REFRESHED.myshopifyDomain}`,
+    );
+
+    /*
+     * And the other half of "refreshing is not a reason to overwrite an answer":
+     * a field the merchant typed is theirs. Its source is what records that, so
+     * the check is that the value AND the source both survive a refresh while an
+     * untouched neighbour still updates — otherwise the loop could be skipping
+     * everything and this would read as a pass.
+     */
+    await prisma.merchantApplication.update({
+      where: { shopDomain: SHOP_PROFILE },
+      data: {
+        currency: "CAD",
+        profileFieldSources: { ...(refreshed?.profileFieldSources as Record<string, string>), currency: "MERCHANT" },
+      },
+    });
+    let typedError = "";
+    try {
+      await applyRefresh({ ...REFRESHED, plan: "Advanced" }, "SHOPIFY", SHOP_PROFILE);
+    } catch (error) {
+      typedError = error instanceof Error ? error.message : String(error);
+    }
+    const afterTyped = await prisma.merchantApplication.findUnique({ where: { shopDomain: SHOP_PROFILE } });
+    const afterTypedSources = (afterTyped?.profileFieldSources ?? {}) as Record<string, string>;
+    check(
+      30,
+      "A value the merchant typed survives a refresh; its untouched neighbours still update",
+      typedError === "" &&
+        afterTyped?.currency === "CAD" &&
+        afterTypedSources.currency === "MERCHANT" &&
+        afterTyped?.shopifyPlan === "Advanced",
+      typedError ||
+        `currency ${afterTyped?.currency} (${afterTypedSources.currency}), plan ${afterTyped?.shopifyPlan}`,
+    );
+
+    /*
+     * The form's starting values. The note under the contact email says it is
+     * prefilled from the store's email, and the store's own email is on the row;
+     * an empty box under that sentence is the page contradicting itself in
+     * writing. `application` is what the loader sends, so a draft arrives as
+     * empty strings rather than nulls.
+     */
+    const storeEmails = {
+      storeOwnerEmail: SAMPLE_PROFILE.storeOwnerEmail,
+      storeContactEmail: SAMPLE_PROFILE.storeContactEmail,
+    };
+    const draftSeed = seedFormState({ email: "" }, { values: storeEmails });
+    const answeredSeed = seedFormState({ email: "merchant@their-own.invalid" }, { values: storeEmails });
+    const noEmailSeed = seedFormState({ email: "" }, { values: { storeOwnerEmail: null, storeContactEmail: null } });
+    check(
+      31,
+      "The contact email starts with the store's own address, a typed answer is kept, and nothing is invented without one",
+      draftSeed.email === SAMPLE_PROFILE.storeOwnerEmail &&
+        answeredSeed.email === "merchant@their-own.invalid" &&
+        noEmailSeed.email === "",
+      `${draftSeed.email} / ${answeredSeed.email} / ${noEmailSeed.email || "(empty)"}`,
     );
   } finally {
     await cleanup();
