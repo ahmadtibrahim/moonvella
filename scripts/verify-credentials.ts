@@ -21,6 +21,8 @@
  * and the disconnect flag for the keys it touches and restores them afterwards,
  * so a real credential saved in Settings is never lost or overwritten.
  */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import {
   encryptCredential,
@@ -59,6 +61,8 @@ import {
   testEshipperAuthentication,
 } from "../app/services/eshipper.server";
 import { testStripeAuthentication } from "../app/services/payments.server";
+import { stripeKeyKindProblem, stripeModeDetail } from "../app/services/stripeMode.server";
+import { browserKeyForPlaces } from "../app/services/addressValidation.server";
 
 const prisma = new PrismaClient();
 
@@ -68,6 +72,11 @@ function check(name: string, pass: boolean, detail = "") {
   total++;
   if (!pass) failures++;
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+}
+
+/** A file from the app tree, for the checks that are about code rather than data. */
+function readSource(relative: string): string {
+  return readFileSync(join(process.cwd(), relative), "utf8");
 }
 
 const calls: { url: string; method: string }[] = [];
@@ -85,7 +94,7 @@ function installFetch(respond: (url: string, method: string) => { status?: numbe
 }
 
 /** Keys this suite writes to. Snapshotted and restored around the run. */
-const TOUCHED_KEYS = ["stripe", "eshipper", "odoo"] as const;
+const TOUCHED_KEYS = ["stripe", "eshipper", "odoo", "google"] as const;
 
 /**
  * The rows this suite is about to disturb, copied verbatim. Credential values
@@ -191,18 +200,22 @@ async function main() {
     allFields
       .filter((field) => !field.secret)
       // The complete list, by design: a new field cannot be added without
-      // someone deciding here whether it is a secret. ODOO_CONSIGNMENT_* name
-      // whose stock an import may sell; they identify records rather than
-      // authenticate, so they are not secrets. GOOGLE_MAPS_BROWSER_KEY is the
+      // someone deciding here whether it is a secret. The ODOO_CONSIGNMENT_*
+      // pair used to sit in this list; it is gone with the global consignment
+      // requirement, and its absence here is what would catch it coming back as
+      // a field nobody decided about. GOOGLE_MAPS_BROWSER_KEY is the
       // one field here that IS handed to a browser, which is exactly why it must
       // not be stored as a secret: the address form has to read it, and a value
       // the server refuses to render is a form that cannot complete an address.
       // Its safety comes from the referrer restriction, not from this store — and
       // the Address Validation call must use the server key, never this one.
-      // ODOO_WHOLESALE_PRICELIST names the pricelist the import reads prices
-      // from. It identifies a record rather than authenticating anything, so it
-      // is stored readable, exactly like the consignment pair beside it.
-      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_CONSIGNMENT_LOCATION", "ODOO_CONSIGNMENT_OWNER", "ODOO_WHOLESALE_PRICELIST", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
+      // ODOO_WAREHOUSE is the one stock setting left: it names the warehouse
+      // whose locations stock is counted from and whose address every outbound
+      // shipment starts from. It identifies a record rather than authenticating
+      // anything, so it is stored readable. ODOO_WHOLESALE_PRICELIST used to sit
+      // in this list; it is gone with the pricing decision, and removing it here
+      // is what would catch it coming back as a field nobody decided about.
+      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_WAREHOUSE", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
   );
 
   // 1. Encryption -------------------------------------------------------------
@@ -446,6 +459,128 @@ async function main() {
     const liveState = await checkIntegration("stripe");
     check("a live key is connected but flagged", liveState.status === "HEALTHY" && /LIVE key/.test(liveState.detail), liveState.detail);
 
+    // 8.5 A Stripe value of the wrong KIND ----------------------------------
+    //
+    // The owner's report: "Stripe reports a publishable key used for a
+    // secret-key request." The mapping was right and the VALUE was the wrong
+    // kind of Stripe value — a publishable key, which is public by design and
+    // authenticates nothing. Both halves are checked here: the sentence an
+    // operator is shown, and the two places they must not be able to get past —
+    // the save, and the probe.
+    const WRONG_KIND_CANARY = "pk_test_LEAKCANARY_9c14";
+
+    check(
+      "A secret key is not a wrong kind of value",
+      stripeKeyKindProblem("sk_test_abc") === null && stripeKeyKindProblem("sk_live_abc") === null
+    );
+    check(
+      "A restricted key is a secret key too, and is not refused",
+      stripeKeyKindProblem("rk_test_abc") === null && stripeKeyKindProblem("rk_live_abc") === null
+    );
+    check("An absent key is not a wrong kind of value", stripeKeyKindProblem(null) === null && stripeKeyKindProblem("") === null);
+
+    const publishableProblem = stripeKeyKindProblem(WRONG_KIND_CANARY);
+    check(
+      "A publishable key is named as one, and the fix is stated",
+      !!publishableProblem &&
+        /publishable key \(pk_…\)/.test(publishableProblem) &&
+        /not a secret key/.test(publishableProblem) &&
+        /Paste the sk_… secret key/.test(publishableProblem) &&
+        /publishable keys never authenticate/.test(publishableProblem),
+      publishableProblem ?? "no problem reported"
+    );
+    check(
+      "The refusal never quotes the value it refused",
+      !!publishableProblem && !publishableProblem.includes(WRONG_KIND_CANARY)
+    );
+    const webhookProblem = stripeKeyKindProblem("whsec_LEAKCANARY_9c14");
+    check(
+      "A webhook signing secret is refused as the other wrong kind, and pointed at its own field",
+      !!webhookProblem && /webhook signing secret/.test(webhookProblem) && /webhook secret field/.test(webhookProblem),
+      webhookProblem ?? "no problem reported"
+    );
+
+    // The save is where this is caught while the person who pasted it is still
+    // looking at the form. Nothing may be written — not the refused field, and
+    // not the other fields of the same submission either, because a form that
+    // half-saved would be reported as saved.
+    const auditBefore = await prisma.auditLog.count({
+      where: { action: "integration.credentials_saved", entityId: "stripe" },
+    });
+    let saveRefusal: string | null = null;
+    try {
+      await saveIntegrationCredentials(
+        "stripe",
+        { STRIPE_SECRET_KEY: WRONG_KIND_CANARY, STRIPE_PUBLISHABLE_KEY: "pk_test_ok_to_keep" },
+        { actorType: "ADMIN_USER", actorId: "verify-credentials", actorName: "Verification" }
+      );
+    } catch (error) {
+      saveRefusal = error instanceof Error ? error.message : String(error);
+    }
+    check("Saving a publishable key into the secret field is refused", saveRefusal === publishableProblem, saveRefusal ?? "it was accepted");
+    check(
+      "And the refusal happens before anything is written — the stored key is untouched",
+      (await stripeSecretKey()) === "sk_test_rejected",
+      String((await stripeSecretKey()) === "sk_test_rejected")
+    );
+    check(
+      "And the same submission's other fields are not half-saved either",
+      (await getCredential("stripe", "STRIPE_PUBLISHABLE_KEY")) !== "pk_test_ok_to_keep"
+    );
+    check(
+      "And a refused save is not audited as a save",
+      (await prisma.auditLog.count({ where: { action: "integration.credentials_saved", entityId: "stripe" } })) === auditBefore
+    );
+
+    /*
+     * The probe, with a publishable key already stored — which is the state the
+     * owner was actually in, since one was saved before this rule existed. It
+     * must be diagnosed without asking Stripe: a request would spend a call to
+     * learn what the prefix already said, and Stripe's answer would bury the
+     * cause in a generic 401. `calls.length` not moving is that proof.
+     */
+    await saveCredentials("stripe", { STRIPE_SECRET_KEY: WRONG_KIND_CANARY });
+    installFetch(() => ({ status: 401, body: { error: { message: "Invalid API Key provided" } } }));
+    const callsBefore = calls.length;
+    const wrongKindProbe = await testStripeAuthentication();
+    check("A stored publishable key does not authenticate", wrongKindProbe.ok === false);
+    check(
+      "And the reason is the wrong KIND, not Stripe's generic 401",
+      wrongKindProbe.reason === publishableProblem,
+      wrongKindProbe.reason ?? ""
+    );
+    check(
+      "And it cost no request: the prefix was read, not sent",
+      calls.length === callsBefore,
+      `${calls.length - callsBefore} call(s) made`
+    );
+
+    const wrongKindState = await checkIntegration("stripe");
+    check("And the integration reports FAILED rather than Connected", wrongKindState.status === "FAILED", wrongKindState.status);
+    check(
+      "And what is shown names the key kind without quoting the key",
+      wrongKindState.detail === publishableProblem && !wrongKindState.detail.includes(WRONG_KIND_CANARY),
+      wrongKindState.detail
+    );
+
+    // A key of the wrong kind must also never be treated as a usable one by the
+    // mode resolver: this is the guarantee that no provider call can be made
+    // with it even by a path that never consults the probe.
+    // The override is lifted for this one read rather than the check being
+    // skipped when it is set: "the override is on, so this proves nothing" is
+    // how a guarantee quietly stops being tested.
+    const savedOverride = process.env.MOONVELLA_STRIPE_MODE;
+    delete process.env.MOONVELLA_STRIPE_MODE;
+    const wrongKindMode = await stripeModeDetail();
+    if (savedOverride === undefined) delete process.env.MOONVELLA_STRIPE_MODE;
+    else process.env.MOONVELLA_STRIPE_MODE = savedOverride;
+    check(
+      "And it can never select a provider mode: the mode resolves to disabled",
+      wrongKindMode.mode === "disabled" && wrongKindMode.source === "unrecognised-key",
+      `${wrongKindMode.mode} (${wrongKindMode.source})`
+    );
+    await saveCredentials("stripe", { STRIPE_SECRET_KEY: "sk_test_rejected" });
+
     // 9. The webhook secret resolves from the store -------------------------
     installFetch(() => ({ status: 200, body: {} }));
     await saveCredentials("stripe", { STRIPE_WEBHOOK_SECRET: "whsec_from_store" });
@@ -609,6 +744,146 @@ async function main() {
     // 16. Rotation is a no-op on rows already on the current key ------------
     const rotation = await rotateCredentialKeys();
     check("rotation leaves current-key rows alone", rotation.rotated === 0 && rotation.unreadable === 0, JSON.stringify(rotation));
+
+    // 17. The Google browser key is the only credential a browser may have ---
+    //
+    // The directive is explicit: reuse a Google credential in the browser only
+    // if its restrictions support the site, never expose a server credential,
+    // and never remove an existing restriction. This module is the only place
+    // that hands a Google value to a page, so the guarantee is checked here by
+    // calling it rather than by reading a comment: with only the server key
+    // stored, there is nothing to hand out.
+    const SERVER_KEY_CANARY = "AIza_SERVERKEY_LEAKCANARY_4a01";
+    const BROWSER_KEY_CANARY = "AIza_BROWSERKEY_PUBLIC_4a01";
+    await saveCredentials("google", { GOOGLE_MAPS_SERVER_KEY: SERVER_KEY_CANARY });
+    check(
+      "with only the server key set, there is no browser key to hand out",
+      (await browserKeyForPlaces()) === null,
+      String(await browserKeyForPlaces())
+    );
+    await saveCredentials("google", { GOOGLE_MAPS_BROWSER_KEY: BROWSER_KEY_CANARY });
+    check(
+      "with both set, the accessor returns the browser key and nothing else",
+      (await browserKeyForPlaces()) === BROWSER_KEY_CANARY,
+      String(await browserKeyForPlaces())
+    );
+    const googleStates = await credentialFieldStates("google");
+    const serverField = googleStates.find((field) => field.name === "GOOGLE_MAPS_SERVER_KEY");
+    check("the server key is marked set without its value", serverField?.isSet === true && serverField?.value === null);
+    check(
+      "and the server key appears in nothing the page receives",
+      !JSON.stringify(googleStates).includes(SERVER_KEY_CANARY)
+    );
+    check(
+      "the browser key is readable, because the page has to render it",
+      googleStates.find((field) => field.name === "GOOGLE_MAPS_BROWSER_KEY")?.value === BROWSER_KEY_CANARY
+    );
+
+    // 18. The Settings page: per provider, what is missing and what happened --
+    //
+    // Source-level, because the requirement is about what the page RENDERS and a
+    // rendering cannot be called from here. Each assertion is a structure the
+    // page must keep, not a sentence it happens to contain: the controls and the
+    // answer live inside the provider's own card, a field without a value says
+    // what belongs in it, and nothing on the page treats a stored value as a
+    // working one.
+    const settingsSource = readSource("app/routes/admin.settings.tsx");
+    const cardBody = settingsSource.slice(
+      settingsSource.indexOf("function DetailCard"),
+      settingsSource.indexOf("function CredentialsForm")
+    );
+
+    check(
+      "the provider card holds the controls, the pending state and the result",
+      cardBody.length > 0 &&
+        cardBody.includes("fetcher.Form") &&
+        /result\?\.error/.test(cardBody) &&
+        /result\?\.success/.test(cardBody) &&
+        /pendingLabel\(pendingIntent/.test(cardBody) &&
+        /busy \?/.test(cardBody),
+      `${cardBody.length} chars between the two components`
+    );
+    check(
+      "and it says what is missing, by field name, before anything is opened",
+      /function missingFieldNames/.test(settingsSource) && /missingFieldNames\(integration\.credentialFields\)/.test(cardBody)
+    );
+    check(
+      "and it shows when the last check succeeded, and what the last one said",
+      /integration\.lastSuccessAt/.test(cardBody) && /integration\.lastError/.test(cardBody)
+    );
+    check(
+      "no integration control is submitted through the page-level form, where the answer would land elsewhere",
+      !/<Form method="post">[\s\S]{0,300}?name="intent" value="(refresh_integration|save_credentials|disconnect_integration|clear_integration_error)"/.test(
+        settingsSource
+      )
+    );
+    check(
+      "a stored value is never presented as a working one",
+      /integration\.status === "HEALTHY" && isCredentialIntegrationKey\(key\)/.test(cardBody) &&
+        /not the same as a working integration/.test(cardBody) &&
+        /never reported as a working one on its own/.test(settingsSource)
+    );
+    check(
+      "an unset field says what to put in it, and a set one does not repeat it",
+      /\{!state\?\.isSet && field\.hint \?/.test(settingsSource)
+    );
+    check(
+      "a secret from the environment is marked as the deployment's, not this store's",
+      /Saved \(from the deployment environment\)/.test(settingsSource)
+    );
+    const hinted = allFields.filter((field) => field.hint).map((field) => field.name).sort();
+    check(
+      "the fields an operator cannot guess a value for all carry their setup",
+      JSON.stringify(hinted) ===
+        JSON.stringify([
+          "GOOGLE_MAPS_BROWSER_KEY",
+          "GOOGLE_MAPS_SERVER_KEY",
+          "ODOO_API_KEY",
+          "ODOO_DATABASE",
+          "ODOO_MODE",
+          "ODOO_URL",
+          "ODOO_USERNAME",
+          "ODOO_WAREHOUSE",
+          "STRIPE_PUBLISHABLE_KEY",
+          "STRIPE_SECRET_KEY",
+          "STRIPE_WEBHOOK_SECRET",
+        ]),
+      hinted.join(",")
+    );
+    const browserHint = allFields.find((field) => field.name === "GOOGLE_MAPS_BROWSER_KEY")?.hint ?? "";
+    const serverHint = allFields.find((field) => field.name === "GOOGLE_MAPS_SERVER_KEY")?.hint ?? "";
+    check(
+      "the browser key's note names the API to enable and both referrers to restrict it to",
+      /Places API \(New\)/.test(browserHint) &&
+        browserHint.includes("https://app.moonvella.com/*") &&
+        browserHint.includes("https://admin.moonvella.com/*"),
+      browserHint.slice(0, 90)
+    );
+    check(
+      "the server key's note names its API and its restriction",
+      /Address Validation API/.test(serverHint) && /IP address/.test(serverHint)
+    );
+    check(
+      "and the browser key's note refuses Odoo's own key by name, so it is not copied here",
+      /google_maps_api_key/.test(browserHint) && /NOT this key/.test(browserHint)
+    );
+    check(
+      "no key is pasted into the module: the notes describe a key, they do not contain one",
+      !/AIza[A-Za-z0-9_-]{10,}/.test(JSON.stringify(CREDENTIAL_INTEGRATIONS))
+    );
+    // The pricelist picker is gone with the pricing decision, and this is what
+    // would notice it coming back: nothing on the page reads a pricelist, and
+    // nothing in the Odoo connector offers one.
+    // Comments are stripped first: the note recording that the pricelist is
+    // gone is not the pricelist coming back, and a check that cannot tell those
+    // apart would forbid explaining the removal.
+    const stripComments = (source: string) =>
+      source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    check(
+      "no pricelist picker survives on the Settings page or in the Odoo connector",
+      !/PRICELIST/.test(stripComments(settingsSource)) &&
+        !/product\.pricelist/.test(stripComments(readSource("app/services/odoo.server.ts")))
+    );
   } finally {
     await restore(snap);
     const restoredRows = await prisma.integrationCredential.count({ where: { key: { in: [...TOUCHED_KEYS] } } });

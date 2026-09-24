@@ -1,49 +1,48 @@
 /**
- * The wholesale price matcher, on its own.
+ * What a seller is charged, on its own.
  *
- * WHAT THIS SUITE IS FOR. `odooPricing.ts` decides which row of the "MoonVella
- * Wholesale" pricelist prices a variant, and every one of its rules is a
- * decision about money that a person will be charged. It is written as a pure
- * module precisely so this suite can exist: there is no Odoo connection in this
- * environment, and a rule that can only be tested against a live instance is a
- * rule whose tests never run.
+ * WHAT THIS SUITE IS FOR. The owner's ruling is that Odoo supplies the price: a
+ * seller pays each variant's effective sales price — the figure on the variant's
+ * own form, which Odoo composes from the template's list price plus that
+ * variant's attribute price extras. MoonVella reads that one field and charges
+ * it. This suite pins every rule around that figure, and each one is a decision
+ * about money:
  *
- * WHAT IT PROVES, AND WHY EACH ONE MATTERS.
+ *   • The price is the variant's own effective sales price, read as one field
+ *     from `product.product`. It is never recomposed here from the template's
+ *     list price and the attribute extras, so no second copy of Odoo's
+ *     arithmetic can drift from Odoo's.
+ *   • There is no fallback. No cost, no retail guess, no zero: a variant whose
+ *     price Odoo will not state carries a problem and is left out.
+ *   • Zero and negative are refused, because both are a pricelist nobody
+ *     finished rather than a free product.
+ *   • The currency is CAD and nothing converts between currencies. A company in
+ *     another currency is a refusal, not a CAD label on a USD figure.
+ *   • Odoo's `false` is read as absent and never as zero — `Number(false) === 0`
+ *     is the trap this exists to close.
  *
- *   • Precedence matches Odoo's own, so MoonVella's charge and Odoo's order
- *     line cannot disagree about which row applies.
- *   • Nothing is ever picked at random — two rows that could both price
- *     quantity 1 are refused with both ids named, because the difference is
- *     money and only the pricelist's owner knows which row was meant.
- *   • Nothing falls back to a list price, a retail price or a cost. Where there
- *     is no usable rule the answer is a problem, and the caller refuses.
- *   • Quantity tiers are not the price of one unit, and the seller is told
- *     plainly that quantity discounts are not supported yet.
- *   • Date windows are date-only and inclusive at both ends, because Odoo
- *     stores dates and a rule ending today still applies today.
- *   • Every price is CAD. There is no conversion anywhere in this module.
+ * There used to be a wholesale-pricelist matcher here, with quantity tiers,
+ * date windows and rule precedence. It is gone, and so are its rules: the price
+ * is no longer chosen from a list of candidate rows, so there is no precedence
+ * left to get wrong.
  *
- * It reads no database, makes no network call and writes nothing. The catalogue
- * files it would otherwise touch are not involved: the rows below are plain
- * objects, shaped the way Odoo sends them, so the normaliser is exercised as
- * part of every check.
+ * It reads no database, makes no network call and writes nothing. The functions
+ * it calls are the ones the sync itself calls, exported for exactly this reason:
+ * a rule whose only test needs a live Odoo is a rule whose test never runs.
  *
  * Usage, inside the app image:
  *   node scripts/run-verify.mjs scripts/verify-pricing.ts
  */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, resolve } from "node:path";
 import {
   WHOLESALE_CURRENCY,
-  VARIANT_LEVEL,
-  TEMPLATE_LEVEL,
-  matchBasePrice,
-  normalizePricelistItem,
-  normalizePricelistItems,
-  todayIso,
-  type OdooPricelistItemRow,
-  type PriceOutcome,
-  type PriceProblem,
-  type PricedOutcome,
-} from "~/services/odooPricing";
+  billableCurrency,
+  chargeablePrice,
+  readNumber,
+  toCents,
+} from "~/services/odooImport.server";
 
 let failures = 0;
 let total = 0;
@@ -53,458 +52,224 @@ function check(name: string, pass: boolean, detail = "") {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
-/* -------------------------------------------------------------------------- */
-/* The fixtures                                                               */
-/* -------------------------------------------------------------------------- */
-
-const VARIANT = 501;
-const TEMPLATE = 901;
-const OTHER_VARIANT = 502;
-const TODAY = "2026-03-15";
-const PRICELIST = "MoonVella Wholesale";
-
-/** A day relative to TODAY, so the window checks never depend on the clock. */
-function day(offset: number): string {
-  const at = new Date(`${TODAY}T00:00:00Z`);
-  at.setUTCDate(at.getUTCDate() + offset);
-  return at.toISOString().slice(0, 10);
+/** The decision, as a price or as null when there is none. */
+function price(value: unknown): number | null {
+  const decision = chargeablePrice(value);
+  return decision.ok ? decision.price : null;
 }
 
-/**
- * A pricelist row as Odoo sends it: a many2one is `[id, label]`, an empty field
- * is `false`, and numbers can arrive as strings. Defaults describe the plain
- * case — this variant, one unit, a fixed 25.00 — so each check states only what
- * it is about.
- */
-function row(overrides: Partial<OdooPricelistItemRow> & { id: number }): OdooPricelistItemRow {
-  return {
-    applied_on: VARIANT_LEVEL,
-    product_id: [VARIANT, "Pillow / White"],
-    min_quantity: 1,
-    compute_price: "fixed",
-    fixed_price: 25,
-    price_surcharge: 0,
-    ...overrides,
-  };
+function problem(value: unknown): string | null {
+  const decision = chargeablePrice(value);
+  return decision.ok ? null : decision.problem;
 }
-
-function templateRow(overrides: Partial<OdooPricelistItemRow> & { id: number }): OdooPricelistItemRow {
-  return row({ applied_on: TEMPLATE_LEVEL, product_id: false, product_tmpl_id: [TEMPLATE, "Pillow"], ...overrides });
-}
-
-function match(rows: OdooPricelistItemRow[], variantId = VARIANT, templateId = TEMPLATE): PriceOutcome {
-  return matchBasePrice(normalizePricelistItems(rows), {
-    variantId,
-    templateId,
-    today: TODAY,
-    pricelistName: PRICELIST,
-  });
-}
-
-function priced(outcome: PriceOutcome): PricedOutcome | null {
-  return outcome.kind === "priced" ? outcome : null;
-}
-
-function problem(outcome: PriceOutcome): PriceProblem | null {
-  return outcome.kind === "problem" ? outcome : null;
-}
-
-/* -------------------------------------------------------------------------- */
-/* The suite                                                                  */
-/* -------------------------------------------------------------------------- */
 
 function main() {
-  console.log(`pricing suite — today ${TODAY}\n`);
+  console.log("pricing suite — the variant's effective sales price\n");
 
   /* ------------------------------------------------------------------------ */
-  console.log("A. Which row prices the variant");
+  console.log("A. Odoo's own figures are charged as they arrive");
   /* ------------------------------------------------------------------------ */
 
-  const direct = match([row({ id: 1 })]);
-  check(
-    "A variant-level fixed price is the price of one unit",
-    priced(direct)?.wholesale === 25 && priced(direct)?.level === "variant" && priced(direct)?.itemId === 1,
-    JSON.stringify(direct)
-  );
-
-  const viaTemplate = match([templateRow({ id: 2, fixed_price: 30 })]);
-  check(
-    "The template's price is used when the variant has no row of its own",
-    priced(viaTemplate)?.wholesale === 30 && priced(viaTemplate)?.level === "template",
-    JSON.stringify(viaTemplate)
-  );
-
-  const both = match([templateRow({ id: 3, fixed_price: 30 }), row({ id: 4, fixed_price: 25 })]);
-  check(
-    "And the variant's own row wins when both exist, which is Odoo's own precedence",
-    priced(both)?.wholesale === 25 && priced(both)?.level === "variant" && priced(both)?.itemId === 4,
-    JSON.stringify(both)
-  );
-
-  const otherVariant = match([row({ id: 5, product_id: [OTHER_VARIANT, "Pillow / Blue"] })]);
-  check(
-    "A row naming a different variant does not price this one",
-    problem(otherVariant)?.code === "WHOLESALE_PRICE_MISSING",
-    JSON.stringify(otherVariant)
-  );
-
-  const globalRow = match([row({ id: 6, applied_on: "3_global", product_id: false, fixed_price: 10 })]);
-  check(
-    "Nor does an 'All Products' row: a global price is not this variant's price",
-    problem(globalRow)?.code === "WHOLESALE_PRICE_MISSING",
-    JSON.stringify(globalRow)
-  );
-
-  const otherTemplate = match([templateRow({ id: 7, product_tmpl_id: [902, "Cushion"] })]);
-  check(
-    "A row for another product template does not price this variant either",
-    problem(otherTemplate)?.code === "WHOLESALE_PRICE_MISSING",
-    JSON.stringify(otherTemplate)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nB. Two rows that could both apply");
-  /* ------------------------------------------------------------------------ */
-
-  const ambiguous = match([row({ id: 10, fixed_price: 25 }), row({ id: 11, fixed_price: 26 })]);
-  check(
-    "Two quantity-1 rows at variant level are refused rather than chosen between",
-    problem(ambiguous)?.code === "WHOLESALE_PRICE_AMBIGUOUS",
-    JSON.stringify(ambiguous)
-  );
-  check(
-    "And the refusal names both rows, so the person who set them can fix it",
-    (problem(ambiguous)?.message ?? "").includes("10") && (problem(ambiguous)?.message ?? "").includes("11"),
-    (problem(ambiguous)?.message ?? "").slice(0, 90)
-  );
-
-  const reversed = match([row({ id: 11, fixed_price: 26 }), row({ id: 10, fixed_price: 25 })]);
-  check(
-    "Reversing the order Odoo returned does not turn the refusal into a price",
-    problem(reversed)?.code === "WHOLESALE_PRICE_AMBIGUOUS" &&
-      priced(reversed) === null,
-    JSON.stringify(reversed)
-  );
-
-  const ambiguousTemplate = match([
-    templateRow({ id: 12, fixed_price: 30 }),
-    templateRow({ id: 13, fixed_price: 31 }),
-  ]);
-  check(
-    "The same refusal applies at template level",
-    problem(ambiguousTemplate)?.code === "WHOLESALE_PRICE_AMBIGUOUS",
-    JSON.stringify(ambiguousTemplate)
-  );
-
-  const oneExpired = match([
-    row({ id: 14, fixed_price: 25, date_end: day(-1) }),
-    row({ id: 15, fixed_price: 26 }),
-  ]);
-  check(
-    "But a row whose window has closed is not a candidate, so one live row is not ambiguous",
-    priced(oneExpired)?.wholesale === 26 && priced(oneExpired)?.itemId === 15,
-    JSON.stringify(oneExpired)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nC. Rules MoonVella cannot turn into a price");
-  /* ------------------------------------------------------------------------ */
-
-  const percentage = match([row({ id: 20, compute_price: "percentage", percent_price: 10, fixed_price: false })]);
-  check(
-    "A percentage rule is refused, and says so",
-    problem(percentage)?.code === "WHOLESALE_PRICE_UNSUPPORTED_RULE" &&
-      /percentage/.test(problem(percentage)?.message ?? ""),
-    (problem(percentage)?.message ?? "").slice(0, 90)
-  );
-
-  const formula = match([row({ id: 21, compute_price: "formula", fixed_price: false })]);
-  check(
-    "A formula rule is refused",
-    problem(formula)?.code === "WHOLESALE_PRICE_UNSUPPORTED_RULE" &&
-      /formula/.test(problem(formula)?.message ?? ""),
-    (problem(formula)?.message ?? "").slice(0, 90)
-  );
-
-  const surcharge = match([row({ id: 22, fixed_price: 25, price_surcharge: 2 })]);
-  check(
-    "A fixed price with a surcharge is refused rather than approximated",
-    problem(surcharge)?.code === "WHOLESALE_PRICE_UNSUPPORTED_RULE" &&
-      /surcharge/.test(problem(surcharge)?.message ?? ""),
-    (problem(surcharge)?.message ?? "").slice(0, 90)
-  );
-
-  /*
-   * The row that matters most here. A percentage rule at variant level is a
-   * rule Odoo applies and MoonVella cannot compute. If it were treated as "not
-   * applicable" the template's fixed price below would be charged instead — a
-   * number MoonVella would bill while Odoo's own order line, which does
-   * understand the percentage, said something else.
-   */
-  const shadowed = match([
-    row({ id: 23, compute_price: "percentage", percent_price: 10, fixed_price: false }),
-    templateRow({ id: 24, fixed_price: 30 }),
-  ]);
-  check(
-    "An unsupported variant rule blocks; it does not fall through to the template's price",
-    problem(shadowed)?.code === "WHOLESALE_PRICE_UNSUPPORTED_RULE" && priced(shadowed) === null,
-    JSON.stringify(shadowed)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nD. Quantity");
-  /* ------------------------------------------------------------------------ */
-
-  const tierOnly = match([row({ id: 30, fixed_price: 20, min_quantity: 6 })]);
-  check(
-    "A bulk tier is not the price of one unit: the variant is refused",
-    problem(tierOnly)?.code === "WHOLESALE_PRICE_TIER_ONLY",
-    JSON.stringify(tierOnly)
-  );
-  check(
-    "And the refusal names the quantity the tier starts at",
-    (problem(tierOnly)?.message ?? "").includes("6"),
-    (problem(tierOnly)?.message ?? "").slice(0, 90)
-  );
-
-  const withTier = match([row({ id: 31, fixed_price: 25 }), row({ id: 32, fixed_price: 20, min_quantity: 6 })]);
-  check(
-    "A quantity-1 price alongside a tier is charged at quantity 1",
-    priced(withTier)?.wholesale === 25 && priced(withTier)?.itemId === 31,
-    JSON.stringify(withTier)
-  );
-  check(
-    "And the seller is told, in the import preview, that the discount was not applied",
-    /Quantity discounts are not supported yet/.test(priced(withTier)?.note ?? "") &&
-      (priced(withTier)?.note ?? "").includes("6"),
-    (priced(withTier)?.note ?? "no note").slice(0, 110)
-  );
-
-  const tierGone = match([row({ id: 33, fixed_price: 25 }), row({ id: 34, min_quantity: 6, date_end: day(-1) })]);
-  check(
-    "A tier outside its own window is not mentioned, because it is not on offer",
-    priced(tierGone)?.note === null,
-    priced(tierGone)?.note ?? "null"
-  );
-
-  const minimumAsString = match([row({ id: 35, min_quantity: "6" })]);
-  check(
-    "A minimum Odoo sends as a string is read as the number it is",
-    problem(minimumAsString)?.code === "WHOLESALE_PRICE_TIER_ONLY",
-    JSON.stringify(minimumAsString)
-  );
-
-  const noMinimum = match([row({ id: 36, min_quantity: false })]);
-  check(
-    "A row with no minimum is a quantity-1 price, which is Odoo's own default",
-    priced(noMinimum)?.wholesale === 25,
-    JSON.stringify(noMinimum)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nE. Dates");
-  /* ------------------------------------------------------------------------ */
-
-  const future = match([row({ id: 40, date_start: day(1) })]);
-  check(
-    "A rule that starts tomorrow prices nothing today",
-    problem(future)?.code === "WHOLESALE_PRICE_NOT_YET_VALID" &&
-      (problem(future)?.message ?? "").includes(day(1)),
-    JSON.stringify(future)
-  );
-
-  const expired = match([row({ id: 41, date_start: day(-30), date_end: day(-1) })]);
-  check(
-    "A rule that ended yesterday prices nothing today",
-    problem(expired)?.code === "WHOLESALE_PRICE_EXPIRED" &&
-      (problem(expired)?.message ?? "").includes(day(-1)),
-    JSON.stringify(expired)
-  );
-
-  const startsToday = match([row({ id: 42, date_start: TODAY })]);
-  const endsToday = match([row({ id: 43, date_end: TODAY })]);
-  check(
-    "The window is inclusive at both ends: a rule starting today, and one ending today, both apply",
-    priced(startsToday)?.wholesale === 25 && priced(endsToday)?.wholesale === 25,
-    `${JSON.stringify(startsToday)} / ${JSON.stringify(endsToday)}`
-  );
-
-  const openEnded = match([row({ id: 44, date_start: day(-400), date_end: false })]);
-  check(
-    "A rule with no end date is in force, however long ago it started",
-    priced(openEnded)?.wholesale === 25,
-    JSON.stringify(openEnded)
-  );
-
-  /*
-   * An expired variant row is not a candidate, so it must not shadow the
-   * template the way an unsupported one does. This is the difference between
-   * "this rule does not apply today" and "this rule applies and I cannot
-   * compute it".
-   */
-  const expiredVariant = match([row({ id: 45, fixed_price: 40, date_end: day(-1) }), templateRow({ id: 46, fixed_price: 30 })]);
-  check(
-    "An expired variant row steps aside for the template's live price",
-    priced(expiredVariant)?.wholesale === 30 && priced(expiredVariant)?.level === "template",
-    JSON.stringify(expiredVariant)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nF. Zero, and nothing at all");
-  /* ------------------------------------------------------------------------ */
-
-  const zero = match([row({ id: 50, fixed_price: 0 })]);
-  check(
-    "A price of zero is refused: it is a pricelist nobody finished, not a free product",
-    problem(zero)?.code === "WHOLESALE_PRICE_NOT_POSITIVE",
-    JSON.stringify(zero)
-  );
-
-  const negative = match([row({ id: 51, fixed_price: -5 })]);
-  check(
-    "And so is a negative one",
-    problem(negative)?.code === "WHOLESALE_PRICE_NOT_POSITIVE",
-    JSON.stringify(negative)
-  );
-
-  const empty = match([]);
-  check(
-    "A pricelist with no row for the variant or its template is missing, not zero",
-    problem(empty)?.code === "WHOLESALE_PRICE_MISSING" &&
-      /no row for this variant/.test(problem(empty)?.message ?? ""),
-    (problem(empty)?.message ?? "").slice(0, 90)
-  );
-
-  const noFixed = match([row({ id: 52, fixed_price: false })]);
-  check(
-    "A fixed rule with no price on it is refused rather than read as zero",
-    problem(noFixed)?.code === "WHOLESALE_PRICE_NOT_POSITIVE",
-    JSON.stringify(noFixed)
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nG. Which problem is reported first");
-  /* ------------------------------------------------------------------------ */
-
-  const unsupportedAndExpired = match([
-    row({ id: 60, compute_price: "percentage", percent_price: 5, fixed_price: false }),
-    row({ id: 61, fixed_price: 25, date_end: day(-1) }),
-  ]);
-  check(
-    "An unsupported rule is named before a date problem: correcting the dates would not make it billable",
-    problem(unsupportedAndExpired)?.code === "WHOLESALE_PRICE_UNSUPPORTED_RULE",
-    problem(unsupportedAndExpired)?.code ?? "none"
-  );
-
-  const tierAndExpired = match([row({ id: 62, min_quantity: 6 }), row({ id: 63, date_end: day(-1) })]);
-  check(
-    "A quantity tier is named before an expired window",
-    problem(tierAndExpired)?.code === "WHOLESALE_PRICE_TIER_ONLY",
-    problem(tierAndExpired)?.code ?? "none"
-  );
-
-  const futureAndExpired = match([row({ id: 64, date_start: day(10) }), row({ id: 65, date_end: day(-10) })]);
-  check(
-    "A rule that has not started is named before one that has ended",
-    problem(futureAndExpired)?.code === "WHOLESALE_PRICE_NOT_YET_VALID",
-    problem(futureAndExpired)?.code ?? "none"
-  );
-
-  /* ------------------------------------------------------------------------ */
-  console.log("\nH. Reading what Odoo sends");
-  /* ------------------------------------------------------------------------ */
-
-  const absent = normalizePricelistItem({
-    id: 70,
-    applied_on: VARIANT_LEVEL,
-    product_id: false,
-    product_tmpl_id: false,
-    min_quantity: false,
-    date_start: false,
-    date_end: "",
-    compute_price: false,
-    fixed_price: false,
-    price_surcharge: false,
-  });
-  check(
-    "Odoo's `false`, an empty string and a missing field are all read as absent",
-    absent.productVariantId === null &&
-      absent.productTemplateId === null &&
-      absent.dateStart === null &&
-      absent.dateEnd === null &&
-      absent.fixedPrice === null &&
-      absent.priceSurcharge === 0,
-    JSON.stringify(absent)
-  );
-  check(
-    "A missing rule type is a fixed price, which is Odoo's own default",
-    absent.computePrice === "fixed" && absent.minQuantity === 1,
-    `${absent.computePrice} @ ${absent.minQuantity}`
-  );
-
-  const many2one = normalizePricelistItem(row({ id: 71 }));
-  check(
-    "A many2one arrives as [id, label] and the id is what is matched on",
-    many2one.productVariantId === VARIANT && many2one.productTemplateId === null,
-    `${many2one.productVariantId}`
-  );
-
-  const asString = normalizePricelistItem(row({ id: 72, fixed_price: "25.50" }));
+  check("A plain price is charged as it stands", price(39.99) === 39.99, String(price(39.99)));
   check(
     "A price Odoo sends as a string is read as the number it is",
-    asString.fixedPrice === 25.5,
-    String(asString.fixedPrice)
+    price("25.50") === 25.5,
+    String(price("25.50"))
   );
-
-  const oddDate = normalizePricelistItem(row({ id: 73, date_start: "not a date" }));
   check(
-    "A date that is not a date is dropped rather than compared as text",
-    oddDate.dateStart === null,
-    String(oddDate.dateStart)
+    "An integer price is not mangled into a float",
+    price(40) === 40,
+    String(price(40))
   );
-
-  const today = todayIso(new Date("2026-03-15T23:30:00Z"));
+  /*
+   * The case the whole design is for: two variants of one template, whose prices
+   * differ only by their attribute extras. Odoo computed 39.99 and 44.99 from a
+   * 39.99 list price and a +5.00 extra; MoonVella reads both figures and adds
+   * nothing itself.
+   */
+  const base = price(39.99);
+  const withExtra = price(44.99);
   check(
-    "Today is a date, not a timestamp, so a window is never decided by the hour",
-    today === "2026-03-15",
-    today
+    "Two variants of one product are charged their own prices, extras included",
+    base === 39.99 && withExtra === 44.99,
+    `${base} / ${withExtra}`
+  );
+  check(
+    "A price with more than two decimals is not rounded on the way in",
+    price(39.999) === 39.999,
+    String(price(39.999))
   );
 
   /* ------------------------------------------------------------------------ */
-  console.log("\nI. Scope and currency");
+  console.log("\nB. Odoo's `false` is absent, never zero");
+  /* ------------------------------------------------------------------------ */
+
+  check(
+    "`false`, which Odoo uses for an empty field, is not read as a price of zero",
+    readNumber(false) === null && price(false) === null,
+    String(price(false))
+  );
+  check(
+    "`true` is not read as the number one",
+    readNumber(true) === null,
+    String(readNumber(true))
+  );
+  check("An empty string is absent", readNumber("") === null && readNumber("   ") === null);
+  check("A missing field is absent", readNumber(undefined) === null && readNumber(null) === null);
+  check(
+    "A value that is not a number at all is absent, not NaN",
+    readNumber("not a price") === null && readNumber({}) === null && readNumber([]) === null,
+    String(readNumber("not a price"))
+  );
+
+  /* ------------------------------------------------------------------------ */
+  console.log("\nC. A price MoonVella will not charge");
+  /* ------------------------------------------------------------------------ */
+
+  check(
+    "No price at all is a problem, and says what was not done about it",
+    /no sales price/.test(problem(undefined) ?? "") &&
+      /does not fall back/.test(problem(undefined) ?? ""),
+    (problem(undefined) ?? "").slice(0, 80)
+  );
+  check(
+    "A price of zero is refused: that is an unfinished pricelist, not a free product",
+    price(0) === null && /cannot be\s+charged/.test(problem(0) ?? ""),
+    (problem(0) ?? "").slice(0, 80)
+  );
+  check("A negative price is refused", price(-5) === null, String(price(-5)));
+  check(
+    "The refusal quotes the figure Odoo holds, so the product can be found and fixed",
+    (problem(0) ?? "").includes("0.00") && (problem(-5) ?? "").includes("-5.00"),
+    problem(-5) ?? ""
+  );
+  check(
+    "`false` — Odoo's empty field — is refused rather than charged at zero",
+    price(false) === null,
+    String(price(false))
+  );
+  check(
+    "A price that is infinite or NaN is refused rather than written",
+    price(Infinity) === null && price(NaN) === null,
+    `${price(Infinity)} / ${price(NaN)}`
+  );
+
+  /* ------------------------------------------------------------------------ */
+  console.log("\nD. Currency: CAD, and nothing is converted");
+  /* ------------------------------------------------------------------------ */
+
+  const cad = billableCurrency("CAD", "TEST PILLOW");
+  check(
+    "A CAD company is charged in CAD",
+    cad.ok && cad.currency === "CAD" && cad.note === null,
+    JSON.stringify(cad)
+  );
+  check(
+    "Every price MoonVella bills is CAD",
+    WHOLESALE_CURRENCY === "CAD",
+    WHOLESALE_CURRENCY
+  );
+
+  const usd = billableCurrency("USD", "TEST PILLOW");
+  check(
+    "A USD company is a refusal, not a CAD label on a USD figure",
+    !usd.ok && usd.blocker.code === "ODOO_PRICE_CURRENCY_NOT_CAD",
+    JSON.stringify(usd)
+  );
+  check(
+    "And the refusal names the currency, the product and what to do",
+    !usd.ok &&
+      usd.blocker.message.includes("USD") &&
+      usd.blocker.message.includes("TEST PILLOW") &&
+      usd.blocker.remedy.includes("untag"),
+    !usd.ok ? usd.blocker.remedy : ""
+  );
+
+  const unnamed = billableCurrency(undefined, "TEST PILLOW");
+  check(
+    "A product shared between companies has no currency of its own: that is a note, not a refusal",
+    unnamed.ok && unnamed.currency === "CAD" && /no company currency/i.test(unnamed.note ?? ""),
+    JSON.stringify(unnamed)
+  );
+  check(
+    "An empty currency string is read as absent rather than as a currency",
+    billableCurrency("", "TEST PILLOW").ok === true &&
+      billableCurrency("   ", "TEST PILLOW").ok === true,
+    JSON.stringify(billableCurrency("", "TEST PILLOW"))
+  );
+
+  /* ------------------------------------------------------------------------ */
+  console.log("\nE. From Odoo's decimals to the cents the catalogue stores");
+  /* ------------------------------------------------------------------------ */
+
+  check("39.99 is 3999 cents", toCents(39.99) === 3999, String(toCents(39.99)));
+  check("44.99 is 4499 cents", toCents(44.99) === 4499, String(toCents(44.99)));
+  check("A whole number of dollars is a whole number of cents", toCents(40) === 4000);
+  check("A third decimal is rounded, not truncated", toCents(39.999) === 4000, String(toCents(39.999)));
+  check(
+    "The rounding is the same one the sync writes with, so preview and catalogue agree",
+    toCents(19.99) === 1999 && toCents(0.01) === 1 && toCents(0.1) === 10,
+    `${toCents(19.99)} / ${toCents(0.01)} / ${toCents(0.1)}`
+  );
+
+  /* ------------------------------------------------------------------------ */
+  console.log("\nF. The module itself: one price field, and no pricelist");
   /* ------------------------------------------------------------------------ */
 
   /*
-   * A row that names this variant but never says at what level is read as "All
-   * Products" — which is what Odoo means by an unset scope, and is not a price
-   * for one variant. Reading it as variant-level instead would apply a global
-   * rule to a single variant's price.
+   * The checks above prove the rules; these prove the module has not grown a
+   * second way to price a variant beside them. Source-level because the thing
+   * being prevented is a line of code, and a line of code is what has to be
+   * looked for.
    */
-  const unscopedRow: OdooPricelistItemRow = {
-    id: 74,
-    applied_on: false,
-    product_id: [VARIANT, "Pillow / White"],
-    fixed_price: 15,
-  };
-  const unscoped = match([unscopedRow]);
-  check(
-    "A row with no scope is 'All Products', which does not price a variant even when it names one",
-    normalizePricelistItem(unscopedRow).appliedOn === "3_global" &&
-      problem(unscoped)?.code === "WHOLESALE_PRICE_MISSING",
-    `${normalizePricelistItem(unscopedRow).appliedOn} — ${problem(unscoped)?.code ?? "priced"}`
-  );
-
-  const anyPrice = match([row({ id: 80, fixed_price: 12.34 })]);
-  check(
-    "Every resolved price is CAD, and the currency is not taken from the row",
-    WHOLESALE_CURRENCY === "CAD" && priced(anyPrice)?.currency === "CAD",
-    `${priced(anyPrice)?.currency}`
-  );
+  const here = dirname(fileURLToPath(import.meta.url));
+  const source = readFileSync(resolve(here, "../app/services/odooImport.server.ts"), "utf8");
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
   check(
-    "The pricelist's name is carried into a refusal, so the message says which list to edit",
-    (problem(empty)?.message ?? "").includes(PRICELIST),
-    (problem(empty)?.message ?? "").slice(0, 80)
+    "The effective sales price is read from the variant, as one field",
+    /lst_price:\s*number/.test(source) && /"lst_price"/.test(code),
+    "product.product.lst_price"
+  );
+  check(
+    "Odoo's inputs to that figure are never read, so the arithmetic cannot be recomposed here",
+    !/\blist_price\b/.test(code) && !/\bprice_extra\b/.test(code),
+    "no list_price, no price_extra"
+  );
+  check(
+    "No pricelist is read at all",
+    !/product\.pricelist/.test(code) && !/pricelist/i.test(code),
+    "no pricelist model"
+  );
+  check(
+    "No wholesale-pricelist blocker survives, in any form",
+    !/WHOLESALE_PRICELIST|PRICELIST_MISSING|PRICELIST_AMBIGUOUS|PRICELIST_ITEM/.test(code),
+    "no pricelist blocker codes"
+  );
+  check(
+    "The only price written for a variant is the one the rule returned",
+    /wholesalePrice:\s*toCents\(wholesale\)/.test(code),
+    "wholesalePrice = toCents(chargeable price)"
+  );
+  /*
+   * The retail column is MoonVella's own, and the one place an import touches it
+   * is the zero the column needs on create — never a figure derived from Odoo's
+   * price. A seller's retail price edited here therefore survives every sync.
+   */
+  const retailLines = code
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.includes("suggestedRetailPrice"));
+  check(
+    "Suggested retail is never derived from the Odoo price, only zeroed where the column needs it",
+    retailLines.length > 0 && retailLines.every((line) => /^suggestedRetailPrice: 0,?$/.test(line)),
+    retailLines.join(" | ") || "no occurrence"
+  );
+  check(
+    "A cost is recorded beside the price and never charged as one",
+    /costPrice: variant\.cost === null \? null : toCents\(variant\.cost\)/.test(code) &&
+      !/wholesalePrice:[^\n]*\bcost\b/.test(code),
+    "costPrice written to its own column"
   );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);

@@ -9,16 +9,26 @@
  * from the wrong dock, and the failure surfaces days later as a missed pickup
  * with a carrier already dispatched.
  *
- * So there is no fallback in this file. An item resolves to a location through
- * an explicit mapping, or it resolves to nothing and the caller is told
- * "pickup location required" with the reason. The absence is a first-class
- * result, not an error to be smoothed over.
+ * So nothing here is inferred. An item resolves to a location through an
+ * explicit mapping, or it resolves to nothing and the caller is told "pickup
+ * location required" with the reason. The absence is a first-class result, not an
+ * error to be smoothed over.
  *
- * THE RESOLUTION ORDER IS TWO STEPS AND NO MORE. A variant may override; the
- * product supplies the default. Nothing is inherited from a category, a
- * supplier, a warehouse, or "the only location we have" — each of those is a
- * guess dressed as a rule, and a guess about a loading dock is not something an
- * operator can audit.
+ * THE RESOLUTION ORDER IS THREE STEPS, AND THE THIRD ONE IS NAMED. A variant may
+ * override; the product supplies the default; and failing both, the ONE location
+ * an operator has designated as the default answers. That third step is not the
+ * fallback this file was written to refuse: the refused thing is an address that
+ * happens to be lying around — a supplier's billing address, another location on
+ * the account, the only dock that exists. This one is a row somebody chose, that
+ * is visible on the Pickup locations page, whose address was read from the Odoo
+ * warehouse the stock physically sits in, and which carries that warehouse's id
+ * so it can be traced back to its source. Nothing is inherited from a category,
+ * a supplier or a warehouse that was not designated.
+ *
+ * A DEFAULT THAT IS SWITCHED OFF IS STILL AN ANSWER, AND IT IS "NO". It comes
+ * back unusable and named, exactly as a mapped location that was turned off does,
+ * because the point of the switch is that nothing keeps shipping from a dock
+ * somebody deactivated.
  *
  * WHAT A LOCATION MUST HAVE BEFORE IT CAN BE USED. `requiredFields` below is
  * deliberately the whole list from the work order rather than a comfortable
@@ -33,14 +43,12 @@
 
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
-import { getCredential } from "./credentials.server";
-import { CONSIGNMENT_OWNER_FIELD } from "./odooImport.server";
 import { searchRead, type OdooRecord } from "./odoo.server";
 // Imported for use here as well as re-exported below: the fields a location must
 // carry, and the check that decides whether it can be collected from.
 import { missingOriginFields, type OriginLocation } from "~/utils/originFields";
 
-export type OriginSource = "variant" | "product" | "missing";
+export type OriginSource = "variant" | "product" | "default" | "missing";
 
 /**
  * The field lists and the completeness check live in `~/utils/originFields`
@@ -82,6 +90,7 @@ const ORIGIN_SELECT = {
   code: true,
   name: true,
   isActive: true,
+  isDefault: true,
   odooDatabase: true,
   odooCompanyId: true,
   odooWarehouseId: true,
@@ -146,13 +155,13 @@ const MISSING_ORIGIN_REASON =
 
 /**
  * Resolve the origin for one variant: the variant's own override, else the
- * product's default, else nothing.
+ * product's default, else the designated default location, else nothing.
  *
  * The returned `source` says which step answered, because "inherited from the
- * product" and "set on this variant" are different facts and the interface
- * shows them differently. `ready` is false whenever the answer is a location
- * that exists but cannot be collected from, which is a different problem from
- * having no location at all and gets a different message.
+ * product", "set on this variant" and "the default dock" are three different
+ * facts and the interface shows them differently. `ready` is false whenever the
+ * answer is a location that exists but cannot be collected from, which is a
+ * different problem from having no location at all and gets a different message.
  */
 export async function resolveOriginForVariant(variantId: string): Promise<ResolvedOrigin> {
   const variant = await prisma.productVariant.findUnique({
@@ -193,12 +202,56 @@ export async function resolveOriginForVariant(variantId: string): Promise<Resolv
     };
   }
 
+  const fallback = await resolveDefaultOrigin();
+  if (fallback) return fallback;
+
   return {
     location: null,
     source: "missing",
     missing: [],
     ready: false,
     reason: `${MISSING_ORIGIN_REASON} (${variant.product.name})`,
+  };
+}
+
+/**
+ * The default origin: the dock every shipment starts from when nothing more
+ * specific says otherwise.
+ *
+ * THE OWNER NAMED ONE. MoonVella's stock leaves from the Premafirm Inc.
+ * warehouse in Odoo — 994 Westport Cres, Unit 7A — and the Odoo sync keeps a
+ * pickup location in step with that warehouse's own partner address. This is
+ * where it is used: after the variant's override and the product's mapping have
+ * both declined to answer, the default answers.
+ *
+ * WHY THIS IS NOT THE "GLOBAL DEFAULT" THE SCHEMA WARNS ABOUT. `Product.
+ * pickupLocationId` is null when nobody has said where that product ships from,
+ * and inventing an address for it is the failure that warning prevents. This is
+ * a different thing: an address that was READ from the warehouse the stock
+ * physically sits in, that an operator can see on the Pickup locations page, and
+ * that carries an Odoo warehouse id so it is traceable to its source. A product
+ * with a genuinely different dock still overrides it, and a product mapped to a
+ * dock that has been switched off is still refused by name rather than quietly
+ * falling back here.
+ *
+ * Returns null when no default is designated, which leaves the caller's
+ * "no origin" answer exactly as it was.
+ */
+export async function resolveDefaultOrigin(): Promise<ResolvedOrigin | null> {
+  const location = await prisma.pickupLocation.findFirst({
+    where: { isDefault: true },
+    select: ORIGIN_SELECT,
+  });
+  if (!location) return null;
+
+  const resolved = describe(location, "default");
+  return {
+    ...resolved,
+    reason:
+      resolved.reason ??
+      (resolved.ready
+        ? null
+        : `The default pickup location "${location.name}" (${location.code}) is not usable.`),
   };
 }
 
@@ -211,6 +264,10 @@ export async function resolveOriginForProduct(productId: string): Promise<Resolv
     return { location: null, source: "missing", missing: [], ready: false, reason: "Unknown product." };
   }
   if (product.pickupLocation) return describe(product.pickupLocation, "product");
+
+  const fallback = await resolveDefaultOrigin();
+  if (fallback) return fallback;
+
   return { location: null, source: "missing", missing: [], ready: false, reason: MISSING_ORIGIN_REASON };
 }
 
@@ -718,12 +775,18 @@ export interface OriginStock {
  * from, for the owner whose stock is sellable there.
  *
  * THE LOCATION IS THE MAPPED ONE, NOT THE CONFIGURED ONE. The import module
- * reads the consignment location from configuration and that remains right for
- * the bulk catalogue sync; a shipment is a different question, because a
- * product mapped to a second warehouse must be filled from that warehouse. So
- * the mapping decides the location. The owner defaults to the configured
- * consignment owner and is overridden by the location's own Odoo address
- * record when it has one — the more specific declaration wins.
+ * counts the whole fulfillment warehouse, because a catalogue figure answers
+ * "how much do we have anywhere we ship from"; a shipment is a different
+ * question, because a product mapped to a second warehouse must be filled from
+ * that warehouse. So the mapping decides the location.
+ *
+ * THE OWNER IS THE LOCATION'S, WHEN IT HAS ONE. `PickupLocation.odooPartnerId`
+ * is the owner of the goods at that dock, and it is the only owner consulted:
+ * there used to be a global "consignment owner" setting behind it, and a global
+ * default that silently applied to every dock is exactly what made adding a
+ * vendor a whole-catalogue decision. With no owner on the location, every quant
+ * at it is counted — which for a dock holding one vendor's consignment is that
+ * vendor's stock, and for the company's own dock is the company's.
  *
  * An unreadable stock figure is null with a reason, never 0. Zero and "we
  * could not ask" look identical in a number field and mean opposite things:
@@ -773,12 +836,10 @@ export async function stockAtOrigin(variantId: string): Promise<OriginStock> {
     };
   }
 
-  let ownerId = origin.location.odooPartnerId;
-  if (ownerId === null) {
-    const configured = await getCredential("odoo", CONSIGNMENT_OWNER_FIELD);
-    const parsed = configured ? Number(configured) : NaN;
-    ownerId = Number.isInteger(parsed) ? parsed : null;
-  }
+  // The location's own owner, or null for "every owner at this dock". There is
+  // no global fallback: the dock says whose stock it holds, or the dock holds
+  // everybody's.
+  const ownerId = origin.location.odooPartnerId;
 
   try {
     const domain: unknown[] = [

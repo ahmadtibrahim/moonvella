@@ -103,6 +103,55 @@ export function importedColumns(
   return out;
 }
 
+/**
+ * Values the merchant owns, as opposed to values an import supplied.
+ *
+ * GOOGLE belongs on this side: the merchant chose the suggestion and kept it, so
+ * a refresh must not overwrite it with Shopify's older value — the same rule
+ * that already protects a typed one. The two differ only in where the value came
+ * from, which is what `explainSource` is for; they behave identically.
+ */
+export function isMerchantOwnedSource(source: string | null | undefined): boolean {
+  return source === "MERCHANT" || source === "GOOGLE";
+}
+
+/**
+ * Which mailbox the contact email box is holding.
+ *
+ * The note under that field used to say the value came from "your Shopify
+ * store's own email address" whatever it actually held — and the seed falls back
+ * through three different mailboxes, one of which (the account owner's) is
+ * private and is not the address the storefront publishes. Naming the mailbox
+ * the value really came from is the difference between a note and a claim.
+ */
+export type ContactEmailPrefill = "ANSWER" | "OWNER" | "STORE" | "NONE";
+
+export function contactEmailPrefill(
+  application: ApplicationAnswers | null | undefined,
+  imported: { values?: Record<string, string | null> } | null | undefined,
+): ContactEmailPrefill {
+  const values = imported?.values ?? {};
+  if (application?.email) return "ANSWER";
+  if (values.storeOwnerEmail) return "OWNER";
+  if (values.storeContactEmail) return "STORE";
+  return "NONE";
+}
+
+const CONTACT_EMAIL_NOTES: Record<ContactEmailPrefill, string> = {
+  ANSWER:
+    "The address you saved with this application. MoonVella has not verified it.",
+  OWNER:
+    "Prefilled from the email address that owns your Shopify account. That mailbox is private and is not the one your storefront publishes — replace it with the address of the person named above if they are somebody else.",
+  STORE:
+    "Prefilled from the public contact email your Shopify storefront publishes. Replace it if the person named above uses a different address.",
+  NONE:
+    "Shopify returned no email address for this store, so enter the address MoonVella should use.",
+};
+
+export function contactEmailNote(prefill: ContactEmailPrefill): string {
+  return CONTACT_EMAIL_NOTES[prefill];
+}
+
 /** The merchant's own answers, as the loader sends them. Empty on a draft. */
 export interface ApplicationAnswers {
   contactName?: string | null;
@@ -137,10 +186,12 @@ export interface ApplicationFormState {
  * would be shown an empty box where a new one is offered its own store email,
  * and a category select holding a value that matches no option.
  *
- * The contact email is prefilled from the store's own email because the note
- * under that field says so, and a promise printed under an empty box is worse
- * than no note at all. It stays editable: the person MoonVella should call about
- * an account is often not the mailbox the storefront publishes.
+ * The contact email is prefilled from whichever mailbox Shopify answered with,
+ * and the note under that field names that mailbox — derived by
+ * `contactEmailPrefill` rather than written by hand, because the hand-written
+ * version named one mailbox while the seed could fill the box from any of three.
+ * It stays editable: the person MoonVella should call about an account is often
+ * not the mailbox the storefront publishes.
  */
 export function seedFormState(
   application: ApplicationAnswers | null | undefined,

@@ -10,17 +10,25 @@ import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 import {
   OPTIONAL_ORIGIN_FIELDS,
   REQUIRED_ORIGIN_FIELDS,
+  SUGGESTION_TARGET_INPUTS,
   missingOriginFields,
   type OriginLocation,
 } from "~/utils/originFields";
+import { useEffect, useRef, useState } from "react";
 import {
   AddressOverrideNotPermitted,
   addressStatus,
+  browserKeyForPlaces,
   recordAddressOverride,
   recordValidation,
   validateAddress,
   type StructuredAddress,
 } from "~/services/addressValidation.server";
+// The address entry aid. Every decision it makes lives in this typed module —
+// Google's components are read, the country is pinned, street2 cannot be
+// reached from a suggestion — and this page only assigns what comes back.
+import { createAddressEntryAid } from "~/utils/placesEntryAid";
+import type { PickedAddress } from "~/utils/placesAddress";
 import {
   INK,
   MUTED,
@@ -77,6 +85,7 @@ const PICKUP_MODES = ["NEEDED", "REGULAR", "DROPOFF"] as const;
 const LOCATION_SELECT = {
   id: true,
   code: true,
+  isDefault: true,
   name: true,
   odooDatabase: true,
   odooCompanyId: true,
@@ -158,11 +167,18 @@ export async function loader({ request }: LoaderFunctionArgs) {
     })
   );
 
+  // The browser key, read on the server from the encrypted store. Null unless
+  // the owner has saved one, and the address fields are then exactly what they
+  // were before the entry aid existed. The server-side key that can spend the
+  // validation quota is not reachable from here.
+  const browserKey = await browserKeyForPlaces();
+
   return {
     isOwner: user.role === "OWNER",
     canManage: userCan(user, "shipping.manage"),
     editingId: url.searchParams.get("location") ?? "",
     isNew: url.searchParams.get("new") === "1",
+    browserKey,
     locations: withStatus,
   };
 }
@@ -401,7 +417,8 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
 }
 
 export default function AdminOrigins() {
-  const { locations, isOwner, canManage, editingId, isNew } = useLoaderData<typeof loader>();
+  const { locations, isOwner, canManage, editingId, isNew, browserKey } =
+    useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const [params] = useSearchParams();
   const editing = editingId || params.get("location") || "";
@@ -443,7 +460,9 @@ export default function AdminOrigins() {
         </p>
       ) : null}
 
-      {isNew || selected ? <LocationForm location={selected} canManage={canManage} /> : null}
+      {isNew || selected ? (
+        <LocationForm location={selected} canManage={canManage} browserKey={browserKey} />
+      ) : null}
 
       {locations.length === 0 ? (
         <div style={card}>
@@ -514,6 +533,29 @@ function LocationCard({
                 }}
               >
                 Off
+              </span>
+            ) : null}
+            {/*
+              * Which dock every shipment without a mapping of its own is
+              * collected from. It is shown because it is the answer to "where do
+              * unmapped items leave from", and an operator reading this page has
+              * no other way to see it — the alternative is a default nobody can
+              * name, which is how a shipment ends up booked from the wrong door.
+              */}
+            {location.isDefault ? (
+              <span
+                style={{
+                  display: "inline-block",
+                  padding: "0.1rem 0.45rem",
+                  borderRadius: 999,
+                  border: `1px solid ${LINE}`,
+                  background: "#f8fafc",
+                  color: INK,
+                  fontSize: "0.68rem",
+                  fontWeight: 700,
+                }}
+              >
+                Default pickup
               </span>
             ) : null}
           </div>
@@ -718,7 +760,15 @@ function Fact({ label: text, value }: { label: string; value: string }) {
  * time. The required set is read from the resolver's own constant rather than
  * typed out again, so the asterisks cannot drift from the rule that enforces it.
  */
-function LocationForm({ location, canManage }: { location: LocationRow | null; canManage: boolean }) {
+function LocationForm({
+  location,
+  canManage,
+  browserKey,
+}: {
+  location: LocationRow | null;
+  canManage: boolean;
+  browserKey: string | null;
+}) {
   const stored = (location ?? {}) as unknown as Record<string, unknown>;
   const value = (field: keyof OriginLocation): string => {
     const raw = stored[String(field)];
@@ -726,6 +776,47 @@ function LocationForm({ location, canManage }: { location: LocationRow | null; c
   };
   const required = new Set<string>(REQUIRED_ORIGIN_FIELDS.map((entry) => String(entry.field)));
   const optional = new Set<string>(OPTIONAL_ORIGIN_FIELDS.map((field) => String(field)));
+
+  /*
+   * The address entry aid.
+   *
+   * This form posts natively and its inputs are uncontrolled — that is what
+   * makes it work before the JavaScript does — so the suggestion fills the DOM
+   * values directly rather than going through state. The aid is given the street
+   * input and the list and nothing else: it cannot write anywhere the mapping
+   * above does not name, and that mapping has no entry for the unit.
+   */
+  const formRef = useRef<HTMLFormElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const [aidReason, setAidReason] = useState<string | null>(null);
+  const [unitHint, setUnitHint] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!browserKey) return undefined;
+    const form = formRef.current;
+    const list = listRef.current;
+    const input = form?.elements.namedItem("street1");
+    if (!form || !list || !(input instanceof HTMLInputElement)) return undefined;
+
+    const aid = createAddressEntryAid({
+      apiKey: browserKey,
+      input,
+      list,
+      onStatus: (_status, reason) => setAidReason(reason ?? null),
+      onPick: (picked: PickedAddress) => {
+        for (const [field, target] of Object.entries(SUGGESTION_TARGET_INPUTS)) {
+          const next = picked.fields[field as keyof typeof SUGGESTION_TARGET_INPUTS];
+          if (!next) continue;
+          const element = form.elements.namedItem(String(target));
+          if (element instanceof HTMLInputElement) element.value = next;
+        }
+        // Reported, never written: Street 2 is the unit, and the unit is the
+        // dock's own line.
+        setUnitHint(picked.unitHint);
+      },
+    });
+    return () => aid.destroy();
+  }, [browserKey]);
 
   const field = (name: keyof OriginLocation, text: string, hint?: string) => (
     <Field
@@ -754,7 +845,7 @@ function LocationForm({ location, canManage }: { location: LocationRow | null; c
         address and the collection window are what a carrier is given, so they are required.
       </p>
 
-      <Form method="post">
+      <Form method="post" ref={formRef}>
         <input type="hidden" name="id" value={location?.id ?? ""} />
 
         <div
@@ -787,12 +878,53 @@ function LocationForm({ location, canManage }: { location: LocationRow | null; c
           {field("contactName", "Contact name")}
           {field("contactPhone", "Contact phone")}
           {field("contactEmail", "Contact email")}
-          {field("street1", "Street address")}
+          {/*
+            * Street 1 carries the entry aid, so it is written out rather than
+            * rendered by the helper above: an operator typing a dock address by
+            * hand is how a postal code ends up in the wrong format, and the
+            * suggestion fills the five address fields one value each.
+            */}
+          <Field
+            id="loc-street1"
+            label={`Street address${required.has("street1") ? " *" : ""}`}
+          >
+            <input
+              id="loc-street1"
+              name="street1"
+              style={input}
+              defaultValue={value("street1")}
+              disabled={!canManage}
+            />
+            {browserKey ? (
+              <div
+                ref={listRef}
+                style={{ border: `1px solid ${LINE}`, borderRadius: 6, background: "#fff", overflow: "hidden" }}
+              />
+            ) : null}
+            {aidReason ? (
+              <div style={helpText} role="status">
+                Address suggestions are unavailable: {aidReason} The fields work as they always
+                did.
+              </div>
+            ) : (
+              <div style={helpText}>
+                {browserKey
+                  ? "Typing offers Google's suggestions, which fill the street, city, province, postal code and country. A suggestion is a convenience, not a check: the gate below still validates the saved address, and the unit is never filled from a suggestion."
+                  : "Type the address in full."}
+              </div>
+            )}
+          </Field>
           {field(
             "street2",
             "Unit / suite",
             "Kept separate from the street on purpose: a unit folded into the street line is a different door."
           )}
+          {unitHint ? (
+            <div style={{ ...helpText, gridColumn: "1 / -1" }}>
+              Google&apos;s record for the address you chose includes “{unitHint}”. Unit / suite is
+              left as you typed it — add it there if it belongs on the label.
+            </div>
+          ) : null}
           {field("city", "City")}
           {field("province", "Province / state")}
           {field("postalCode", "Postal code")}

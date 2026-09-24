@@ -594,8 +594,58 @@ model ProductVariant {
   variantOptions   VariantOption[]
   mediaAssignments MediaAssetAssignment[]
   externalMappings ExternalVariantMapping[]
+  stockRecords     VariantStockRecord[]
 
   @@index([productId, sortOrder])
+}
+
+/// One stock record behind a variant's on-hand figure: how much of it sits at
+/// one Odoo location, and whose it is.
+///
+/// WHY THIS IS A TABLE AND NOT A NUMBER. A variant's `inventory` is a total, and
+/// a total on its own cannot answer the two questions that come next: where the
+/// goods are, and who owns them. The catalogue now counts every shelf inside the
+/// fulfillment warehouse, which means one figure can be two vendors' stock and
+/// the company's own — so the parts are kept, not just the sum. Ownership here
+/// is about the goods on the shelf (Odoo's `stock.quant.owner_id`), which is a
+/// different fact from the product's supplier: the supplier is who MoonVella
+/// buys from, the owner is whose boxes these are.
+///
+/// The rows are REPLACED on every sync, never appended to, so a sync that runs
+/// every six hours cannot accumulate history that reads like current stock.
+/// `odooOwnerId` is null for company-owned stock — Odoo writes `false` there,
+/// and "the company owns it" is a real answer that must not be confused with
+/// "nobody knows".
+model VariantStockRecord {
+  id       String         @id @default(cuid())
+  variantId String
+  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  /// The Odoo location this stock sits at, and its name as Odoo shows it
+  /// ("WH/Stock/EcoComfort Consignment"), kept because a location can be
+  /// renamed or archived in Odoo and the record should still read as it did.
+  odooLocationId Int
+  locationName   String
+
+  /// The Odoo partner that owns the goods, null when the company does.
+  odooOwnerId Int?
+  ownerName   String?
+
+  quantity         Int
+  reservedQuantity Int
+
+  /// Which Odoo database these ids belong to. MoonVella can be pointed at more
+  /// than one, and an id without its database is not an identifier.
+  odooDatabase String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// One row per location and owner. PostgreSQL treats NULLs as distinct, so
+  /// this binds the owned rows and leaves company-owned ones to the replace
+  /// -never-append rule that writes them.
+  @@unique([variantId, odooLocationId, odooOwnerId])
+  @@index([variantId])
 }
 
 model PackagingPreset {
@@ -1993,6 +2043,17 @@ model PickupLocation {
   /// tail-lift, appointment windows.
   accessRequirements String?
 
+  /// The ONE location every outbound shipment starts from when neither the
+  /// variant nor the product names its own.
+  ///
+  /// This is not the "global default" a product's null `pickupLocationId` is
+  /// warned about. That warning is about inventing an address for an item nobody
+  /// has said where it ships from; this is the opposite — an operator has named
+  /// one dock as where stock physically leaves, and the row carries the raw
+  /// Odoo address rather than a copy of it. A per-product or per-variant mapping
+  /// still wins, and a product with a genuinely different origin keeps saying so.
+  isDefault Boolean @default(false)
+
   /// How parcels leave this dock by default: NEEDED (call a truck), REGULAR (a
   /// standing collection already comes here), DROPOFF (handed in at the
   /// carrier's depot, so no collection is involved).
@@ -2023,6 +2084,7 @@ model PickupLocation {
 
   @@index([isActive])
   @@index([odooDatabase, odooLocationId])
+  @@index([isDefault])
 }
 
 /// The verdict of an address check, for both origin and delivery addresses.

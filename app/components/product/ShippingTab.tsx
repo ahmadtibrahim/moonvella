@@ -65,8 +65,11 @@ export interface ShippingVariant {
   name: string;
   sku: string;
   pickupLocationId: string | null;
-  /** Which step answered: the variant's own mapping, the product's, or none. */
-  originSource: "variant" | "product" | "missing";
+  /**
+   * Which step answered: the variant's own mapping, the product's, the one
+   * default location, or none.
+   */
+  originSource: "variant" | "product" | "default" | "missing";
   originReady: boolean;
   originReason: string | null;
   originName: string | null;
@@ -184,7 +187,11 @@ export default function ShippingTab({
                       {variant.originReady ? (
                         <span style={{ color: "#065f46" }}>
                           {variant.originName} —{" "}
-                          {variant.originSource === "variant" ? "set on this variant" : "inherited"}
+                          {variant.originSource === "variant"
+                            ? "set on this variant"
+                            : variant.originSource === "default"
+                              ? "the default pickup location"
+                              : "inherited"}
                         </span>
                       ) : (
                         <span style={{ color: "#92400e" }}>{variant.originReason}</span>

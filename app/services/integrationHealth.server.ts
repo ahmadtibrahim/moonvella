@@ -61,8 +61,12 @@ export const DEFAULTS: Record<
       "keeps the booking gate shut rather than treating an unchecked address as a good one. " +
       "Save a referrer-restricted browser key for Places autocomplete and a separate " +
       "IP-restricted server key for Address Validation.",
+    // The console-side setup is written on each field below, where the operator
+    // is when they need it. What is left here is the part no field can carry:
+    // the restrictions are not readable from this app, and nothing here can
+    // verify them.
     credentialHints:
-      "GOOGLE_MAPS_BROWSER_KEY: public key, restricted by HTTP referrer, with only Places API (New) enabled\nGOOGLE_MAPS_SERVER_KEY: server key, restricted by IP, with Address Validation API enabled",
+      "Two keys from ONE Google Cloud project, not one key used twice, and not the google_maps_api_key Odoo holds.\nNothing on this page can check a key's restrictions: they live in the Google Cloud console, and that is where they have to be right.",
   },
   stripe: {
     status: "NOT_CONFIGURED",
@@ -80,7 +84,10 @@ export const DEFAULTS: Record<
     status: "NOT_CONFIGURED",
     message:
       "Odoo is not configured. Set ODOO_URL, ODOO_DATABASE, ODOO_USERNAME and ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
-    credentialHints: "ODOO_URL: Odoo instance URL (e.g. https://erp.premafirm.com)\nODOO_DATABASE: database name\nODOO_USERNAME: service account username\nODOO_API_KEY: service account API key\nODOO_MODE: readonly (default) or live\nODOO_ALLOW_PROD_DB: yes (only if connecting to Prod-db deliberately)",
+    // Values for the fields themselves are written on the fields. This is the
+    // deployment-side half, which the page cannot set and must not imply it can.
+    credentialHints:
+      "Not settable from this page, and both live in the deployment environment:\nODOO_ALLOW_PROD_DB=yes — Prod-db is refused by name without it, which is the guard against pointing a read at the wrong database.\nODOO_ALLOW_WRITES — never set for MoonVella: the catalogue sync reads and writes nothing back to the ERP, and no form here can authorise it.",
   },
   shopify_analytics: {
     status: "NOT_CONFIGURED",
@@ -337,6 +344,24 @@ export async function saveIntegrationCredentials(
     throw new Error(`${key} is an operational check and holds no credentials.`);
   }
 
+  /*
+   * A value of the wrong KIND is refused before anything is written.
+   *
+   * The field mapping is right — STRIPE_SECRET_KEY is a secret field and takes
+   * the sk_… key — so this is not a mapping fix: it is what happens when the
+   * VALUE pasted into that field is the publishable key from the top of the same
+   * Stripe console page. Storing it produces a provider that reports FAILED
+   * forever with a generic 401, and the operator's next move is to re-check the
+   * mapping, which was never wrong. Refusing at the door names the mistake while
+   * the person who made it is still looking at the form.
+   *
+   * The whole submission is refused rather than the one field skipped: silently
+   * saving the other fields of a form whose key field was rejected would leave
+   * the operator believing the paste worked.
+   */
+  const rejected = await rejectWrongKindValues(key, credentials);
+  if (rejected) throw new Error(rejected);
+
   const result = await saveCredentials(key, credentials);
 
   // Field NAMES only. A credential value must never reach the audit log.
@@ -354,6 +379,25 @@ export async function saveIntegrationCredentials(
 
   await resetProviderState(key);
   return refreshIntegration(key, actor);
+}
+
+/**
+ * The values a provider will refuse to authenticate, caught while they are still
+ * in the operator's hands.
+ *
+ * Only the Stripe secret field has a wrong KIND today — a key that is valid,
+ * issued by the same provider, and simply not a secret — so the check is written
+ * as a lookup on that one field rather than as a general rule that would have to
+ * guess what every other provider's values look like. Returns the sentence to
+ * show, or null when nothing is wrong. Never returns or logs the value.
+ */
+async function rejectWrongKindValues(
+  key: CredentialKey,
+  credentials: Record<string, string>
+): Promise<string | null> {
+  if (key !== "stripe") return null;
+  const { stripeKeyKindProblem } = await import("./stripeMode.server");
+  return stripeKeyKindProblem(credentials.STRIPE_SECRET_KEY ?? null);
 }
 
 /**

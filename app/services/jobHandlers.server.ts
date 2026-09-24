@@ -12,6 +12,7 @@ import { JOB_KIND, PermanentJobError, type JobHandler } from "./jobs.server";
 import { runContactSyncJob } from "./odooContacts.server";
 import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
+import { syncOdooCatalog } from "./odooSync.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
@@ -109,6 +110,7 @@ export const jobHandlers: Record<string, JobHandler> = {
         created: result.created,
         updated: result.updated,
         variants: result.variantsWritten,
+        blocked: result.blocked,
         templates: result.templates.map((item) => ({
           odooTemplateId: item.odooTemplateId,
           productCode: item.productCode,
@@ -116,6 +118,18 @@ export const jobHandlers: Record<string, JobHandler> = {
         })),
       },
     };
+  },
+
+  /**
+   * The whole Odoo catalogue sync, on its six-hour clock.
+   *
+   * Idempotent for the same reason the import is — the external mappings make a
+   * second read an update rather than a second catalogue — and the withdrawal
+   * pass is idempotent on top of that: it skips a product that is already
+   * archived, so a run that repeats does not re-date every withdrawal.
+   */
+  [JOB_KIND.ODOO_CATALOG_SYNC]: async () => {
+    return syncOdooCatalog();
   },
 
   /**

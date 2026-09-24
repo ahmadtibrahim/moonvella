@@ -14,41 +14,59 @@
  * refuses to write if it reports a blocker. What the owner approved is what the
  * import does, because it is literally the same read.
  *
- * PRICES COME FROM THE WHOLESALE PRICELIST, AND FROM NOWHERE ELSE. The owner's
- * ruling is that Odoo is the pricing authority: the price MoonVella charges a
- * seller is the fixed quantity-1 price on the "MoonVella Wholesale" pricelist
- * selected in MoonVella's Odoo settings. It is not `lst_price`, it is not the
- * template's `list_price`, and it is never the product's cost — all three are
- * still readable in Odoo and all three would look like an answer, which is why
- * the substitution this module used to make is called out and refused in
- * `odooPricing.ts` rather than merely avoided here.
+ * PRICES COME FROM EACH VARIANT'S EFFECTIVE SALES PRICE. The owner's ruling is
+ * that Odoo is the pricing authority, and the figure it supplies is the one a
+ * seller would see on the product's own form: `product.product.lst_price`, which
+ * the Odoo ORM composes from the template's list price plus that variant's
+ * attribute price extras. It is read AS THE ORM COMPUTES IT and is never
+ * recomposed here — the read is one field, so there is no second formula in this
+ * module that could drift from Odoo's.
  *
- * The rule set is that module's, and the outcome is one of two things: a price,
- * or a problem that blocks the import. There is no third "fall back to
- * something" path. A product with no usable pricelist row is not imported at a
- * guessed price; it is left alone and the owner is told which row to add.
+ * There used to be a wholesale pricelist between Odoo and this module. It is
+ * gone, and the fields it priced from are gone with it: no `list_price` or
+ * `price_extra` appears in any read below, so the arithmetic cannot creep back
+ * in one field at a time.
  *
- * CAD ONLY, NO CONVERSION. Every price written here is CAD cents, and the
- * selected pricelist must itself be a CAD pricelist — checked here, because it
- * is a fact about the pricelist rather than about a row. A product whose Odoo
- * company is in another currency is imported with a note: the storefront
- * currency is recorded, the wholesale price is still CAD, and nothing is
- * converted.
+ * The outcome is one of two things: a price, or a problem that blocks the
+ * import. There is no third "fall back to something" path — a variant with no
+ * usable sales price is not imported at the product's cost, at a retail guess or
+ * at zero; it is left alone and the owner is told which product to price.
+ *
+ * CAD, CHECKED WHERE IT IS NOW DECIDED. The price comes from a product, so the
+ * currency is the product's company currency. A company in another currency is a
+ * refusal rather than a note: writing a USD figure into a column MoonVella bills
+ * in CAD is a mispriced order, and nothing here converts between currencies.
  *
  * SUGGESTED RETAIL IS NOT IMPORTED. It is MoonVella's own field, edited here,
  * and an import neither writes it nor copies the wholesale price into it. On a
  * re-import it is left exactly as it is, including when the wholesale price
  * changes underneath it.
  *
- * STOCK IS READ, NEVER WRITTEN, AND NEVER INVENTED. Available quantity is the
- * quantity held at the configured consignment location for the configured
- * owner, minus what is already reserved there. The quantities are read at
- * import time on every run — this module contains no quantity literals — and
- * nothing here writes to `stock.quant`. If the consignment location or owner is
- * not configured, the import stops and says so rather than importing a
+ * STOCK IS READ, NEVER WRITTEN, AND NEVER INVENTED. Available quantity is what
+ * is held ANYWHERE INSIDE THE CONFIGURED FULFILLMENT WAREHOUSE — every shelf,
+ * every owner — minus what is already reserved there. The quantities are read
+ * at import time on every run — this module contains no quantity literals — and
+ * nothing here writes to `stock.quant`. If the fulfillment warehouse is not
+ * configured, the import stops and says so rather than importing a
  * plausible-looking number, because a stock figure that is wrong is worse than
  * one that is absent: absent stock stops a sale, and wrong stock takes an order
  * nobody can fill.
+ *
+ * ONE CATALOGUE, MANY VENDORS. There used to be a global "consignment owner" and
+ * a global "consignment location", and the import refused to run without both.
+ * That made the whole catalogue depend on one vendor's setting: adding a vendor,
+ * or stocking a second one, meant changing a global and re-deciding what every
+ * other product's stock count meant. The tag is the owner's instruction to carry
+ * a product, and it is the only eligibility rule left — a tagged product is
+ * imported whichever vendor it belongs to.
+ *
+ * OWNERSHIP IS PRESERVED, NOT FLATTENED. Every quant read here carries the
+ * location and owner it sits at, and those are kept per record — a variant's
+ * stock is a list of (location, owner, quantity, reserved) rows, not one merged
+ * number. What is company-owned and what is a vendor's consignment stock stay
+ * distinguishable, so nobody has to guess later why a figure was what it was.
+ * This is separate from the product's supplier, which is a fact about who sells
+ * it to MoonVella, not about who owns the boxes on the shelf.
  *
  * DRAFTS, AND IDEMPOTENT ONES. A second import of the same template updates the
  * same MoonVella product and the same variants, found through the durable
@@ -70,30 +88,33 @@ import {
   searchRead,
   type OdooRecord,
 } from "./odoo.server";
-import {
-  WHOLESALE_CURRENCY,
-  matchBasePrice,
-  normalizePricelistItems,
-  todayIso,
-  type OdooPricelistItem,
-  type OdooPricelistItemRow,
-} from "./odooPricing";
 import { checkProductCode } from "~/utils/productCode";
 
+/**
+ * The currency MoonVella bills a seller in. Odoo's own currency for a product
+ * is recorded alongside it as the storefront currency, and the two are never
+ * converted into one another.
+ */
+export const WHOLESALE_CURRENCY = "CAD";
+
 const PRODUCT_TEMPLATE_MODEL = "product.template";
+const PRODUCT_VARIANT_MODEL = "product.product";
 const STOCK_QUANT_MODEL = "stock.quant";
-const STOCK_LOCATION_MODEL = "stock.location";
-const PARTNER_MODEL = "res.partner";
 const ATTRIBUTE_VALUE_MODEL = "product.template.attribute.value";
 const ATTRIBUTE_MODEL = "product.attribute";
 const ATTRIBUTE_NAMED_VALUE_MODEL = "product.attribute.value";
 const CURRENCY_MODEL = "res.currency";
-const PRICELIST_MODEL = "product.pricelist";
-const PRICELIST_ITEM_MODEL = "product.pricelist.item";
 
-export const CONSIGNMENT_LOCATION_FIELD = "ODOO_CONSIGNMENT_LOCATION";
-export const CONSIGNMENT_OWNER_FIELD = "ODOO_CONSIGNMENT_OWNER";
-export const WHOLESALE_PRICELIST_FIELD = "ODOO_WHOLESALE_PRICELIST";
+/**
+ * The one thing the owner configures about stock: which warehouse fulfils it.
+ *
+ * The field name and the model are named here rather than imported from
+ * `odooSync.server.ts`, which keeps its own copy for the pickup address.
+ * Importing them the other way round would make this module depend on the sync
+ * that depends on it.
+ */
+const WAREHOUSE_FIELD = "ODOO_WAREHOUSE";
+const WAREHOUSE_MODEL = "stock.warehouse";
 
 export interface ImportBlocker {
   code: string;
@@ -103,10 +124,12 @@ export interface ImportBlocker {
 }
 
 /*
- * `list_price` on the template and `lst_price` / `price_extra` on the variant
- * are deliberately ABSENT from these reads. They are the fields the import used
- * to price from, and leaving them in the read would leave them one line away
- * from being used again. The wholesale pricelist is the only price source.
+ * `list_price` on the template and `price_extra` on the attribute value are
+ * deliberately ABSENT from these reads. They are the inputs Odoo's ORM adds up
+ * to produce a variant's effective sales price, and reading them here would put
+ * a second copy of that arithmetic in this module — free to drift from Odoo's
+ * the first time the ORM's rules change. `lst_price` is read instead: one field,
+ * already computed, on the record that is actually sold.
  */
 interface OdooTemplateRow extends OdooRecord {
   name: string | false;
@@ -122,6 +145,13 @@ interface OdooVariantRow extends OdooRecord {
   barcode: string | false;
   /** The product's cost. Written to `costPrice`, never used as a price. */
   standard_price: number;
+  /**
+   * This variant's effective sales price, as Odoo computes it: the template's
+   * list price plus the price extras of the attribute values this variant
+   * carries. Odoo returns `false` for a field it holds nothing in, which is why
+   * the caller narrows on `typeof === "number"` rather than on null.
+   */
+  lst_price: number | false;
   active: boolean;
   product_tmpl_id: [number, string] | false;
   product_template_attribute_value_ids: number[];
@@ -135,24 +165,134 @@ interface OdooQuantRow extends OdooRecord {
   reserved_quantity: number;
 }
 
+/**
+ * One stock record, as Odoo holds it: a quantity of one product at one location
+ * belonging to one owner.
+ *
+ * `ownerId`/`ownerName` are null for company-owned stock. Odoo writes `false`
+ * into `owner_id` when nobody outside the company owns the goods, and `false` is
+ * not "unknown owner" — it is the company itself, which is a thing the record
+ * can say and must not lose.
+ */
+export interface StockEntry {
+  locationId: number;
+  locationName: string;
+  ownerId: number | null;
+  ownerName: string | null;
+  quantity: number;
+  reserved: number;
+}
+
+export interface QuantSummary {
+  /** Per Odoo variant id: the totals the catalogue's `inventory` column uses. */
+  totals: Map<number, { onHand: number; reserved: number }>;
+  /** Per Odoo variant id: every (location, owner) record, summed within itself. */
+  records: Map<number, StockEntry[]>;
+}
+
+/**
+ * Turn the quant rows into totals and per-record detail.
+ *
+ * PURE AND EXPORTED, like the money rules above and for the same reason: this
+ * decides a stock figure, and a rule whose only test needs a live Odoo is a rule
+ * whose test never runs. The awkward shapes Odoo really sends — `false` for a
+ * missing owner, several quants at one location for one owner, a negative
+ * correction — are exercised directly against this function instead of argued
+ * about.
+ *
+ * Two levels, and they are not the same thing. A RECORD is one (location,
+ * owner) pair: several quant rows there are one shelf, so they are summed. A
+ * TOTAL adds the records up. The total is what the catalogue shows, and the
+ * records are what say where it came from — neither is derived from the other by
+ * discarding information, because a figure nobody can trace is a figure nobody
+ * can check.
+ *
+ * A negative quantity is passed through rather than clamped. It is a real Odoo
+ * correction, and it reached this function only because it sits inside the
+ * warehouse subtree the caller asked for; hiding it here would make the records
+ * disagree with the total. Records are sorted by location then owner so two runs
+ * over the same data produce the same rows in the same order.
+ */
+export function summariseQuants(quants: OdooQuantRow[]): QuantSummary {
+  const totals: QuantSummary["totals"] = new Map();
+  const byKey = new Map<number, Map<string, StockEntry>>();
+
+  for (const quant of quants) {
+    const productId = toId(quant.product_id);
+    if (productId === null) continue;
+
+    const total = totals.get(productId) ?? { onHand: 0, reserved: 0 };
+    total.onHand += quant.quantity ?? 0;
+    total.reserved += quant.reserved_quantity ?? 0;
+    totals.set(productId, total);
+
+    const locationId = toId(quant.location_id);
+    if (locationId === null) continue;
+    const ownerId = toId(quant.owner_id);
+
+    const forProduct = byKey.get(productId) ?? new Map<string, StockEntry>();
+    const key = `${locationId}|${ownerId ?? ""}`;
+    const entry = forProduct.get(key) ?? {
+      locationId,
+      locationName: labelOf(quant.location_id, locationId),
+      ownerId,
+      // The owner's name comes from the same many2one tuple the id did — the
+      // quant read already returned it, so nothing extra is asked of Odoo.
+      ownerName: ownerId === null ? null : labelOf(quant.owner_id, ownerId),
+      quantity: 0,
+      reserved: 0,
+    };
+    entry.quantity += quant.quantity ?? 0;
+    entry.reserved += quant.reserved_quantity ?? 0;
+    forProduct.set(key, entry);
+    byKey.set(productId, forProduct);
+  }
+
+  const records: QuantSummary["records"] = new Map();
+  for (const [productId, forProduct] of byKey) {
+    records.set(
+      productId,
+      [...forProduct.values()].sort(
+        (a, b) =>
+          a.locationId - b.locationId ||
+          (a.ownerId ?? 0) - (b.ownerId ?? 0),
+      ),
+    );
+  }
+
+  return { totals, records };
+}
+
+/** The display name out of a many2one tuple, or the id when it has none. */
+function labelOf(value: unknown, fallback: number): string {
+  if (Array.isArray(value) && typeof value[1] === "string" && value[1].trim()) {
+    return value[1].trim();
+  }
+  return String(fallback);
+}
+
 export interface PreviewVariant {
   odooVariantId: number;
   sku: string | null;
   attributes: { attribute: string; value: string }[];
   /**
-   * The quantity-1 price from the wholesale pricelist, and the row it came
-   * from. Null exactly when the variant carries a problem, so a null is never
+   * Odoo's effective sales price for this variant, and the currency Odoo holds
+   * it in. Null exactly when the variant carries a problem, so a null is never
    * silently imported as a price.
    */
   wholesalePrice: number | null;
-  wholesaleCurrency: typeof WHOLESALE_CURRENCY | null;
-  /** The pricelist row the price was read from, so a figure can be traced. */
-  wholesaleItemId: number | null;
+  wholesaleCurrency: string | null;
   /** Cost as Odoo records it. Shown for context; never used as a price. */
   cost: number | null;
   onHand: number;
   reserved: number;
   available: number;
+  /**
+   * Every stock record behind those three figures: which location, whose stock,
+   * how much, how much reserved. Shown so a number can be traced, and written to
+   * `VariantStockRecord` so it survives the next sync.
+   */
+  stock: StockEntry[];
   barcode: string | null;
   active: boolean;
   existingVariantId: string | null;
@@ -174,29 +314,43 @@ export interface PreviewTemplate {
   problems: string[];
 }
 
+/**
+ * The warehouse stock is counted from, and the one the owner actually named.
+ *
+ * `rootLocationId` is the warehouse's own view location — Odoo's `view_location_id`
+ * — and it is what makes "inside this warehouse" a rule instead of a guess: the
+ * read is the subtree below it, so every shelf, bin and consignment corner the
+ * warehouse owns is counted, and another warehouse's stock, a customer's
+ * location or the supplier negatives under `Partners/Vendors` are not.
+ */
+export interface OdooWarehouse {
+  id: number;
+  name: string;
+  rootLocationId: number;
+  rootLocationName: string;
+  note: string;
+}
+
 export interface OdooImportPreview {
   ok: boolean;
   connection: { url: string | null; database: string | null; mode: string | null };
   tag: { id: number; name: string } | null;
   /**
-   * The pricelist every price in this preview came from. Null until it has been
-   * resolved, which is what the owner sees when it is missing or misconfigured.
+   * Where a seller's price comes from, stated once for the whole page. There is
+   * nothing to configure here any more: it is a fact about Odoo rather than a
+   * setting, and the card shows it so the figure in the table is traceable.
    */
-  pricelist: {
-    id: number | null;
-    name: string | null;
-    currency: string | null;
-    /** Rows read from the pricelist itself, before any of them matched. */
-    rows: number;
-    note: string;
-  } | null;
-  consignment: {
-    locationId: number | null;
-    location: string | null;
-    ownerId: number | null;
-    owner: string | null;
+  pricing: {
+    currency: typeof WHOLESALE_CURRENCY;
     note: string;
   };
+  /**
+   * The fulfilling warehouse, once it resolves. Null means the read could not
+   * name one, which is always accompanied by a blocker — the stock figures in
+   * `templates` are only meaningful against a scope, so there is no "unknown
+   * warehouse" state worth showing a number for.
+   */
+  warehouse: OdooWarehouse | null;
   templates: PreviewTemplate[];
   blockers: ImportBlocker[];
   notes: string[];
@@ -204,27 +358,150 @@ export interface OdooImportPreview {
 }
 
 /* -------------------------------------------------------------------------- */
+/* The money rules, as pure functions                                         */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * WHY THESE ARE PURE AND EXPORTED. Each one decides a figure a person is
+ * charged, and a rule whose only test needs a live Odoo is a rule whose test
+ * never runs. `scripts/verify-pricing.ts` calls everything below directly, with
+ * the shapes Odoo really sends — including the awkward ones — so the refusals
+ * are exercised in this environment rather than argued about.
+ */
+
+export type PriceDecision =
+  | { ok: true; price: number }
+  | { ok: false; problem: string };
+
+/**
+ * The price a seller is charged for one variant, from the value Odoo returned
+ * for `lst_price`.
+ *
+ * There is no fallback of any kind, and that is the whole point. A cost, a
+ * retail guess or a zero would each look like an answer; a figure nobody set is
+ * worse than a refusal, because a refusal is visible and a wrong price is an
+ * order. So a variant without a usable sales price carries the reason instead,
+ * and its product is left out of the sync.
+ */
+export function chargeablePrice(lstPrice: unknown): PriceDecision {
+  const price = readNumber(lstPrice);
+  if (price === null) {
+    return {
+      ok: false,
+      problem:
+        "Odoo returns no sales price for this variant, so there is no figure to charge a " +
+        "seller. MoonVella does not fall back to the product's cost, to a retail guess or " +
+        "to zero.",
+    };
+  }
+  if (!(price > 0)) {
+    return {
+      ok: false,
+      problem:
+        `Odoo's sales price for this variant is ${price.toFixed(2)}, which cannot be ` +
+        `charged. Set the price in Odoo, then sync again.`,
+    };
+  }
+  return { ok: true, price };
+}
+
+/**
+ * The currency a variant's price may be written in.
+ *
+ * One function because it is one decision: the price comes from a product, so it
+ * carries the product's company currency, and MoonVella bills in CAD. A company
+ * in another currency is a refusal and not a note — writing a USD figure into a
+ * column that is billed in CAD misprices the order, and nothing in this module
+ * converts between currencies, so there is no correct figure to write.
+ *
+ * A template shared between companies genuinely has no single company currency.
+ * That is a note rather than a refusal: the price is still a number Odoo
+ * computed, and what is recorded is what MoonVella bills in, said out loud.
+ */
+export function billableCurrency(
+  companyCurrency: unknown,
+  productName: string,
+): { ok: true; currency: string; note: string | null } | { ok: false; blocker: ImportBlocker } {
+  const currency = typeof companyCurrency === "string" && companyCurrency.trim()
+    ? companyCurrency.trim()
+    : null;
+
+  if (currency === null) {
+    return {
+      ok: true,
+      currency: WHOLESALE_CURRENCY,
+      note:
+        `No company currency could be read from Odoo for ${productName}; ` +
+        `${WHOLESALE_CURRENCY} is recorded because that is the currency MoonVella bills in.`,
+    };
+  }
+  if (currency !== WHOLESALE_CURRENCY) {
+    return {
+      ok: false,
+      blocker: {
+        code: "ODOO_PRICE_CURRENCY_NOT_CAD",
+        message:
+          `${productName} is priced in ${currency}, and MoonVella bills sellers in ` +
+          `${WHOLESALE_CURRENCY}.`,
+        remedy:
+          `Set that product's company currency to ${WHOLESALE_CURRENCY} in Odoo, or untag it ` +
+          `from "${MOONVELLA_PRODUCT_TAG_NAME}". MoonVella does not convert between currencies.`,
+      },
+    };
+  }
+  return { ok: true, currency, note: null };
+}
+
+/**
+ * A price in the currency's major unit, as the whole number of minor units the
+ * catalogue stores. Rounding lives here rather than at the call site so there is
+ * one answer to "what is 19.99 in cents" in the whole import.
+ */
+export function toCents(price: number): number {
+  return Math.round(price * 100);
+}
+
+/**
+ * A number Odoo sent, or null.
+ *
+ * Odoo puts `false` in a field it holds nothing in, and `false` is a perfectly
+ * good zero in JavaScript — which is exactly the trap: `Number(false) === 0`,
+ * and a price of zero looks like a free product rather than a missing one. So
+ * only a number, or a string that is entirely a number, is read as a number.
+ */
+export function readNumber(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Reference resolution                                                       */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Resolve the consignment location and owner from configuration.
+ * A configuration label, as a stable code fragment: "Fulfillment warehouse"
+ * becomes `FULFILLMENT_WAREHOUSE`. A code with a space in it is not an
+ * identifier, and these are the codes blockers are read by.
+ */
+function codeFor(label: string): string {
+  return label.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+/**
+ * Resolve a configured location, owner or warehouse from its label.
  *
  * A numeric value is taken as an id; anything else is a name, and a name has to
  * be unambiguous. Two locations called "Consignment" would otherwise become
  * whichever one the database happened to return first, which is a stock figure
  * taken from the wrong shelf.
  */
-/**
- * The label, as a stable code fragment: "Wholesale pricelist" becomes
- * `WHOLESALE_PRICELIST`. A code with a space in it is not an identifier, and
- * these are matched on.
- */
-function codeFor(label: string): string {
-  return label.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-}
-
-async function resolveReference(
+export async function resolveReference(
   model: string,
   value: string,
   lookup: { field: string; label: string }[],
@@ -303,91 +580,6 @@ async function resolveReference(
 }
 
 /* -------------------------------------------------------------------------- */
-/* The wholesale pricelist                                                    */
-/* -------------------------------------------------------------------------- */
-
-/** Every column a price decision is made from, and nothing else. */
-const PRICELIST_ITEM_FIELDS = [
-  "id",
-  "applied_on",
-  "product_id",
-  "product_tmpl_id",
-  "min_quantity",
-  "date_start",
-  "date_end",
-  "compute_price",
-  "fixed_price",
-  "price_surcharge",
-  "percent_price",
-];
-
-/**
- * The currency of a pricelist, by name ("CAD"), or null when Odoo holds none or
- * it could not be read. Null is not "probably CAD": the caller refuses on it.
- */
-async function pricelistCurrencyName(pricelistId: number): Promise<string | null> {
-  const [pricelist] = await searchRead<OdooRecord>(
-    PRICELIST_MODEL,
-    [["id", "=", pricelistId]],
-    ["id", "currency_id"],
-    { limit: 1 },
-  );
-  const currencyId = toId(pricelist?.currency_id);
-  if (currencyId === null) return null;
-  const [currency] = await searchRead<OdooRecord>(
-    CURRENCY_MODEL,
-    [["id", "=", currencyId]],
-    ["id", "name"],
-    { limit: 1 },
-  );
-  return text(currency?.name ?? null);
-}
-
-/**
- * Every row of one pricelist, read in pages.
- *
- * `searchRead` returns 80 rows by default, and a truncated pricelist does not
- * look truncated: the variants whose rows fell off the end simply have no
- * price. That is a refusal rather than a wrong figure, but it is still the
- * import telling the owner something untrue about their own pricelist — that a
- * row they wrote is not there. So the read pages until a short page arrives,
- * and refuses outright rather than pretending if it never does.
- */
-async function readPricelistItems(
-  pricelistId: number,
-): Promise<{ rows: OdooPricelistItem[] } | ImportBlocker> {
-  const pageSize = 200;
-  // A guard against a pricelist so large that paging never terminates. At ten
-  // thousand rows something is wrong with the source, and the honest answer is
-  // to stop rather than to page forever inside a web request.
-  const maxRows = 10_000;
-  const rows: OdooPricelistItemRow[] = [];
-
-  for (let offset = 0; ; offset += pageSize) {
-    const page = await searchRead<OdooPricelistItemRow>(
-      PRICELIST_ITEM_MODEL,
-      [["pricelist_id", "=", pricelistId]],
-      PRICELIST_ITEM_FIELDS,
-      { limit: pageSize, offset, order: "id asc" },
-    );
-    rows.push(...page);
-    if (page.length < pageSize) break;
-    if (rows.length >= maxRows) {
-      return {
-        code: "WHOLESALE_PRICELIST_TOO_LARGE",
-        message:
-          `The selected pricelist has more than ${maxRows} rows, so MoonVella stopped reading it ` +
-          `and will not import from a price list it has only partly seen.`,
-        remedy:
-          "Use a pricelist dedicated to MoonVella wholesale prices, or narrow this one, then try again.",
-      };
-    }
-  }
-
-  return { rows: normalizePricelistItems(rows) };
-}
-
-/* -------------------------------------------------------------------------- */
 /* The read                                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -425,7 +617,7 @@ export function productCodeFor(template: { id: number; default_code: string | fa
  *
  * Read-only, and safe to run at any time: it resolves references, reads the
  * tagged templates, their variants, their attributes, their prices and their
- * consignment stock, and writes nothing anywhere.
+ * stock, and writes nothing anywhere.
  */
 export async function previewOdooImport(): Promise<OdooImportPreview> {
   const blockers: ImportBlocker[] = [];
@@ -442,14 +634,16 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
       mode,
     },
     tag: null,
-    pricelist: null,
-    consignment: {
-      locationId: null,
-      location: null,
-      ownerId: null,
-      owner: null,
-      note: "",
+    pricing: {
+      currency: WHOLESALE_CURRENCY,
+      note:
+        "A seller is charged each variant's effective sales price in Odoo — the price on the " +
+        "variant's own form, which is the template's list price plus that variant's attribute " +
+        "price extras. It is read as the Odoo ORM computes it, in one field, so this module holds " +
+        "no second copy of the arithmetic. The product's cost is recorded for reference and is " +
+        "never charged to a seller.",
     },
+    warehouse: null,
     templates: [],
     blockers,
     notes,
@@ -493,112 +687,66 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   }
   preview.tag = { id: tag.id, name: tag.name };
 
-  const [locationValue, ownerValue, pricelistValue] = await Promise.all([
-    getCredential("odoo", CONSIGNMENT_LOCATION_FIELD),
-    getCredential("odoo", CONSIGNMENT_OWNER_FIELD),
-    getCredential("odoo", WHOLESALE_PRICELIST_FIELD),
-  ]);
-
-  const location = await resolveReference(
-    STOCK_LOCATION_MODEL,
-    locationValue ?? "",
+  /*
+   * The fulfillment warehouse. ONE setting, and it is not about ownership: the
+   * owner names where goods ship from, and every vendor's stock inside it counts.
+   * A name is searched on either of the two fields a warehouse is called by —
+   * its name ("Premafirm Inc.") or its code ("WH") — because Odoo's warehouse
+   * form has both and the owner may reach for either.
+   */
+  const warehouseValue = await getCredential("odoo", WAREHOUSE_FIELD);
+  const warehouse = await resolveReference(
+    WAREHOUSE_MODEL,
+    warehouseValue ?? "",
     [
-      { field: "complete_name", label: "its full path" },
-      { field: "name", label: "its short name" },
+      { field: "name", label: "name" },
+      { field: "code", label: "short code" },
     ],
-    ["id", "name", "complete_name"],
-    "Consignment location",
+    ["id", "name", "code", "view_location_id"],
+    "Fulfillment warehouse",
   );
-  if ("code" in location) {
-    blockers.push(location);
-  } else {
-    preview.consignment.locationId = location.id;
-    preview.consignment.location = location.name;
-  }
-
-  const owner = await resolveReference(
-    PARTNER_MODEL,
-    ownerValue ?? "",
-    [{ field: "name", label: "name" }],
-    ["id", "name"],
-    "Consignment owner",
-  );
-  if ("code" in owner) {
-    blockers.push(owner);
-  } else {
-    preview.consignment.ownerId = owner.id;
-    preview.consignment.owner = owner.name;
+  if ("code" in warehouse) {
+    blockers.push(warehouse);
+    return preview;
   }
 
   /*
-   * The pricing authority, resolved by the same name-or-id rule as the
-   * consignment pair and for the same reason: two pricelists called "MoonVella
-   * Wholesale" must stop the import rather than become whichever one Odoo
-   * returned first, because the difference is what every seller is charged.
+   * The view location, read from the resolved row. It is what makes "inside this
+   * warehouse" a subtree rather than a list of location ids somebody has to
+   * maintain: WH/Stock, WH/Stock/EcoComfort Consignment and any bin added later
+   * are all below it, and none of them has to be named here.
    */
-  const pricelist = await resolveReference(
-    PRICELIST_MODEL,
-    pricelistValue ?? "",
-    [{ field: "name", label: "name" }],
-    ["id", "name", "currency_id"],
-    "Wholesale pricelist",
+  const [warehouseRow] = await searchRead<OdooRecord>(
+    WAREHOUSE_MODEL,
+    [["id", "=", warehouse.id]],
+    ["id", "name", "view_location_id"],
   );
-
-  let pricelistItems: OdooPricelistItem[] = [];
-  if ("code" in pricelist) {
-    blockers.push(pricelist);
-  } else {
-    preview.pricelist = {
-      id: pricelist.id,
-      name: pricelist.name,
-      currency: null,
-      rows: 0,
-      note: "",
-    };
-
-    /*
-     * CAD, CHECKED AT THE PRICELIST, because that is where a currency lives.
-     * A missing currency is a refusal too: "we could not read it" is not
-     * evidence that it is CAD, and importing a price whose unit nobody can name
-     * is how a seller gets billed in a currency they did not agree to.
-     */
-    const currencyName = await pricelistCurrencyName(pricelist.id);
-    preview.pricelist.currency = currencyName;
-    if (currencyName !== WHOLESALE_CURRENCY) {
-      blockers.push({
-        code: "WHOLESALE_PRICELIST_CURRENCY_NOT_CAD",
-        message:
-          `The "${pricelist.name}" pricelist is in ` +
-          `${currencyName ?? "a currency MoonVella could not read from it"}, and MoonVella bills ` +
-          `sellers in ${WHOLESALE_CURRENCY}.`,
-        remedy:
-          `Set that pricelist's currency to ${WHOLESALE_CURRENCY} in Odoo, or select a different ` +
-          `pricelist on the Odoo integration. MoonVella does not convert between currencies.`,
-      });
-    }
-
-    const items = await readPricelistItems(pricelist.id);
-    if ("code" in items) {
-      blockers.push(items);
-    } else {
-      pricelistItems = items.rows;
-      preview.pricelist.rows = items.rows.length;
-      preview.pricelist.note =
-        `Seller prices come from the "${pricelist.name}" pricelist (id ${pricelist.id}, ` +
-        `${currencyName ?? "currency unread"}): ${items.rows.length} row(s) read, and each variant ` +
-        `is priced by its own quantity-1 fixed price. Odoo's list price is not read at all, and the ` +
-        `product's cost is recorded for reference but is never charged to a seller.`;
-    }
+  const rootLocationId = toId(warehouseRow?.view_location_id);
+  if (rootLocationId === null) {
+    blockers.push({
+      code: "WAREHOUSE_WITHOUT_LOCATION",
+      message:
+        `Odoo's warehouse "${warehouse.name}" (id ${warehouse.id}) has no view location, so ` +
+        `MoonVella cannot tell which shelves belong to it.`,
+      remedy:
+        `Set that warehouse's location in Odoo (Inventory → Configuration → Warehouses), or ` +
+        `point ${WAREHOUSE_FIELD} at a warehouse that has one.`,
+    });
+    return preview;
   }
 
-  if (blockers.length > 0) return preview;
-
-  const locationId = preview.consignment.locationId as number;
-  const ownerId = preview.consignment.ownerId as number;
-  preview.consignment.note =
-    `Stock is read from ${preview.consignment.location} (id ${locationId}) for owner ` +
-    `${preview.consignment.owner}, less anything already reserved there. No other location ` +
-    `and no other owner is counted.`;
+  const rootLocationName = labelOf(warehouseRow.view_location_id, rootLocationId);
+  preview.warehouse = {
+    id: warehouse.id,
+    name: warehouse.name,
+    rootLocationId,
+    rootLocationName,
+    note:
+      `Stock is counted inside ${warehouse.name} (id ${warehouse.id}), i.e. everything under ` +
+      `${rootLocationName} (location ${rootLocationId}), less anything already reserved ` +
+      `there. Every owner counts — company-owned and consignment stock alike — and stock at ` +
+      `any other warehouse is not counted.`,
+  };
 
   /* ------------------------- templates and variants ------------------------ */
   const templates = await searchRead<OdooTemplateRow>(
@@ -608,8 +756,9 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
       "id",
       "name",
       "default_code",
-      // No `list_price`: it is not a price MoonVella charges, and reading it
-      // would leave it a keystroke away from being used as one.
+      // No `list_price`: it is one of the two inputs the ORM adds up to make a
+      // variant's effective price, and reading it here would put that sum a
+      // keystroke away from being done again in this module.
       "categ_id",
       "company_id",
       "description_sale",
@@ -629,18 +778,24 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
 
   const templateIds = templates.map((row) => row.id);
   const variants = await searchRead<OdooVariantRow>(
-    "product.product",
+    PRODUCT_VARIANT_MODEL,
     [
       ["product_tmpl_id", "in", templateIds],
+      // Archived variants are read too: a variant withdrawn in Odoo is a fact
+      // the owner is owed, and it arrives as `active: false` rather than as a
+      // variant that quietly stops existing.
       ["active", "in", [true, false]],
     ],
     [
       "id",
       "default_code",
       "barcode",
-      // Cost, and only cost. `lst_price` and `price_extra` are the fields the
-      // price used to be composed from; they are not read at all now.
+      // Cost, for reference only — it is never a price.
       "standard_price",
+      // The seller's price: the ORM-computed effective sales price, in one
+      // field. `price_extra` is deliberately not read; it is an input to this
+      // number, not a second opinion about it.
+      "lst_price",
       "active",
       "product_template_attribute_value_ids",
       "product_tmpl_id",
@@ -656,8 +811,9 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   const attributeValueIds = [
     ...new Set(variants.flatMap((row) => row.product_template_attribute_value_ids ?? [])),
   ];
-  // Names only. `price_extra` used to be summed into the price; the wholesale
-  // pricelist prices the variant, so the attribute no longer contributes money.
+  // Names only. `price_extra` is not read: the attribute's money already
+  // reaches MoonVella inside `lst_price`, and reading it here as well would be
+  // the first half of adding it up a second time.
   const attributeValues = attributeValueIds.length
     ? await searchRead<OdooRecord>(
         ATTRIBUTE_VALUE_MODEL,
@@ -687,27 +843,32 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   const valueNames = new Map(namedValues.map((row) => [row.id, String(row.name ?? row.id)]));
   const attributeById = new Map(attributeValues.map((row) => [row.id, row]));
 
-  // Consignment stock: one query, filtered by both the location and the owner.
+  /*
+   * Stock: one query, scoped to the warehouse and to NOTHING else.
+   *
+   * `child_of` the warehouse's view location is the whole rule. It reaches every
+   * location the warehouse owns — WH/Stock, the consignment corner under it, a
+   * bin somebody adds next month — and it stops there, so another warehouse's
+   * shelves, a customer's location and the supplier negatives Odoo books under
+   * `Partners/Vendors` are all outside the scope and cannot be counted.
+   *
+   * THERE IS NO OWNER FILTER, deliberately. Filtering by owner is what made the
+   * import depend on one vendor's setting; the owner of each record is read and
+   * kept instead, so two vendors' stock inside the same warehouse are both
+   * counted, and which is which stays legible. `owner_id` is still in the fields
+   * list — as something to READ, not something to filter on.
+   */
   const quants = variantIds.length
     ? await searchRead<OdooQuantRow>(
         STOCK_QUANT_MODEL,
         [
           ["product_id", "in", variantIds],
-          ["location_id", "=", locationId],
-          ["owner_id", "=", ownerId],
+          ["location_id", "child_of", [rootLocationId]],
         ],
         ["id", "product_id", "location_id", "owner_id", "quantity", "reserved_quantity"],
       )
     : [];
-  const stockByVariant = new Map<number, { onHand: number; reserved: number }>();
-  for (const quant of quants) {
-    const productId = toId(quant.product_id);
-    if (productId === null) continue;
-    const current = stockByVariant.get(productId) ?? { onHand: 0, reserved: 0 };
-    current.onHand += quant.quantity ?? 0;
-    current.reserved += quant.reserved_quantity ?? 0;
-    stockByVariant.set(productId, current);
-  }
+  const { totals: stockByVariant, records: stockRecordsByVariant } = summariseQuants(quants);
 
   // Currency: read from the templates' own companies rather than assumed.
   const companyIds = [
@@ -792,17 +953,6 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
   const variantBySku = new Map(skuOwners.map((row) => [row.sku, row.id]));
   const productByCode = new Map(codeOwners.map((row) => [row.productCode, row]));
 
-  /*
-   * One date for the whole read, and the date the pricelist windows are judged
-   * against. A per-variant `new Date()` could straddle midnight and price two
-   * variants of the same product on different days.
-   */
-  const today = todayIso();
-
-  // Deduplicated: a tier note is a fact about the pricelist, not about each
-  // variant that happens to carry tiers.
-  const tierNotes = new Set<string>();
-
   for (const template of templates) {
     const problems: string[] = [];
     const { code, source } = productCodeFor(template);
@@ -828,27 +978,13 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
         ? "Odoo internal note"
         : "Odoo holds no description — left empty rather than invented";
 
-    const currency =
-      companyCurrency.get(toId(template.company_id) ?? -1) ?? null;
-    const currencyCode = currency ?? WHOLESALE_CURRENCY;
-    if (!currency) {
-      notes.push(
-        `No currency could be read from Odoo for ${text(template.name) ?? template.id}; ` +
-          `${WHOLESALE_CURRENCY} is recorded because that is the currency MoonVella bills in.`,
-      );
-    } else if (currency !== WHOLESALE_CURRENCY) {
-      /*
-       * A note, not a blocker. The storefront currency and the billing currency
-       * are different facts: the product is sold to shoppers in Odoo's company
-       * currency, and the seller is billed in CAD. Nothing is converted — the
-       * wholesale figure is the CAD figure from a CAD pricelist.
-       */
-      notes.push(
-        `${text(template.name) ?? template.id}: Odoo's company currency for this product is ` +
-          `${currency}, recorded as its storefront currency. The wholesale price is in ` +
-          `${WHOLESALE_CURRENCY} and no conversion is applied between them.`,
-      );
-    }
+    const currency = billableCurrency(
+      companyCurrency.get(toId(template.company_id) ?? -1),
+      text(template.name) ?? String(template.id),
+    );
+    const currencyCode = currency.ok ? currency.currency : WHOLESALE_CURRENCY;
+    if (!currency.ok) blockers.push(currency.blocker);
+    else if (currency.note) notes.push(currency.note);
 
     const templateVariants = variants.filter(
       (row) => toId(row.product_tmpl_id) === template.id,
@@ -891,34 +1027,25 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
         });
 
       /*
-       * The price, or the reason there is none. `matchBasePrice` never guesses:
-       * a variant with no row it can use comes back as a problem, the problem
-       * blocks the whole import, and nothing is written at a price nobody set.
+       * The price, or the reason there is none. The decision itself is
+       * `chargeablePrice`, above: this line reads Odoo's field and hands it
+       * over unchanged, so the rule has one implementation and one test.
        */
-      const price = matchBasePrice(pricelistItems, {
-        variantId: variant.id,
-        templateId: template.id,
-        today,
-        pricelistName: preview.pricelist?.name ?? null,
-      });
-      if (price.kind === "problem") {
-        variantProblems.push(price.message);
-      } else if (price.note) {
-        tierNotes.add(price.note);
-      }
+      const priced = chargeablePrice(variant.lst_price);
+      if (!priced.ok) variantProblems.push(priced.problem);
 
       const stock = stockByVariant.get(variant.id) ?? { onHand: 0, reserved: 0 };
       return {
         odooVariantId: variant.id,
         sku,
         attributes: attributesForVariant,
-        wholesalePrice: price.kind === "priced" ? price.wholesale : null,
-        wholesaleCurrency: price.kind === "priced" ? price.currency : null,
-        wholesaleItemId: price.kind === "priced" ? price.itemId : null,
+        wholesalePrice: priced.ok ? priced.price : null,
+        wholesaleCurrency: priced.ok ? currencyCode : null,
         cost: variant.standard_price ?? null,
         onHand: stock.onHand,
         reserved: stock.reserved,
         available: Math.max(0, stock.onHand - stock.reserved),
+        stock: stockRecordsByVariant.get(variant.id) ?? [],
         barcode: text(variant.barcode),
         active: variant.active !== false,
         existingVariantId: variantByOdooId.get(variant.id) ?? null,
@@ -947,16 +1074,13 @@ export async function previewOdooImport(): Promise<OdooImportPreview> {
     });
   }
 
-  for (const note of tierNotes) notes.push(note);
-
   const totalVariants = preview.templates.reduce((sum, item) => sum + item.variants.length, 0);
   notes.push(
     `${preview.templates.length} tagged template(s), ${totalVariants} variant(s) read from Odoo. ` +
-      `Every price is the fixed quantity-1 price on ${
-        preview.pricelist?.name ? `the "${preview.pricelist.name}" pricelist` : "the wholesale pricelist"
-      }, in ${WHOLESALE_CURRENCY}; Odoo's list price is not read at all, and the product's cost is ` +
-      `never charged. ` +
-      `Stock is what is held at the consignment location for the consignment owner.`,
+      `Every price is that variant's effective sales price in Odoo, in ${WHOLESALE_CURRENCY}; the ` +
+      `product's cost is recorded for reference and is never charged. ` +
+      `Stock is what is held inside the fulfillment warehouse, every owner included, ` +
+      `less what is already reserved.`,
   );
   notes.push(
     "Suggested retail is not imported: it is MoonVella's own field and a re-import leaves it " +
@@ -980,7 +1104,7 @@ function text(value: unknown): string | null {
  *
  * Odoo sends `false` for a field it has nothing in, and `??` does not catch it:
  * `complete_name ?? name` yields `false`, and stringifying that shows the owner
- * a consignment location called "false". A record that has a name uses it; one
+ * a warehouse location called "false". A record that has a name uses it; one
  * that does not falls back to something that identifies it.
  */
 function nameOf(record: OdooRecord, fallback: string | number): string {
@@ -1001,7 +1125,20 @@ function toId(value: unknown): number | null {
 export interface ImportResult {
   created: number;
   updated: number;
+  /**
+   * Products this sync had withdrawn, and has just brought back because the
+   * template carries the tag again. Counted separately from `updated` because it
+   * is the one update that changes whether a product is on sale at all.
+   */
+  restored: number;
   variantsWritten: number;
+  /**
+   * Tagged templates that were NOT written, and why. A product Odoo cannot
+   * describe completely is left exactly as it is — not created, not updated, and
+   * not deleted — and reported here so the reason is on a screen rather than in
+   * somebody's memory of a page that used to show it.
+   */
+  blocked: { odooTemplateId: number; name: string; problems: string[] }[];
   templates: {
     odooTemplateId: number;
     name: string;
@@ -1016,6 +1153,13 @@ export interface ImportResult {
       price: number;
       priceCurrency: string;
       available: number;
+      /** The stock records written for this variant, one per location and owner. */
+      stock: {
+        locationName: string;
+        ownerName: string | null;
+        quantity: number;
+        reserved: number;
+      }[];
     }[];
   }[];
 }
@@ -1023,9 +1167,19 @@ export interface ImportResult {
 /**
  * Write the previewed templates into MoonVella as drafts.
  *
- * Refuses to run at all when the preview reports a blocker: a partial import of
- * a catalogue the owner has not seen is worse than no import, because the
- * missing half looks like a product that does not exist.
+ * TWO KINDS OF REFUSAL, AND THEY ARE NOT THE SAME.
+ *
+ * A BLOCKER stops the whole run. Every blocker is a fact about the read itself —
+ * no connection, no tag, no fulfillment warehouse, a company billing in another
+ * currency — so there is no trustworthy catalogue to write and nothing is
+ * written. A half-read catalogue that looks complete is worse than no import.
+ *
+ * A TEMPLATE PROBLEM skips that template and lets the rest through. A product
+ * missing a SKU is a fact about one product, and the tag is the owner's
+ * instruction to carry it. Refusing the whole catalogue over it would mean one
+ * unfinished product in Odoo silently freezes every finished one — which is what
+ * a scheduled sync must never do. The skipped product is reported with its
+ * reason, is left exactly as it was, and is tried again on the next run.
  */
 export async function importOdooProducts(options: {
   confirm: boolean;
@@ -1041,21 +1195,27 @@ export async function importOdooProducts(options: {
       `The Odoo import was not run: ${preview.blockers.map((b) => b.message).join(" ")}`,
     );
   }
-  const blocked = preview.templates.filter((item) => item.problems.length > 0);
-  if (blocked.length > 0) {
-    throw new PermanentJobError(
-      `The Odoo import was not run: ${blocked.length} template(s) have problems. ` +
-        blocked
-          .slice(0, 3)
-          .map((item) => `${item.odooName}: ${item.problems[0]}`)
-          .join(" | "),
-    );
-  }
+
+  const writable = preview.templates.filter((item) => item.problems.length === 0);
+  const blocked = preview.templates
+    .filter((item) => item.problems.length > 0)
+    .map((item) => ({
+      odooTemplateId: item.odooTemplateId,
+      name: item.odooName,
+      problems: item.problems,
+    }));
 
   const database = preview.connection.database ?? "";
-  const result: ImportResult = { created: 0, updated: 0, variantsWritten: 0, templates: [] };
+  const result: ImportResult = {
+    created: 0,
+    updated: 0,
+    restored: 0,
+    variantsWritten: 0,
+    blocked,
+    templates: [],
+  };
 
-  for (const template of preview.templates) {
+  for (const template of writable) {
     await prisma.$transaction(async (tx) => {
       const existing = await tx.externalProductMapping.findFirst({
         where: {
@@ -1063,9 +1223,17 @@ export async function importOdooProducts(options: {
           shopDomain: database,
           externalProductId: String(template.odooTemplateId),
         },
-        select: { productId: true },
+        select: { productId: true, importStatus: true },
       });
 
+      /*
+       * Only Odoo-owned columns are written on an update. Media, documents,
+       * features, materials, care instructions and shipping detail are not in
+       * this object, so a re-import cannot blank work that was done here after
+       * the first import — which is exactly what "preserve MoonVella-added
+       * media and documents" requires, and it is achieved by omission rather
+       * than by a merge.
+       */
       const productFields = {
         name: template.odooName,
         description: template.description,
@@ -1079,18 +1247,30 @@ export async function importOdooProducts(options: {
       };
 
       /*
-       * Only MoonVella-owned columns are written on an update. Media, documents,
-       * features, materials, care instructions and shipping detail are not in
-       * this object, so a re-import cannot blank work that was done here after
-       * the first import — which is exactly what "preserve MoonVella-added
-       * media and documents" requires, and it is achieved by omission rather
-       * than by a merge.
+       * A WITHDRAWN PRODUCT IS BROUGHT BACK, AND NOTHING ELSE IS.
+       *
+       * The sync archives a product when its template loses the tag or is
+       * archived in Odoo, and it records that on the mapping. If the tag comes
+       * back, this is the row that says the sync is the one that hid it — so the
+       * sync is the one that may unhide it, with the same four columns
+       * `setArchived(false)` writes.
+       *
+       * A product an OPERATOR archived keeps `importStatus: "IMPORTED"` and is
+       * therefore left alone: an import that un-archived it would be fighting a
+       * decision somebody made here on purpose, and would do it every six hours.
        */
+      const restoring = existing?.importStatus === "WITHDRAWN";
       const product = existing
-        ? await tx.product.update({ where: { id: existing.productId }, data: productFields })
+        ? await tx.product.update({
+            where: { id: existing.productId },
+            data: restoring
+              ? { ...productFields, isArchived: false, isActive: true }
+              : productFields,
+          })
         : await tx.product.create({
             data: { ...productFields, productCode: template.productCode },
           });
+      if (restoring) result.restored += 1;
 
       await tx.externalProductMapping.upsert({
         where: {
@@ -1122,19 +1302,20 @@ export async function importOdooProducts(options: {
       for (const [index, variant] of template.variants.entries()) {
         const sku = variant.sku as string;
         /*
-         * Unreachable: a variant with no resolved price carries a problem, and
-         * `importOdooProducts` refuses before this loop when any template has
-         * one. It is written out anyway because the alternative — multiplying a
-         * null by 100 — would write a price of zero into a catalogue, and that
+         * Unreachable: a variant with no usable sales price carries a problem,
+         * and only templates with no problems are written. It is checked again
+         * here anyway because the alternative — multiplying a null by 100, or a
+         * zero by 100 — would put a price of zero into the catalogue, and that
          * is the one mistake this whole module is arranged to prevent.
          */
-        const wholesale = variant.wholesalePrice;
-        if (wholesale === null || !(wholesale > 0)) {
+        const priced = chargeablePrice(variant.wholesalePrice);
+        if (!priced.ok) {
           throw new PermanentJobError(
-            `The Odoo import stopped before writing: ${template.odooName} / ${sku} has no ` +
-              `wholesale price from the pricelist. Nothing was written for this template.`,
+            `The Odoo sync stopped before writing: ${template.odooName} / ${sku} — ` +
+              `${priced.problem} Nothing was written for this template.`,
           );
         }
+        const wholesale = priced.price;
 
         const existingVariant = await tx.externalVariantMapping.findFirst({
           where: {
@@ -1148,9 +1329,9 @@ export async function importOdooProducts(options: {
         const variantFields = {
           name: variantName(template.odooName, variant),
           sku,
-          // The approved price source: the fixed quantity-1 price from the
-          // selected wholesale pricelist, in CAD cents.
-          wholesalePrice: Math.round(wholesale * 100),
+          // The approved price source: Odoo's own effective sales price for
+          // this variant, in cents. It is what a seller is charged.
+          wholesalePrice: toCents(wholesale),
           /*
            * `suggestedRetailPrice` IS NOT HERE, and its absence is the point.
            * It is MoonVella's own editorial field, so an update must not touch
@@ -1159,9 +1340,15 @@ export async function importOdooProducts(options: {
            * is filled in only on create, where the column is required and the
            * honest value is zero: "no suggested retail has been set".
            */
-          costPrice: variant.cost === null ? null : Math.round(variant.cost * 100),
+          costPrice: variant.cost === null ? null : toCents(variant.cost),
           // Read, never written back, never defaulted.
           inventory: variant.available,
+          /*
+           * The other half of the figure above, kept so the catalogue can say
+           * "25 on hand, 20 reserved" rather than only the difference. Written
+           * from the same read as `inventory`, so the two cannot disagree.
+           */
+          reserved: variant.reserved,
           currency: template.currency,
           barcode: variant.barcode,
           isActive: variant.active,
@@ -1211,6 +1398,29 @@ export async function importOdooProducts(options: {
           },
         });
 
+        /*
+         * Stock records are REPLACED, never appended — the same rule the
+         * attributes below follow, for the same reason. These rows describe what
+         * Odoo holds right now; a row left behind by a previous sync would be a
+         * quantity that no longer exists anywhere, and six-hourly syncs would
+         * pile them up until the breakdown no longer described the total.
+         */
+        await tx.variantStockRecord.deleteMany({ where: { variantId: variantRow.id } });
+        if (variant.stock.length) {
+          await tx.variantStockRecord.createMany({
+            data: variant.stock.map((record) => ({
+              variantId: variantRow.id,
+              odooLocationId: record.locationId,
+              locationName: record.locationName,
+              odooOwnerId: record.ownerId,
+              ownerName: record.ownerName,
+              quantity: record.quantity,
+              reservedQuantity: record.reserved,
+              odooDatabase: database,
+            })),
+          });
+        }
+
         // Attributes are replaced rather than merged: they describe the Odoo
         // variant, and a stale "size: Queen" left behind by a correction in
         // Odoo would be a claim about a product that is no longer true.
@@ -1230,10 +1440,17 @@ export async function importOdooProducts(options: {
           odooVariantId: variant.odooVariantId,
           variantId: variantRow.id,
           sku,
-          // What was charged, i.e. the wholesale price written above.
+          // What a seller is charged, i.e. the effective sales price written
+          // above, in the currency Odoo holds it in.
           price: wholesale,
-          priceCurrency: WHOLESALE_CURRENCY,
+          priceCurrency: variant.wholesaleCurrency ?? WHOLESALE_CURRENCY,
           available: variant.available,
+          stock: variant.stock.map((record) => ({
+            locationName: record.locationName,
+            ownerName: record.ownerName,
+            quantity: record.quantity,
+            reserved: record.reserved,
+          })),
         });
         result.variantsWritten += 1;
       }
@@ -1263,14 +1480,21 @@ export async function importOdooProducts(options: {
       database,
       created: result.created,
       updated: result.updated,
+      restored: result.restored,
       variants: result.variantsWritten,
-      // Which pricelist the prices came from, so a figure in the catalogue can
-      // be traced to the read that produced it without opening the products.
-      pricelist: preview.pricelist
+      blocked: result.blocked,
+      // Where the prices came from, so a figure in the catalogue can be traced
+      // to the read that produced it without opening the products.
+      priceSource: "ODOO_EFFECTIVE_SALES_PRICE",
+      priceCurrency: WHOLESALE_CURRENCY,
+      // And where the stock figures came from: without the scope, "25" in the
+      // catalogue is a number with no shelf behind it.
+      stockScope: preview.warehouse
         ? {
-            id: preview.pricelist.id,
-            name: preview.pricelist.name,
-            currency: preview.pricelist.currency,
+            warehouseId: preview.warehouse.id,
+            warehouse: preview.warehouse.name,
+            rootLocationId: preview.warehouse.rootLocationId,
+            rootLocation: preview.warehouse.rootLocationName,
           }
         : null,
       templates: result.templates.map((item) => ({

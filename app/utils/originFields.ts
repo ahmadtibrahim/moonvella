@@ -14,6 +14,8 @@
  * The reads and writes that use this verdict live in `origins.server.ts`.
  */
 
+import type { PlaceAddressField } from "./placesAddress";
+
 /** The shape of a location as this module reads it. */
 export interface OriginLocation {
   id: string;
@@ -26,6 +28,15 @@ export interface OriginLocation {
    * are reported with different messages.
    */
   isActive: boolean;
+  /**
+   * True for the one location every shipment falls back to.
+   *
+   * Read here because it is shown — the page marks it as the default, and a
+   * form that offered "make this the default" without saying which one already
+   * is would be asking a question it had the answer to. It is not a required
+   * field: a location is usable whether or not it is the default.
+   */
+  isDefault: boolean;
   odooDatabase: string | null;
   odooCompanyId: number | null;
   odooWarehouseId: number | null;
@@ -90,6 +101,26 @@ export const OPTIONAL_ORIGIN_FIELDS: (keyof OriginLocation)[] = [
   "instructions",
   "accessRequirements",
 ];
+
+/**
+ * Where an accepted address suggestion lands on this form.
+ *
+ * A suggestion arrives in the application's own column names and the inputs on
+ * this page have different ones, so the bridge is written down once, next to the
+ * type it writes into.
+ *
+ * `addressLine2` is absent, and cannot be added: Street 2 is the unit, the unit
+ * is the thing that decides which door a carrier is sent to, and nothing Google
+ * offers may reach it. The suggestion type has no such field either, so this is
+ * a second lock on the same door rather than the only one.
+ */
+export const SUGGESTION_TARGET_INPUTS: Record<PlaceAddressField, keyof OriginLocation> = {
+  addressLine1: "street1",
+  addressCity: "city",
+  addressProvinceCode: "province",
+  addressPostalCode: "postalCode",
+  addressCountryCode: "country",
+};
 
 /** A value counts as present only when it is not blank after trimming. */
 function isPresent(value: unknown): boolean {

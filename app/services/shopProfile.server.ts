@@ -59,7 +59,18 @@ export type ProfileFieldSource =
   /** The whole request failed: network, auth, or a GraphQL error. */
   | "IMPORT_FAILED"
   /** A merchant has typed over the imported value. */
-  | "MERCHANT";
+  | "MERCHANT"
+  /**
+   * The merchant chose this value from an address suggestion and kept it.
+   *
+   * Worth its own name because it is neither of the two things the other names
+   * mean: it is not Shopify's value, and it is not something somebody typed
+   * character by character — it is a value Google offered and the merchant
+   * accepted. It is NOT a verification. Google does not confirm that a business
+   * operates at an address it suggests, and nothing here sets a verdict;
+   * `validateAddress()` is still the only path that produces one.
+   */
+  | "GOOGLE";
 
 export interface ShopProfile {
   shopifyShopId: string | null;
@@ -125,6 +136,8 @@ export function explainSource(source: ProfileFieldSource): string {
       return "The Shopify request failed, so this value was not read. Refresh to try again.";
     case "MERCHANT":
       return "Entered by you. Refreshing from Shopify will not overwrite it unless you clear it first.";
+    case "GOOGLE":
+      return "Chosen from a Google address suggestion. Google does not verify that this is your business address, and MoonVella has not checked it against any registry.";
   }
 }
 

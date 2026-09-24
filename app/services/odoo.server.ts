@@ -1451,36 +1451,13 @@ export async function findProductTagByName(
   return rows[0] ?? null;
 }
 
-const PRICELIST_MODEL = "product.pricelist";
-
-/**
- * The pricelists this Odoo holds, for the Settings picker. Read-only.
- *
- * NEVER THROWS AND NEVER BLOCKS A PAGE. It answers `null` when Odoo is not
- * configured, is switched off, or cannot be reached — all three of which are
- * ordinary states for a Settings page that must still render. The caller falls
- * back to a plain text field, which accepts the same name-or-id the picker
- * would have offered, so a pricelist can always be set even when the list
- * cannot be read.
- *
- * The list is a convenience over that field, not a replacement for it: a
- * pricelist whose list is truncated or whose name was edited between reading
- * this and saving it must not leave the operator unable to save what they
- * meant.
+/*
+ * There used to be a `listOdooPricelists` here, read once at Settings-page
+ * render to offer a picker for ODOO_WHOLESALE_PRICELIST. Both are gone with the
+ * pricing decision: the price charged is now each variant's own effective sales
+ * price, so there is no pricelist to choose and nothing for a picker to offer.
+ * `product.pricelist` is not read anywhere in this codebase.
  */
-export async function listOdooPricelists(): Promise<OdooLookup[] | null> {
-  try {
-    const rows = await searchRead<OdooLookup>(
-      PRICELIST_MODEL,
-      [],
-      ["id", "name"],
-      { limit: 200, order: "name asc" },
-    );
-    return rows.filter((row) => typeof row.name === "string" && row.name.trim() !== "");
-  } catch {
-    return null;
-  }
-}
 
 export interface OdooPartnerRecord extends OdooRecord {
   name?: string;

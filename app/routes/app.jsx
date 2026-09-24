@@ -176,6 +176,24 @@ BlockedScreen.propTypes = {
   message: PropTypes.string.isRequired,
 };
 
+/**
+ * Whether a thrown response is the Shopify library's bootstrap page.
+ *
+ * The library builds that body itself — one App Bridge <script> carrying the
+ * app's public client id and no text — so it is matched by shape, not by the
+ * status alone. Both parts are required: a body that merely names the script
+ * file could be a real error whose text happens to include an asset path, and
+ * styling that as a harmless notice would hide the failure it was reporting.
+ */
+function isAppBridgeBootstrap(error) {
+  return (
+    isRouteErrorResponse(error) &&
+    typeof error.data === "string" &&
+    error.data.includes("data-api-key=") &&
+    error.data.includes("app-bridge.js")
+  );
+}
+
 // Shopify needs React Router to catch some thrown responses, so that their headers are included in the response.
 export function ErrorBoundary() {
   const error = useRouteError();
@@ -200,6 +218,39 @@ export function ErrorBoundary() {
   ) {
     // No apiKey: the layout loader is the thing that failed, so there is none.
     return <BlockedScreen message={BLOCKED_MESSAGE} />;
+  }
+
+  /*
+   * The app's bootstrap page, said out loud.
+   *
+   * `authenticate.admin` refuses a request that carries no `shop`/`host` — a
+   * URL opened from outside the Shopify admin, a bookmarked app page, a link
+   * pasted into a new tab — by throwing a 200 whose body is one App Bridge
+   * <script> tag. `boundary.error` renders that body and nothing else, so the
+   * answer is a blank page that reports success. Every page under this layout
+   * looks identical from there, which makes "the page is empty" and "the page
+   * never ran" impossible to tell apart — and the second is what happened.
+   *
+   * The script is still rendered, and still first: inside the admin iframe it
+   * is the thing that performs the top-level redirect, and removing it would
+   * break the flow it belongs to. The sentence after it is what a person gets
+   * when there is no iframe for it to run in.
+   */
+  if (isAppBridgeBootstrap(error)) {
+    return (
+      <div className="mv-container" style={{ padding: "3rem 1rem" }}>
+        <div className="mv-section-card" style={{ maxWidth: "32rem", margin: "0 auto" }}>
+          {/* eslint-disable-next-line react/no-danger */}
+          <div dangerouslySetInnerHTML={{ __html: error.data }} />
+          <p style={{ margin: 0, fontSize: "1rem" }}>
+            MoonVella has to be opened from your Shopify admin — it reads which store is
+            asking from Shopify itself, so a page opened on its own has nothing to show.
+            Open it from <strong>Apps</strong> in your admin, or press <strong>Reload</strong>{" "}
+            if you are already there.
+          </p>
+        </div>
+      </div>
+    );
   }
 
   return boundary.error(error);

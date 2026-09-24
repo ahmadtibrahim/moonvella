@@ -572,6 +572,29 @@ async function main() {
       "poll + revalidate on visibility",
     );
 
+    /*
+     * The layout's error boundary has a case for the app's own bootstrap page.
+     *
+     * `authenticate.admin` refuses a request with no `shop`/`host` — an app URL
+     * opened outside the admin — by throwing a 200 whose body is a single App
+     * Bridge <script>. `boundary.error` renders that body verbatim, so the answer
+     * used to be a blank page reporting success: every page under this layout
+     * looked the same from there, and "empty" could not be told from "never
+     * ran". The script still has to be rendered and still has to be first —
+     * inside the admin iframe it performs the redirect — so what is asserted is
+     * that the sentence a person needs comes with it.
+     */
+    check(
+      17.1,
+      "A request with no shop/host is answered with the bootstrap script AND the sentence explaining it",
+      /function isAppBridgeBootstrap\(error\)/.test(layout) &&
+        /isAppBridgeBootstrap\(error\)/.test(layout) &&
+        /data-api-key=|app-bridge\.js/.test(layout) &&
+        /dangerouslySetInnerHTML/.test(layout) &&
+        /Opened from your Shopify admin/i.test(layout),
+      "blank 200 with an App Bridge script is named, not rendered bare",
+    );
+
     const applicationRoute = readFileSync(join(routesDir, "app.application.jsx"), "utf8");
     check(
       18,

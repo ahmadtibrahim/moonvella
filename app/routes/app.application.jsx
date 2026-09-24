@@ -16,9 +16,18 @@ import {
   ADDRESS_FIELDS,
   IMPORTED_FIELDS,
   STORED_FIELDS,
+  contactEmailNote,
+  contactEmailPrefill,
   importedColumns,
+  isMerchantOwnedSource,
   seedFormState,
 } from "../utils/applicationFields";
+/*
+ * The address entry aid. All of its logic is in the typed modules — this file
+ * is `.jsx`, which this build never typechecks, so what it does with a picked
+ * address is assigning values and nothing else.
+ */
+import { createAddressEntryAid } from "../utils/placesEntryAid";
 
 const PRODUCT_CATEGORIES = [
   "Bedding & Bath",
@@ -178,6 +187,12 @@ export async function loader({ request }) {
     addressCountryCode: rawBilling.countryCodeV2 ?? null,
   };
 
+  // The browser key is read on the server, from the encrypted store, and only
+  // its value crosses to the page. The server-side key — the one that can spend
+  // the account's validation quota — is not reachable from here at all.
+  const { browserKeyForPlaces } = await import("../services/addressValidation.server");
+  const placesBrowserKey = await browserKeyForPlaces();
+
   return {
     // Serialized values only: the explanation of a blank field is data, so it
     // travels with the response rather than being computed by the component.
@@ -204,6 +219,13 @@ export async function loader({ request }) {
         ADDRESS_KEYS.map((k) => [k, storedSources[k] ?? "IMPORT_FAILED"]),
       ),
     },
+    /*
+     * The one credential this app deliberately hands to a page — a
+     * referrer-restricted browser key whose only enabled API is Places. It is
+     * null unless the owner has saved one, and the page renders exactly as it
+     * does today when it is: no key, no suggestions, fields still typeable.
+     */
+    placesBrowserKey,
     // A row exists as soon as the page is opened, because the imported profile is
     // stored on it — but the merchant's own answers are only there once they have
     // submitted. Those come back as null on a draft and are rendered as empty
@@ -268,6 +290,16 @@ export async function action({ request }) {
 
   const formData = await request.formData();
   const intent = str(formData, "intent") || "submit";
+  /*
+   * Saving for later is not submitting.
+   *
+   * "Save & Continue Later" sent `intent=submit` and was then held to the
+   * submission's rules, so the one button a merchant presses when they cannot
+   * finish yet was the one that refused to save a half-finished form. A draft is
+   * written with whatever is filled in; the required fields are enforced on the
+   * submission, where they belong.
+   */
+  const savingDraft = intent === "save";
 
   const existing = await prisma.merchantApplication.findUnique({
     where: { shopDomain: shop },
@@ -309,13 +341,16 @@ export async function action({ request }) {
       if (field.identity) continue;
 
       /*
-       * A field the merchant typed is theirs. Refreshing is not a reason to
-       * overwrite an answer somebody gave deliberately — the note under an
-       * overridden field says exactly that, and this is the code that makes the
-       * sentence true. Clearing is available per field for when they want
+       * A field the merchant typed is theirs, and so is one they chose from a
+       * suggestion: both describe an address somebody settled on deliberately,
+       * and a refresh must not quietly put Shopify's older value back. The two
+       * differ only in where the value came from, which is why the test is one
+       * shared rule rather than the word "MERCHANT" written out here — the last
+       * time this comparison was spelled out by hand it did not know about the
+       * second source at all. Clearing is available per field for when they want
        * Shopify's value back.
        */
-      const overridden = storedSources[key] === "MERCHANT";
+      const overridden = isMerchantOwnedSource(storedSources[key]);
       if (overridden && onlyField !== key) continue;
 
       data[field.column] = imported.profile[key];
@@ -367,20 +402,30 @@ export async function action({ request }) {
     submittedAddress[field.key] = str(formData, field.key);
   }
 
+  /*
+   * The submission's requirements, enforced here rather than only in the form:
+   * a browser is not the authority on what may be submitted. The legal business
+   * name and a complete address are what the Odoo customer record and a carrier
+   * label are built from, so an incomplete submission is refused with the list
+   * of what is still missing. Street 2 and the GST/HST number are optional, and
+   * a draft is not held to any of it.
+   */
   const errors = {};
-  if (!contactName) errors.contactName = "Contact name is required.";
-  if (!isEmail(email)) errors.email = "A valid email address is required.";
-  if (!legalBusinessName) {
-    errors.legalBusinessName = "Legal business name is required.";
-  }
-  for (const field of ADDRESS_FIELDS) {
-    if (field.required && !submittedAddress[field.key]) {
-      errors[field.key] = `${field.label} is required.`;
+  if (!savingDraft) {
+    if (!contactName) errors.contactName = "Contact name is required.";
+    if (!isEmail(email)) errors.email = "A valid email address is required.";
+    if (!legalBusinessName) {
+      errors.legalBusinessName = "Legal business name is required.";
     }
-  }
-  if (urgentContactName && !urgentPhone) {
-    errors.urgentPhone =
-      "An urgent contact name was given, so an urgent contact number is required.";
+    for (const field of ADDRESS_FIELDS) {
+      if (field.required && !submittedAddress[field.key]) {
+        errors[field.key] = `${field.label} is required.`;
+      }
+    }
+    if (urgentContactName && !urgentPhone) {
+      errors.urgentPhone =
+        "An urgent contact name was given, so an urgent contact number is required.";
+    }
   }
 
   if (Object.keys(errors).length > 0) {
@@ -391,11 +436,19 @@ export async function action({ request }) {
    * Provenance for each address column.
    *
    * A value equal to the one Shopify returned keeps its imported source; a
-   * different one is the merchant's. Comparing against the *stored* import
-   * rather than re-reading Shopify here is deliberate: it keeps submission from
-   * depending on a live API call, so a merchant can still apply during a
-   * Shopify outage — and the stored import is the same snapshot they were
-   * looking at when they typed.
+   * different one is the merchant's — typed by them, or chosen from a Google
+   * suggestion, which the form marks with `source_<key>`. Comparing against the
+   * *stored* import rather than re-reading Shopify here is deliberate: it keeps
+   * submission from depending on a live API call, so a merchant can still apply
+   * during a Shopify outage — and the stored import is the same snapshot they
+   * were looking at when they typed.
+   *
+   * The marker is a claim only the page can make, and it is accepted because it
+   * claims LESS than the alternative. "Chosen from a suggestion" is not a
+   * statement that Google confirmed anything — it is the record of where the
+   * value came from, which is exactly what a reviewer needs and what no verdict
+   * is built on. Anything other than the one accepted word is ignored, so the
+   * stored vocabulary stays closed.
    */
   const storedSources = readSources(existing?.profileFieldSources);
   const nextSources = { ...storedSources };
@@ -413,7 +466,8 @@ export async function action({ request }) {
       continue;
     }
     if (storedSources[field.key] === "MERCHANT" || submitted !== stored) {
-      nextSources[field.key] = "MERCHANT";
+      const marked = str(formData, `source_${field.key}`).toUpperCase();
+      nextSources[field.key] = marked === "GOOGLE" ? "GOOGLE" : "MERCHANT";
     } else {
       nextSources[field.key] = storedSources[field.key] ?? "MERCHANT";
     }
@@ -431,13 +485,16 @@ export async function action({ request }) {
 
   // Editing contact details must not silently reset an approved or suspended
   // seller back into review. A deactivated store, by contrast, is applying
-  // again: its own state is the request to re-enter the queue.
+  // again: its own state is the request to re-enter the queue. A draft save is
+  // neither: unfinished work must not move a store through the queue, so a save
+  // keeps whatever state the row already had.
   let status = existing?.status ?? "PENDING";
   if (
-    !existing ||
-    existing.status === "REJECTED" ||
-    existing.status === "NEEDS_INFO" ||
-    existing.status === "DEACTIVATED"
+    !savingDraft &&
+    (!existing ||
+      existing.status === "REJECTED" ||
+      existing.status === "NEEDS_INFO" ||
+      existing.status === "DEACTIVATED")
   ) {
     status = "PENDING";
   }
@@ -465,8 +522,28 @@ export async function action({ request }) {
 
   const saved = await prisma.merchantApplication.upsert({
     where: { shopDomain: shop },
-    create: { shopDomain: shop, ...data, submittedAt: new Date() },
-    update: data,
+    /*
+     * `submittedAt` is the marker that separates a draft from an application:
+     * it is set on the submission and never on a save, so "has this merchant
+     * applied" is answerable from the row alone.
+     *
+     * It is written on BOTH branches, and that is the point. A row already
+     * exists by the time anyone submits, because the first visit to this page
+     * stores the imported Shopify profile on one — so the submission always
+     * takes the update branch. That branch used to write the answers and leave
+     * this column alone: the merchant was told "Application Submitted", their
+     * details were saved, and the row stayed a draft for ever. The owner's
+     * queue reads `submittedAt IS NOT NULL`, so it listed nothing at all while
+     * the application sat there complete.
+     *
+     * An existing value is kept rather than overwritten: a merchant editing an
+     * application they have already submitted has not un-submitted it, and the
+     * date a reviewer reads should be the date it was first submitted.
+     */
+    create: { shopDomain: shop, ...data, submittedAt: savingDraft ? null : new Date() },
+    update: savingDraft
+      ? data
+      : { ...data, submittedAt: existing?.submittedAt ?? new Date() },
   });
 
   const { recordAudit, AUDIT_ENTITY } = await import("../services/audit.server");
@@ -474,7 +551,11 @@ export async function action({ request }) {
     actorType: "MERCHANT",
     actorId: shop,
     actorName: storeName,
-    action: existing ? "application.updated" : "application.submitted",
+    action: savingDraft
+      ? "application.draft_saved"
+      : existing
+        ? "application.updated"
+        : "application.submitted",
     entityType: AUDIT_ENTITY.APPLICATION,
     entityId: saved.id,
     afterData: {
@@ -486,10 +567,22 @@ export async function action({ request }) {
       merchantSupplied: Object.entries(nextSources)
         .filter(([, source]) => source === "MERCHANT")
         .map(([key]) => key),
+      // Separated from the typed ones because the two are different facts: a
+      // suggestion was offered and accepted, which says nothing about whether
+      // the address is right — only where it came from.
+      googleSuggested: Object.entries(nextSources)
+        .filter(([, source]) => source === "GOOGLE")
+        .map(([key]) => key),
+      draft: savingDraft,
     },
   });
 
-  return { ok: true, status: saved.status };
+  // The two are answered differently by the page on purpose: a draft is saved,
+  // an application is submitted for review, and a toast that says "will review
+  // your store" after a half-finished save is a claim the row does not support.
+  return savingDraft
+    ? { ok: true, draft: true }
+    : { ok: true, submitted: true, status: saved.status };
 }
 
 /** The reason a field is blank, rendered under it. */
@@ -533,27 +626,48 @@ ImportedValue.propTypes = {
 };
 
 export default function ApplicationPage() {
-  const { imported, importedAddress, address, application, apiVersion } = useLoaderData();
+  const { imported, importedAddress, address, application, apiVersion, placesBrowserKey } =
+    useLoaderData();
   const fetcher = useFetcher();
   const shopify = useAppBridge();
   const navigate = useNavigate();
   const isSubmitting = fetcher.state !== "idle";
-  const submitted = fetcher.data?.ok === true && !fetcher.data?.refreshed;
+  const submitted = fetcher.data?.submitted === true;
+  const draftSaved = fetcher.data?.draft === true;
   const refreshed = fetcher.data?.refreshed === true;
   const serverError = fetcher.data?.error;
-  const fieldErrors = fetcher.data?.errors || {};
+  /*
+   * What the form found missing, before the request left. It holds the same
+   * shape the action returns, so the fields render one set of messages whichever
+   * side answered — and the server's answer replaces this one as soon as it
+   * arrives, because the server is still the authority.
+   */
+  const [localErrors, setLocalErrors] = React.useState({});
+  const fieldErrors = { ...localErrors, ...(fetcher.data?.errors || {}) };
   const [intent, setIntent] = React.useState("submit");
 
   React.useEffect(() => {
+    if (submitted || draftSaved) {
+      // The form's own findings are cleared once the server has accepted what
+      // was sent: leaving them up would tell a merchant to fix something that
+      // is no longer wrong.
+      setLocalErrors({});
+    }
     if (submitted) {
       shopify.toast.show(
-        "Application saved. MoonVella will review your store before wholesale access is unlocked.",
+        "Application submitted. MoonVella will review your store before wholesale access is unlocked.",
       );
+      return;
+    }
+    if (draftSaved) {
+      // Deliberately not the submission's sentence: nothing has been sent for
+      // review, and saying otherwise would be a promise the row cannot keep.
+      shopify.toast.show("Saved. You can finish your application later.");
       if (intent === "save") {
         navigate("/app/status");
       }
     }
-  }, [submitted, intent, shopify, navigate]);
+  }, [submitted, draftSaved, intent, shopify, navigate]);
 
   React.useEffect(() => {
     if (refreshed) {
@@ -573,6 +687,16 @@ export default function ApplicationPage() {
   // there.
   const [addressValues, setAddressValues] = React.useState(address.values);
 
+  /*
+   * Which address columns are holding a value the merchant chose from a Google
+   * suggestion, and has not edited since.
+   *
+   * Editing a column clears its mark, so what is submitted is a claim about the
+   * value actually in the box rather than about a suggestion that was once
+   * taken: type over the city and the city is yours.
+   */
+  const [googleFields, setGoogleFields] = React.useState({});
+
   const [urgentIsDifferent, setUrgentIsDifferent] = React.useState(
     Boolean(application?.urgentContactName),
   );
@@ -580,8 +704,12 @@ export default function ApplicationPage() {
   const handleChange = (field, value) =>
     setFormData((prev) => ({ ...prev, [field]: value }));
 
-  const handleAddressChange = (field, value) =>
+  const handleAddressChange = (field, value) => {
     setAddressValues((prev) => ({ ...prev, [field]: value }));
+    setGoogleFields((prev) => (prev[field] ? { ...prev, [field]: false } : prev));
+  };
+
+  const contactEmailSource = contactEmailPrefill(application, imported);
 
   const handleMarketChange = (market) => {
     setFormData((prev) => {
@@ -595,8 +723,58 @@ export default function ApplicationPage() {
 
   const handleSubmit = (event) => {
     event.preventDefault();
+    /*
+     * Which button was pressed, read from the event rather than from state.
+     *
+     * The two buttons used to set a piece of state their own submit handler
+     * then read, so whether a merchant saved a draft or submitted an
+     * application depended on a re-render landing between the click and the
+     * submit. Enter inside a field has no button behind it, and means submit.
+     */
+    const pressed =
+      event.nativeEvent?.submitter?.getAttribute("value") === "save" ? "save" : "submit";
+    setIntent(pressed);
+
+    /*
+     * The form states the submission's requirement before the request leaves.
+     *
+     * The same list the server enforces from — `required` on the address fields
+     * in `ADDRESS_FIELDS`, and the four named answers — so the two cannot
+     * disagree, and a merchant sees what is missing without a round trip. A
+     * draft is checked against none of it: that is the whole point of saving one.
+     */
+    if (pressed === "submit") {
+      const missing = {};
+      if (!String(formData.legalBusinessName || "").trim()) {
+        missing.legalBusinessName = "Legal business name is required.";
+      }
+      if (!String(formData.contactName || "").trim()) {
+        missing.contactName = "Contact name is required.";
+      }
+      if (!isEmail(formData.email)) {
+        missing.email = "A valid email address is required.";
+      }
+      for (const field of ADDRESS_FIELDS) {
+        if (field.required && !String(addressValues[field.key] || "").trim()) {
+          missing[field.key] = `${field.label} is required.`;
+        }
+      }
+      if (
+        urgentIsDifferent &&
+        String(formData.urgentContactName || "").trim() &&
+        !String(formData.urgentPhone || "").trim()
+      ) {
+        missing.urgentPhone =
+          "An urgent contact name was given, so an urgent contact number is required.";
+      }
+      setLocalErrors(missing);
+      if (Object.keys(missing).length > 0) return;
+    } else {
+      setLocalErrors({});
+    }
+
     const payload = new FormData();
-    payload.set("intent", "submit");
+    payload.set("intent", pressed);
     payload.set("contactName", formData.contactName || "");
     payload.set("phone", formData.phone || "");
     payload.set("urgentPhone", formData.urgentPhone || "");
@@ -610,10 +788,63 @@ export default function ApplicationPage() {
     payload.set("productCategory", formData.productCategory || "Other");
     for (const field of ADDRESS_FIELDS) {
       payload.set(field.key, addressValues[field.key] || "");
+      // Only the columns still holding a suggestion the merchant accepted and
+      // left alone carry the mark; an edited one is simply theirs.
+      if (googleFields[field.key]) payload.set(`source_${field.key}`, "GOOGLE");
     }
     (formData.markets || []).forEach((market) => payload.append("markets", market));
     fetcher.submit(payload, { method: "POST" });
   };
+
+  /*
+   * The address entry aid, attached to Street 1.
+   *
+   * What it fills is the five address columns, one value each; what it never
+   * touches is Street 2. The unit is the exact thing Google offers to fold into
+   * a street line, and a unit lost that way is a delivery to a different door —
+   * so the unit is reported as a sentence and the column stays the merchant's.
+   *
+   * The whole aid is inert without a key: `placesBrowserKey` is null until the
+   * owner saves one, and the fields go on working as ordinary text boxes. The
+   * render says so in as many words — a field that silently offers nothing is
+   * indistinguishable from one that is broken, and the merchant can fix
+   * neither. What must not change is the fallback: the fields render and behave
+   * exactly as they did
+   * before this existed.
+   */
+  const street1Ref = React.useRef(null);
+  const suggestionListRef = React.useRef(null);
+  const [aidStatus, setAidStatus] = React.useState("idle");
+  const [aidReason, setAidReason] = React.useState(null);
+  const [unitHint, setUnitHint] = React.useState(null);
+
+  React.useEffect(() => {
+    if (!placesBrowserKey || !street1Ref.current || !suggestionListRef.current) return undefined;
+    const aid = createAddressEntryAid({
+      apiKey: placesBrowserKey,
+      input: street1Ref.current,
+      list: suggestionListRef.current,
+      onStatus: (status, reason) => {
+        setAidStatus(status);
+        setAidReason(reason ?? null);
+      },
+      onPick: (picked) => {
+        const keys = Object.keys(picked.fields);
+        setAddressValues((prev) => {
+          const next = { ...prev };
+          for (const key of keys) next[key] = picked.fields[key];
+          return next;
+        });
+        setGoogleFields((prev) => {
+          const next = { ...prev };
+          for (const key of keys) next[key] = true;
+          return next;
+        });
+        setUnitHint(picked.unitHint);
+      },
+    });
+    return () => aid.destroy();
+  }, [placesBrowserKey]);
 
   const refreshFromShopify = () =>
     fetcher.submit({ intent: "refresh" }, { method: "POST" });
@@ -787,8 +1018,40 @@ export default function ApplicationPage() {
             <p className="mv-branding-message" style={{ marginBottom: "1rem" }}>
               Imported from your Shopify store’s billing address where it is set. Complete any
               field Shopify left blank — each one says below it where its current value came
-              from.
+              from. Street 1, city, province, postal code and country are required to submit;
+              Street 2 and the GST/HST number are optional, and you can save a draft at any
+              point.
             </p>
+            {placesBrowserKey ? (
+              <p className="mv-branding-message" style={{ marginBottom: "1rem" }}>
+                Typing a street address offers Google’s suggestions. Choosing one fills the
+                fields below so the province and postal code arrive in the form a carrier
+                wants. This is an entry aid, not a check: a suggestion is not a confirmation
+                that this is your registered address, nothing is verified by taking one, and
+                your Unit / Street 2 line is never filled from it.
+              </p>
+            ) : (
+              /*
+               * Switched off, and said out loud.
+               *
+               * With no browser key the aid is inert: the street field became an
+               * ordinary text box that offered nothing when typed into, and the
+               * page said nothing about why. An entry aid that is missing and an
+               * entry aid that is broken look identical from here, and the
+               * merchant is the one person who cannot fix either — so the state
+               * is named rather than left to be discovered by typing and waiting
+               * for a list that never comes.
+               */
+              <p
+                className="mv-branding-message"
+                role="status"
+                style={{ marginBottom: "1rem" }}
+              >
+                Address suggestions are switched off: this app has no Google Maps browser
+                key configured. Type the full address into the fields below — they work
+                exactly as they look, and nothing else about your application changes.
+              </p>
+            )}
             <div className="mv-settings-grid">
               {ADDRESS_FIELDS.map((field) => {
                 const source = address.sources[field.key];
@@ -805,7 +1068,47 @@ export default function ApplicationPage() {
                       value={addressValues[field.key] ?? ""}
                       onChange={(e) => handleAddressChange(field.key, e.target.value)}
                       aria-invalid={!!fieldErrors[field.key]}
+                      ref={field.key === "addressLine1" ? street1Ref : undefined}
                     />
+                    {field.key === "addressLine1" && placesBrowserKey && (
+                      <>
+                        <div
+                          ref={suggestionListRef}
+                          className="mv-place-suggestions"
+                          style={{
+                            marginTop: "0.25rem",
+                            border: "1px solid var(--border-color, #e5e5e5)",
+                            borderRadius: "var(--radius-md, 6px)",
+                            background: "#fff",
+                            overflow: "hidden",
+                          }}
+                        />
+                        {aidStatus === "failed" && aidReason ? (
+                          <p
+                            role="status"
+                            style={{
+                              color: "var(--text-secondary)",
+                              fontSize: "0.72rem",
+                              marginTop: "0.25rem",
+                            }}
+                          >
+                            Address suggestions are unavailable: {aidReason} Keep typing — the
+                            fields above work as they always did.
+                          </p>
+                        ) : null}
+                      </>
+                    )}
+                    {field.key === "addressLine2" && unitHint ? (
+                      /*
+                       * Google's unit, said rather than written. Filling Street 2
+                       * from a suggestion would be this app deciding which door a
+                       * shipment goes to on the strength of a record it has not
+                       * checked, so the merchant is told and the column stays theirs.
+                       */
+                      <SourceNote
+                        note={`Google’s record for the address you chose includes “${unitHint}”. Street 2 is left as you typed it — add it there if it belongs on your label.`}
+                      />
+                    ) : null}
                     <SourceNote note={imported.notes[field.key]} />
                     {source === "MERCHANT" && (
                       <button
@@ -874,7 +1177,11 @@ export default function ApplicationPage() {
                   onChange={(e) => handleChange("email", e.target.value)}
                   aria-invalid={!!fieldErrors.email}
                 />
-                <SourceNote note="Prefilled from your Shopify store's own email address for convenience. Enter the address of the person named above if that is somebody else." />
+                {/* Names the mailbox this box was actually filled from: the
+                    seed falls back through the merchant's own answer, the
+                    account owner's private address and the storefront's public
+                    one, and one sentence cannot honestly describe all three. */}
+                <SourceNote note={contactEmailNote(contactEmailSource)} />
                 {fieldErrors.email && (
                   <p style={{ color: "var(--danger-red)", fontSize: "0.75rem", marginTop: "0.25rem" }}>
                     {fieldErrors.email}
@@ -990,19 +1297,21 @@ export default function ApplicationPage() {
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '1rem', marginTop: '1.5rem' }}>
             <button
               type="submit"
+              name="intent"
+              value="save"
               className="mv-btn mv-btn-secondary"
-              onClick={() => setIntent("save")}
               disabled={isSubmitting}
             >
-              Save &amp; Continue Later
+              {isSubmitting && intent === "save" ? "Saving..." : "Save & Continue Later"}
             </button>
             <button
               type="submit"
+              name="intent"
+              value="submit"
               className="mv-btn mv-btn-primary"
-              onClick={() => setIntent("submit")}
               disabled={isSubmitting}
             >
-              {isSubmitting ? "Submitting..." : "Submit Application"}
+              {isSubmitting && intent === "submit" ? "Submitting..." : "Submit Application"}
             </button>
           </div>
         </form>

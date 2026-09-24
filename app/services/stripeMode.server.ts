@@ -54,6 +54,42 @@ export function classifyStripeKey(key: string | null): StripeProviderMode | null
   return null;
 }
 
+/**
+ * Why a value sitting in the secret-key field cannot be used, when it is a
+ * Stripe value of the wrong KIND.
+ *
+ * `classifyStripeKey` answers "usable, and in which mode" and returns null for
+ * anything else — which is right for branching, and useless for explaining. The
+ * two values an operator actually confuses with a secret key both come from the
+ * same Stripe console page: the publishable key, which is public by design, and
+ * the webhook signing secret, which belongs in its own field. Both produce the
+ * same symptom downstream — a generic 401 from Stripe that names no cause — so
+ * the kind is recognised here, by name, and said out loud.
+ *
+ * Restricted keys (`rk_…`) are NOT wrong: Stripe issues them from the same menu,
+ * they authenticate the same way, and refusing one would be this module
+ * inventing a rule Stripe does not have.
+ *
+ * The value itself is never echoed — only the shape of it, which is the part
+ * already printed in Stripe's own documentation.
+ */
+export function stripeKeyKindProblem(key: string | null): string | null {
+  const value = key?.trim() ?? "";
+  if (value.startsWith("pk_")) {
+    return (
+      "The saved key is a publishable key (pk_…), not a secret key. " +
+      "Paste the sk_… secret key; publishable keys never authenticate."
+    );
+  }
+  if (value.startsWith("whsec_")) {
+    return (
+      "The saved value is a webhook signing secret (whsec_…), not a secret key. " +
+      "Paste the sk_… secret key; the signing secret belongs in the webhook secret field."
+    );
+  }
+  return null;
+}
+
 function override(): StripeMode | null {
   const raw = (process.env[OVERRIDE_VAR] ?? "").trim().toLowerCase();
   if (!raw) return null;

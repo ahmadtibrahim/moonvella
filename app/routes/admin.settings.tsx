@@ -1,5 +1,13 @@
 import React from "react";
-import { Form, Link, useActionData, useLoaderData, useNavigation, useSearchParams } from "react-router";
+import {
+  Form,
+  Link,
+  useActionData,
+  useFetcher,
+  useLoaderData,
+  useNavigation,
+  useSearchParams,
+} from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import {
   requireAuth,
@@ -29,12 +37,7 @@ import {
 import {
   CREDENTIAL_INTEGRATIONS,
   type CredentialKey,
-  type CredentialOption,
 } from "~/services/integrationFields";
-// Server-only, and used only to READ the choices a picker offers. Nothing it
-// returns is a credential, and a failure to read it falls back to the plain
-// text field rather than failing the page.
-import { listOdooPricelists } from "~/services/odoo.server";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   // Any signed-in user: everyone needs to be able to change their own password.
@@ -54,31 +57,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const operationalKeys = OPERATIONAL_KEYS as string[];
 
   /*
-   * A FEW FIELDS CHOOSE FROM WHAT THE PROVIDER ACTUALLY HOLDS. The wholesale
-   * pricelist is one: it can be typed as a name or an id, but a list read from
-   * Odoo is what stops a typo becoming a price list nobody can find.
-   *
-   * Read only when the Odoo integration ALREADY reports HEALTHY. Asking an
-   * unreachable Odoo would stall this page for the length of the connector's
-   * timeout to learn what the tile above already says, and the field falls back
-   * to text input either way — which accepts exactly what the picker offers.
+   * Every credential field's live state already arrives on each integration's
+   * view, so the page needs nothing else to say what is missing: the fields
+   * marked `isSet: false` ARE the missing fields, and each one carries the
+   * sentence saying what to put in it. There is deliberately no second read here
+   * — no provider is contacted to render this page, so an unreachable provider
+   * cannot stall it.
    */
-  const odooHealthy = states.some((state) => state.key === "odoo" && state.status === "HEALTHY");
-  const pricelists =
-    canSeeIntegrations && odooHealthy ? await listOdooPricelists() : null;
-
-  // Keyed by field, because an integration may later offer a picker for more
-  // than one of its fields.
-  const runtimeOptions: Record<string, CredentialOption[]> = {};
-  if (pricelists?.length) {
-    runtimeOptions["odoo:ODOO_WHOLESALE_PRICELIST"] = pricelists.map((row) => ({
-      value: String(row.id),
-      label: `${row.name} (id ${row.id})`,
-    }));
-  }
 
   return {
-    runtimeOptions,
     user: {
       name: user.name,
       email: user.email,
@@ -121,14 +108,21 @@ export async function action({ request }: ActionFunctionArgs) {
       userAgent,
     };
 
+    /*
+     * THE MESSAGES DO NOT NAME THE PROVIDER, and that is deliberate: each is
+     * returned to the fetcher of the card it came from and rendered inside that
+     * card, so "Odoo" would be telling the operator what they are already
+     * looking at. The status word and the reason below it are the parts they
+     * cannot see from outside.
+     */
     if (intent === "refresh_integration") {
       const state = await refreshIntegration(key, auditActor);
-      return { success: `${key} re-checked: ${state.status}.` };
+      return { success: `Re-checked: ${state.status}.` };
     }
 
     if (intent === "clear_integration_error") {
       await clearIntegrationError(key, auditActor);
-      return { success: `${key} error cleared.` };
+      return { success: "Recorded error cleared." };
     }
 
     if (intent === "save_credentials") {
@@ -142,8 +136,11 @@ export async function action({ request }: ActionFunctionArgs) {
       );
       try {
         const state = await saveIntegrationCredentials(key, submitted, auditActor);
-        return { success: `${key} credentials saved and re-checked: ${state.status}.` };
+        return { success: `Credentials saved, then checked: ${state.status}.` };
       } catch (error) {
+        // Nothing was written. A refusal from the store arrives here with its
+        // own sentence — which says which field was wrong and what belongs in
+        // it — and is shown as it is rather than wrapped in a generic apology.
         return { error: error instanceof Error ? error.message : "Could not save credentials." };
       }
     }
@@ -151,7 +148,7 @@ export async function action({ request }: ActionFunctionArgs) {
     if (intent === "disconnect_integration") {
       try {
         await disconnectIntegration(key, auditActor);
-        return { success: `${key} disconnected. Provider operations are disabled.` };
+        return { success: "Disconnected. Provider operations are disabled until credentials are saved again." };
       } catch (error) {
         return { error: error instanceof Error ? error.message : "Could not disconnect." };
       }
@@ -231,7 +228,6 @@ export default function AdminSettings() {
     credentialIntegrations,
     operationalIntegrations,
     canSeeIntegrations,
-    runtimeOptions,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -318,12 +314,7 @@ export default function AdminSettings() {
               live provider calls until credentials are saved again.
             </p>
             {credentialIntegrations.map((i) => (
-              <DetailCard
-                key={i.key}
-                integration={i}
-                isSubmitting={isSubmitting}
-                runtimeOptions={runtimeOptions}
-              />
+              <DetailCard key={i.key} integration={i} />
             ))}
           </div>
 
@@ -338,12 +329,7 @@ export default function AdminSettings() {
               here whether or not anyone opens this page.
             </p>
             {operationalIntegrations.map((i) => (
-              <DetailCard
-                key={i.key}
-                integration={i}
-                isSubmitting={isSubmitting}
-                runtimeOptions={runtimeOptions}
-              />
+              <DetailCard key={i.key} integration={i} />
             ))}
           </div>
         </>
@@ -465,9 +451,6 @@ export default function AdminSettings() {
 
 interface DetailCardProps {
   integration: IntegrationStateView;
-  isSubmitting: boolean;
-  /** Choices read live from the provider, keyed `"<integrationKey>:<fieldName>"`. */
-  runtimeOptions: Record<string, CredentialOption[]>;
 }
 
 /** Display names. A raw key like "shopify_fulfillment" is not a label. */
@@ -482,9 +465,26 @@ const INTEGRATION_LABEL: Record<string, string> = {
   product_import: "Product import",
 };
 
-function DetailCard({ integration, isSubmitting, runtimeOptions }: DetailCardProps) {
+/*
+ * ONE CARD, ONE FETCHER, ONE ANSWER.
+ *
+ * Every control on a provider's card — Save, Test connection, Re-check, Clear
+ * error, Disconnect — is submitted through this card's own fetcher, so the
+ * pending state and the result belong to the provider they came from. Before
+ * this, all of them went through the page-level <Form> and the answer was
+ * printed at the top of the page: an operator who pressed "Test connection" on
+ * the Odoo card read a message four cards up, about a provider whose name was
+ * the only thing tying the two together. The failures worth the most are the
+ * ones that need acting on, and they have to land next to the control that
+ * caused them.
+ */
+function DetailCard({ integration }: DetailCardProps) {
   // Taken from the row rather than a props name of "key", which React reserves.
   const key = integration.key;
+  const fetcher = useFetcher<{ success?: string; error?: string }>();
+  const busy = fetcher.state !== "idle";
+  const pendingIntent = busy ? String(fetcher.formData?.get("intent") ?? "") : null;
+  const result = fetcher.data ?? null;
 
   return (
     <div style={{
@@ -519,37 +519,107 @@ function DetailCard({ integration, isSubmitting, runtimeOptions }: DetailCardPro
         </p>
       ) : null}
 
+      {/*
+        * WHAT IS MISSING, BY NAME, BEFORE ANYONE OPENS A FORM. "Not configured"
+        * is a state; the list of fields with no value is the instruction. Each
+        * one renders with the sentence saying what belongs in it, so the fix is
+        * on the page rather than in a runbook.
+        */}
+      {isCredentialIntegrationKey(key) ? (
+        <p style={{ fontSize: "0.72rem", color: "#334155", marginTop: "0.25rem" }}>
+          {missingFieldNames(integration.credentialFields).length ? (
+            <span style={{ color: "#b45309" }}>
+              Missing: {missingFieldNames(integration.credentialFields).join(", ")}. A field with a
+              value is not the same as a working integration — press Test connection to find out
+              whether the provider accepts it.
+            </span>
+          ) : (
+            <span>
+              Every field in this integration has a value. That is still not proof it works: only
+              the authenticated check does that.
+            </span>
+          )}
+        </p>
+      ) : null}
+
       {/* Credential forms belong to the integrations that hold secrets. An
           operational check has nothing to configure, so it never renders one. */}
       {isCredentialIntegrationKey(key) ? (
         <CredentialsForm
           integrationKey={key}
           integration={integration}
-          isSubmitting={isSubmitting}
-          runtimeOptions={runtimeOptions}
+          fetcher={fetcher}
+          busy={busy}
+          pendingIntent={pendingIntent}
         />
       ) : null}
 
       {/* Action buttons. Saving and disconnecting live inside each credential
           form, where the fields they submit actually are. */}
       <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-        <Form method="post">
+        <fetcher.Form method="post">
           <input type="hidden" name="intent" value="refresh_integration" />
           <input type="hidden" name="key" value={key} />
-          <button type="submit" style={smallButton} disabled={isSubmitting}>
-            Re-check
+          <button type="submit" style={smallButton} disabled={busy}>
+            {pendingIntent === "refresh_integration" ? "Re-checking…" : "Re-check"}
           </button>
-        </Form>
+        </fetcher.Form>
         {integration.lastError || integration.lastErrorAt ? (
-          <Form method="post">
+          <fetcher.Form method="post">
             <input type="hidden" name="intent" value="clear_integration_error" />
             <input type="hidden" name="key" value={key} />
-            <button type="submit" style={smallButton} disabled={isSubmitting}>
-              Clear error
+            <button type="submit" style={smallButton} disabled={busy}>
+              {pendingIntent === "clear_integration_error" ? "Clearing…" : "Clear error"}
             </button>
-          </Form>
+          </fetcher.Form>
         ) : null}
       </div>
+
+      {/*
+        * THE ANSWER, WHERE THE QUESTION WAS ASKED.
+        *
+        * Rendered inside this card rather than at the top of the page, so a
+        * failure on one provider cannot be read as a result on another. The
+        * server's sentence is used verbatim: it names the field, or quotes the
+        * provider's own refusal.
+        */}
+      {busy ? (
+        <p role="status" style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.4rem" }}>
+          {pendingLabel(pendingIntent, INTEGRATION_LABEL[key] ?? key)}
+        </p>
+      ) : null}
+      {!busy && result?.error ? (
+        <p role="alert" style={{ fontSize: "0.75rem", color: "#dc2626", marginTop: "0.4rem" }}>
+          {result.error}
+        </p>
+      ) : null}
+      {!busy && result?.success ? (
+        <p role="status" style={{ fontSize: "0.75rem", color: "#059669", marginTop: "0.4rem" }}>
+          {result.success}
+        </p>
+      ) : null}
+
+      {/*
+        * WHAT THE LAST CHECKS SAID. A successful check is dated rather than
+        * asserted, because a connection that worked last week is not a
+        * connection that works now, and the honest form of "it worked" is when.
+        * The failure text is the provider's own, already stripped of anything
+        * credential-shaped by the store before it was written.
+        */}
+      <p style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "0.4rem" }}>
+        {integration.lastSuccessAt
+          ? `Last successful check: ${new Date(integration.lastSuccessAt).toLocaleString()}.`
+          : "No successful check has been recorded yet."}
+      </p>
+      {integration.lastError ? (
+        <p style={{ fontSize: "0.65rem", color: "#dc2626", marginTop: "0.15rem" }}>
+          Last failure
+          {integration.lastErrorAt
+            ? ` (${new Date(integration.lastErrorAt).toLocaleString()})`
+            : ""}
+          : {integration.lastError}
+        </p>
+      ) : null}
 
       {/* Credential hints. Multi-line by design, hence pre-line. */}
       {integration.credentialHints ? (
@@ -559,6 +629,27 @@ function DetailCard({ integration, isSubmitting, runtimeOptions }: DetailCardPro
       ) : null}
     </div>
   );
+}
+
+/** The fields with no value at all, in the order the form presents them. */
+function missingFieldNames(fields: IntegrationStateView["credentialFields"]): string[] {
+  return fields.filter((field) => !field.isSet).map((field) => field.name);
+}
+
+/** What the in-flight control is doing, in the operator's words. */
+function pendingLabel(intent: string | null, label: string): string {
+  switch (intent) {
+    case "save_credentials":
+      return "Saving, then authenticating against the provider…";
+    case "refresh_integration":
+      return `Contacting ${label}…`;
+    case "disconnect_integration":
+      return "Disconnecting…";
+    case "clear_integration_error":
+      return "Clearing the recorded error…";
+    default:
+      return "Working…";
+  }
 }
 
 /* ---------------------------------------------------------------
@@ -582,26 +673,50 @@ function DetailCard({ integration, isSubmitting, runtimeOptions }: DetailCardPro
 function CredentialsForm({
   integrationKey,
   integration,
-  isSubmitting,
-  runtimeOptions,
+  fetcher,
+  busy,
+  pendingIntent,
 }: {
   integrationKey: CredentialKey;
   integration: IntegrationStateView;
-  isSubmitting: boolean;
-  runtimeOptions: Record<string, CredentialOption[]>;
+  fetcher: ReturnType<typeof useFetcher<{ success?: string; error?: string }>>;
+  busy: boolean;
+  pendingIntent: string | null;
 }) {
   const spec = CREDENTIAL_INTEGRATIONS[integrationKey];
   const stateByName = new Map(integration.credentialFields.map((field) => [field.name, field]));
+  const set = spec.fields.filter((field) => stateByName.get(field.name)?.isSet).length;
+
+  /*
+   * OPEN BY DEFAULT WHEN SOMETHING IS MISSING.
+   *
+   * The panel is collapsed once it is configured — that is the state an operator
+   * wants it in most of the time — and expanded when it is not, because a page
+   * that reports "not configured" and then hides the fields that would fix it
+   * has made the operator click to be told what it already knows.
+   */
+  const [open, setOpen] = React.useState(set < spec.fields.length);
 
   return (
     <div style={{ marginTop: "1rem" }}>
-      <details>
+      <details
+        open={open}
+        onToggle={(event) => setOpen(event.currentTarget.open)}
+        style={{ border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.5rem 0.75rem" }}
+      >
         <summary style={{ cursor: "pointer", fontWeight: 600, color: "#082a4a" }}>
-          {spec.label} credentials
+          {/* The glyph and the count are the whole affordance: it has to be
+              obvious that this opens, and how much is left to do inside it. */}
+          {open ? "▾" : "▸"} {spec.label} credentials
+          <span style={{ marginLeft: "0.5rem", fontWeight: 400, color: set === spec.fields.length ? "#059669" : "#b45309" }}>
+            {set === spec.fields.length
+              ? `— all ${spec.fields.length} fields set`
+              : `— ${spec.fields.length - set} of ${spec.fields.length} fields unset`}
+          </span>
         </summary>
         <p style={{ fontSize: "0.7rem", color: "#64748b" }}>{spec.note}</p>
 
-        <Form method="post">
+        <fetcher.Form method="post">
           <input type="hidden" name="intent" value="save_credentials" />
           <input type="hidden" name="key" value={integrationKey} />
           {spec.fields.map((field) => {
@@ -609,28 +724,14 @@ function CredentialsForm({
             const statusText = state?.problem
               ? state.problem
               : state?.isSet
-                ? `Saved${state.fromEnvironment ? " (from the deployment environment)" : ""}${
-                    state.updatedAt ? ` ${new Date(state.updatedAt).toLocaleString()}` : ""
-                  }`
+                ? state.fromEnvironment
+                  ? // A value from the environment is not stored here, and the
+                    // difference matters: it is the deployment's, and saving a
+                    // value here is what overrides it.
+                    "Saved (from the deployment environment)"
+                  : `Saved${state.updatedAt ? ` ${new Date(state.updatedAt).toLocaleString()}` : ""}`
                 : "Not set";
-            const statusTone = state?.problem ? "#dc2626" : state?.isSet ? "#059669" : "#94a3b8";
-
-            /*
-             * Live choices win over the static ones, and both are optional: a
-             * field with neither is a text input.
-             *
-             * The saved value is kept as an option even when the read did not
-             * return it. It can be a name where the list offers ids, or a
-             * pricelist that was renamed or hidden since it was saved — and a
-             * select whose value is not among its options silently shows the
-             * first one instead, so simply opening this form and saving would
-             * quietly repoint pricing at a different pricelist. It is offered
-             * back verbatim, labelled as what it is.
-             */
-            const options = runtimeOptions[`${integrationKey}:${field.name}`] ?? field.options;
-            const savedValue = state?.value ?? null;
-            const savedNotListed =
-              !!options && !!savedValue && !options.some((option) => option.value === savedValue);
+            const statusTone = state?.problem ? "#dc2626" : state?.isSet ? "#059669" : "#b45309";
 
             return (
               <div key={field.name}>
@@ -643,7 +744,15 @@ function CredentialsForm({
                     {statusText}
                   </span>
                 </label>
-                {options ? (
+                {/* What to put here, while there is nothing in it. This is where
+                    the console-side setup lives, so it is shown at the moment it
+                    is needed and never as a wall of text above a filled form. */}
+                {!state?.isSet && field.hint ? (
+                  <p style={{ fontSize: "0.68rem", color: "#64748b", margin: "0 0 0.25rem" }}>
+                    {field.hint}
+                  </p>
+                ) : null}
+                {field.options ? (
                   <select
                     style={input}
                     id={`${integrationKey}-${field.name}`}
@@ -651,17 +760,11 @@ function CredentialsForm({
                     // An empty first option when nothing is saved, so that
                     // saving this form does not silently choose for the
                     // operator: the first entry in a list they have not read is
-                    // still a choice, and for a pricelist it is the price every
-                    // seller is charged.
-                    defaultValue={savedValue ?? ""}
+                    // still a choice.
+                    defaultValue={state?.value ?? ""}
                   >
-                    {!savedValue ? <option value="">— not set —</option> : null}
-                    {savedNotListed && savedValue ? (
-                      <option value={savedValue}>
-                        {savedValue} — saved, and not in the list just read from Odoo
-                      </option>
-                    ) : null}
-                    {options.map((option) => (
+                    {!state?.value ? <option value="">— not set —</option> : null}
+                    {field.options.map((option) => (
                       <option key={option.value} value={option.value}>
                         {option.label}
                       </option>
@@ -684,27 +787,31 @@ function CredentialsForm({
             );
           })}
           <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-            <button type="submit" style={smallButton} disabled={isSubmitting}>
-              Save credentials
+            <button type="submit" style={smallButton} disabled={busy}>
+              {pendingIntent === "save_credentials" ? "Saving…" : "Save credentials"}
             </button>
           </div>
-        </Form>
+          <p style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "0.35rem" }}>
+            Saving runs the authenticated check straight away, so the result appears above: a saved
+            value is never reported as a working one on its own.
+          </p>
+        </fetcher.Form>
 
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem" }}>
-          <Form method="post">
+          <fetcher.Form method="post">
             <input type="hidden" name="intent" value="refresh_integration" />
             <input type="hidden" name="key" value={integrationKey} />
-            <button type="submit" style={smallButton} disabled={isSubmitting}>
-              Test connection
+            <button type="submit" style={smallButton} disabled={busy}>
+              {pendingIntent === "refresh_integration" ? "Testing…" : "Test connection"}
             </button>
-          </Form>
-          <Form method="post">
+          </fetcher.Form>
+          <fetcher.Form method="post">
             <input type="hidden" name="intent" value="disconnect_integration" />
             <input type="hidden" name="key" value={integrationKey} />
-            <button type="submit" style={smallButton} disabled={isSubmitting}>
-              Disconnect
+            <button type="submit" style={smallButton} disabled={busy}>
+              {pendingIntent === "disconnect_integration" ? "Disconnecting…" : "Disconnect"}
             </button>
-          </Form>
+          </fetcher.Form>
         </div>
       </details>
     </div>

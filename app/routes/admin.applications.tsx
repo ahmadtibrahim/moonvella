@@ -23,6 +23,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
       // applications. It is also what makes the answers below non-null when the
       // row is rendered: the submit action writes the contact details and
       // `submittedAt` together, and nothing else writes `submittedAt` at all.
+      //
+      // "Together" is the load-bearing word, and the filter is what enforces it.
+      // When the submit action wrote the details on the update branch but left
+      // `submittedAt` to the create branch, the one store that had already
+      // opened the page — every store — submitted into a row this query could
+      // not see, and the queue was empty while the application sat complete.
       prisma.merchantApplication.findMany({
         where: { status: { in: ["PENDING", "NEEDS_INFO"] }, submittedAt: { not: null } },
         orderBy: { submittedAt: "desc" },

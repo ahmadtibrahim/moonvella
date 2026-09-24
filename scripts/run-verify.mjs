@@ -358,6 +358,22 @@ const CHECKS = [
     file: "scripts/verify-odoo-import.ts",
     requires: [],
   },
+  // The scheduled catalogue sync: the recurring bucket key, the lease and
+  // attempt rules that make a crashed run resumable, the archive path for a
+  // product whose tag was removed, and the refusal to turn a failed read into
+  // zero stock. It drives the job machinery against the verify clone and makes
+  // no Odoo call — the connection it uses is `odoo.invalid`, which RFC 2606
+  // reserves and which therefore never resolves.
+  //
+  // It was written alongside the sync and is registered here for the same reason
+  // the other suites are: an unregistered suite is not run by `--all`, and a
+  // check nobody runs is indistinguishable from no check at all.
+  {
+    name: "odoo-sync",
+    kind: "ts",
+    file: "scripts/verify-odoo-sync.ts",
+    requires: [],
+  },
   // The wholesale price matcher: which row of the "MoonVella Wholesale"
   // pricelist prices a variant at quantity 1, and every case where the answer
   // is a refusal instead. It is a PURE suite — no database, no network, no
@@ -369,6 +385,27 @@ const CHECKS = [
     name: "pricing",
     kind: "ts",
     file: "scripts/verify-pricing.ts",
+    requires: [],
+  },
+  // The address entry aid: Google's Places suggestions on the merchant
+  // application and the admin pickup form.
+  //
+  // It is PURE — no database, no fixture, no network — because the modules it
+  // tests are pure by design: the parser, the request builders and the session
+  // state machine. Google is never contacted; `fetch` is stubbed with the
+  // documented response shapes AND with the way a real fetch rejects an aborted
+  // request, so the checks about a refused key, a busy server and a superseded
+  // keystroke are about this code rather than about the stub. It proves the
+  // requests this code builds and nothing about Places itself — whether a key is
+  // enabled, or a referrer allowed, is a console fact this cannot see.
+  //
+  // The two pages are checked by reading them, comments stripped: the merchant
+  // application is a `.jsx` file, which this build never typechecks, so reading
+  // it is the only automated check it gets.
+  {
+    name: "places",
+    kind: "ts",
+    file: "scripts/verify-places.ts",
     requires: [],
   },
   // Phase A of the shipping work: origin mappings, packaging inheritance,

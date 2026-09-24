@@ -43,6 +43,17 @@ export const JOB_KIND = {
   /** Create or update MoonVella products from Odoo templates. */
   ODOO_PRODUCT_IMPORT: "ODOO_PRODUCT_IMPORT",
   /**
+   * The whole Odoo catalogue sync: the default pickup location, the tagged
+   * products, and the withdrawal of anything that has lost its tag.
+   *
+   * It is RECURRING — see RECURRING_JOBS — because a catalogue that is only
+   * synced when somebody remembers to press a button is a catalogue that
+   * disagrees with Odoo for as long as nobody remembers. The manual control on
+   * the Odoo page runs this same work and records it in this same table, so
+   * "when did it last run" has one answer.
+   */
+  ODOO_CATALOG_SYNC: "ODOO_CATALOG_SYNC",
+  /**
    * Tell Shopify a shipment's tracking, after a booking whose immediate push
    * did not go through.
    *
@@ -216,6 +227,15 @@ export const RECURRING_JOBS: readonly RecurringJob[] = [
     kind: JOB_KIND.SHIPMENT_TRACKING_SWEEP,
     everyMs: 5 * 60 * 1000,
     summary: "Poll carriers for shipments that are due a tracking check.",
+  },
+  {
+    kind: JOB_KIND.ODOO_CATALOG_SYNC,
+    // Six hours. A catalogue is not a shipment: prices and stock move in Odoo
+    // over days, and every run reads the whole tagged set. Often enough that a
+    // change made in the morning is on a seller's screen the same afternoon,
+    // rare enough that it is not the busiest thing this app does.
+    everyMs: 6 * 60 * 60 * 1000,
+    summary: "Read the tagged Odoo catalogue and update MoonVella's drafts.",
   },
 ];
 

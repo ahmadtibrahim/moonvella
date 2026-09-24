@@ -4,7 +4,7 @@ import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import { persistPaymentMethodFromSetupIntent } from "./sellerBilling.server";
 import { redactSecrets, stripeSecretKey } from "./credentials.server";
-import { assertNotDisabled, stripeMode } from "./stripeMode.server";
+import { assertNotDisabled, stripeKeyKindProblem, stripeMode } from "./stripeMode.server";
 
 /**
  * Wholesale payment integration.
@@ -58,6 +58,18 @@ export async function testStripeAuthentication(): Promise<StripeAuthTest> {
   const key = await stripeSecretKey();
   if (!key) {
     return { ok: false, livemode: null, reason: "No Stripe secret key is configured." };
+  }
+
+  /*
+   * A value of the wrong KIND is diagnosed here, without a request. The
+   * alternative is what this used to do: send a publishable key as a bearer
+   * token, collect Stripe's 401, and report it as an authentication failure —
+   * which is true, and tells the operator nothing about the one thing they can
+   * fix. Nothing is spent by not asking: no request, no retry, no rate limit.
+   */
+  const wrongKind = stripeKeyKindProblem(key);
+  if (wrongKind) {
+    return { ok: false, livemode: null, reason: wrongKind };
   }
 
   try {
