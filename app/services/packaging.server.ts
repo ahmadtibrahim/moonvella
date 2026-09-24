@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { recordAudit, AUDIT_ENTITY, type AuditInput } from "~/services/audit.server";
 
 /**
  * SHIPPING DIMENSIONS ARE PACKED DIMENSIONS. The product's own length, width,
@@ -61,6 +62,20 @@ export function roundTripPreserved(entered: number, unit: string, kind: "length"
 
 export async function listPresets() {
   return prisma.packagingPreset.findMany({ where: { isActive: true }, orderBy: { name: "asc" } });
+}
+
+/**
+ * Every pack, retired ones included, for the dropdowns that offer one.
+ *
+ * Retired packs are in this list on purpose and it is not a leak: a carton row
+ * that was filled from a pack before it was retired still points at it, and a
+ * dropdown that could not show the row's own choice would silently reassign it
+ * to whatever option happens to be first. The forms mark a retired pack and
+ * refuse to offer it to a row that has not already chosen it; the filtering is
+ * the form's job, and it can only do it with the row present.
+ */
+export async function listPresetsForChoice() {
+  return prisma.packagingPreset.findMany({ orderBy: [{ isActive: "desc" }, { name: "asc" }] });
 }
 
 export async function getVariantPackages(variantId: string) {
@@ -231,6 +246,235 @@ export async function copyVariantPackaging(fromVariantId: string, toVariantId: s
     }))
   );
   return rows.length;
+}
+
+/* -------------------------------------------------------------------------- *
+ * The packs a carton row can be filled from.
+ * -------------------------------------------------------------------------- */
+
+/**
+ * A SAVED CARTON IS A MEASUREMENT, NOT A PRICE. A pack records the dimensions
+ * of a box the operator buys in quantity, so the same box does not have to be
+ * typed onto every variant that ships in it. It carries what the empty box
+ * weighs and the most it is rated to hold, and neither of those is the parcel's
+ * weight: the gross weight of a shipment depends on what is inside, so it stays
+ * on the row and the pack never supplies it.
+ *
+ * The numbers keep the unit they were entered in, exactly as a carton row does,
+ * because that is the unit they were measured in. A pack saved in centimetres
+ * reads correctly on a page set to inches — the conversion happens in the
+ * display layer, once, and the stored figure does not move.
+ */
+export interface PresetInput {
+  name?: string | null;
+  packageType?: string | null;
+  length?: number | string | null;
+  width?: number | string | null;
+  height?: number | string | null;
+  dimensionUnit?: string | null;
+  emptyWeight?: number | string | null;
+  weightUnit?: string | null;
+  maxWeight?: number | string | null;
+  isActive?: boolean | string;
+}
+
+export class PresetValidationError extends Error {
+  readonly problems: string[];
+  constructor(problems: string[]) {
+    super(`The pack could not be saved: ${problems.join("; ")}`);
+    this.name = "PresetValidationError";
+    this.problems = problems;
+  }
+}
+
+/**
+ * Every reason a pack is not savable, returned together.
+ *
+ * The name is checked case-insensitively against the others even though the
+ * column's constraint is not: two packs called "Small carton" and "small
+ * carton" are one pack to everybody reading a dropdown, and the second one is
+ * always a mistake. Refusing it here says so in a sentence; letting the
+ * database refuse it would say it in a stack trace.
+ */
+export function validatePreset(input: PresetInput, otherNames: string[]): string[] {
+  const problems: string[] = [];
+  const name = String(input.name ?? "").trim();
+
+  if (!name) {
+    problems.push("a pack needs a name");
+  } else if (otherNames.some((other) => other.trim().toLowerCase() === name.toLowerCase())) {
+    problems.push(`"${name}" is already the name of another pack`);
+  }
+
+  for (const field of ["length", "width", "height"] as const) {
+    const raw = input[field];
+    if (raw === undefined || raw === null || String(raw).trim() === "") {
+      problems.push(`${field} is required`);
+      continue;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value)) problems.push(`${field} is not a number`);
+    else if (value <= 0) problems.push(`${field} must be greater than zero`);
+  }
+
+  const empty = optionalWeight(input.emptyWeight);
+  if (empty === "not a number") problems.push("the empty weight is not a number");
+  else if (typeof empty === "number" && empty < 0) problems.push("the empty weight cannot be negative");
+
+  const max = optionalWeight(input.maxWeight);
+  if (max === "not a number") problems.push("the maximum weight is not a number");
+  else if (typeof max === "number" && max < 0) problems.push("the maximum weight cannot be negative");
+
+  if (typeof empty === "number" && typeof max === "number" && max < empty) {
+    problems.push("a pack cannot hold less than it weighs empty");
+  }
+
+  return problems;
+}
+
+/** A weight the operator may leave blank, read as a number or as a refusal. */
+function optionalWeight(raw: number | string | null | undefined): number | null | "not a number" {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : "not a number";
+}
+
+/**
+ * The row a pack is stored as. Every caller has validated first, so the "not a
+ * number" case the reader above can return is unreachable here and is stored as
+ * "not recorded" rather than as a NaN the column would keep.
+ */
+function presetData(input: PresetInput) {
+  const empty = optionalWeight(input.emptyWeight);
+  const max = optionalWeight(input.maxWeight);
+  return {
+    name: String(input.name ?? "").trim(),
+    packageType: input.packageType ? String(input.packageType) : "carton",
+    length: Number(input.length),
+    width: Number(input.width),
+    height: Number(input.height),
+    dimensionUnit: input.dimensionUnit === "in" ? "in" : "cm",
+    emptyWeight: typeof empty === "number" ? empty : null,
+    weightUnit: input.weightUnit === "lb" ? "lb" : "kg",
+    maxWeight: typeof max === "number" ? max : null,
+    isActive: !(input.isActive === false || input.isActive === "false"),
+  };
+}
+
+/**
+ * Every pack, active and retired, with how many carton rows point at each.
+ *
+ * The count is the reason this is not `listPresets`, which is what the packaging
+ * editors read: an operator deciding whether to delete a pack needs to know how
+ * many rows chose it, and a page that showed the packs without that would make
+ * "delete" look like it costs nothing.
+ */
+export async function listPresetsAll() {
+  return prisma.packagingPreset.findMany({
+    orderBy: [{ isActive: "desc" }, { name: "asc" }],
+    include: { _count: { select: { packages: true, productPackages: true } } },
+  });
+}
+
+export async function createPreset(
+  input: PresetInput,
+  actor: Pick<AuditInput, "actorType" | "actorId" | "actorName" | "ipAddress" | "userAgent">,
+) {
+  const existing = await prisma.packagingPreset.findMany({ select: { name: true } });
+  const problems = validatePreset(input, existing.map((row) => row.name));
+  if (problems.length > 0) throw new PresetValidationError(problems);
+
+  const created = await prisma.packagingPreset.create({ data: presetData(input) });
+
+  await recordAudit({
+    ...actor,
+    action: "preset.created",
+    entityType: AUDIT_ENTITY.PACKAGING_PRESET,
+    entityId: created.id,
+    afterData: created,
+  });
+  return created;
+}
+
+export async function updatePreset(
+  id: string,
+  input: PresetInput,
+  actor: Pick<AuditInput, "actorType" | "actorId" | "actorName" | "ipAddress" | "userAgent">,
+) {
+  const before = await prisma.packagingPreset.findUnique({ where: { id } });
+  if (!before) throw new Error("That pack no longer exists.");
+
+  const existing = await prisma.packagingPreset.findMany({
+    where: { id: { not: id } },
+    select: { name: true },
+  });
+  const problems = validatePreset(input, existing.map((row) => row.name));
+  if (problems.length > 0) throw new PresetValidationError(problems);
+
+  const after = await prisma.packagingPreset.update({ where: { id }, data: presetData(input) });
+
+  await recordAudit({
+    ...actor,
+    action: "preset.updated",
+    entityType: AUDIT_ENTITY.PACKAGING_PRESET,
+    entityId: id,
+    beforeData: before,
+    afterData: after,
+  });
+  return after;
+}
+
+export async function setPresetActive(
+  id: string,
+  isActive: boolean,
+  actor: Pick<AuditInput, "actorType" | "actorId" | "actorName" | "ipAddress" | "userAgent">,
+) {
+  const before = await prisma.packagingPreset.findUnique({ where: { id } });
+  if (!before) throw new Error("That pack no longer exists.");
+
+  const after = await prisma.packagingPreset.update({ where: { id }, data: { isActive } });
+
+  await recordAudit({
+    ...actor,
+    action: isActive ? "preset.activated" : "preset.deactivated",
+    entityType: AUDIT_ENTITY.PACKAGING_PRESET,
+    entityId: id,
+    beforeData: { isActive: before.isActive },
+    afterData: { isActive: after.isActive },
+  });
+  return after;
+}
+
+/**
+ * Remove a pack.
+ *
+ * THE ROWS THAT CHOSE IT KEEP THEIR NUMBERS. The foreign key is ON DELETE SET
+ * NULL, so a variant package loses the LINK to the pack and not the dimensions
+ * that were copied from it — a carton that had been filled from "Medium carton"
+ * still weighs what it weighs. That is what makes deleting safe, and it is why
+ * the page can offer it at all: the alternative, refusing to delete a pack that
+ * is in use, would leave a mistyped one in every dropdown forever.
+ */
+export async function deletePreset(
+  id: string,
+  actor: Pick<AuditInput, "actorType" | "actorId" | "actorName" | "ipAddress" | "userAgent">,
+) {
+  const before = await prisma.packagingPreset.findUnique({
+    where: { id },
+    include: { _count: { select: { packages: true, productPackages: true } } },
+  });
+  if (!before) throw new Error("That pack no longer exists.");
+
+  await prisma.packagingPreset.delete({ where: { id } });
+
+  await recordAudit({
+    ...actor,
+    action: "preset.deleted",
+    entityType: AUDIT_ENTITY.PACKAGING_PRESET,
+    entityId: id,
+    beforeData: before,
+  });
+  return { rowsThatKeptTheirNumbers: before._count.packages + before._count.productPackages };
 }
 
 /** The package fields every resolution reads, from either table. */

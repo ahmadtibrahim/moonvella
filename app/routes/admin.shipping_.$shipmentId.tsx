@@ -40,6 +40,8 @@ import {
 } from "~/services/fulfillment.server";
 import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
+import { getUnitsPreference } from "~/services/adminPreferences.server";
+import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
 
 const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
   "packed",
@@ -231,7 +233,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const selectedQuote = quotes.find((q) => q.selected) ?? null;
 
+  /*
+   * The admin's unit preference, for reading a parcel's stored centimetres and
+   * kilograms back in the unit the operator is working in. The stored values do
+   * not move: this is the same conversion the packaging editors do, on a value
+   * whose own unit is fixed.
+   */
+  const units = unitsView(await getUnitsPreference());
+
   return {
+    units,
     shipment: {
       id: shipment.id,
       reference: shipment.id.slice(0, 8),
@@ -335,8 +346,22 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const orderId = shipment.orderId;
 
     if (intent === "add_package") {
-      const dimensionUnit = String(form.get("dimensionUnit") || "in");
-      const weightUnit = String(form.get("weightUnit") || "lb");
+      /*
+       * The unit the form was drawn in — the admin's, not a per-parcel choice.
+       * There is one unit setting for the whole admin and this form reads it
+       * like every other: an operator who set centimetres should not have to
+       * remember to also change a dropdown before typing a parcel.
+       *
+       * The value the form carried back wins over the stored preference, for the
+       * same reason it does everywhere else: a preference changed in another tab
+       * while this page sat open must not reinterpret a number somebody typed
+       * while looking at a label in the old unit. A hand-made request with
+       * neither falls back to the stored preference rather than guessing.
+       */
+      const submitted = form.get("units");
+      const preference = isUnitPreference(submitted) ? submitted : await getUnitsPreference();
+      const dimensionUnit = unitsView(preference).dimensionUnit;
+      const weightUnit = unitsView(preference).weightUnit;
       const length = Number(form.get("length"));
       const width = Number(form.get("width"));
       const height = Number(form.get("height"));
@@ -674,7 +699,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -777,15 +802,21 @@ export default function AdminShipmentDetail() {
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.6rem" }}>
             <thead>
-              <tr><th style={th}>Count</th><th style={th}>Dimensions (cm)</th><th style={th}>Weight (kg)</th><th style={th}>Total weight</th><th style={th}></th></tr>
+              {/*
+                * The stored columns are centimetres and kilograms — that is what
+                * a carrier is told and it does not change with the preference —
+                * so the heading and the figures are both read in the unit the
+                * operator is working in, converted for display only.
+                */}
+              <tr><th style={th}>Count</th><th style={th}>Dimensions ({units.dimensionUnit})</th><th style={th}>Weight ({units.weightUnit})</th><th style={th}>Total weight</th><th style={th}></th></tr>
             </thead>
             <tbody>
               {packages.map((p) => (
                 <tr key={p.id} style={{ borderTop: "1px solid #f1f5f9" }}>
                   <td style={td}>{p.count}</td>
-                  <td style={td}>{p.length} × {p.width} × {p.height}</td>
-                  <td style={td}>{p.weight}</td>
-                  <td style={td}>{(p.weight * p.count).toFixed(3)}</td>
+                  <td style={td}>{convertedDisplay(p.length, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.width, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.height, "cm", units.dimensionUnit, "length")}</td>
+                  <td style={td}>{convertedDisplay(p.weight, "kg", units.weightUnit, "weight")}</td>
+                  <td style={td}>{convertedDisplay(p.weight * p.count, "kg", units.weightUnit, "weight")}</td>
                   <td style={td}>
                     {!shipment.providerShipmentId ? (
                       <Form method="post">
@@ -803,23 +834,15 @@ export default function AdminShipmentDetail() {
         {!shipment.providerShipmentId ? (
           <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
             <input type="hidden" name="intent" value="add_package" />
+            {/* The unit this form was drawn in. There is no selector beside the
+                fields: the admin has one unit setting and it is on the
+                Settings page, where it says that it applies everywhere. */}
+            <input type="hidden" name="units" value={units.preference} />
             <label style={label}>Count<br /><input style={{ ...input, width: 70 }} name="count" type="number" defaultValue={1} min={1} /></label>
-            <label style={label}>Length<br /><input style={{ ...input, width: 80 }} name="length" type="number" step="0.01" required /></label>
-            <label style={label}>Width<br /><input style={{ ...input, width: 80 }} name="width" type="number" step="0.01" required /></label>
-            <label style={label}>Height<br /><input style={{ ...input, width: 80 }} name="height" type="number" step="0.01" required /></label>
-            <label style={label}>Dimension unit<br />
-              <select name="dimensionUnit" defaultValue="in" style={input}>
-                <option value="in">in</option>
-                <option value="cm">cm</option>
-              </select>
-            </label>
-            <label style={label}>Gross weight<br /><input style={{ ...input, width: 90 }} name="weight" type="number" step="0.01" required /></label>
-            <label style={label}>Weight unit<br />
-              <select name="weightUnit" defaultValue="lb" style={input}>
-                <option value="lb">lb</option>
-                <option value="kg">kg</option>
-              </select>
-            </label>
+            <label style={label}>Length ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="length" type="number" step="0.01" required /></label>
+            <label style={label}>Width ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="width" type="number" step="0.01" required /></label>
+            <label style={label}>Height ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="height" type="number" step="0.01" required /></label>
+            <label style={label}>Gross weight ({units.weightUnit})<br /><input style={{ ...input, width: 90 }} name="weight" type="number" step="0.01" required /></label>
             <button type="submit" style={btn("#0369a1")}>Add parcel</button>
           </Form>
         ) : null}

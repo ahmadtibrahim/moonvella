@@ -18,12 +18,9 @@ import {
   LINE,
   helpText,
 } from "./ui";
-import {
-  storedToDisplay,
-  UNITS_VALUES,
-  unitsView,
-  type UnitsView,
-} from "~/utils/measurementUnits";
+import { convertedDisplay, storedToDisplay, type UnitsView } from "~/utils/measurementUnits";
+import { fillPackagingRow, preservePackagingRows } from "./packagingRows";
+import { PackagingValue } from "./PackagingValue";
 
 /**
  * Variants — the things that are actually sold.
@@ -36,8 +33,9 @@ import {
  * MEASUREMENT UNITS. The canonical storage is centimetres and kilograms — that
  * is what a quote, a booking and an order snapshot read, and it does not change
  * here. What the operator SEES and TYPES is whichever unit the admin is set to,
- * chosen once on the Settings page or from the selector on this form, and
- * defaulting to inches and pounds.
+ * chosen ONCE on the Settings page and defaulting to inches and pounds. There is
+ * deliberately no second selector on this page: two places to change one global
+ * setting is two places to disagree about it.
  *
  * The ambiguity this used to guard against — "the number in the database
  * depends on which box was filled last" — is answered rather than avoided:
@@ -112,6 +110,8 @@ interface Preset {
   emptyWeight: number | null;
   weightUnit: string;
   maxWeight: number | null;
+  /** Retired packs stay readable on the rows that already chose them. */
+  isActive: boolean;
 }
 
 interface Product {
@@ -120,23 +120,17 @@ interface Product {
   variants: Variant[];
 }
 
-function dec(value: unknown): string {
-  return value === null || value === undefined ? "" : String(value);
-}
-
 export default function VariantsTab({
   product,
   presets,
   canEditCost,
   units,
-  canChangeUnits,
 }: {
   product: Product;
   presets: Preset[];
   canEditCost: boolean;
   /** The admin's unit preference, resolved by the route and rendered here. */
   units: UnitsView;
-  canChangeUnits: boolean;
 }) {
   const [params] = useSearchParams();
   // Which variant's editor is open. Held in the URL so a half-finished edit
@@ -188,7 +182,6 @@ export default function VariantsTab({
           presets={presets}
           canEditCost={canEditCost}
           units={units}
-          canChangeUnits={canChangeUnits}
           mode="add"
         />
       ) : null}
@@ -201,7 +194,6 @@ export default function VariantsTab({
             presets={presets}
             canEditCost={canEditCost}
             units={units}
-            canChangeUnits={canChangeUnits}
             mode="edit"
             variant={variant}
           />
@@ -317,11 +309,17 @@ function VariantCard({
           label="Product weight"
           value={weight ? `${weight} ${units.weightUnit}` : "not measured"}
         />
+        {/*
+          * Shown in the admin's unit, converted from the unit the row is stored
+          * in. A carton recorded in centimetres reads in inches on a page set to
+          * inches, which is the point of the setting — and the conversion is for
+          * reading only: nothing here is written back.
+          */}
         <Fact
           label="Shipping carton"
           value={
             carton
-              ? `${carton.length} × ${carton.width} × ${carton.height} ${carton.dimensionUnit}, ${carton.grossWeight} ${carton.weightUnit}`
+              ? `${convertedDisplay(carton.length, carton.dimensionUnit, units.dimensionUnit, "length")} × ${convertedDisplay(carton.width, carton.dimensionUnit, units.dimensionUnit, "length")} × ${convertedDisplay(carton.height, carton.dimensionUnit, units.dimensionUnit, "length")} ${units.dimensionUnit}, ${convertedDisplay(carton.grossWeight, carton.weightUnit, units.weightUnit, "weight")} ${units.weightUnit}`
               : "not set"
           }
         />
@@ -368,11 +366,16 @@ function Fact({ label: text, value }: { label: string; value: string }) {
  * document in the same order — no row is added or removed without a round trip,
  * so the arrays cannot fall out of step.
  *
- * The unit is per row and stays per row: a carton keeps whichever unit it was
- * recorded in, because that is the unit its numbers were measured in and the
- * carrier reads the row as written. What the admin preference decides is only
- * what an EMPTY row starts as, so a new carton is offered in the unit the
- * operator is already thinking in.
+ * THE UNIT IS THE ADMIN'S, NOT THE ROW'S. Every figure on this table is shown
+ * and entered in the unit the Settings page sets, and the row's stored unit is
+ * kept out of sight behind it — see `./packagingRows` for how a row that was
+ * never touched is put back exactly as it is stored, and how a row that was
+ * edited is re-expressed without drifting. A blank row starts in the admin's
+ * unit because there is nothing stored for it yet.
+ *
+ * A PACK FILLS IN THE BOX, NOT THE PARCEL. Choosing one copies the three
+ * dimensions and leaves the gross weight alone, because the weight of a shipment
+ * is a fact about what is inside the box and that differs for every variant.
  */
 function PackagingEditor({
   variant,
@@ -396,26 +399,32 @@ function PackagingEditor({
       </summary>
       <p style={{ ...helpText, marginTop: "0.4rem" }}>
         These measurements are what a shipping quote is calculated from, so an order records
-        whichever carton is listed first.
+        whichever carton is listed first. Everything here is in {units.phrase}, the unit set on
+        the Settings page.
       </p>
 
-      <Form method="post">
+      <Form method="post" onSubmit={preservePackagingRows}>
         <input type="hidden" name="tab" value="variants" />
         <input type="hidden" name="variantId" value={variant.id} />
+        {/* The unit this table was drawn in, so a row is saved in the unit its
+            own labels were written in even if the preference changed elsewhere
+            while the page sat open. */}
+        <input type="hidden" name="units" value={units.preference} />
 
         <div style={{ overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.75rem", marginTop: "0.5rem" }}>
           <thead>
             <tr style={{ textAlign: "left", color: FAINT }}>
+              {/* The pack comes first because it is the shortcut: pick the box
+                  you ship in and the three measurements below fill in. */}
+              <th style={{ padding: "0.3rem" }}>Pack</th>
               <th style={{ padding: "0.3rem" }}>Label</th>
               <th style={{ padding: "0.3rem" }}>Type</th>
               <th style={{ padding: "0.3rem" }}>Description</th>
-              <th style={{ padding: "0.3rem" }}>L</th>
-              <th style={{ padding: "0.3rem" }}>W</th>
-              <th style={{ padding: "0.3rem" }}>H</th>
-              <th style={{ padding: "0.3rem" }}>Unit</th>
-              <th style={{ padding: "0.3rem" }}>Gross wt</th>
-              <th style={{ padding: "0.3rem" }}>Unit</th>
+              <th style={{ padding: "0.3rem" }}>L ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>W ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>H ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>Gross wt ({units.weightUnit})</th>
               <th style={{ padding: "0.3rem" }}>Units/pkg</th>
               <th style={{ padding: "0.3rem" }}>Declared value</th>
               <th style={{ padding: "0.3rem" }}>Ships separately</th>
@@ -424,7 +433,15 @@ function PackagingEditor({
           </thead>
           <tbody>
             {rows.map((row, index) => (
-              <tr key={row?.id ?? `new-${index}`}>
+              <tr
+                key={row?.id ?? `new-${index}`}
+                data-pkg-row={index}
+                data-global-dim={units.dimensionUnit}
+                data-global-weight={units.weightUnit}
+              >
+                <td style={{ padding: "0.2rem" }}>
+                  <PackSelect row={row} presets={presets} units={units} index={index} />
+                </td>
                 <td style={{ padding: "0.2rem" }}>
                   <input
                     style={input}
@@ -452,45 +469,25 @@ function PackagingEditor({
                 </td>
                 {(["length", "width", "height"] as const).map((dimension) => (
                   <td style={{ padding: "0.2rem" }} key={dimension}>
-                    <input
-                      style={input}
+                    <PackagingValue
                       name={`pkg_${dimension}`}
-                      inputMode="decimal"
-                      defaultValue={row ? dec(row[dimension]) : ""}
-                      aria-label={`Carton ${index + 1} ${dimension}`}
+                      kind="length"
+                      label={`Carton ${index + 1} ${dimension}`}
+                      stored={row ? row[dimension] : null}
+                      storedUnit={row?.dimensionUnit ?? units.dimensionUnit}
+                      shownUnit={units.dimensionUnit}
                     />
                   </td>
                 ))}
                 <td style={{ padding: "0.2rem" }}>
-                  <select
-                    style={input}
-                    name="pkg_dimUnit"
-                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
-                    aria-label={`Carton ${index + 1} dimension unit`}
-                  >
-                    <option value="in">in</option>
-                    <option value="cm">cm</option>
-                  </select>
-                </td>
-                <td style={{ padding: "0.2rem" }}>
-                  <input
-                    style={input}
+                  <PackagingValue
                     name="pkg_weight"
-                    inputMode="decimal"
-                    defaultValue={row ? dec(row.grossWeight) : ""}
-                    aria-label={`Carton ${index + 1} gross weight`}
+                    kind="weight"
+                    label={`Carton ${index + 1} gross weight`}
+                    stored={row ? row.grossWeight : null}
+                    storedUnit={row?.weightUnit ?? units.weightUnit}
+                    shownUnit={units.weightUnit}
                   />
-                </td>
-                <td style={{ padding: "0.2rem" }}>
-                  <select
-                    style={input}
-                    name="pkg_weightUnit"
-                    defaultValue={row?.weightUnit ?? units.weightUnit}
-                    aria-label={`Carton ${index + 1} weight unit`}
-                  >
-                    <option value="lb">lb</option>
-                    <option value="kg">kg</option>
-                  </select>
                 </td>
                 <td style={{ padding: "0.2rem" }}>
                   <input
@@ -536,10 +533,26 @@ function PackagingEditor({
                   />
                 </td>
                 {/* Inside a cell: an input that is a direct child of a `<tr>` is
-                    invalid markup and browsers move it out of the table. */}
+                    invalid markup and browsers move it out of the table.
+
+                    The two unit fields are here rather than in a column of their
+                    own because they are no longer a choice — the admin's unit
+                    decides what every row shows. What is submitted is the unit
+                    the row's numbers are being SAVED in: the unit it is already
+                    stored in when nothing was touched, and the unit on screen
+                    when something was. `packagingRows` moves them. */}
                 <td style={{ display: "none" }}>
                   <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
-                  <input type="hidden" name="pkg_presetId" value={row?.presetId ?? ""} />
+                  <input
+                    type="hidden"
+                    name="pkg_dimUnit"
+                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
+                  />
+                  <input
+                    type="hidden"
+                    name="pkg_weightUnit"
+                    defaultValue={row?.weightUnit ?? units.weightUnit}
+                  />
                 </td>
               </tr>
             ))}
@@ -560,29 +573,70 @@ function PackagingEditor({
         </p>
       ) : null}
 
-      {presets.length ? (
-        <details style={{ marginTop: "0.5rem" }}>
-          <summary style={{ cursor: "pointer", fontSize: "0.72rem", color: MUTED }}>
-            Standard cartons ({presets.length}) — measurements to copy from
-          </summary>
-          <ul style={{ margin: "0.4rem 0 0", paddingLeft: "1.1rem", fontSize: "0.72rem", color: MUTED, lineHeight: 1.7 }}>
-            {presets.map((preset) => (
-              <li key={preset.id}>
-                <strong>{preset.name}</strong> — {preset.length} × {preset.width} × {preset.height}{" "}
-                {preset.dimensionUnit}
-                {preset.emptyWeight !== null ? `, empty ${preset.emptyWeight} ${preset.weightUnit}` : ""}
-                {preset.maxWeight !== null ? `, holds up to ${preset.maxWeight} ${preset.weightUnit}` : ""}
-              </li>
-            ))}
-          </ul>
-          <p style={{ ...helpText, paddingLeft: "1.1rem" }}>
-            A preset describes the empty box. The weight and the number of units inside it are
-            different for every variant, so they stay on the variant.
-          </p>
-        </details>
-      ) : null}
     </details>
   );
+}
+
+/**
+ * The saved pack a carton row was filled from.
+ *
+ * A pack that has been retired is still OFFERED on a row that already points at
+ * it, marked as retired, because the alternative is worse than it sounds: the
+ * select would fall back to its first option, and saving the row would silently
+ * unlink a carton from the pack it was built from. A retired pack cannot be
+ * chosen for a row that does not already use it.
+ */
+function PackSelect({
+  row,
+  presets,
+  units,
+  index,
+}: {
+  row: Variant["packages"][number] | null;
+  presets: Preset[];
+  units: UnitsView;
+  index: number;
+}) {
+  const options = presets.filter((preset) => preset.isActive || preset.id === row?.presetId);
+
+  return (
+    <select
+      style={input}
+      name="pkg_presetId"
+      defaultValue={row?.presetId ?? ""}
+      aria-label={`Carton ${index + 1} pack`}
+      onChange={(event) => fillPackagingRow(event.currentTarget)}
+    >
+      <option value="">— none —</option>
+      {options.map((preset) => (
+        <option
+          key={preset.id}
+          value={preset.id}
+          data-length={preset.length}
+          data-width={preset.width}
+          data-height={preset.height}
+          data-unit={preset.dimensionUnit}
+        >
+          {packLabel(preset, units)}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+/**
+ * A pack in a dropdown: its name and the box it actually is.
+ *
+ * The dimensions are converted into the unit the page is in, so the choice can
+ * be made by reading rather than by remembering which pack is which — two packs
+ * whose names differ by one word are told apart by their measurements, which are
+ * the thing being chosen.
+ */
+function packLabel(preset: Preset, units: UnitsView): string {
+  const dims = (["length", "width", "height"] as const)
+    .map((dimension) => convertedDisplay(preset[dimension], preset.dimensionUnit, units.dimensionUnit, "length"))
+    .join(" × ");
+  return `${preset.name} — ${dims} ${units.dimensionUnit}${preset.isActive ? "" : " (retired)"}`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -594,7 +648,6 @@ function VariantForm({
   presets,
   canEditCost,
   units,
-  canChangeUnits,
   mode,
   variant,
 }: {
@@ -602,7 +655,6 @@ function VariantForm({
   presets: Preset[];
   canEditCost: boolean;
   units: UnitsView;
-  canChangeUnits: boolean;
   mode: "add" | "edit";
   variant?: Variant;
 }) {
@@ -621,16 +673,6 @@ function VariantForm({
         centimetres and kilograms either way — a quote, a booking and an order snapshot all read
         the one canonical figure.
       </p>
-
-      {/* The unit selector.
-
-          It sits outside the variant form because a form cannot be nested in
-          another, and it posts its own intent: choosing a unit is a preference,
-          not a variant edit, and it must not save — or be blocked by — the
-          half-filled variant beside it. The choice is global, so the note says
-          so; without that, an operator reasonably reads it as a setting for
-          this product only. */}
-      <UnitsSelector units={units} canChange={canChangeUnits} />
 
       <Form method="post" onSubmit={preserveUntouchedMeasurements}>
         <input type="hidden" name="tab" value="variants" />
@@ -913,56 +955,10 @@ function preserveUntouchedMeasurements(event: FormEvent<HTMLFormElement>) {
   }
 }
 
-/**
- * Inches or centimetres, applied to the whole admin.
- *
- * Rendered as a form of its own because a preference is not part of the variant
- * being edited: posting it must work on a form whose required fields are still
- * empty, and it must not save anything else. The pair is named in full — a
- * lone "CM" does not tell an operator that the weights follow it.
+/*
+ * The unit selector that used to sit here is gone, and its absence is the
+ * feature: the unit is set once on the Settings page and every page in the
+ * admin reads it. Two selectors for one preference is how an operator ends up
+ * changing it in the place that does not save, or believing the choice applies
+ * to the product they are looking at when it applies to all of them.
  */
-function UnitsSelector({ units, canChange }: { units: UnitsView; canChange: boolean }) {
-  if (!canChange) {
-    return (
-      <p style={{ ...helpText, marginBottom: "0.75rem" }}>
-        Measurements are shown and entered in {units.phrase}.
-      </p>
-    );
-  }
-
-  return (
-    <Form
-      method="post"
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "0.75rem",
-        flexWrap: "wrap",
-        border: `1px solid ${LINE}`,
-        borderRadius: 6,
-        padding: "0.5rem 0.7rem",
-        marginBottom: "0.9rem",
-      }}
-    >
-      <input type="hidden" name="tab" value="variants" />
-      <span style={{ fontSize: "0.78rem", color: MUTED }}>Measurements in:</span>
-      {UNITS_VALUES.map((value) => (
-        <label key={value} style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.8rem", color: INK }}>
-          <input
-            type="radio"
-            name="units"
-            value={value}
-            defaultChecked={value === units.preference}
-          />
-          {unitsView(value).phrase}
-        </label>
-      ))}
-      <button type="submit" name="intent" value="set_units" style={btn(MUTED)}>
-        Apply
-      </button>
-      <span style={{ fontSize: "0.72rem", color: FAINT }}>
-        Applies to every product page in the admin.
-      </span>
-    </Form>
-  );
-}

@@ -1,13 +1,6 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import {
-  requirePermission,
-  assertSameOrigin,
-  getRequestMeta,
-  // Checked directly for the unit preference, which is writable by a different
-  // permission than the one that guards the rest of this page.
-  userCan,
-} from "~/utils/adminAuth.server";
+import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { permissionsFor } from "~/services/permissions";
 import {
@@ -37,7 +30,7 @@ import { publicationReadiness } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import {
   getProductPackages,
-  listPresets,
+  listPresetsForChoice,
   resolvePackagesForVariant,
   saveProductPackages,
   saveVariantPackages,
@@ -50,16 +43,16 @@ import {
   type OriginLocation,
 } from "~/services/origins.server";
 import { card, INK, MUTED, catalogueValue, listValue } from "~/components/product/ui";
-import {
-  getUnitsPreference,
-  setUnitsPreference,
-  unitsChangedMessage,
-} from "~/services/adminPreferences.server";
+// Reading the preference only. It is CHANGED on the Settings page and nowhere
+// else: one choice for the whole admin, made once, which is what makes a
+// measurement mean the same thing on every page.
+import { getUnitsPreference } from "~/services/adminPreferences.server";
 import {
   enteredToCanonical,
   isUnitPreference,
   unitsView,
   type MeasureKind,
+  type UnitPreference,
 } from "~/utils/measurementUnits";
 import DetailsTab from "~/components/product/DetailsTab";
 import VariantsTab from "~/components/product/VariantsTab";
@@ -94,8 +87,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const url = new URL(request.url);
   const tab = readTab(url.searchParams.get("tab"));
+  /*
+   * Every saved pack, retired ones included. The editors need the retired ones
+   * to keep showing the pack a row already chose — dropping it from the list
+   * would make the dropdown fall back to its first option and quietly unlink the
+   * row the next time somebody saved that page.
+   */
   const [presets, media, readiness, pack] = await Promise.all([
-    listPresets(),
+    listPresetsForChoice(),
     listProductMedia(productId),
     publicationReadiness(productId),
     // Describes the seller's pack without opening any of its files, so the
@@ -142,10 +141,6 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     can: {
       manage: held.has("products.manage"),
       cost: held.has("products.cost.edit"),
-      // Whether this person may change the unit preference from the inline
-      // selector. The selector is not drawn without it, and the intent below
-      // refuses either way.
-      settingsGeneral: held.has("settings.general"),
     },
   };
 }
@@ -168,8 +163,16 @@ type LoadedProduct = NonNullable<Awaited<ReturnType<typeof getProduct>>>;
  * carton edited through the editor would quietly lose its declared value, its
  * description and its "ships separately" flag, and the quote would change
  * without anybody touching a number.
+ *
+ * THE UNIT DEFAULTS COME FROM THE PREFERENCE the form was drawn in, and they are
+ * only defaults: a row always submits its own unit beside its own numbers. What
+ * they cover is the row that submits neither — an operator who typed dimensions
+ * into a row whose hidden unit fields were somehow absent — and the right answer
+ * for that row is the unit those numbers were on screen in, which is the one the
+ * page was rendered with.
  */
-function packageRows(form: FormData) {
+function packageRows(form: FormData, unitsPref: UnitPreference) {
+  const view = unitsView(unitsPref);
   const at = (name: string, index: number) => String(form.getAll(name)[index] ?? "");
   return form.getAll("pkg_length").map((_, index) => ({
     label: at("pkg_label", index),
@@ -178,11 +181,9 @@ function packageRows(form: FormData) {
     length: at("pkg_length", index),
     width: at("pkg_width", index),
     height: at("pkg_height", index),
-    // The forms default to inches and pounds; the service converts once, to the
-    // canonical centimetres and kilograms, without rounding the stored value.
-    dimensionUnit: at("pkg_dimUnit", index) || "in",
+    dimensionUnit: at("pkg_dimUnit", index) || view.dimensionUnit,
     grossWeight: at("pkg_weight", index),
-    weightUnit: at("pkg_weightUnit", index) || "lb",
+    weightUnit: at("pkg_weightUnit", index) || view.weightUnit,
     unitsPerPackage: at("pkg_unitsPerPackage", index) || "1",
     packagesPerUnit: at("pkg_packagesPerUnit", index) || "1",
     description: at("pkg_description", index) || null,
@@ -338,25 +339,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   try {
     switch (intent) {
-      /*
-       * The inline selector on the variant form writes the same global
-       * preference the Settings page does. It is here because the operator is
-       * looking at the boxes they want to type in when they decide, and sending
-       * them to another page to make the choice would mean leaving the form.
-       *
-       * It is gated on the general-settings permission rather than on
-       * products.manage: editing a product and deciding what unit every
-       * operator reads in are different powers, and the second is not implied
-       * by the first.
-       */
-      case "set_units": {
-        if (!userCan(user, "settings.general")) {
-          throw new Response("Your role does not permit this.", { status: 403 });
-        }
-        const saved = await setUnitsPreference(form.get("units"), actor);
-        return { unitsChanged: unitsChangedMessage(saved) };
-      }
-
       /* ---------------------------------------------------------------- */
       /* Product details                                                   */
       /* ---------------------------------------------------------------- */
@@ -578,7 +560,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
       /* Shipping and packaging — a separate feature, kept working          */
       /* ---------------------------------------------------------------- */
       case "save_packaging":
-        await saveVariantPackages(text("variantId"), packageRows(form));
+        await saveVariantPackages(text("variantId"), packageRows(form, unitsPref));
         break;
 
       case "copy_packaging":
@@ -592,7 +574,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
        * row refused as a set rather than filtered — lives in one place.
        */
       case "save_product_packages":
-        await saveProductPackages(productId, packageRows(form));
+        await saveProductPackages(productId, packageRows(form, unitsPref));
         break;
 
       case "save_origin": {
@@ -678,24 +660,6 @@ export default function AdminProductDetail() {
         </div>
       ) : null}
 
-      {/* The unit preference can also be changed from the selector on the
-          variant form, so its confirmation is printed here rather than inside
-          that tab: this is the one place every tab's post can reach. */}
-      {actionData && "unitsChanged" in actionData ? (
-        <div
-          role="status"
-          style={{
-            ...card,
-            background: "#f0fdf4",
-            borderColor: "#bbf7d0",
-            color: "#166534",
-            fontSize: "0.85rem",
-          }}
-        >
-          {actionData.unitsChanged}
-        </div>
-      ) : null}
-
       <nav
         aria-label="Product sections"
         style={{ display: "flex", gap: "0.25rem", borderBottom: "1px solid #e2e8f0", marginBottom: "1.25rem", flexWrap: "wrap" }}
@@ -738,7 +702,6 @@ export default function AdminProductDetail() {
           presets={presets}
           canEditCost={can.cost}
           units={units}
-          canChangeUnits={can.settingsGeneral}
         />
       ) : null}
       {tab === "shipping" && shipping ? (

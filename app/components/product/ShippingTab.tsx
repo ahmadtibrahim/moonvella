@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Form, Link } from "react-router";
 import {
   INK,
@@ -14,7 +14,9 @@ import {
   sectionNote,
   EmptyState,
 } from "~/components/product/ui";
-import type { UnitsView } from "~/utils/measurementUnits";
+import { convertedDisplay, type UnitsView } from "~/utils/measurementUnits";
+import { fillPackagingRow, preservePackagingRows } from "./packagingRows";
+import { PackagingValue } from "./PackagingValue";
 
 /**
  * Where a product is collected from, and how it is packed.
@@ -40,6 +42,24 @@ export interface ShippingLocation {
   name: string;
   isActive: boolean;
   missing: string[];
+}
+
+/**
+ * A saved carton size, as this tab needs it.
+ *
+ * Not the same list the variant editor gets: a pack is chosen here as well, and
+ * the choice is offered the same way in both places so that "the medium box"
+ * means one thing on every page of the admin. `isActive` is carried because a
+ * retired pack must stay readable on the rows that already chose it.
+ */
+export interface ShippingPreset {
+  id: string;
+  name: string;
+  length: number;
+  width: number;
+  height: number;
+  dimensionUnit: string;
+  isActive: boolean;
 }
 
 export interface ProductPackageRow {
@@ -92,9 +112,9 @@ export default function ShippingTab({
   variants: ShippingVariant[];
   locations: ShippingLocation[];
   packages: ProductPackageRow[];
-  presets: { id: string; name: string; length: number; width: number; height: number; dimensionUnit: string }[];
+  presets: ShippingPreset[];
   canManage: boolean;
-  /** The admin's unit preference, used only to seed a blank carton row. */
+  /** The admin's unit preference: what every carton row is shown in. */
   units: UnitsView;
 }) {
   const unmapped = variants.filter((variant) => variant.originSource === "missing");
@@ -294,9 +314,16 @@ function optionLabel(location: ShippingLocation): string {
  * have as many cartons as it was first saved with, which is not enough for the
  * "one sold unit ships as two parcels" case this exists to describe.
  *
- * The hidden `packagesPerUnit` and `presetId` fields sit inside a cell rather
- * than beside the row: an input that is a direct child of a `<tr>` is not valid
- * markup, and browsers move it out of the table when they parse the page.
+ * ROWS CARRY A STABLE IDENTITY. The key used to be the row's index, which is
+ * the one thing about a row that changes when another one is removed: deleting
+ * the first of two unsaved rows left the survivor wearing the deleted row's key,
+ * so React reused that row's DOM node and the numbers typed into one box
+ * appeared in the other. A counter that only ever goes up gives every row a name
+ * of its own, and the data attributes `packagingRows` reads travel with it.
+ *
+ * The hidden fields sit inside a cell rather than beside the row: an input that
+ * is a direct child of a `<tr>` is not valid markup, and browsers move it out of
+ * the table when they parse the page.
  */
 function PackagingDefaults({
   packages,
@@ -305,16 +332,29 @@ function PackagingDefaults({
   units,
 }: {
   packages: ProductPackageRow[];
-  presets: { id: string; name: string; length: number; width: number; height: number; dimensionUnit: string }[];
+  presets: ShippingPreset[];
   canManage: boolean;
   units: UnitsView;
 }) {
   const [rows, setRows] = useState<(ProductPackageRow | null)[]>(() =>
     packages.length ? packages : [null]
   );
+  // A name per row that survives its neighbours being removed. It starts past
+  // the rows that are already on screen — a saved row's id, or the `new-0` an
+  // empty table begins with — so a row added later can never take a name that
+  // is already in use.
+  const nextKey = useRef(packages.length > 0 ? packages.length : 1);
+  const [keys, setKeys] = useState<string[]>(() => rows.map((row, index) => row?.id ?? `new-${index}`));
 
-  const addRow = () => setRows((current) => [...current, null]);
-  const removeRow = (index: number) => setRows((current) => current.filter((_, i) => i !== index));
+  const addRow = () => {
+    setKeys((current) => [...current, `new-${nextKey.current}`]);
+    nextKey.current += 1;
+    setRows((current) => [...current, null]);
+  };
+  const removeRow = (index: number) => {
+    setKeys((current) => current.filter((_, i) => i !== index));
+    setRows((current) => current.filter((_, i) => i !== index));
+  };
 
   return (
     <div style={card}>
@@ -322,10 +362,13 @@ function PackagingDefaults({
       <p style={sectionNote}>
         The packed measurements of this product — the box, not the item. A shipping quote is
         calculated from these, and every variant without cartons of its own is quoted from them.
+        Everything here is in {units.phrase}, the unit set on the Settings page.
       </p>
 
-      <Form method="post">
+      <Form method="post" onSubmit={preservePackagingRows}>
         <input type="hidden" name="tab" value="shipping" />
+        {/* The unit this table was drawn in — see the variant editor. */}
+        <input type="hidden" name="units" value={units.preference} />
 
         {/* A carton row has a lot of columns and the table must not force the
             whole page sideways at a narrower window. */}
@@ -335,15 +378,14 @@ function PackagingDefaults({
         >
           <thead>
             <tr style={{ textAlign: "left", color: FAINT }}>
+              <th style={{ padding: "0.3rem" }}>Pack</th>
               <th style={{ padding: "0.3rem" }}>Label</th>
               <th style={{ padding: "0.3rem" }}>Type</th>
               <th style={{ padding: "0.3rem" }}>Description</th>
-              <th style={{ padding: "0.3rem" }}>L</th>
-              <th style={{ padding: "0.3rem" }}>W</th>
-              <th style={{ padding: "0.3rem" }}>H</th>
-              <th style={{ padding: "0.3rem" }}>Unit</th>
-              <th style={{ padding: "0.3rem" }}>Gross wt</th>
-              <th style={{ padding: "0.3rem" }}>Unit</th>
+              <th style={{ padding: "0.3rem" }}>L ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>W ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>H ({units.dimensionUnit})</th>
+              <th style={{ padding: "0.3rem" }}>Gross wt ({units.weightUnit})</th>
               <th style={{ padding: "0.3rem" }}>Units/pkg</th>
               <th style={{ padding: "0.3rem" }}>Declared value</th>
               <th style={{ padding: "0.3rem" }}>Ships separately</th>
@@ -353,7 +395,50 @@ function PackagingDefaults({
           </thead>
           <tbody>
             {rows.map((row, index) => (
-              <tr key={row?.id ?? `new-${index}`}>
+              <tr
+                key={keys[index]}
+                data-pkg-row={index}
+                data-global-dim={units.dimensionUnit}
+                data-global-weight={units.weightUnit}
+              >
+                <td style={{ padding: "0.2rem" }}>
+                  <select
+                    style={input}
+                    name="pkg_presetId"
+                    defaultValue={row?.presetId ?? ""}
+                    aria-label={`Carton ${index + 1} pack`}
+                    disabled={!canManage}
+                    onChange={(event) => fillPackagingRow(event.currentTarget)}
+                  >
+                    <option value="">— none —</option>
+                    {presets
+                      .filter((preset) => preset.isActive || preset.id === row?.presetId)
+                      .map((preset) => (
+                        <option
+                          key={preset.id}
+                          value={preset.id}
+                          data-length={preset.length}
+                          data-width={preset.width}
+                          data-height={preset.height}
+                          data-unit={preset.dimensionUnit}
+                        >
+                          {preset.name} —{" "}
+                          {(["length", "width", "height"] as const)
+                            .map((dimension) =>
+                              convertedDisplay(
+                                preset[dimension],
+                                preset.dimensionUnit,
+                                units.dimensionUnit,
+                                "length",
+                              ),
+                            )
+                            .join(" × ")}{" "}
+                          {units.dimensionUnit}
+                          {preset.isActive ? "" : " (retired)"}
+                        </option>
+                      ))}
+                  </select>
+                </td>
                 <td style={{ padding: "0.2rem" }}>
                   <input
                     style={input}
@@ -384,49 +469,27 @@ function PackagingDefaults({
                 </td>
                 {(["length", "width", "height"] as const).map((dimension) => (
                   <td style={{ padding: "0.2rem" }} key={dimension}>
-                    <input
-                      style={input}
+                    <PackagingValue
                       name={`pkg_${dimension}`}
-                      inputMode="decimal"
-                      defaultValue={row ? dec(row[dimension]) : ""}
-                      aria-label={`Carton ${index + 1} ${dimension}`}
+                      kind="length"
+                      label={`Carton ${index + 1} ${dimension}`}
+                      stored={row ? row[dimension] : null}
+                      storedUnit={row?.dimensionUnit ?? units.dimensionUnit}
+                      shownUnit={units.dimensionUnit}
                       disabled={!canManage}
                     />
                   </td>
                 ))}
                 <td style={{ padding: "0.2rem" }}>
-                  <select
-                    style={input}
-                    name="pkg_dimUnit"
-                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
-                    aria-label={`Carton ${index + 1} dimension unit`}
-                    disabled={!canManage}
-                  >
-                    <option value="in">in</option>
-                    <option value="cm">cm</option>
-                  </select>
-                </td>
-                <td style={{ padding: "0.2rem" }}>
-                  <input
-                    style={input}
+                  <PackagingValue
                     name="pkg_weight"
-                    inputMode="decimal"
-                    defaultValue={row ? dec(row.grossWeight) : ""}
-                    aria-label={`Carton ${index + 1} gross weight`}
+                    kind="weight"
+                    label={`Carton ${index + 1} gross weight`}
+                    stored={row ? row.grossWeight : null}
+                    storedUnit={row?.weightUnit ?? units.weightUnit}
+                    shownUnit={units.weightUnit}
                     disabled={!canManage}
                   />
-                </td>
-                <td style={{ padding: "0.2rem" }}>
-                  <select
-                    style={input}
-                    name="pkg_weightUnit"
-                    defaultValue={row?.weightUnit ?? units.weightUnit}
-                    aria-label={`Carton ${index + 1} weight unit`}
-                    disabled={!canManage}
-                  >
-                    <option value="lb">lb</option>
-                    <option value="kg">kg</option>
-                  </select>
                 </td>
                 <td style={{ padding: "0.2rem" }}>
                   <input
@@ -485,10 +548,23 @@ function PackagingDefaults({
                     ×
                   </button>
                 </td>
-                {/* Inside a cell, so the parser keeps it in the row it belongs to. */}
+                {/* Inside a cell, so the parser keeps it in the row it belongs
+                    to. `pkg_presetId` is no longer hidden — it is the pack
+                    dropdown at the front of the row — and the two unit fields
+                    are, because the admin's unit decides what every row shows
+                    and only the unit a row is SAVED in needs submitting. */}
                 <td style={{ display: "none" }}>
                   <input type="hidden" name="pkg_packagesPerUnit" value={row?.packagesPerUnit ?? 1} />
-                  <input type="hidden" name="pkg_presetId" value={row?.presetId ?? ""} />
+                  <input
+                    type="hidden"
+                    name="pkg_dimUnit"
+                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
+                  />
+                  <input
+                    type="hidden"
+                    name="pkg_weightUnit"
+                    defaultValue={row?.weightUnit ?? units.weightUnit}
+                  />
                 </td>
               </tr>
             ))}
@@ -515,41 +591,13 @@ function PackagingDefaults({
         <p style={helpText}>
           Zero or missing measurements are refused rather than stored: a parcel of 0 × 0 × 0 is
           priced by a carrier as if it weighed nothing, and the resulting quote looks like a bargain
-          rather than a mistake. Inches and pounds are converted once, on the way to a carrier, and
-          the value you typed stays in the unit you typed it in.
+          rather than a mistake. Choosing a pack fills in the box&rsquo;s dimensions and never its
+          weight — the gross weight of a parcel is a fact about what is inside it. The figures above
+          are the unit set on the Settings page, converted once for the carrier, and a carton that
+          is not edited keeps the exact measurements it was saved with.
         </p>
       </Form>
-
-      {presets.length ? (
-        <details style={{ marginTop: "0.7rem" }}>
-          <summary style={{ cursor: "pointer", fontSize: "0.75rem", color: MUTED }}>
-            Standard cartons ({presets.length}) — measurements to copy from
-          </summary>
-          <ul
-            style={{
-              margin: "0.4rem 0 0",
-              paddingLeft: "1.1rem",
-              fontSize: "0.75rem",
-              color: MUTED,
-              lineHeight: 1.7,
-            }}
-          >
-            {presets.map((preset) => (
-              <li key={preset.id}>
-                <strong>{preset.name}</strong> — {preset.length} × {preset.width} × {preset.height}{" "}
-                {preset.dimensionUnit}
-              </li>
-            ))}
-          </ul>
-        </details>
-      ) : null}
     </div>
   );
 }
 
-/** Two decimals at most, and never a trailing ".00" the eye has to skip. */
-function dec(value: unknown): string {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "";
-  return String(Math.round(number * 100) / 100);
-}

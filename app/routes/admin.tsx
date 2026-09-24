@@ -32,6 +32,10 @@ const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permi
   { href: "/admin/stores", label: "Stores", icon: "S", permission: "merchants.view" },
   { href: "/admin/rankings", label: "Rankings", icon: "R", permission: "reports.view" },
   { href: "/admin/products", label: "Products", icon: "P", permission: "products.view" },
+  // The boxes a carton row is filled from. It sits with Products rather than
+  // under Settings because it is catalogue data — what a variant ships in — and
+  // the packaging editors on every product point at it.
+  { href: "/admin/packaging", label: "Packaging", icon: "C", permission: "products.view" },
   // Reading Odoo is enough to open the import page; only the import itself
   // needs products.manage, so support staff can look at what would arrive
   // without being able to write it.

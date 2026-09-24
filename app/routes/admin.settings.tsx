@@ -384,13 +384,18 @@ export default function AdminSettings() {
           Units
         </h2>
         <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "1rem" }}>
-          How measurements are entered and shown across the admin: a product&rsquo;s own length,
-          width, height and weight, and the units a new shipping carton starts in. It applies to
-          every product page, not only the one you are looking at. Each carton keeps the unit it
-          was saved in, so switching here never reinterprets one that already exists, and
-          MoonVella stores every measurement in centimetres and kilograms either way &mdash; the
-          conversion is applied to what you type and to what you read, once, so the stored figure
-          does not move when the setting changes.
+          How measurements are entered and shown across the whole admin: a product&rsquo;s own
+          length, width, height and weight, the shipping cartons on a variant or a product, the
+          saved packs you choose a carton from, and the parcels added to a shipment. This is the
+          only place the choice is made &mdash; there is no second selector on the product pages,
+          because two places to set one thing is two places to disagree about it.
+          <br />
+          <br />
+          Changing it never reinterprets a figure that is already saved. MoonVella stores every
+          measurement at a fixed scale and converts once, for what you type and for what you read,
+          so a 30 cm carton is still 30 cm after you switch to inches &mdash; it simply reads
+          11.81 in. What a carton keeps is the unit its own numbers were recorded in; what this
+          decides is the unit every page shows it in.
         </p>
         {canChangeUnits ? (
           <Form method="post">

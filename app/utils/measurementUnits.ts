@@ -151,6 +151,72 @@ export function enteredToCanonical(
 }
 
 /**
+ * A value the PACKAGING TABLES hold, read in a different unit.
+ *
+ * These two are not the same job as `storedToDisplay` above, and the difference
+ * is which way the value is already expressed. A `ProductVariant` measurement is
+ * canonical — always centimetres and kilograms — so reading it is one conversion
+ * from a known unit. A carton row is stored AS ENTERED, in whichever unit the
+ * operator recorded it in, so reading it takes TWO facts: the number and the
+ * unit beside it. That is why both of these take a `fromUnit`.
+ *
+ * `convertedDisplay` is what a page shows and `convertedExact` is what a page
+ * SUBMITS when it has decided to re-express a row in another unit. Keeping them
+ * apart is the whole defence against the drift this module exists to prevent:
+ * the operator reads a rounded figure, and the number that gets stored is the
+ * unrounded one, so a carton re-expressed from centimetres to inches and back
+ * lands on the measurement it started with rather than a few thousandths beside
+ * it. Rounding is for the eye; it is never for the column.
+ */
+export function convertedDisplay(
+  value: unknown,
+  fromUnit: string,
+  toUnit: string,
+  kind: MeasureKind,
+): string {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+
+  const converted =
+    kind === "length"
+      ? fromCm(toCm(number, fromUnit), toUnit)
+      : fromKg(toKg(number, fromUnit), toUnit);
+  return String(kind === "length" ? round2(converted) : round3(converted));
+}
+
+/**
+ * The same conversion WITHOUT rounding, as the string a form submits.
+ *
+ * The result can be long — 30 cm is 11.811023622047244 inches — and that is the
+ * point: it is the same quantity, so a quote that converts it back gets 30 cm
+ * rather than 29.9974. It is shown to nobody; the field on screen holds the
+ * rounded display value, and this one is swapped in at submit time for the
+ * fields the operator did not touch.
+ */
+export function convertedExact(
+  value: unknown,
+  fromUnit: string,
+  toUnit: string,
+  kind: MeasureKind,
+): string {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  /*
+   * Same unit on both sides returns the stored text untouched rather than
+   * pushing it through a multiply and a divide that can only lose precision.
+   */
+  if (fromUnit === toUnit) return String(value);
+
+  const converted =
+    kind === "length"
+      ? fromCm(toCm(number, fromUnit), toUnit)
+      : fromKg(toKg(number, fromUnit), toUnit);
+  return String(converted);
+}
+
+/**
  * A stored canonical value, as the operator's chosen unit shows it.
  *
  * Empty for a measurement that has never been taken, so a box that holds

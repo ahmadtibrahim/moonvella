@@ -250,21 +250,41 @@ async function main() {
     const variants = await get(`/admin/products/${product.id}?tab=variants`, cookie);
     const dimTag = tagWithAttribute(variants.html, 'name="pkg_dimUnit"');
     const weightTag = tagWithAttribute(variants.html, 'name="pkg_weightUnit"');
-    const dims = variants.html.slice(
-      variants.html.indexOf('name="pkg_dimUnit"') - 300,
-      variants.html.indexOf('name="pkg_dimUnit"') + 300
-    );
-    const weights = variants.html.slice(
-      variants.html.indexOf('name="pkg_weightUnit"') - 300,
-      variants.html.indexOf('name="pkg_weightUnit"') + 300
-    );
+    /**
+     * The unit is no longer chosen on the row. It is the admin's, set once on
+     * the Settings page, and what the row submits instead is the unit its
+     * numbers are STORED in — which for a row that has never been saved is the
+     * admin's unit, carried on a hidden field rather than shown as a chooser.
+     *
+     * This clone has never chosen, so the global unit is the default and the
+     * hidden fields say "in" and "lb".
+     */
     check(
-      "A new carton offers inches and pounds first",
-      dims.indexOf('value="in"') !== -1 &&
-        dims.indexOf('value="in"') < dims.indexOf('value="cm"') &&
-        weights.indexOf('value="lb"') !== -1 &&
-        weights.indexOf('value="lb"') < weights.indexOf('value="kg"'),
-      `${dimTag.slice(0, 40)} / ${weightTag.slice(0, 40)}`
+      "A new carton takes its unit from the admin setting, not from a chooser on the row",
+      dimTag.startsWith("<input") &&
+        /type="hidden"/.test(dimTag) &&
+        /value="in"/.test(dimTag) &&
+        weightTag.startsWith("<input") &&
+        /type="hidden"/.test(weightTag) &&
+        /value="lb"/.test(weightTag),
+      `${dimTag.slice(0, 50)} / ${weightTag.slice(0, 50)}`
+    );
+    /**
+     * And the row says which unit it is being SHOWN in, because the two can
+     * differ: this row's numbers may be stored in centimetres while the page
+     * reads in inches, and the submit handler needs the second one to translate
+     * the figures the operator did not touch.
+     */
+    check(
+      "The row records the unit it is shown in, and is marked as a packaging row",
+      /data-pkg-row="0"[^>]*data-global-dim="in"/.test(variants.html) &&
+        /data-pkg-row="0"[^>]*data-global-weight="lb"/.test(variants.html)
+    );
+    const packSelect = tagWithAttribute(variants.html, 'name="pkg_presetId"');
+    check(
+      "And chooses its box from a saved pack rather than typing the numbers",
+      packSelect.startsWith("<select"),
+      packSelect.slice(0, 60)
     );
 
     await post(`/admin/products/${product.id}`, cookie, {

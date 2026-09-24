@@ -86,12 +86,15 @@ export async function setUnitsPreference(
 }
 
 /**
- * The sentence a page prints after the change, and the phrase the form uses.
- * One place, so the settings page and the inline selector on the product form
- * cannot congratulate the operator on two different things.
+ * The sentence the settings page prints after the change.
+ *
+ * One place, and it names the surfaces rather than saying "measurements": the
+ * setting also decides what unit a shipping carton and a saved pack are read in,
+ * and an operator who was told only about product sizes would reasonably think
+ * those were separate.
  */
 export function unitsChangedMessage(value: UnitPreference): string {
   return value === "imperial"
-    ? "Measurements will be entered and shown in inches and pounds."
-    : "Measurements will be entered and shown in centimetres and kilograms.";
+    ? "Inches and pounds everywhere: product measurements, shipping cartons, saved packs and shipment parcels."
+    : "Centimetres and kilograms everywhere: product measurements, shipping cartons, saved packs and shipment parcels.";
 }

@@ -20,6 +20,8 @@ export const AUDIT_ENTITY = {
   PAYMENT_METHOD: "SellerPaymentMethod",
   /** An operator-wide setting that belongs to no store and no record. */
   ADMIN_PREFERENCE: "AdminPreference",
+  /** A saved carton size, chosen on packaging rows rather than typed into them. */
+  PACKAGING_PRESET: "PackagingPreset",
 } as const;
 
 /**
