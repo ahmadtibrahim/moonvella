@@ -18,6 +18,8 @@ export const AUDIT_ENTITY = {
   INTEGRATION: "Integration",
   BILLING_SETTINGS: "SellerBillingSettings",
   PAYMENT_METHOD: "SellerPaymentMethod",
+  /** An operator-wide setting that belongs to no store and no record. */
+  ADMIN_PREFERENCE: "AdminPreference",
 } as const;
 
 /**

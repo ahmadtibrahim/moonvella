@@ -10,22 +10,28 @@ import { prisma } from "~/db.server";
  * different columns and this module only ever reads the packaging ones.
  */
 
-const INCHES_PER_CM = 2.54;
-/** International avoirdupois pound, exact by definition. */
-const KG_PER_LB = 0.45359237;
+/*
+ * The converters live in `~/utils/measurementUnits` and are re-exported here,
+ * because that module is isomorphic: the admin's unit preference is resolved in
+ * a route and rendered in a component, and neither can import a `.server`
+ * module. The definitions moved; the names did not, so every existing import
+ * from this file still resolves to the same function.
+ *
+ * One home for the constants is the point. A second copy of 2.54 is how a
+ * conversion ends up disagreeing with itself, and the display layer beside
+ * these (`ui.tsx`) already carries its own for rendering — a third was not
+ * going to make anything truer.
+ */
+import {
+  fromCm,
+  fromKg,
+  round2,
+  round3,
+  toCm,
+  toKg,
+} from "~/utils/measurementUnits";
 
-export function toCm(value: number, unit: string): number {
-  return unit === "in" ? value * INCHES_PER_CM : value;
-}
-export function toKg(value: number, unit: string): number {
-  return unit === "lb" ? value * KG_PER_LB : value;
-}
-export function fromCm(value: number, unit: string): number {
-  return unit === "in" ? value / INCHES_PER_CM : value;
-}
-export function fromKg(value: number, unit: string): number {
-  return unit === "lb" ? value / KG_PER_LB : value;
-}
+export { fromCm, fromKg, toCm, toKg };
 
 /**
  * Conversions are exact both ways, and the guarantee is worth stating because
@@ -422,12 +428,11 @@ export async function buildQuotePackagesForOrder(order: {
   return { packages, missing, source };
 }
 
-function round2(value: number): number {
-  return Math.round(value * 100) / 100;
-}
-function round3(value: number): number {
-  return Math.round(value * 1000) / 1000;
-}
+/*
+ * The rounding those two helpers did is the same rounding the entry form now
+ * applies to an imperial measurement, so it comes from the shared module
+ * instead of being written out twice.
+ */
 
 export interface PackageSnapshotRow extends QuotePackage {
   packageType: string;

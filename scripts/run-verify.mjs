@@ -465,6 +465,22 @@ const CHECKS = [
     file: "scripts/verify-tracking.ts",
     requires: [],
   },
+  // The unit the operator measures in, against the one the columns store.
+  //
+  // The conversion itself is pure and is checked as arithmetic; the preference
+  // is checked against the clone, with the row snapshotted and put back so a
+  // later suite still reads in inches; and the two forms — the product's and
+  // the settings page's — are READ, with comments stripped, because the failure
+  // this is really about is a display value being saved back over a canonical
+  // one, and that is a property of the form. It needs a session to drive those
+  // screens and does not have one, so it says so in its own output rather than
+  // implying a browser was involved. No network, no Shopify, no Odoo.
+  {
+    name: "units",
+    kind: "ts",
+    file: "scripts/verify-units.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

@@ -14,6 +14,7 @@ import {
   sectionNote,
   EmptyState,
 } from "~/components/product/ui";
+import type { UnitsView } from "~/utils/measurementUnits";
 
 /**
  * Where a product is collected from, and how it is packed.
@@ -85,6 +86,7 @@ export default function ShippingTab({
   packages,
   presets,
   canManage,
+  units,
 }: {
   product: { id: string; name: string; pickupLocationId: string | null };
   variants: ShippingVariant[];
@@ -92,6 +94,8 @@ export default function ShippingTab({
   packages: ProductPackageRow[];
   presets: { id: string; name: string; length: number; width: number; height: number; dimensionUnit: string }[];
   canManage: boolean;
+  /** The admin's unit preference, used only to seed a blank carton row. */
+  units: UnitsView;
 }) {
   const unmapped = variants.filter((variant) => variant.originSource === "missing");
   const inheritingCartons = variants.filter((variant) => variant.packageSource !== "variant");
@@ -231,7 +235,12 @@ export default function ShippingTab({
         ) : null}
       </div>
 
-      <PackagingDefaults packages={packages} presets={presets} canManage={canManage} />
+      <PackagingDefaults
+        packages={packages}
+        presets={presets}
+        canManage={canManage}
+        units={units}
+      />
 
       <div style={card}>
         <h2 style={sectionTitle}>What each variant is quoted from</h2>
@@ -293,10 +302,12 @@ function PackagingDefaults({
   packages,
   presets,
   canManage,
+  units,
 }: {
   packages: ProductPackageRow[];
   presets: { id: string; name: string; length: number; width: number; height: number; dimensionUnit: string }[];
   canManage: boolean;
+  units: UnitsView;
 }) {
   const [rows, setRows] = useState<(ProductPackageRow | null)[]>(() =>
     packages.length ? packages : [null]
@@ -387,7 +398,7 @@ function PackagingDefaults({
                   <select
                     style={input}
                     name="pkg_dimUnit"
-                    defaultValue={row?.dimensionUnit ?? "in"}
+                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
                     aria-label={`Carton ${index + 1} dimension unit`}
                     disabled={!canManage}
                   >
@@ -409,7 +420,7 @@ function PackagingDefaults({
                   <select
                     style={input}
                     name="pkg_weightUnit"
-                    defaultValue={row?.weightUnit ?? "lb"}
+                    defaultValue={row?.weightUnit ?? units.weightUnit}
                     aria-label={`Carton ${index + 1} weight unit`}
                     disabled={!canManage}
                   >

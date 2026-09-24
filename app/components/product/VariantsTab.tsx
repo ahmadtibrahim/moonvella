@@ -1,3 +1,4 @@
+import type { FormEvent } from "react";
 import { Form, Link, useSearchParams } from "react-router";
 import {
   card,
@@ -11,14 +12,18 @@ import {
   ConfirmForm,
   money,
   centsToInput,
-  cmToInches,
-  kgToPounds,
   INK,
   MUTED,
   FAINT,
   LINE,
   helpText,
 } from "./ui";
+import {
+  storedToDisplay,
+  UNITS_VALUES,
+  unitsView,
+  type UnitsView,
+} from "~/utils/measurementUnits";
 
 /**
  * Variants — the things that are actually sold.
@@ -28,12 +33,18 @@ import {
  * That is why this tab is the busiest one and why the product cannot be
  * published until at least one variant exists and has a default.
  *
- * MEASUREMENT UNITS. The canonical storage is centimetres and kilograms, and
- * the inputs on this form are those. The inches and pounds beside each box are
- * computed for reading only — they are not submitted and cannot become the
- * stored value. The alternative, a unit toggle that converts on save, makes the
- * number in the database depend on which toggle was last touched, and that is
- * precisely the ambiguity the canonical unit exists to remove.
+ * MEASUREMENT UNITS. The canonical storage is centimetres and kilograms — that
+ * is what a quote, a booking and an order snapshot read, and it does not change
+ * here. What the operator SEES and TYPES is whichever unit the admin is set to,
+ * chosen once on the Settings page or from the selector on this form, and
+ * defaulting to inches and pounds.
+ *
+ * The ambiguity this used to guard against — "the number in the database
+ * depends on which box was filled last" — is answered rather than avoided:
+ * every measurement input submits its own unit alongside it, the route converts
+ * once on the way in, and an input the operator did not touch is not submitted
+ * at all, so a stored value is never rewritten by a display round trip. See
+ * `~/utils/measurementUnits` for the conversions and the reasoning.
  */
 
 interface VariantOption {
@@ -117,10 +128,15 @@ export default function VariantsTab({
   product,
   presets,
   canEditCost,
+  units,
+  canChangeUnits,
 }: {
   product: Product;
   presets: Preset[];
   canEditCost: boolean;
+  /** The admin's unit preference, resolved by the route and rendered here. */
+  units: UnitsView;
+  canChangeUnits: boolean;
 }) {
   const [params] = useSearchParams();
   // Which variant's editor is open. Held in the URL so a half-finished edit
@@ -171,6 +187,8 @@ export default function VariantsTab({
           product={product}
           presets={presets}
           canEditCost={canEditCost}
+          units={units}
+          canChangeUnits={canChangeUnits}
           mode="add"
         />
       ) : null}
@@ -182,6 +200,8 @@ export default function VariantsTab({
             product={product}
             presets={presets}
             canEditCost={canEditCost}
+            units={units}
+            canChangeUnits={canChangeUnits}
             mode="edit"
             variant={variant}
           />
@@ -192,6 +212,7 @@ export default function VariantsTab({
             currency={product.currency}
             canEditCost={canEditCost}
             presets={presets}
+            units={units}
           />
         )
       )}
@@ -208,15 +229,27 @@ function VariantCard({
   currency,
   canEditCost,
   presets,
+  units,
 }: {
   variant: Variant;
   currency: string;
   canEditCost: boolean;
   presets: Preset[];
+  units: UnitsView;
 }) {
   const carton = variant.packages[0] ?? null;
   const margin =
     variant.costPrice !== null ? variant.suggestedRetailPrice - variant.costPrice : null;
+
+  // The three dimensions and the weight, read in whichever unit the admin is
+  // set to. The size reads "not measured" unless all three are present, because
+  // two of three is not a size — it is an unfinished measurement.
+  const size = [
+    storedToDisplay(variant.productLengthCm, "length", units.preference),
+    storedToDisplay(variant.productWidthCm, "length", units.preference),
+    storedToDisplay(variant.productHeightCm, "length", units.preference),
+  ];
+  const weight = storedToDisplay(variant.productWeightKg, "weight", units.preference);
 
   return (
     <div style={card}>
@@ -274,17 +307,15 @@ function VariantCard({
         />
         <Fact
           label="Product size"
-          value={[
-            dec(variant.productLengthCm),
-            dec(variant.productWidthCm),
-            dec(variant.productHeightCm),
-          ].every(Boolean)
-            ? `${dec(variant.productLengthCm)} × ${dec(variant.productWidthCm)} × ${dec(variant.productHeightCm)} cm`
-            : "not measured"}
+          value={
+            size.every(Boolean)
+              ? `${size.join(" × ")} ${units.dimensionUnit}`
+              : "not measured"
+          }
         />
         <Fact
           label="Product weight"
-          value={variant.productWeightKg ? `${dec(variant.productWeightKg)} kg` : "not measured"}
+          value={weight ? `${weight} ${units.weightUnit}` : "not measured"}
         />
         <Fact
           label="Shipping carton"
@@ -311,7 +342,7 @@ function VariantCard({
         </a>
       </div>
 
-      <PackagingEditor variant={variant} presets={presets} />
+      <PackagingEditor variant={variant} presets={presets} units={units} />
     </div>
   );
 }
@@ -336,8 +367,22 @@ function Fact({ label: text, value }: { label: string; value: string }) {
  * the action zips by index. That works because every row is present in the
  * document in the same order — no row is added or removed without a round trip,
  * so the arrays cannot fall out of step.
+ *
+ * The unit is per row and stays per row: a carton keeps whichever unit it was
+ * recorded in, because that is the unit its numbers were measured in and the
+ * carrier reads the row as written. What the admin preference decides is only
+ * what an EMPTY row starts as, so a new carton is offered in the unit the
+ * operator is already thinking in.
  */
-function PackagingEditor({ variant, presets }: { variant: Variant; presets: Preset[] }) {
+function PackagingEditor({
+  variant,
+  presets,
+  units,
+}: {
+  variant: Variant;
+  presets: Preset[];
+  units: UnitsView;
+}) {
   const rows = variant.packages.length ? variant.packages : [null];
 
   return (
@@ -420,7 +465,7 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                   <select
                     style={input}
                     name="pkg_dimUnit"
-                    defaultValue={row?.dimensionUnit ?? "in"}
+                    defaultValue={row?.dimensionUnit ?? units.dimensionUnit}
                     aria-label={`Carton ${index + 1} dimension unit`}
                   >
                     <option value="in">in</option>
@@ -440,7 +485,7 @@ function PackagingEditor({ variant, presets }: { variant: Variant; presets: Pres
                   <select
                     style={input}
                     name="pkg_weightUnit"
-                    defaultValue={row?.weightUnit ?? "lb"}
+                    defaultValue={row?.weightUnit ?? units.weightUnit}
                     aria-label={`Carton ${index + 1} weight unit`}
                   >
                     <option value="lb">lb</option>
@@ -548,17 +593,20 @@ function VariantForm({
   product,
   presets,
   canEditCost,
+  units,
+  canChangeUnits,
   mode,
   variant,
 }: {
   product: Product;
   presets: Preset[];
   canEditCost: boolean;
+  units: UnitsView;
+  canChangeUnits: boolean;
   mode: "add" | "edit";
   variant?: Variant;
 }) {
   const currency = product.currency;
-  const weightKg = dec(variant?.productWeightKg);
   // Only variants that already carry a carton are useful as a source: copying
   // from an empty one would offer to replace packaging with nothing.
   const copySources = product.variants.filter(
@@ -569,13 +617,28 @@ function VariantForm({
     <div style={{ ...card, borderColor: INK }}>
       <h2 style={sectionTitle}>{mode === "add" ? "New variant" : `Editing ${variant?.name}`}</h2>
       <p style={sectionNote}>
-        Prices are per unit. Measurements are stored in centimetres and kilograms; the imperial
-        figures beside each box are for reading and are not saved.
+        Prices are per unit. Measurements are entered and shown in {units.phrase}, and stored in
+        centimetres and kilograms either way — a quote, a booking and an order snapshot all read
+        the one canonical figure.
       </p>
 
-      <Form method="post">
+      {/* The unit selector.
+
+          It sits outside the variant form because a form cannot be nested in
+          another, and it posts its own intent: choosing a unit is a preference,
+          not a variant edit, and it must not save — or be blocked by — the
+          half-filled variant beside it. The choice is global, so the note says
+          so; without that, an operator reasonably reads it as a setting for
+          this product only. */}
+      <UnitsSelector units={units} canChange={canChangeUnits} />
+
+      <Form method="post" onSubmit={preserveUntouchedMeasurements}>
         <input type="hidden" name="tab" value="variants" />
         {variant ? <input type="hidden" name="variantId" value={variant.id} /> : null}
+        {/* The unit this form's labels and numbers were written in. Carried so
+            the route converts in the same unit that was on screen, even if the
+            preference changed in another tab while this one sat open. */}
+        <input type="hidden" name="units" value={units.preference} />
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.85rem" }}>
           <Field id={`v-name-${variant?.id ?? "new"}`} label="Variant name">
@@ -685,13 +748,14 @@ function VariantForm({
 
         <h3 style={{ ...sectionTitle, marginTop: "1.1rem" }}>Measurements</h3>
         <p style={{ ...sectionNote, marginBottom: "0.6rem" }}>
-          The unpacked product, not the carton. Canonical units are cm and kg.
+          The unpacked product, not the carton. In {units.phrase}
+          {units.preference === "imperial" ? ", converted and stored in centimetres and kilograms." : "."}
         </p>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "0.85rem" }}>
-          <MetricField id={`v-len-${variant?.id ?? "new"}`} name="productLengthCm" label="Length (cm)" value={dec(variant?.productLengthCm)} imperial={cmToInches(dec(variant?.productLengthCm))} unit="in" />
-          <MetricField id={`v-wid-${variant?.id ?? "new"}`} name="productWidthCm" label="Width (cm)" value={dec(variant?.productWidthCm)} imperial={cmToInches(dec(variant?.productWidthCm))} unit="in" />
-          <MetricField id={`v-hei-${variant?.id ?? "new"}`} name="productHeightCm" label="Height (cm)" value={dec(variant?.productHeightCm)} imperial={cmToInches(dec(variant?.productHeightCm))} unit="in" />
-          <MetricField id={`v-wt-${variant?.id ?? "new"}`} name="productWeightKg" label="Weight (kg)" value={weightKg} imperial={kgToPounds(weightKg)} unit="lb" />
+          <MetricField id={`v-len-${variant?.id ?? "new"}`} name="productLengthCm" label={units.lengthLabel} value={storedToDisplay(variant?.productLengthCm, "length", units.preference)} />
+          <MetricField id={`v-wid-${variant?.id ?? "new"}`} name="productWidthCm" label={units.widthLabel} value={storedToDisplay(variant?.productWidthCm, "length", units.preference)} />
+          <MetricField id={`v-hei-${variant?.id ?? "new"}`} name="productHeightCm" label={units.heightLabel} value={storedToDisplay(variant?.productHeightCm, "length", units.preference)} />
+          <MetricField id={`v-wt-${variant?.id ?? "new"}`} name="productWeightKg" label={units.weightLabel} value={storedToDisplay(variant?.productWeightKg, "weight", units.preference)} />
         </div>
 
         <h3 style={{ ...sectionTitle, marginTop: "1.1rem" }}>Options</h3>
@@ -787,40 +851,118 @@ function VariantForm({
 }
 
 /**
- * A measurement input whose canonical value is the one submitted.
+ * A measurement input, in whichever unit the admin is set to.
  *
- * The imperial figure is rendered as text, not as a second input: a second
- * input invites someone to type in it, and then the stored value depends on
- * which box was filled last.
+ * The number in the box is a DISPLAY value — inches when the admin reads in
+ * inches, centimetres when it reads in centimetres — and the route converts it
+ * once on the way to the column that stores it. What makes that safe is
+ * `data-measure-original`: the input carries the display value it was rendered
+ * with, and the form's submit handler disables every input the operator has not
+ * changed, so an untouched measurement is not submitted at all and the stored
+ * canonical figure survives byte-exact. Without that, saving a price would
+ * rewrite 60.96 cm as 24 in and back again, and the point of the canonical
+ * column — that everyone downstream reads one number — would erode quietly.
+ *
+ * There is deliberately no second box showing the other unit. A second box
+ * invites someone to type in it, and then the stored value depends on which of
+ * the two was filled last, which is the defect this replaced.
  */
 function MetricField({
   id,
   name,
-  label: text,
+  label,
   value,
-  imperial,
-  unit,
 }: {
   id: string;
   name: string;
   label: string;
+  /** What the operator should see, already in their chosen unit. */
   value: string;
-  imperial: string;
-  unit: string;
 }) {
   return (
-    <Field
-      id={id}
-      label={text}
-      hint={imperial ? <>≈ {imperial} {unit}</> : "not measured"}
-    >
+    <Field id={id} label={label}>
       <input
         style={input}
         id={id}
         name={name}
         inputMode="decimal"
         defaultValue={value}
+        data-measure-original={value}
       />
     </Field>
+  );
+}
+
+/**
+ * Leave untouched measurements out of the submission.
+ *
+ * Runs before react-router reads the form (its `Form` calls this handler first
+ * and only then serialises), and disabling an input removes it from the
+ * submitted data. The route reads a measurement only when the field is present,
+ * so absent means "keep what is stored" — which is the whole point, because the
+ * value on screen has been through a conversion and back and re-saving it would
+ * be a round trip nothing asked for.
+ *
+ * An emptied box is a change and is still submitted, which is how a measurement
+ * is cleared.
+ */
+function preserveUntouchedMeasurements(event: FormEvent<HTMLFormElement>) {
+  const form = event.currentTarget;
+  for (const field of form.querySelectorAll<HTMLInputElement>("input[data-measure-original]")) {
+    if (field.value === field.dataset.measureOriginal) field.disabled = true;
+  }
+}
+
+/**
+ * Inches or centimetres, applied to the whole admin.
+ *
+ * Rendered as a form of its own because a preference is not part of the variant
+ * being edited: posting it must work on a form whose required fields are still
+ * empty, and it must not save anything else. The pair is named in full — a
+ * lone "CM" does not tell an operator that the weights follow it.
+ */
+function UnitsSelector({ units, canChange }: { units: UnitsView; canChange: boolean }) {
+  if (!canChange) {
+    return (
+      <p style={{ ...helpText, marginBottom: "0.75rem" }}>
+        Measurements are shown and entered in {units.phrase}.
+      </p>
+    );
+  }
+
+  return (
+    <Form
+      method="post"
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "0.75rem",
+        flexWrap: "wrap",
+        border: `1px solid ${LINE}`,
+        borderRadius: 6,
+        padding: "0.5rem 0.7rem",
+        marginBottom: "0.9rem",
+      }}
+    >
+      <input type="hidden" name="tab" value="variants" />
+      <span style={{ fontSize: "0.78rem", color: MUTED }}>Measurements in:</span>
+      {UNITS_VALUES.map((value) => (
+        <label key={value} style={{ display: "flex", alignItems: "center", gap: "0.3rem", fontSize: "0.8rem", color: INK }}>
+          <input
+            type="radio"
+            name="units"
+            value={value}
+            defaultChecked={value === units.preference}
+          />
+          {unitsView(value).phrase}
+        </label>
+      ))}
+      <button type="submit" name="intent" value="set_units" style={btn(MUTED)}>
+        Apply
+      </button>
+      <span style={{ fontSize: "0.72rem", color: FAINT }}>
+        Applies to every product page in the admin.
+      </span>
+    </Form>
   );
 }

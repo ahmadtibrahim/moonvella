@@ -2199,3 +2199,27 @@ model ImportMediaSelection {
   @@unique([sellerId, productId, mediaAssetId])
   @@index([sellerId, productId])
 }
+
+/// One operator's answer to a question about the whole admin, stored by name.
+///
+/// WHY A TABLE AND NOT A COLUMN SOMEWHERE. There is no row that means "the
+/// admin": MoonVella's settings are per-seller (SellerSettings), per-integration
+/// (IntegrationCredential) or per-record, and none of those can hold a choice
+/// that belongs to the operator rather than to a store. A key/value row says
+/// what it is — one preference, named — and adding the next one does not widen
+/// a table that something else is already reading.
+///
+/// Absence is meaningful and is the reason `getUnitsPreference` reads a missing
+/// row as the default rather than treating it as an error: a fresh deployment
+/// has expressed no preference, and the default is the answer, not a gap.
+model AdminPreference {
+  id        String   @id @default(cuid())
+  /// The question, not the answer: "units".
+  key       String   @unique
+  /// The answer, as one of the values the reading service accepts. Stored as
+  /// text so a new preference does not need a migration to add a column; the
+  /// service validates it on the way in and falls back on the way out.
+  value     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}

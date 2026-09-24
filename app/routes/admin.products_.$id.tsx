@@ -1,6 +1,13 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
+import {
+  requirePermission,
+  assertSameOrigin,
+  getRequestMeta,
+  // Checked directly for the unit preference, which is writable by a different
+  // permission than the one that guards the rest of this page.
+  userCan,
+} from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { permissionsFor } from "~/services/permissions";
 import {
@@ -43,6 +50,17 @@ import {
   type OriginLocation,
 } from "~/services/origins.server";
 import { card, INK, MUTED, catalogueValue, listValue } from "~/components/product/ui";
+import {
+  getUnitsPreference,
+  setUnitsPreference,
+  unitsChangedMessage,
+} from "~/services/adminPreferences.server";
+import {
+  enteredToCanonical,
+  isUnitPreference,
+  unitsView,
+  type MeasureKind,
+} from "~/utils/measurementUnits";
 import DetailsTab from "~/components/product/DetailsTab";
 import VariantsTab from "~/components/product/VariantsTab";
 import ShippingTab from "~/components/product/ShippingTab";
@@ -87,12 +105,21 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   const held = permissionsFor(user.role);
 
+  /*
+   * The admin's unit preference, resolved once and handed to both tabs that
+   * show a measurement. The form also carries it back on submit, so a value is
+   * always interpreted in the unit its own label was written in.
+   */
+  const unitsPreference = await getUnitsPreference();
+
   return {
     product,
     presets,
     media,
     readiness,
     pack,
+    unitsPreference,
+    units: unitsView(unitsPreference),
     /**
      * Resolving every variant's origin and packaging costs a query per variant
      * per question, so it is only done when the Shipping tab is open. It goes
@@ -115,6 +142,10 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     can: {
       manage: held.has("products.manage"),
       cost: held.has("products.cost.edit"),
+      // Whether this person may change the unit preference from the inline
+      // selector. The selector is not drawn without it, and the intent below
+      // refuses either way.
+      settingsGeneral: held.has("settings.general"),
     },
   };
 }
@@ -249,6 +280,56 @@ export async function action({ request, params }: ActionFunctionArgs) {
     const value = String(form.get(name) ?? "").trim();
     return value === "" ? null : value;
   };
+
+  /*
+   * WHICH UNIT A SUBMITTED MEASUREMENT IS IN, taken from the form itself.
+   *
+   * The form carries the preference it was RENDERED with, and that is the one
+   * this uses — not a fresh read from the database. They are the same in every
+   * ordinary case, and they differ exactly when it matters: if somebody changes
+   * the admin's units while this page is open, the operator is still looking at
+   * boxes labelled in the old unit, and their 24 means what the label beside it
+   * said. Reading the row again here would reinterpret their number under them.
+   *
+   * A form that carries no preference (an older page, a hand-made request)
+   * falls back to the stored one, and a value that is neither falls back the
+   * same way rather than throwing: the unit a number is in should never be
+   * guessed from an error path.
+   */
+  const submittedUnits = form.get("units");
+  const unitsPref = isUnitPreference(submittedUnits)
+    ? submittedUnits
+    : await getUnitsPreference();
+
+  /**
+   * A measurement the operator typed, as the canonical column value.
+   *
+   * Metric passes through untouched, which is what this route did before the
+   * preference existed; imperial converts once and rounds once, to the scale
+   * the column and its validator use.
+   *
+   * THE THREE CASES ARE THREE DIFFERENT ANSWERS, and the difference is the whole
+   * reason this does not go through `optional()` beside it:
+   *
+   *   field not in the form  ->  undefined, which `updateVariant` reads as "not
+   *                              supplied" and leaves the stored value alone.
+   *                              This is what an input the operator never
+   *                              touched submits as, and it is how an untouched
+   *                              measurement stays byte-exact instead of being
+   *                              round-tripped through a display conversion.
+   *   field present but empty -> null, which clears it. The operator deleted
+   *                              the number, and that is a decision.
+   *   field present with text -> the number, converted once.
+   *
+   * `optional()` collapses the first two into null. For every other field on
+   * this form that is right — an absent value there means an empty one — but
+   * for a measurement it would silently erase the figure on every save that did
+   * not retype it.
+   */
+  const measurementFor = (name: string, kind: MeasureKind) => {
+    if (!form.has(name)) return undefined;
+    return enteredToCanonical(String(form.get(name) ?? ""), kind, unitsPref);
+  };
   const variantScope = () =>
     form
       .getAll("scopeVariantIds")
@@ -257,6 +338,25 @@ export async function action({ request, params }: ActionFunctionArgs) {
 
   try {
     switch (intent) {
+      /*
+       * The inline selector on the variant form writes the same global
+       * preference the Settings page does. It is here because the operator is
+       * looking at the boxes they want to type in when they decide, and sending
+       * them to another page to make the choice would mean leaving the form.
+       *
+       * It is gated on the general-settings permission rather than on
+       * products.manage: editing a product and deciding what unit every
+       * operator reads in are different powers, and the second is not implied
+       * by the first.
+       */
+      case "set_units": {
+        if (!userCan(user, "settings.general")) {
+          throw new Response("Your role does not permit this.", { status: 403 });
+        }
+        const saved = await setUnitsPreference(form.get("units"), actor);
+        return { unitsChanged: unitsChangedMessage(saved) };
+      }
+
       /* ---------------------------------------------------------------- */
       /* Product details                                                   */
       /* ---------------------------------------------------------------- */
@@ -328,10 +428,28 @@ export async function action({ request, params }: ActionFunctionArgs) {
           costPrice: form.has("costPrice") ? (optional("costPrice") as never) : undefined,
           inventory: Number(form.get("inventory") || 0),
           unitsPerPackage: Number(form.get("unitsPerPackage") || 1),
-          productLengthCm: optional("productLengthCm"),
-          productWidthCm: optional("productWidthCm"),
-          productHeightCm: optional("productHeightCm"),
-          productWeightKg: optional("productWeightKg"),
+          /*
+           * The form shows measurements in the admin's preferred unit, and
+           * these columns are centimetres and kilograms whatever that
+           * preference is. The conversion therefore happens here, on the way
+           * in, and never in the component: a value that reached the service
+           * in inches would be stored as inches and read as centimetres by
+           * every quote, snapshot and carrier request built from it.
+           *
+           * `enteredToCanonical` returns the raw text unchanged when the
+           * preference is metric, when the box is empty (which is how a
+           * measurement is cleared) and when the text is not a number — so the
+           * service's own validator still produces its own message for a typo.
+           *
+           * An input the operator did not touch is not submitted at all; the
+           * form disables it so `updateVariant`'s partial semantics keep the
+           * stored value byte-exact instead of round-tripping it through a
+           * display conversion.
+           */
+          productLengthCm: measurementFor("productLengthCm", "length"),
+          productWidthCm: measurementFor("productWidthCm", "length"),
+          productHeightCm: measurementFor("productHeightCm", "length"),
+          productWeightKg: measurementFor("productWeightKg", "weight"),
           options: form
             .getAll("optionName")
             .map((name, index) => ({
@@ -512,7 +630,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function AdminProductDetail() {
-  const { product, presets, media, readiness, pack, shipping, tab, can, preview } =
+  const { product, presets, media, readiness, pack, shipping, tab, can, preview, units } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
@@ -560,6 +678,24 @@ export default function AdminProductDetail() {
         </div>
       ) : null}
 
+      {/* The unit preference can also be changed from the selector on the
+          variant form, so its confirmation is printed here rather than inside
+          that tab: this is the one place every tab's post can reach. */}
+      {actionData && "unitsChanged" in actionData ? (
+        <div
+          role="status"
+          style={{
+            ...card,
+            background: "#f0fdf4",
+            borderColor: "#bbf7d0",
+            color: "#166534",
+            fontSize: "0.85rem",
+          }}
+        >
+          {actionData.unitsChanged}
+        </div>
+      ) : null}
+
       <nav
         aria-label="Product sections"
         style={{ display: "flex", gap: "0.25rem", borderBottom: "1px solid #e2e8f0", marginBottom: "1.25rem", flexWrap: "wrap" }}
@@ -597,7 +733,13 @@ export default function AdminProductDetail() {
         />
       ) : null}
       {tab === "variants" ? (
-        <VariantsTab product={product} presets={presets} canEditCost={can.cost} />
+        <VariantsTab
+          product={product}
+          presets={presets}
+          canEditCost={can.cost}
+          units={units}
+          canChangeUnits={can.settingsGeneral}
+        />
       ) : null}
       {tab === "shipping" && shipping ? (
         <ShippingTab
@@ -607,6 +749,7 @@ export default function AdminProductDetail() {
           packages={shipping.packages}
           presets={presets}
           canManage={can.manage}
+          units={units}
         />
       ) : null}
       {tab === "media" ? <MediaTab product={product} media={media} /> : null}

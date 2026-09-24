@@ -38,6 +38,14 @@ import {
   CREDENTIAL_INTEGRATIONS,
   type CredentialKey,
 } from "~/services/integrationFields";
+import {
+  getUnitsPreference,
+  setUnitsPreference,
+  unitsChangedMessage,
+} from "~/services/adminPreferences.server";
+// Also isomorphic: the unit names and labels are rendered here and on the
+// product form, and both read them from the one definition.
+import { unitsView, UNITS_VALUES } from "~/utils/measurementUnits";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   // Any signed-in user: everyone needs to be able to change their own password.
@@ -55,6 +63,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const states = canSeeIntegrations ? await listIntegrationStates() : [];
   const credentialKeys = CREDENTIAL_KEYS as string[];
   const operationalKeys = OPERATIONAL_KEYS as string[];
+
+  /*
+   * The unit preference is READ by anyone signed in and WRITTEN only by
+   * whoever may change general settings. The asymmetry is deliberate: the
+   * choice governs every operator's product page, so everybody needs to know
+   * what it is set to, while changing it is a decision about the admin rather
+   * than about one person's view of it.
+   */
+  const unitsPreference = await getUnitsPreference();
 
   /*
    * Every credential field's live state already arrives on each integration's
@@ -78,6 +95,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     canSeeIntegrations,
     credentialIntegrations: states.filter((s) => credentialKeys.includes(s.key)),
     operationalIntegrations: states.filter((s) => operationalKeys.includes(s.key)),
+    unitsPreference,
+    canChangeUnits: userCan(user, "settings.general"),
   };
 }
 
@@ -91,6 +110,29 @@ export async function action({ request }: ActionFunctionArgs) {
   const formData = await request.formData();
   const intent = String(formData.get("intent") || "change_password");
   const { ip, userAgent } = getRequestMeta(request);
+
+  /*
+   * The unit choice is a general setting like the integrations below it, so it
+   * is gated the same way and for the same reason: it changes what every
+   * operator sees, not what this one person sees.
+   */
+  if (intent === "set_units") {
+    if (!userCan(user, "settings.general")) {
+      throw new Response("Your role does not permit this.", { status: 403 });
+    }
+    try {
+      const saved = await setUnitsPreference(formData.get("units"), {
+        actorType: "ADMIN_USER",
+        actorId: user.id,
+        actorName: user.name,
+        ipAddress: ip,
+        userAgent,
+      });
+      return { success: unitsChangedMessage(saved) };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Could not save the unit preference." };
+    }
+  }
 
   if (intent === "refresh_integration" || intent === "clear_integration_error" || intent === "save_credentials" || intent === "disconnect_integration") {
     if (!userCan(user, "settings.general")) {
@@ -228,6 +270,8 @@ export default function AdminSettings() {
     credentialIntegrations,
     operationalIntegrations,
     canSeeIntegrations,
+    unitsPreference,
+    canChangeUnits,
   } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -334,6 +378,57 @@ export default function AdminSettings() {
           </div>
         </>
       ) : null}
+
+      <div style={card}>
+        <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
+          Units
+        </h2>
+        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "1rem" }}>
+          How measurements are entered and shown across the admin: a product&rsquo;s own length,
+          width, height and weight, and the units a new shipping carton starts in. It applies to
+          every product page, not only the one you are looking at. Each carton keeps the unit it
+          was saved in, so switching here never reinterprets one that already exists, and
+          MoonVella stores every measurement in centimetres and kilograms either way &mdash; the
+          conversion is applied to what you type and to what you read, once, so the stored figure
+          does not move when the setting changes.
+        </p>
+        {canChangeUnits ? (
+          <Form method="post">
+            <input type="hidden" name="intent" value="set_units" />
+            <div style={{ display: "flex", gap: "1.5rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+              {UNITS_VALUES.map((value) => (
+                <label
+                  key={value}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "0.4rem",
+                    fontSize: "0.85rem",
+                    color: "#082a4a",
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="units"
+                    value={value}
+                    defaultChecked={unitsPreference === value}
+                  />
+                  {unitsView(value).phrase}
+                </label>
+              ))}
+            </div>
+            <button type="submit" style={smallButton} disabled={isSubmitting}>
+              Save units
+            </button>
+          </Form>
+        ) : (
+          <p style={{ fontSize: "0.85rem", color: "#082a4a", margin: 0 }}>
+            Set to {unitsView(unitsPreference).phrase}. Changing it needs the general settings
+            permission.
+          </p>
+        )}
+      </div>
 
       <div style={card}>
         <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginBottom: "1.5rem" }}>
