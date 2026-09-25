@@ -1,9 +1,10 @@
 import React from "react";
 import PropTypes from "prop-types";
-import { Link, redirect, useFetcher, useLoaderData, useNavigate } from "react-router";
+import { Link, useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import {
   asAccessResponse,
+  merchantRedirect,
   requireMerchantAccess,
 } from "../services/seller.server";
 /*
@@ -87,8 +88,14 @@ export async function loader({ request }) {
   // An approved seller has no application to edit. The page stays reachable by
   // URL for anyone who bookmarked it, so it redirects rather than showing a
   // form whose submission the action would refuse to accept.
+  //
+  // Through `merchantRedirect`, never a bare `redirect("/app")`: this runs
+  // inside the Shopify admin's iframe, and a destination stripped of `shop`,
+  // `host`, `embedded` and `id_token` cannot be authenticated at all — the
+  // seller is answered with App Bridge's bootstrap page and the sentence about
+  // opening MoonVella from their admin, while they are in their admin.
   if (context.access === "APPROVED") {
-    throw redirect("/app");
+    throw merchantRedirect(request, "/app");
   }
 
   const { fetchShopProfile, explainSource, SHOP_API_VERSION } = await import(
@@ -275,7 +282,9 @@ const str = (formData, name) => String(formData.get(name) ?? "").trim();
 export async function action({ request }) {
   const context = await requireMerchantAccess(request, "VIEW").catch(asAccessResponse);
   if (context.access === "APPROVED") {
-    throw redirect("/app");
+    // Same reason as the loader's: the frame context has to survive the hop, or
+    // the seller's form submission lands on a page that cannot authenticate.
+    throw merchantRedirect(request, "/app");
   }
 
   const { authenticate } = await import("../shopify.server");

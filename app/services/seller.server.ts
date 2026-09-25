@@ -1,3 +1,4 @@
+import { redirect } from "react-router";
 import { prisma } from "~/db.server";
 import { authenticate } from "~/shopify.server";
 import { BLOCKED_MESSAGE } from "~/utils/blockedMessage";
@@ -143,6 +144,42 @@ export async function resolveSellerContext(shop: string): Promise<SellerContext>
 export async function requireSellerContext(request: Request): Promise<SellerContext> {
   const shop = await getAuthenticatedShop(request);
   return resolveSellerContext(shop);
+}
+
+/**
+ * A redirect inside the merchant app that KEEPS the Shopify frame context.
+ *
+ * Every merchant page is loaded inside the Shopify admin's iframe, and the only
+ * thing that authenticates a document load there is what is on the URL: `shop`,
+ * `host`, `embedded` and a short-lived `id_token`. A bare `redirect("/app")`
+ * arrives at the next request carrying none of them, so `authenticate.admin`
+ * has nothing to verify and answers with App Bridge's bootstrap page — which
+ * the layout's error boundary dresses in the sentence about opening MoonVella
+ * from the Shopify admin. A seller then reads that sentence from inside their
+ * own Shopify admin, every time, in a loop:
+ *
+ *     /  ->  /app/application?...  ->  /app  ->  the sentence
+ *
+ * The rule applied here is the one the framework's own App Bridge-aware
+ * `redirect` helper uses for a same-origin target: carry over every parameter
+ * the destination does not already name. Expiry needs no special case — a stale
+ * `id_token` carried along on the destination is exactly what sends the request
+ * back through the bounce page to have a fresh one issued.
+ *
+ * Use this for every internal redirect under `/app`. The one thing it must not
+ * be used for is a redirect that is meant to *leave* the frame (a Shopify admin
+ * deep link, an external URL, the billing confirmation URL): those already name
+ * their own destination and must not inherit this app's parameters.
+ */
+export function merchantRedirect(request: Request, to: string): Response {
+  const from = new URL(request.url);
+  const target = new URL(to, from);
+
+  from.searchParams.forEach((value, key) => {
+    if (!target.searchParams.has(key)) target.searchParams.set(key, value);
+  });
+
+  return redirect(`${target.pathname}${target.search}${target.hash}`);
 }
 
 export class AccessError extends Error {
