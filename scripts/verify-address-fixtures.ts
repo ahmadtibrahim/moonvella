@@ -30,15 +30,22 @@ import {
 
 type SubjectType = "PICKUP" | "DELIVERY";
 
-/** The address as the gate will read it, hashed the way the gate hashes it. */
-async function hashedAddress(subjectType: SubjectType, subjectId: string) {
+/**
+ * The address as the gate will read it.
+ *
+ * Returned unhashed: every caller hashes it itself, because the two callers
+ * hash different things — the default is the address as it stands now, and the
+ * override is the address the row was checked against. A helper that hashed
+ * here would be handing back a hash one of them has to discard.
+ */
+async function subjectAddress(subjectType: SubjectType, subjectId: string) {
   const address = await loadSubjectAddress(subjectType, subjectId);
   if (!address) {
     throw new Error(
       `verify-address-fixtures: no ${subjectType} address resolves for ${subjectId}, so no verdict can be recorded for it.`
     );
   }
-  return { address, inputHash: addressInputHash(address) };
+  return address;
 }
 
 /**
@@ -78,7 +85,7 @@ export async function recordVerdict(
     differences?: unknown;
   }
 ): Promise<{ id: string; inputHash: string }> {
-  const { address, inputHash } = await hashedAddress(input.subjectType, input.subjectId);
+  const address = await subjectAddress(input.subjectType, input.subjectId);
   const original = input.originalAddress ?? address;
   const row = await client.addressValidation.create({
     data: {
