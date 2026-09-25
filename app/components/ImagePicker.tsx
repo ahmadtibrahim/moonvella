@@ -12,7 +12,7 @@ import type { SelectionView } from "~/services/importMediaSelection.server";
  * that found the product in the first place.
  *
  * THE DEFAULT IS EVERYTHING, AND IT SAYS SO. A seller who never opens this panel
- * imports every approved, seller-visible image, exactly as they always did. Only
+ * imports every image offered to that seller, exactly as they always did. Only
  * once a choice is saved does the import follow it, and `defaulted` is what
  * tells the panel which of those two states it is showing — a panel that
  * presented a default as a decision would be asking for confirmation of a

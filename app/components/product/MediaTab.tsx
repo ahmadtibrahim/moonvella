@@ -180,23 +180,24 @@ export default function MediaTab({
 /**
  * The gap report.
  *
- * With shared assets it is entirely possible to publish a product where one
- * size has photographs and another has none, and nothing would say so. This
- * panel exists to make that visible — including the honest case where the
- * product has no variants yet and the question does not apply.
+ * A product whose photographs all hang off one size can be published with the
+ * other sizes showing nothing, and no other screen would say so. This panel
+ * exists to make that visible — including the honest case where the product has
+ * no variants yet and the question does not apply.
  */
 function CoveragePanel({ product, media }: { product: Product; media: MediaAssetView[] }) {
-  const shared = media.filter(
+  const general = media.filter(
     (asset) => asset.assignments.some((assignment) => assignment.variantId === null)
   );
 
   /**
    * What each variant would actually show.
    *
-   * Own images come before shared ones, and within each the merchant's order
-   * decides — the same rule the catalogue uses to build a gallery, expressed
-   * here so this panel reports what will be seen rather than what is merely
-   * attached.
+   * A variant's OWN images are the whole of its gallery when it has any; the
+   * family's general media is what a variant with none falls back to. Within
+   * each set the merchant's order decides — the same rule the catalogue uses to
+   * build a gallery, expressed here so this panel reports what will be seen
+   * rather than what is merely attached.
    */
   const rows = product.variants.map((variant) => {
     const images = media.filter((asset) => IMAGE_CATEGORIES.includes(asset.category));
@@ -206,20 +207,20 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
         Boolean(row.assignment)
       )
       .sort((a, b) => a.assignment.sortOrder - b.assignment.sortOrder);
-    const inherited = images
+    const fallback = images
       .map((asset) => ({ asset, assignment: asset.assignments.find((a) => a.variantId === null) }))
       .filter((row): row is { asset: MediaAssetView; assignment: NonNullable<typeof row.assignment> } =>
         Boolean(row.assignment)
       )
       .sort((a, b) => a.assignment.sortOrder - b.assignment.sortOrder);
 
-    const shown = own[0] ?? inherited[0] ?? null;
+    const shown = own[0] ?? fallback[0] ?? null;
     return {
       variant,
-      count: own.length + inherited.length,
+      count: own.length + fallback.length,
       ownCount: own.length,
       shown,
-      source: own[0] ? ("own" as const) : inherited[0] ? ("shared" as const) : null,
+      source: own[0] ? ("own" as const) : fallback[0] ? ("general" as const) : null,
     };
   });
 
@@ -229,15 +230,18 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
     <div style={card}>
       <h2 style={sectionTitle}>Coverage</h2>
       <p style={sectionNote}>
-        A file is stored once and attached where it applies. An image attached to the whole
-        product is shared, and every variant shows it without a second copy of the file.
+        A file is stored once and attached where it applies. General product media belongs to
+        the product itself — it is the gallery before a size is chosen, and what a size with no
+        photographs of its own falls back to. A size that has its own photographs shows those
+        instead, not a mixture.
       </p>
       <p style={{ ...helpText, marginBottom: "0.85rem" }}>
         Coverage and publication are two different questions, and the tiles below answer only the
-        first: does every variant have a picture? Attaching a file to one variant leaves the rest
-        showing a placeholder, and those pictures are not what publication counts. Publication
-        asks whether the product has an approved, seller-visible image, and whether every such
-        image has alt text — questions the readiness strip at the top of this page answers.
+        first: does every size have a picture? Attaching a file to one size leaves the rest on the
+        general gallery, or on a placeholder when there is none. Publication is the other
+        question — whether the product itself has an active, seller-visible image, whether exactly
+        one image is marked primary, and whether every seller-visible image has alt text. The
+        readiness strip at the top of this page answers those.
       </p>
 
       {product.variants.length === 0 ? (
@@ -273,7 +277,7 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
                   </div>
                   <div style={{ fontSize: "0.66rem", color: FAINT }}>
                     {row.count} image{row.count === 1 ? "" : "s"}
-                    {row.source === "shared" ? " (shared)" : row.ownCount ? " (own)" : ""}
+                    {row.source === "general" ? " (general)" : row.ownCount ? " (own)" : ""}
                   </div>
                 </div>
               ) : (
@@ -291,8 +295,8 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
             </p>
           ) : (
             <p style={{ ...helpText }}>
-              {shared.length} asset{shared.length === 1 ? "" : "s"} shared across the whole
-              product; every active variant shows a picture.
+              {general.length} general product asset{general.length === 1 ? "" : "s"}, and every
+              active size shows a picture.
             </p>
           )}
         </>
@@ -307,7 +311,7 @@ function CoveragePanel({ product, media }: { product: Product; media: MediaAsset
 
 function UploadPanel({ product }: { product: Product }) {
   const [params] = useSearchParams();
-  const scope = params.get("scope") ?? "shared";
+  const scope = params.get("scope") ?? "general";
   /**
    * Alt text is required of an image and meaningless for a video or a
    * template, and this one form uploads all three — so the field asks for it
@@ -316,6 +320,14 @@ function UploadPanel({ product }: { product: Product }) {
    */
   const [category, setCategory] = useState("WHITE_BACKGROUND_IMAGE");
   const altRequired = IMAGE_CATEGORIES.includes(category);
+  /**
+   * Which claim the file makes, held here because the size list below it is
+   * drawn from it. `?scope=variant` is how a link from the variant editor
+   * arrives; anything else starts on the family claim, which is the common case.
+   */
+  const [scopeMode, setScopeMode] = useState<"general" | "variant">(
+    scope === "variant" ? "variant" : "general"
+  );
   /**
    * A template is a link, and asking for a file beside the link would be asking
    * for something the row does not have. The form swaps one field for the other
@@ -429,32 +441,56 @@ function UploadPanel({ product }: { product: Product }) {
           }}
         >
           <legend style={{ fontSize: "0.72rem", color: MUTED, padding: "0 0.35rem" }}>
-            Applies to
+            Scope
           </legend>
           <label style={{ display: "block", fontSize: "0.8rem", marginBottom: "0.4rem" }}>
-            <input type="radio" name="scopeMode" value="shared" defaultChecked={scope !== "variant"} />{" "}
-            The whole product — one copy of the file, shown for every variant
+            <input
+              type="radio"
+              name="scopeMode"
+              value="general"
+              checked={scopeMode === "general"}
+              onChange={() => setScopeMode("general")}
+            />{" "}
+            General product media — belongs to the product itself, not to any one size
           </label>
+          <p style={{ ...helpText, margin: "0 0 0.6rem 1.4rem" }}>
+            This is the gallery a seller sees before choosing a size, and what the catalogue card
+            and the storefront thumbnail are drawn from.
+          </p>
           <label style={{ display: "block", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
-            <input type="radio" name="scopeMode" value="variant" defaultChecked={scope === "variant"} />{" "}
-            Selected variants
+            <input
+              type="radio"
+              name="scopeMode"
+              value="variant"
+              checked={scopeMode === "variant"}
+              onChange={() => setScopeMode("variant")}
+            />{" "}
+            Variant-specific media — belongs to the size(s) ticked below
           </label>
 
-          {product.variants.length ? (
-            <div style={{ display: "flex", gap: "0.85rem", flexWrap: "wrap", paddingLeft: "1.4rem" }}>
-              {product.variants
-                .filter((variant) => variant.isActive)
-                .map((variant) => (
-                  <label key={variant.id} style={{ fontSize: "0.78rem", color: MUTED }}>
-                    <input type="checkbox" name="scopeVariantIds" value={variant.id} /> {variant.name}
-                  </label>
-                ))}
-            </div>
-          ) : (
-            <p style={{ ...helpText, paddingLeft: "1.4rem" }}>
-              There are no variants to attach to yet, so this will be shared.
-            </p>
-          )}
+          {/*
+            * THE SIZE LIST FOLLOWS THE RADIO. These boxes decide the claim, so
+            * leaving them on screen under "general product media" invited a tick
+            * that the scope had already overruled.
+            */}
+          {scopeMode === "variant" ? (
+            product.variants.length ? (
+              <div style={{ display: "flex", gap: "0.85rem", flexWrap: "wrap", paddingLeft: "1.4rem" }}>
+                {product.variants
+                  .filter((variant) => variant.isActive)
+                  .map((variant) => (
+                    <label key={variant.id} style={{ fontSize: "0.78rem", color: MUTED }}>
+                      <input type="checkbox" name="scopeVariantIds" value={variant.id} /> {variant.name}
+                    </label>
+                  ))}
+              </div>
+            ) : (
+              <p style={{ ...helpText, paddingLeft: "1.4rem" }}>
+                This product has no active variants yet, so there is no size for this file to
+                belong to. Leave the scope on general product media, or add a size first.
+              </p>
+            )
+          ) : null}
         </fieldset>
 
         <div style={{ marginTop: "0.85rem" }}>
@@ -760,8 +796,8 @@ function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product
           </div>
         ) : asset.processingStatus === "PROCESSING" && isVideo ? (
           <div style={{ fontSize: "0.68rem", color: "#92400e", marginTop: "0.3rem" }}>
-            Waiting to be measured — the length is not known yet, so this video cannot be
-            approved or published.
+            Waiting to be measured — the length is not known yet, so this video stays out of
+            the seller&apos;s gallery and blocks publication until it is.
           </div>
         ) : asset.processingStatus === "PROCESSING" ? (
           <div style={{ fontSize: "0.68rem", color: "#92400e", marginTop: "0.3rem" }}>
@@ -782,44 +818,54 @@ function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product
           >
             Edit
           </Link>
-          {asset.approvalStatus !== "APPROVED" ? (
-            <Form method="post">
-              <input type="hidden" name="tab" value="media" />
-              <input type="hidden" name="assetId" value={asset.id} />
-              <button
-                type="submit"
-                name="intent"
-                value="media_approve"
-                style={{ ...btn("#065f46"), padding: "0.25rem 0.5rem" }}
-              >
-                Approve
-              </button>
-            </Form>
-          ) : null}
-          {asset.approvalStatus !== "REJECTED" ? (
-            <Form method="post">
-              <input type="hidden" name="tab" value="media" />
-              <input type="hidden" name="assetId" value={asset.id} />
-              <button
-                type="submit"
-                name="intent"
-                value="media_reject"
-                style={{ ...btn("#92400e"), padding: "0.25rem 0.5rem" }}
-              >
-                Reject
-              </button>
-            </Form>
-          ) : null}
+          {/*
+            * NO APPROVE, NO REJECT — SEE `uploadMedia`.
+            *
+            * A file uploaded from this panel is already decided: it is approved
+            * and switched on as it is written, so the two buttons that used to
+            * sit here were asking an administrator to countersign their own
+            * upload. What is left is the pair a person actually reaches for.
+            *
+            * Deactivate is the way to take a file out of the seller's gallery
+            * without losing it — the row, the attachments and the order all
+            * stay, so switching it back on restores exactly what was there.
+            * Delete (in the editor, with its confirmation) is the other one,
+            * and it is refused outright on a live published product.
+            */}
+          <Form method="post">
+            <input type="hidden" name="tab" value="media" />
+            <input type="hidden" name="assetId" value={asset.id} />
+            <input type="hidden" name="sellerVisible" value={asset.sellerVisible ? "false" : "true"} />
+            <button
+              type="submit"
+              name="intent"
+              value="media_visibility"
+              style={{
+                ...btn(asset.sellerVisible ? "#92400e" : "#065f46"),
+                padding: "0.25rem 0.5rem",
+              }}
+            >
+              {asset.sellerVisible ? "Deactivate" : "Activate"}
+            </button>
+          </Form>
         </div>
       </div>
     </div>
   );
 }
 
-/** "Shared", or the names of the variants it is attached to. */
+/**
+ * Where the file belongs, in words.
+ *
+ * "GENERAL PRODUCT MEDIA" RATHER THAN "SHARED". The family claim is not the
+ * file being handed round the variants: a variant that has photographs of its
+ * own shows those and nothing else, and only falls back to the family gallery
+ * when it has none. Calling it "shared with every variant" described the
+ * opposite of what happens on screen.
+ */
 function describeAssignments(asset: MediaAssetView, product: Product): string {
   if (asset.assignments.length === 0) return "Attached to nothing — not visible";
-  const shared = asset.assignments.some((assignment) => assignment.variantId === null);
+  const general = asset.assignments.some((assignment) => assignment.variantId === null);
   const names = asset.assignments
     .map((assignment) =>
       assignment.variantId
@@ -828,8 +874,8 @@ function describeAssignments(asset: MediaAssetView, product: Product): string {
     )
     .filter((name): name is string => Boolean(name));
 
-  if (shared && names.length === 0) return "Shared with every variant";
-  if (shared) return `Shared, plus ${names.join(", ")}`;
+  if (general && names.length === 0) return "General product media";
+  if (general) return `General product media, plus ${names.join(", ")}`;
   return names.join(", ");
 }
 
@@ -942,8 +988,8 @@ function AssetEditor({
               Applies to
             </div>
             <label style={{ display: "block", fontSize: "0.78rem", marginBottom: "0.3rem" }}>
-              <input type="checkbox" name="scopeVariantIds" value="" defaultChecked={isShared} /> The
-              whole product
+              <input type="checkbox" name="scopeVariantIds" value="" defaultChecked={isShared} />{" "}
+              General product media — the product itself
             </label>
             {product.variants.map((variant) => (
               <label key={variant.id} style={{ display: "block", fontSize: "0.78rem" }}>
@@ -998,7 +1044,7 @@ function AssetAssignments({ asset, product }: { asset: MediaAssetView; product: 
                 {assignment.variantId
                   ? product.variants.find((variant) => variant.id === assignment.variantId)?.name ??
                     "a removed variant"
-                  : "Whole product"}
+                  : "General product media"}
               </span>
               {assignment.isPrimary ? <StatusChip status="DEFAULT" /> : null}
               <span style={{ color: FAINT }}>#{assignment.sortOrder + 1}</span>

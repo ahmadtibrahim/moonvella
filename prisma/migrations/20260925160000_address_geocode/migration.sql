@@ -1,0 +1,37 @@
+-- WHERE GOOGLE SAYS THE ADDRESS IS.
+--
+-- WHY THE ADDRESS VALIDATION RESPONSE CARRIES COORDINATES. `validateAddress`
+-- answers with more than a verdict: alongside the corrected components it
+-- returns `geocode.location`, the latitude and longitude it matched. That is
+-- the difference between "we believe this is 12 Main Street" and "12 Main
+-- Street is here", and it is the only answer in the response that survives a
+-- postal code being ambiguous across a town boundary.
+--
+-- It was being read and dropped. The apply action saved the corrected street,
+-- city, province, postal code and country, and threw the one field that says
+-- where the result actually is. A correspondence test that later disagrees with
+-- the carrier about a postal code has nothing to appeal to.
+--
+-- ON `AddressValidation`, NOT ON THE LOCATION. These are GOOGLE'S coordinates
+-- for ONE verdict about ONE version of an address. Putting them on
+-- `PickupLocation` would create a second, writable set of coordinates next to
+-- the facility master's own — the master is the authority for where a dock is
+-- (see the effective-coordinates helper the booking path reads), and a copy
+-- that a Google response could overwrite would eventually disagree with it. A
+-- verdict's coordinates belong to the verdict, which is what a history table is
+-- for: each row keeps what Google said at the moment it said it, and the next
+-- check writes its own.
+--
+-- `DOUBLE PRECISION` and nullable. Nullable because every row recorded before
+-- today has no coordinates and inventing a pair would put a fabricated position
+-- in an evidence table; null also covers a verdict Google answered without a
+-- geocode (a country-level match has none).
+--
+-- NO BACKFILL. There is nothing to backfill from: the response bodies were not
+-- retained — Google's terms limit how long one may be kept, and the schema was
+-- deliberately reduced to the fields the screens read. The coordinates arrive
+-- from the next check somebody runs.
+
+-- AlterTable
+ALTER TABLE "AddressValidation" ADD COLUMN     "latitude" DOUBLE PRECISION,
+ADD COLUMN     "longitude" DOUBLE PRECISION;

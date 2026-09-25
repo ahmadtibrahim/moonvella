@@ -66,6 +66,9 @@ export interface GateStatus {
    * one that may be stale.
    */
   suggestionCurrent?: boolean;
+  /** Where Google matched the address, when its answer carried a point. */
+  latitude?: number | null;
+  longitude?: number | null;
   overrideReason?: string | null;
   overriddenBy?: string | null;
   original?: GateAddress | null;
@@ -194,12 +197,37 @@ export function AddressGateCard({
         </p>
       ) : null}
 
-      {status.differences.length > 0 ? (
-        <details style={{ marginTop: "0.6rem" }}>
-          <summary style={{ cursor: "pointer", fontSize: "0.78rem", color: INK, fontWeight: 600 }}>
-            What Google would change ({status.differences.length})
-          </summary>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.76rem", marginTop: "0.4rem" }}>
+      {/*
+        GOOGLE'S ANSWER IN FULL, THEN COMPONENT BY COMPONENT.
+        The table underneath is the part that decides whether to press Apply, so
+        it is the part that has to be readable — but a table of five rows is not
+        an address somebody can look at and recognise. The whole suggestion is
+        printed first, as Google formatted it, and the table says which parts of
+        it differ. Both, because either one alone has been the reason a person
+        clicked Apply on the wrong address: a bare field list reads as a diff
+        against nothing, and a bare sentence hides that the postal code moved.
+      */}
+      {status.suggestionCurrent && status.suggested && status.differences.length > 0 ? (
+        <div style={{ marginTop: "0.6rem", border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.6rem 0.7rem", background: "#f8fafc" }}>
+          <p style={{ ...helpText, marginTop: 0 }}>
+            <strong style={{ color: INK }}>Address entered:</strong> {addressLine(status.original)}
+          </p>
+          <p style={{ ...helpText, marginTop: "0.25rem" }}>
+            <strong style={{ color: INK }}>Google suggests:</strong>{" "}
+            {addressLine(status.suggested)}
+          </p>
+          {/*
+            The coordinates are not an alternative address, they are the evidence
+            that Google matched this one to a point on the map rather than to a
+            name that reads correctly. Shown only when a check returned them.
+          */}
+          {typeof status.latitude === "number" && typeof status.longitude === "number" ? (
+            <p style={{ ...helpText, marginTop: "0.25rem" }}>
+              Google matched this address at {status.latitude.toFixed(6)},{" "}
+              {status.longitude.toFixed(6)}.
+            </p>
+          ) : null}
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.76rem", marginTop: "0.45rem" }}>
             <thead>
               <tr style={{ textAlign: "left", color: FAINT }}>
                 <th style={{ padding: "0.25rem" }}>Field</th>
@@ -209,7 +237,14 @@ export function AddressGateCard({
             </thead>
             <tbody>
               {status.differences.map((difference, index) => (
-                <tr key={`${difference.component}-${index}`}>
+                <tr
+                  key={`${difference.component}-${index}`}
+                  style={
+                    difference.component === "postalCode"
+                      ? { background: "#fef3c7", fontWeight: 700 }
+                      : { background: "#ffffff" }
+                  }
+                >
                   <td style={{ padding: "0.25rem" }}>{difference.component}</td>
                   <td style={{ padding: "0.25rem" }}>{difference.entered ?? "—"}</td>
                   <td style={{ padding: "0.25rem" }}>{difference.suggested ?? "—"}</td>
@@ -217,12 +252,22 @@ export function AddressGateCard({
               ))}
             </tbody>
           </table>
-          <p style={helpText}>
-            Nothing here changes on its own. The address on the label stays the address that was
-            recorded until somebody applies the suggestion, corrects the fields, or an owner
-            accepts the address as it stands.
-          </p>
-        </details>
+        </div>
+      ) : null}
+
+      {/*
+        A SUGGESTION THAT IS NOT CURRENT SAYS SO.
+        The server withholds the table when the stored suggestion describes an
+        older version of the address (see `suggestionCurrent`), which is right —
+        but a panel that silently shows nothing reads as "Google had no
+        complaint", and the operator stops looking. So the absence is explained,
+        with the one action that resolves it.
+      */}
+      {status.differences.length === 0 && !status.suggestionCurrent && status.checkedAt ? (
+        <p style={{ ...helpText, marginTop: "0.5rem" }}>
+          This address has changed since it was last checked, so the earlier suggestion no longer
+          describes it and is not shown. Check it again to compare.
+        </p>
       ) : null}
 
       {/*
@@ -263,6 +308,23 @@ export function AddressGateCard({
           >
             Apply Google suggestion and save
           </button>
+          {/*
+            The other decision, and it has to be offered next to this one. An
+            operator who does not want Google's version is not asking for the
+            suggestion to be applied — they are saying the entered address is the
+            right one, which is the override below, recorded with a reason and a
+            name. Naming it here rather than leaving the panel to imply that
+            "Apply" is the only way forward is the difference between an owner
+            accepting an address on purpose and an owner accepting it because
+            the panel offered nothing else.
+          */}
+          {status.canOverride && isOwner ? (
+            <p style={helpText}>
+              Prefer the address as entered? Keep it with{" "}
+              <strong>Keep the entered address</strong> below — an owner records why, and the
+              address stays exactly as it is.
+            </p>
+          ) : null}
         </Form>
       ) : null}
 
@@ -304,7 +366,7 @@ export function AddressGateCard({
             an unchecked address reaches a carrier, and booking will not proceed without it.
           </p>
           <button type="submit" name="intent" value="override_address" style={{ ...button("#b45309"), marginTop: "0.4rem" }}>
-            Accept anyway
+            Keep the entered address
           </button>
         </Form>
       ) : null}

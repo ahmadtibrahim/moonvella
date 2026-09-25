@@ -459,7 +459,7 @@ async function uploadTo(path: string, cookie: string, filename: string) {
   body.set("category", "WHITE_BACKGROUND_IMAGE");
   body.set("title", "Verify upload");
   body.set("altText", "A one pixel image");
-  body.set("scopeMode", "shared");
+  body.set("scopeMode", "general");
   body.set("file", new Blob([pngBytes()], { type: "image/png" }), filename);
 
   return postForm(path, cookie, body);
@@ -703,7 +703,7 @@ async function videoPipeline(cookie: string, productId: string) {
     body.set("tab", "media");
     body.set("category", "PRODUCT_VIDEO");
     body.set("title", title);
-    body.set("scopeMode", "shared");
+    body.set("scopeMode", "general");
     body.set("file", new Blob([new Uint8Array(bytes)], { type: "video/mp4" }), filename);
     return postForm(dataPath, cookie, body);
   };
@@ -838,7 +838,7 @@ async function videoPipeline(cookie: string, productId: string) {
   templateForm.set("title", "Verify template");
   templateForm.set("templateUrl", templateUrl);
   templateForm.set("instructions", "Keep the palette.");
-  templateForm.set("scopeMode", "shared");
+  templateForm.set("scopeMode", "general");
   const templateRes = await postForm(productPath, cookie, templateForm);
 
   const templateRow = await prisma.mediaAsset.findFirst({

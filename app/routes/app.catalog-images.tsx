@@ -11,11 +11,12 @@ import { listSelectableImages, saveImageSelection } from "../services/importMedi
  * own would send the seller away from the catalogue to decide and back again,
  * losing their filters and their place.
  *
- * WHAT IS OFFERED IS NOT WHAT EXISTS. Only images that are approved AND marked
- * seller-visible are listed, and only image categories — a document or a
- * marketing file is not something a storefront shows. That filter is applied in
- * the service, so the list a seller chooses from and the list an import sends
- * come from one expression rather than two that have to be kept in step.
+ * WHAT IS OFFERED IS NOT WHAT EXISTS. Only images that are offered to sellers
+ * — switched on, not withdrawn, finished processing (see `mediaState`) — are
+ * listed, and only image categories, because a document or a marketing file is
+ * not something a storefront shows. That filter is applied in the service, so
+ * the list a seller chooses from and the list an import sends come from one
+ * expression rather than two that have to be kept in step.
  *
  * READING IS A PREVIEW, WRITING IS A DECISION. A store that may look at the
  * catalogue but may not import it can open the panel (VIEW) and cannot save a

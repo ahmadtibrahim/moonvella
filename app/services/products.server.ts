@@ -545,22 +545,40 @@ export async function setPublished(id: string, published: boolean, actor: Catalo
     await assertPublishable(id);
   }
 
-  const product = await prisma.product.update({
-    where: { id },
-    data: { isPublished: published, status: published ? "PUBLISHED" : "DRAFT" },
+  /*
+   * THE STATE AND ITS RECORD ARE ONE WRITE.
+   *
+   * These were two sequential statements, and the gap between them is a product
+   * that is live to sellers with nothing in the audit log saying who released
+   * it — which is the one question asked after a mistake reaches a storefront.
+   * Publishing is the act that sends work out of the building, so the row and
+   * the account of it are committed together or not at all. `recordAudit`
+   * accepts the transaction client for exactly this.
+   */
+  return prisma.$transaction(async (tx) => {
+    const product = await tx.product.update({
+      where: { id },
+      data: { isPublished: published, status: published ? "PUBLISHED" : "DRAFT" },
+    });
+    await recordAudit(
+      {
+        actorType: actor.actorType ?? "ADMIN_USER",
+        actorId: actor.actorId,
+        actorName: actor.actorName,
+        action: published ? "product.published" : "product.unpublished",
+        entityType: AUDIT_ENTITY.PRODUCT,
+        entityId: id,
+        afterData: { isPublished: published },
+        ipAddress: actor.ipAddress,
+        userAgent: actor.userAgent,
+      },
+      // The transaction client, cast the way every other caller of `recordAudit`
+      // casts one: `AuditClient` is the single method the function actually
+      // uses, and a full Prisma client is structurally wider than that.
+      tx as unknown as Parameters<typeof recordAudit>[1]
+    );
+    return product;
   });
-  await recordAudit({
-    actorType: actor.actorType ?? "ADMIN_USER",
-    actorId: actor.actorId,
-    actorName: actor.actorName,
-    action: published ? "product.published" : "product.unpublished",
-    entityType: AUDIT_ENTITY.PRODUCT,
-    entityId: id,
-    afterData: { isPublished: published },
-    ipAddress: actor.ipAddress,
-    userAgent: actor.userAgent,
-  });
-  return product;
 }
 
 export async function addVariant(productId: string, input: VariantInput, actor: CatalogActor) {

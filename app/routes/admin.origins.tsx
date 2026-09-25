@@ -49,6 +49,9 @@ import {
 } from "~/services/holidays";
 import { createAddressEntryAid } from "~/utils/placesEntryAid";
 import type { PickedAddress } from "~/utils/placesAddress";
+// The address verdict panel, shared with the booking screens rather than redrawn
+// here. See the note where it is rendered.
+import { AddressGateCard } from "~/components/AddressGateCard";
 import {
   INK,
   MUTED,
@@ -185,6 +188,26 @@ export async function loader({ request }: LoaderFunctionArgs) {
           overrideReason: status.overrideReason,
           overriddenBy: status.overriddenBy,
           canOverride: status.canOverride,
+          /*
+           * THE THREE FIELDS THE APPLY PANEL NEEDS, and their absence is why
+           * this page could show a suggestion and offer no way to take it.
+           *
+           * `addressStatus` computes the full comparison — the suggestion, the
+           * component differences, and whether the stored suggestion still
+           * describes the address as it stands. This loader kept the difference
+           * list and dropped the rest, so the shared `AddressGateCard` (which
+           * requires `suggestionCurrent` and `suggested` before it will draw an
+           * Apply button) rendered its table with no button under it: exactly
+           * the "Google gave me an answer and I cannot use it" report.
+           *
+           * The values are Google's, read inside the service from the stored
+           * verdict. Nothing here is assembled from the form.
+           */
+          suggested: status.suggested,
+          suggestionCurrent: status.suggestionCurrent,
+          original: status.original,
+          latitude: status.latitude,
+          longitude: status.longitude,
         },
       };
     })
@@ -270,6 +293,17 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
   const text = (name: string) => String(form.get(name) ?? "").trim();
+  /*
+   * The address the two Google actions are about.
+   *
+   * Two field names for one value, because the shared `AddressGateCard` posts
+   * `subjectId` — it serves a pickup location and an order's delivery address
+   * from the same markup, so it cannot know the pickup screen calls the same
+   * thing `id`. The other intents on this page post `id`, and both names are
+   * read here rather than in each case so the two panels cannot be given
+   * different locations to act on.
+   */
+  const subjectId = () => text("subjectId") || text("id");
   const orNull = (name: string) => {
     const value = text(name);
     return value === "" ? null : value;
@@ -421,7 +455,7 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
       }
 
       case "check_address": {
-        const id = text("id");
+        const id = subjectId();
         const location = await prisma.pickupLocation.findUnique({
           where: { id },
           select: {
@@ -460,7 +494,7 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
       }
 
       case "apply_suggestion": {
-        const id = text("id");
+        const id = subjectId();
         /*
          * The values written here come from the stored verdict, read inside the
          * service — never from this form. A suggestion the browser could supply
@@ -487,7 +521,15 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
       }
 
       case "override_address": {
-        const id = text("id");
+        /*
+         * `subjectId`, like the other two address actions — this case read `id`
+         * while the shared card posts `subjectId`, which meant the owner's
+         * "Keep the entered address" button posted a form the action read an
+         * empty subject out of and answered "that address could not be found."
+         * The three actions are read through the same helper so they cannot
+         * drift apart again.
+         */
+        const id = subjectId();
         // The role check that matters lives inside the service, against the
         // stored account — a role submitted by this form would be a role the
         // submitter chose.
@@ -873,71 +915,32 @@ function LocationCard({
         </div>
       ) : null}
 
-      {location.gate.blockers.length > 0 && location.missing.length === 0 ? (
-        <div style={{ marginTop: "0.9rem", fontSize: "0.78rem", color: "#92400e" }}>
-          {location.gate.blockers.join(" ")}
-        </div>
-      ) : null}
-
-      {location.gate.differences.length > 0 ? (
-        <details style={{ marginTop: "0.7rem" }}>
-          <summary style={{ cursor: "pointer", fontSize: "0.78rem", color: INK, fontWeight: 600 }}>
-            What Google would change ({location.gate.differences.length})
-          </summary>
-          <table
-            style={{
-              width: "100%",
-              borderCollapse: "collapse",
-              fontSize: "0.76rem",
-              marginTop: "0.4rem",
-            }}
-          >
-            <thead>
-              <tr style={{ textAlign: "left", color: FAINT }}>
-                <th style={{ padding: "0.25rem" }}>Field</th>
-                <th style={{ padding: "0.25rem" }}>Entered</th>
-                <th style={{ padding: "0.25rem" }}>Suggested</th>
-              </tr>
-            </thead>
-            <tbody>
-              {location.gate.differences.map((difference, index) => (
-                <tr key={`${difference.component}-${index}`}>
-                  <td style={{ padding: "0.25rem" }}>{difference.component}</td>
-                  <td style={{ padding: "0.25rem" }}>{difference.entered ?? "—"}</td>
-                  <td style={{ padding: "0.25rem" }}>{difference.suggested ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p style={helpText}>
-            Nothing is changed automatically — no city, postal code, unit or country is edited on
-            your behalf. Correct the fields above and check again, or have an owner accept the
-            address as it stands.
-          </p>
-        </details>
-      ) : null}
-
-      {location.gate.overrideReason ? (
-        <p style={{ ...helpText, marginTop: "0.6rem" }}>
-          <strong>Accepted by an owner</strong>
-          {location.gate.overriddenBy ? ` (${location.gate.overriddenBy})` : ""}:{" "}
-          {location.gate.overrideReason}
-        </p>
-      ) : null}
+      {/*
+        ONE ADDRESS PANEL, SHARED WITH THE BOOKING SCREENS.
+        This block used to be a copy: the same verdict, the same difference
+        table, and none of the actions — while `/admin/orders/:id` and the
+        shipment screen drew the shared card, which does have them. The copy is
+        exactly where the reported defect lived. An owner checking a dock's
+        address here saw Google's correction listed, read "nothing is changed
+        automatically", and had no button to apply it: the panel showed the
+        answer and withheld the one action the page exists for. Applying meant
+        going to a booking screen and finding the same address there, which is
+        not a workflow anybody discovers.
+        The card brings its own check button, Apply button and override form, so
+        the copies of those below are gone rather than kept in parallel — two
+        renderings of one verdict is how the two drift apart again.
+      */}
+      <AddressGateCard
+        title="Address check"
+        subjectType="PICKUP"
+        subjectId={location.id}
+        status={location.gate}
+        isOwner={isOwner}
+        canManage={canManage}
+      />
 
       {canManage ? (
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.9rem", flexWrap: "wrap" }}>
-          <Form method="post">
-            <input type="hidden" name="id" value={location.id} />
-            <button
-              type="submit"
-              name="intent"
-              value="check_address"
-              style={btn(INK, { solid: true })}
-            >
-              Check address with Google
-            </button>
-          </Form>
           <Form method="post">
             <input type="hidden" name="id" value={location.id} />
             <input type="hidden" name="active" value={location.isActive ? "false" : "true"} />
@@ -946,37 +949,6 @@ function LocationCard({
             </button>
           </Form>
         </div>
-      ) : null}
-
-      {canManage && isOwner && location.gate.canOverride ? (
-        <Form
-          method="post"
-          style={{ marginTop: "1rem", borderTop: `1px solid ${LINE}`, paddingTop: "0.8rem" }}
-        >
-          <input type="hidden" name="id" value={location.id} />
-          <label style={label} htmlFor={`reason-${location.id}`}>
-            Owner: accept this address without Google
-          </label>
-          <input
-            id={`reason-${location.id}`}
-            name="reason"
-            style={input}
-            placeholder="Why this address is known to be correct (at least 10 characters)"
-          />
-          <p style={helpText}>
-            The address keeps an honest verdict: it is recorded as accepted by an owner and is never
-            described as validated by Google. Your name and this reason are stored in the audit log,
-            because this is the one route by which an unchecked address reaches a carrier.
-          </p>
-          <button
-            type="submit"
-            name="intent"
-            value="override_address"
-            style={{ ...btn("#b45309"), marginTop: "0.4rem" }}
-          >
-            Accept anyway
-          </button>
-        </Form>
       ) : null}
     </div>
   );

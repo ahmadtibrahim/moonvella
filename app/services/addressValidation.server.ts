@@ -100,6 +100,13 @@ export interface ValidationOutcome {
   /** Deliverability of Google's answer: SUB_PREMISE and PREMISE are doors. */
   granularity: string | null;
   placeId: string | null;
+  /**
+   * Where Google put the address, when it put it anywhere. Null on an
+   * unavailable verdict, on a match too coarse to carry a point, and on every
+   * verdict recorded before these columns existed.
+   */
+  latitude: number | null;
+  longitude: number | null;
   /** Components Google says are missing, e.g. subpremise for a unit number. */
   missingComponents: string[];
   reason: string | null;
@@ -542,7 +549,11 @@ interface GoogleValidationResponse {
       unconfirmedComponentTypes?: string[];
       missingComponentTypes?: string[];
     };
-    geocode?: { placeId?: string };
+    geocode?: {
+      placeId?: string;
+      /** Where Google matched the address, when it matched it to a point. */
+      location?: { latitude?: number; longitude?: number };
+    };
   };
 }
 
@@ -756,6 +767,8 @@ export function outcomeFromResponse(
     differences: suggested ? collectDifferences(entered, suggested, components) : [],
     granularity: response.result?.verdict?.validationGranularity ?? null,
     placeId: response.result?.geocode?.placeId ?? null,
+    latitude: coordinate(response.result?.geocode?.location?.latitude),
+    longitude: coordinate(response.result?.geocode?.location?.longitude),
     missingComponents: response.result?.address?.missingComponentTypes ?? [],
     reason,
     cached: false,
@@ -808,6 +821,9 @@ export async function validateAddress(
       differences: [],
       granularity: null,
       placeId: null,
+      // Refused before Google was asked, so it has no coordinates for it.
+      latitude: null,
+      longitude: null,
       missingComponents: missing,
       reason: `This address is incomplete: ${missing.join(", ")}.`,
       cached: false,
@@ -867,6 +883,8 @@ async function findStoredVerdict(hash: string): Promise<ValidationOutcome | null
     differences: (row.differences as unknown as AddressDifference[] | null) ?? [],
     granularity: row.granularity,
     placeId: row.placeId,
+    latitude: row.latitude,
+    longitude: row.longitude,
     missingComponents: [],
     reason: null,
     cached: true,
@@ -931,11 +949,28 @@ function unavailable(address: StructuredAddress, reason: string): ValidationOutc
     differences: [],
     granularity: null,
     placeId: null,
+    // Nothing was checked, so there is nowhere Google said this address is.
+    latitude: null,
+    longitude: null,
     missingComponents: [],
     reason: `${reason} The address has not been checked, so it is not marked valid.`,
     cached: false,
     checkedAt: new Date(),
   };
+}
+
+/**
+ * One half of a coordinate pair, or null.
+ *
+ * A response is untrusted input. `0` is a real coordinate and is kept — the
+ * equator and the prime meridian are places — so this cannot use a truthiness
+ * test, and a JSON body that sent a string or NaN is dropped rather than
+ * written into a numeric column as a guess. Nothing is invented for the missing
+ * half: a latitude with no longitude is not a location, and storing one would
+ * invite a map to plot it at a longitude it made up.
+ */
+function coordinate(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -971,6 +1006,8 @@ export async function recordValidation(input: RecordValidationInput) {
       differences: outcome.differences as unknown as object,
       granularity: outcome.granularity,
       placeId: outcome.placeId,
+      latitude: outcome.latitude,
+      longitude: outcome.longitude,
       unavailableReason: outcome.verdict === "UNAVAILABLE" ? outcome.reason : null,
       checkedAt: outcome.checkedAt,
       // An unavailable verdict expires immediately: it is a record that a check
@@ -1738,6 +1775,14 @@ export async function addressStatus(
       ? ((latest?.differences as unknown as AddressDifference[] | null) ?? [])
       : [],
     suggestionCurrent: describesCurrent,
+    /*
+     * Where the last check put this address. Withheld on the same rule as the
+     * suggestion: coordinates belong to the address they were computed for, and
+     * showing a point from before an edit beside the edited address would put a
+     * confident-looking position next to an address nobody has located.
+     */
+    latitude: describesCurrent ? (latest?.latitude ?? null) : null,
+    longitude: describesCurrent ? (latest?.longitude ?? null) : null,
     overrideReason: latest?.overrideReason ?? null,
     overriddenBy: latest?.overriddenByName ?? null,
     original: describesCurrent ? latestAddress : (current ?? null),

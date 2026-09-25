@@ -577,8 +577,8 @@ export async function transferAsset(input: TransferInput): Promise<TransferOutco
   // the panel is a rendering of an earlier read, and approval or visibility can
   // be withdrawn between the two. Sending a file the merchant has since hidden
   // would be the one mistake this whole surface exists to prevent.
-  if (asset.approvalStatus !== "APPROVED") {
-    return fail("This file is not approved, so it cannot be sent to your store.");
+  if (asset.approvalStatus === "REJECTED") {
+    return fail("This file has been withdrawn, so it cannot be sent to your store.");
   }
   if (!asset.sellerVisible) {
     return fail("This file is not shared with sellers.");

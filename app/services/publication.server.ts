@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { isSellerFacing, type MediaStateFields } from "./mediaState";
 
 /**
  * The publication gate.
@@ -38,6 +39,36 @@ export interface ReadinessReport {
 
 /** Categories a seller sees as product imagery, which therefore need alt text. */
 const IMAGE_CATEGORIES = ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"];
+
+/**
+ * An image a seller could actually be shown.
+ *
+ * The moderation half of the question — switched on, not rejected — is answered
+ * by `isSellerFacing`, which is the same function the catalogue, the file route
+ * and the Shopify transfer use, so those four screens cannot disagree about a
+ * file. This adds the category: a document is offered to a seller too, but it is
+ * not a picture of the product.
+ *
+ * NOTE WHAT IS NOT ASKED FOR HERE. `approvalStatus === "APPROVED"` used to be
+ * part of this test, and it is the reason a product full of finished
+ * photographs could not be published: every file uploaded through the Admin
+ * Panel was created a draft and stayed one until its uploader approved it.
+ */
+function isActiveImage(asset: { category: string } & MediaStateFields): boolean {
+  return IMAGE_CATEGORIES.includes(asset.category) && isSellerFacing(asset);
+}
+
+/**
+ * Whether the asset makes the product-family claim (`variantId === null`)
+ * rather than one variant's.
+ *
+ * The product-level gallery is what a seller sees before choosing a size, and
+ * what the catalogue card and the Shopify product are pictured with, so a
+ * family that has only variant photographs has no picture of itself.
+ */
+function isProductLevel(asset: { assignments: { variantId: string | null; isPrimary: boolean }[] }): boolean {
+  return asset.assignments.some((assignment) => assignment.variantId === null);
+}
 
 export async function publicationReadiness(productId: string): Promise<ReadinessReport> {
   const product = await prisma.product.findUnique({
@@ -182,24 +213,37 @@ export async function publicationReadiness(productId: string): Promise<Readiness
     tab: "variants",
   });
 
-  const sellerImages = product.mediaAssets.filter(
-    (asset) =>
-      IMAGE_CATEGORIES.includes(asset.category) &&
-      asset.approvalStatus === "APPROVED" &&
-      asset.sellerVisible
+  /*
+   * THE FAMILY NEEDS A PICTURE OF ITSELF, not just pictures of its sizes.
+   *
+   * This asks for a product-level image — one attached to the family rather
+   * than to a variant — because that is the image the catalogue card, the
+   * Shopify product and the gallery before any size is chosen are all built
+   * from. A family whose only photographs hang off "Queen" has nothing to be
+   * represented by, and the seller's first sight of it would be blank.
+   *
+   * It has to have finished processing, because a file still being measured
+   * cannot be shipped to anyone yet.
+   */
+  const familyImages = product.mediaAssets.filter(
+    (asset) => isActiveImage(asset) && isProductLevel(asset) && asset.processingStatus === "READY"
   );
   checks.push({
     key: "seller_image",
-    label: "At least one approved, seller-visible image",
-    ok: sellerImages.length > 0,
-    detail:
-      "Approving an image is what lets it reach a seller; a draft image is visible only here.",
+    label: "At least one active, seller-visible product image",
+    ok: familyImages.length > 0,
+    detail: familyImages.length
+      ? "This is the picture the catalogue shows for the family."
+      : "Upload an image for the product itself, not only for its sizes. It is what the catalogue card and the product page before a size is chosen are drawn from.",
     tab: "media",
   });
 
   // Alt text is an accessibility requirement that has to hold before an image
   // can be shown to a buyer, so it gates publication rather than being a
-  // warning that is never acted on.
+  // warning that is never acted on. It is checked across every seller-visible
+  // image, not only the family ones: a variant's photograph reaches a shopper
+  // the moment that size is selected.
+  const sellerImages = product.mediaAssets.filter(isActiveImage);
   const missingAlt = sellerImages.filter((asset) => !asset.altText?.trim());
   checks.push({
     key: "alt_text",
@@ -211,24 +255,35 @@ export async function publicationReadiness(productId: string): Promise<Readiness
     tab: "media",
   });
 
-  const hasPrimary = product.mediaAssets.some(
-    (asset) =>
-      IMAGE_CATEGORIES.includes(asset.category) &&
-      asset.approvalStatus === "APPROVED" &&
-      asset.sellerVisible &&
-      asset.assignments.some((assignment) => assignment.isPrimary)
+  /*
+   * EXACTLY ONE, and the count is the check. Zero means the catalogue has no
+   * image to lead with. Two means the answer to "which picture represents this
+   * product" depends on row order, which is how the same product ends up with
+   * one thumbnail in the admin list, another on the Shopify product and a third
+   * in a marketing email. `setPrimaryAssignment` clears the previous holder in
+   * the same transaction, so two can only arise from a write that bypassed it.
+   */
+  const familyPrimaries = familyImages.filter((asset) =>
+    asset.assignments.some((assignment) => assignment.variantId === null && assignment.isPrimary)
   );
   checks.push({
     key: "primary_image",
-    label: "A primary image is set",
-    ok: hasPrimary,
-    detail: "The image a seller sees first in the catalogue.",
+    label: "Exactly one primary product image is set",
+    ok: familyPrimaries.length === 1,
+    detail:
+      familyPrimaries.length === 0
+        ? "No product image is marked primary. The primary is the thumbnail for the catalogue, the seller's storefront and the marketing fallback."
+        : familyPrimaries.length > 1
+          ? `More than one image is primary: ${familyPrimaries.map((a) => a.title).join(", ")}. Keep one and the rest become part of the gallery.`
+          : "The image a seller sees first, before choosing a size.",
     tab: "media",
   });
 
   const stuck = product.mediaAssets.filter(
     (asset) =>
-      asset.sellerVisible && asset.processingStatus !== "READY" && asset.processingStatus !== "FAILED"
+      isSellerFacing(asset) &&
+      asset.processingStatus !== "READY" &&
+      asset.processingStatus !== "FAILED"
   );
   checks.push({
     key: "processing",
@@ -256,7 +311,7 @@ export async function publicationReadiness(productId: string): Promise<Readiness
   });
 
   const sellerDocuments = product.mediaAssets.filter(
-    (asset) => asset.category === "DOCUMENT" && asset.approvalStatus === "APPROVED" && asset.sellerVisible
+    (asset) => asset.category === "DOCUMENT" && isSellerFacing(asset)
   );
   const documentsMissingType = sellerDocuments.filter((asset) => !asset.documentType);
   checks.push({
@@ -290,12 +345,31 @@ export async function publicationReadiness(productId: string): Promise<Readiness
  * fixes the page in one pass instead of discovering the next problem each time
  * they press the button.
  */
+/**
+ * The refusal, carrying the checks that caused it.
+ *
+ * A message string was enough while the only thing done with a refusal was to
+ * print it. It is not enough now: the page has to link each failed check to the
+ * tab that resolves it, and the two renderings it used to produce — a yellow
+ * readiness strip from the loader and a red alert repeating the same bullets
+ * from the action — showed a merchant the same list twice, in two colours, with
+ * only one of them clickable. The report travels with the refusal so the page
+ * can draw it once.
+ */
+export class PublicationRefused extends Error {
+  readonly report: ReadinessReport;
+
+  constructor(report: ReadinessReport) {
+    const lines = report.blockers.map((check) => `• ${check.label} — ${check.detail}`);
+    super(`This product is not ready to publish:\n${lines.join("\n")}`);
+    this.name = "PublicationRefused";
+    this.report = report;
+  }
+}
+
 export async function assertPublishable(productId: string): Promise<void> {
   const report = await publicationReadiness(productId);
   if (report.ready) return;
 
-  const lines = report.blockers.map((check) => `• ${check.label} — ${check.detail}`);
-  throw new Error(
-    `This product is not ready to publish:\n${lines.join("\n")}`
-  );
+  throw new PublicationRefused(report);
 }

@@ -175,9 +175,7 @@ function uniquePath(folder: string, filename: string, taken: Set<string>): strin
  * from my pack" has an answer that is not a guess.
  */
 function exclusionReason(asset: PackAsset): string | null {
-  if (asset.approvalStatus !== "APPROVED") {
-    return `Not approved (${asset.approvalStatus.toLowerCase().replace("_", " ")}).`;
-  }
+  if (asset.approvalStatus === "REJECTED") return "Withdrawn from sellers.";
   if (!asset.sellerVisible) return "Not marked visible to sellers.";
   if (asset.processingStatus === "FAILED") return "Processing failed.";
   if (asset.processingStatus === "UPLOADING") return "Upload did not finish.";

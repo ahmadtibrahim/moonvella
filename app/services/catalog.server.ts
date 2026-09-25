@@ -59,12 +59,12 @@ type MediaAssetWithAssignments = {
 /**
  * Chooses the image a seller sees for a family.
  *
- * Preference order is the order the merchant expressed: the variant's own
- * primary image first, because it is the most specific thing they chose, then
- * any variant-scoped primary, then the shared primary, then simply the
- * lowest-ordered asset. The fallbacks matter because a product can legitimately
- * carry only shared media, which is the common case for a family whose variants
- * differ only in size.
+ * Preference order is the order the merchant expressed: the product-level
+ * primary image first, because it is the one picture they nominated for the
+ * product as a whole, then the general gallery in its configured order, then
+ * the default variant's own photograph, then any variant-scoped one. The
+ * fallbacks matter because a product can legitimately carry only variant media,
+ * and a card with no picture at all is worse than a picture of one size.
  *
  * IT RETURNS A URL, NOT A KEY. It used to return `storageKey`, which is 32 hex
  * characters and nothing else, and the catalog card rendered it directly as an
@@ -89,6 +89,34 @@ function pickPrimaryImage(
     return match ? match.sortOrder : Number.MAX_SAFE_INTEGER;
   };
 
+  /*
+   * THE PRODUCT'S OWN PRIMARY IMAGE COMES FIRST, and this is a change of order
+   * rather than a change of preference.
+   *
+   * It used to lead with the default variant's own photograph, which made the
+   * catalogue entry for a family a picture of one of its sizes: the King size
+   * was pictured with the King shot, and which picture a seller saw depended on
+   * which size happened to be marked default. The same product then had one
+   * thumbnail in the catalogue, another on the Shopify product and a third in a
+   * marketing email, because each of those walks its own list.
+   *
+   * The product-level primary is the merchant's explicit answer to "which
+   * picture represents this product", set on the media tab and enforced to be
+   * unique by the publication gate (`primary_image`). When it exists it is the
+   * answer everywhere. The old preferences survive underneath it, for the
+   * families that have not nominated one — a product with only variant
+   * photographs still gets a picture rather than a blank card.
+   */
+  const productPrimary = withImage.find((asset) =>
+    asset.assignments.some((assignment) => assignment.variantId === null && assignment.isPrimary)
+  );
+  if (productPrimary) return assetUrl(productPrimary);
+
+  const shared = withImage
+    .filter((asset) => asset.assignments.some((a) => a.variantId === null))
+    .sort((a, b) => byVariantOrder(a, null) - byVariantOrder(b, null));
+  if (shared.length) return assetUrl(shared[0]);
+
   if (defaultVariantId) {
     const own = withImage
       .filter((asset) => asset.assignments.some((a) => a.variantId === defaultVariantId))
@@ -105,16 +133,6 @@ function pickPrimaryImage(
       return a.id.localeCompare(b.id);
     });
   if (scoped.length) return assetUrl(scoped[0]);
-
-  const shared = withImage
-    .filter((asset) => asset.assignments.some((a) => a.variantId === null))
-    .sort((a, b) => {
-      const aPrimary = a.assignments.some((x) => x.isPrimary) ? 0 : 1;
-      const bPrimary = b.assignments.some((x) => x.isPrimary) ? 0 : 1;
-      if (aPrimary !== bPrimary) return aPrimary - bPrimary;
-      return byVariantOrder(a, null) - byVariantOrder(b, null);
-    });
-  if (shared.length) return assetUrl(shared[0]);
 
   return assetUrl(withImage[0]);
 }
@@ -143,9 +161,16 @@ export async function listCatalog(
       category: true,
       productCode: true,
       mediaAssets: {
+        /*
+         * The same pair of questions every seller-facing screen asks, in the
+         * query rather than in JavaScript — see `mediaState`. Written out here
+         * because a Prisma filter cannot call a function; the three clauses and
+         * `isReadyForSellers` must change together.
+         */
         where: {
-          approvalStatus: "APPROVED",
           sellerVisible: true,
+          approvalStatus: { not: "REJECTED" },
+          processingStatus: "READY",
           category: { in: [...CATALOG_IMAGE_CATEGORIES] },
         },
         select: {

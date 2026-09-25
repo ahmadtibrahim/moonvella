@@ -2,6 +2,7 @@ import type { LoaderFunctionArgs } from "react-router";
 import { prisma } from "~/db.server";
 import { contentTypeForKey, isStorageKey, readObject } from "~/services/storage.server";
 import { getCurrentUser } from "~/utils/adminAuth.server";
+import { isReadyForSellers } from "~/services/mediaState";
 
 /**
  * Serves a stored object by its key.
@@ -13,8 +14,8 @@ import { getCurrentUser } from "~/utils/adminAuth.server";
  * key is treated as a locator and the decision is made from the database, on
  * every request:
  *
- *   • An asset that is APPROVED, seller-visible, and on a product that is
- *     actually published is catalogue imagery. It is meant to be public, and
+ *   • An asset that is offered to sellers, finished processing, and on a
+ *     product that is actually published is catalogue imagery. It is meant to be public, and
  *     requiring a session would break the storefront and the marketing pack.
  *
  *   • Everything else — a draft, a rejected file, an asset held back from
@@ -59,6 +60,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     select: {
       approvalStatus: true,
       sellerVisible: true,
+      processingStatus: true,
       product: { select: { status: true, isActive: true, isArchived: true } },
     },
   });
@@ -69,9 +71,11 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     throw new Response("Not found", { status: 404 });
   }
 
+  // The same question the catalogue asks — see `mediaState` — and then the
+  // product's own state on top of it: a file that is offered to sellers is still
+  // not public until the family it belongs to is published.
   const isPublicCatalogueImage =
-    asset.approvalStatus === "APPROVED" &&
-    asset.sellerVisible &&
+    isReadyForSellers(asset) &&
     asset.product.status === "PUBLISHED" &&
     asset.product.isActive &&
     !asset.product.isArchived;

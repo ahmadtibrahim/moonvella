@@ -73,6 +73,7 @@ export async function probeVideoAsset(assetId: string): Promise<ProbeOutcome> {
       height: true,
       processingStatus: true,
       durationSeconds: true,
+      approvalStatus: true,
     },
   });
   if (!asset) return { assetId, status: "SKIPPED", reason: "the asset no longer exists" };
@@ -119,6 +120,23 @@ export async function probeVideoAsset(assetId: string): Promise<ProbeOutcome> {
       ...(asset.width === null && measured.width !== null
         ? { width: measured.width, height: measured.height }
         : {}),
+      /*
+       * MEASURING A VIDEO IS WHAT ACTIVATES IT, and this is the second half of
+       * the upload path's promise. A video arrives PROCESSING and seller-visible
+       * because its length is not known yet; the upload cannot approve what it
+       * could not measure, so the probe finishes the job here. Without this the
+       * file would reach READY and sit inactive — the exact state that made an
+       * administrator hunt for an Approve button on their own upload.
+       *
+       * A REJECTED VIDEO IS NOT RESURRECTED. Rejection is the one deliberate
+       * "no" in the model, and it is reachable while a file is still
+       * processing; a probe that finished later would otherwise switch it back
+       * on. The rejection also already cleared `sellerVisible`, so leaving the
+       * row alone leaves it withdrawn.
+       */
+      ...(asset.approvalStatus === "REJECTED"
+        ? {}
+        : { approvalStatus: "APPROVED" as const, sellerVisible: true }),
     },
   });
   return { assetId, status: "READY", seconds: measured.seconds };

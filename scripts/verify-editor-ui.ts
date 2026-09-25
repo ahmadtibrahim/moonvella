@@ -25,6 +25,14 @@ import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcryptjs";
 import { ADMIN_SESSION_COOKIE } from "~/utils/adminAuth.server";
 import { publicationReadiness } from "~/services/publication.server";
+// The verdict seed is the same helper the booking suites use, so a fixture
+// written here cannot disagree with the gate about what "current" means.
+import { recordVerdict } from "./verify-address-fixtures";
+// The server-side Google key, read the way the application reads it, so the
+// check that it never reaches a page is about the value that actually resolves
+// rather than about a column that might be empty.
+import { SERVER_KEY_FIELD } from "~/services/addressValidation.server";
+import { getCredential } from "~/services/credentials.server";
 // The same conversion the packing screen applies to a stored carton, so the
 // check is about the application's arithmetic rather than a copy of it.
 import { toCm, toKg } from "~/services/packaging.server";
@@ -102,6 +110,98 @@ async function postMulti(path: string, cookie: string, data: [string, string][])
     },
     body: new URLSearchParams(data),
   });
+}
+
+/*
+ * Two real PNGs, one pixel each and deliberately different pictures.
+ *
+ * The upload path measures the image from its own header and refuses a file
+ * whose contents do not match the type the form declared, so a fixture has to
+ * be a genuine image rather than a buffer with a .png name. They differ because
+ * the same bytes uploaded twice is a duplicate on the same product, whatever
+ * the title says — that refusal has its own check in the product system suite,
+ * and a fixture that tripped it here would report it as the wrong defect.
+ */
+const TINY_PNG_A = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGM4IScHRAwQCgAfJgQRoo8irwAAAABJRU5ErkJggg==",
+  "base64"
+);
+const TINY_PNG_B = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAMAAAADCAIAAADZSiLoAAAAEElEQVR4nGOQszkBQQxYWACTEgozKdnjIQAAAABJRU5ErkJggg==",
+  "base64"
+);
+
+/**
+ * Post the media form the way a browser does — multipart, with a file — because
+ * the path from the control to the row is the thing under test, and a JSON post
+ * would start after the part that breaks.
+ */
+async function uploadMediaForm(
+  productId: string,
+  cookie: string,
+  input: {
+    fields: Record<string, string>;
+    file: { name: string; type: string; bytes: Buffer };
+  }
+) {
+  const body = new FormData();
+  for (const [key, value] of Object.entries(input.fields)) body.append(key, value);
+  body.append(
+    "file",
+    new Blob([new Uint8Array(input.file.bytes)], { type: input.file.type }),
+    input.file.name
+  );
+  return fetch(`${BASE}/admin/products/${productId}`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { Origin: BASE, Cookie: cookie },
+    body,
+  });
+}
+
+/**
+ * The words that would mean an approval step had come back.
+ *
+ * Matched as markup rather than as prose: a sentence explaining that an
+ * administrator no longer approves their own upload is not a control, and a
+ * check that failed on it would be failing on the comment that documents the
+ * change.
+ */
+const MODERATION_CONTROLS = [
+  'value="media_approve"',
+  'value="media_reject"',
+  'value="media_pending_approval"',
+  ">Approve<",
+  ">Reject<",
+];
+
+/**
+ * The address panel belonging to one record, out of a page that draws one for
+ * every location it lists.
+ *
+ * Each card names its own subject in a hidden field, and each begins with the
+ * same heading, so the slice runs from this card's heading to the next one's.
+ * Reading the whole page instead is how a check passes on a neighbour's
+ * evidence: "there is an Apply button on this screen" is true of the page and
+ * false of the record under test.
+ */
+function cardFor(html: string, subjectId: string): string {
+  const starts = [...html.matchAll(/>Address check<\/strong>/g)].map((match) => match.index ?? -1);
+  for (let index = 0; index < starts.length; index += 1) {
+    const slice = html.slice(starts[index], starts[index + 1] ?? html.length);
+    if (slice.includes(`name="subjectId" value="${subjectId}"`)) return slice;
+  }
+  return "";
+}
+
+/**
+ * The verdict chip an address panel is showing, for a failure message that says
+ * which verdict was rendered rather than only that the expected words were
+ * absent.
+ */
+function verdictOnPanel(card: string): string {
+  const match = card.match(/Address check<\/strong><span style="[^"]*">([^<]+)<\/span>/);
+  return match?.[1] ?? "(no verdict chip found in this dock's panel)";
 }
 
 /** How many controls in this page submit under one name. */
@@ -686,7 +786,7 @@ async function main() {
     const detailsBeforeReady = await get(`/admin/products/${product.id}?tab=details`, cookie);
     check(
       "A product with no image is told what it is missing, next to Publish",
-      detailsBeforeReady.html.includes("At least one approved, seller-visible image") &&
+      detailsBeforeReady.html.includes("At least one active, seller-visible product image") &&
         detailsBeforeReady.html.includes("Publish to sellers"),
       "the requirement and the control are on the same screen"
     );
@@ -703,14 +803,16 @@ async function main() {
     );
     check(
       "And the refusal names the requirement rather than saying no",
-      (await ownerBlocked.text()).includes("approved, seller-visible image"),
+      (await ownerBlocked.text()).includes("active, seller-visible product image"),
       "a refusal that does not say what to fix is a dead end"
     );
 
-    // Make it publishable: a description, an approved seller-visible image with
-    // alt text, and that image marked primary. Written directly, because the
-    // media forms have their own suite and a failure there would be reported
-    // here as the wrong defect.
+    // Make it publishable: a description, a seller-visible image with alt text,
+    // and that image marked primary. Written directly, because the media forms
+    // have their own suite and a failure there would be reported here as the
+    // wrong defect. The row is written the way an admin upload now arrives —
+    // approved, switched on, finished — so this fixture is what the real editor
+    // produces rather than a shape nothing writes.
     await prisma.product.update({
       where: { id: product.id },
       data: { description: "Written by verify-editor-ui." },
@@ -834,6 +936,46 @@ async function main() {
       "the gate is what keeps the status and the flag consistent"
     );
 
+    /*
+     * THE CONTROL NAMES THE CHANGE IT WOULD MAKE. A page that says Published
+     * and offers a button marked Publish is a page asking its reader to guess
+     * whether the press is a no-op, a re-publish or a duplicate — and the
+     * answer changes what they do next. So the same control is asserted in both
+     * directions, and each is asserted on the page whose badge says the state
+     * it belongs to.
+     */
+    const ownerAfterPublish = await get(`/admin/products/${product.id}?tab=details`, cookie);
+    check(
+      "Once published, the control reads Unpublish rather than Publish",
+      withdrawControl(ownerAfterPublish.html) && !publishControl(ownerAfterPublish.html),
+      "the label follows the state beside it"
+    );
+
+    /*
+     * A SECOND PRESS IS NOT A SECOND PUBLICATION. What must not change is the
+     * product's state and its media: a re-publish that re-ran an export and
+     * attached the image a second time would double the gallery on every
+     * impatient click, and the seller would see the same shirt twice. An audit
+     * row per press is deliberate and is not counted here — the record of who
+     * asked is not a side effect.
+     */
+    const secondPublish = await post(`/admin/products/${product.id}`, cookie, {
+      intent: "publish",
+      tab: "details",
+    });
+    const afterSecond = await prisma.product.findUnique({ where: { id: product.id } });
+    const primaryRows = await prisma.mediaAssetAssignment.count({
+      where: { asset: { productId: product.id }, isPrimary: true, variantId: null },
+    });
+    check(
+      "A second Publish changes nothing — still published, still one primary, no second copy of the image",
+      secondPublish.status === 302 &&
+        afterSecond?.status === "PUBLISHED" &&
+        afterSecond?.isPublished === true &&
+        primaryRows === 1,
+      `HTTP ${secondPublish.status}, ${afterSecond?.status}, ${primaryRows} product primary row(s)`
+    );
+
     const catalogWithdraw = await post(`/admin/products/${product.id}`, catalogCookie, {
       intent: "unpublish",
       tab: "details",
@@ -861,6 +1003,134 @@ async function main() {
       "A hand-made POST cannot park a product in the retired approval state",
       parkAttempt.status !== 500 && afterPark?.status === "PUBLISHED",
       `HTTP ${parkAttempt.status}, status ${afterPark?.status}`
+    );
+
+    /* ------------------------------------------------------------------ */
+    /* Uploading from the Admin Panel, and the scope the file is given      */
+    /* ------------------------------------------------------------------ */
+
+    /*
+     * TWO PROMISES, DRIVEN THROUGH THE REAL FORM.
+     *
+     * The first is that an administrator's upload needs no approval: the file
+     * arrives finished, switched on and already approved, because asking an
+     * administrator to approve the file they just chose themselves is the same
+     * person pressing a second button. The failure this guards against is not
+     * loud — a row that landed DRAFT looks healthy on the media tab and simply
+     * never reaches a seller, and the "product image" check keeps refusing the
+     * product for a reason nobody can see on the tab they are looking at.
+     *
+     * The second is that the scope radio decides what the file belongs to: a
+     * general upload is a claim by the product family with no variant on it,
+     * and a variant upload is a claim by the size(s) ticked. Getting that
+     * backwards is how one size's photograph ends up in every other size's
+     * gallery.
+     *
+     * The bytes are real PNGs, because the upload path reads the header to
+     * measure the image and refuses a file whose contents do not match what it
+     * declared — a fixture that skipped that would be testing a path no browser
+     * can reach. Two different pictures, because the same bytes twice is a
+     * duplicate and is refused by design.
+     */
+    const mediaBefore = await get(`/admin/products/${product.id}?tab=media`, cookie);
+    const moderation = MODERATION_CONTROLS.filter((needle) => mediaBefore.html.includes(needle));
+    check(
+      "The media tab offers no Approve and no Reject — there is no moderation step left to press",
+      moderation.length === 0 &&
+        mediaBefore.html.includes('value="media_visibility"') &&
+        mediaBefore.html.includes(">Edit<"),
+      `moderation controls found: ${moderation.join(", ") || "none"}; the actions it offers instead are Edit and Activate/Deactivate`
+    );
+
+    const generalUpload = await uploadMediaForm(product.id, cookie, {
+      fields: {
+        tab: "media",
+        intent: "media_upload",
+        category: "WHITE_BACKGROUND_IMAGE",
+        title: "General upload",
+        altText: "One pixel of product, at the family level.",
+        scopeMode: "general",
+      },
+      file: { name: "general.png", type: "image/png", bytes: TINY_PNG_A },
+    });
+    const generalAsset = await prisma.mediaAsset.findFirst({
+      where: { productId: product.id, title: "General upload" },
+      include: { assignments: true },
+    });
+    check(
+      "An image uploaded from the Admin Panel arrives READY, switched on and approved, with no second press",
+      generalUpload.status === 302 &&
+        generalAsset?.processingStatus === "READY" &&
+        generalAsset?.sellerVisible === true &&
+        generalAsset?.approvalStatus === "APPROVED",
+      `HTTP ${generalUpload.status}, ${generalAsset?.processingStatus}/${generalAsset?.approvalStatus}, visible=${generalAsset?.sellerVisible}`
+    );
+    check(
+      "And it is the product family's own image — a general upload is assigned to no variant",
+      generalAsset?.assignments.length === 1 && generalAsset.assignments[0].variantId === null,
+      `${generalAsset?.assignments.length ?? 0} claim(s), variant=${generalAsset?.assignments[0]?.variantId ?? "none"}`
+    );
+
+    const variantUpload = await uploadMediaForm(product.id, cookie, {
+      fields: {
+        tab: "media",
+        intent: "media_upload",
+        category: "WHITE_BACKGROUND_IMAGE",
+        title: "Size upload",
+        altText: "One pixel of product, on one size.",
+        scopeMode: "variant",
+        scopeVariantIds: variant.id,
+      },
+      file: { name: "size.png", type: "image/png", bytes: TINY_PNG_B },
+    });
+    const sizeAsset = await prisma.mediaAsset.findFirst({
+      where: { productId: product.id, title: "Size upload" },
+      include: { assignments: true },
+    });
+    check(
+      "A variant-specific upload is claimed by the size that was ticked, and is just as ready",
+      variantUpload.status === 302 &&
+        sizeAsset?.assignments.length === 1 &&
+        sizeAsset.assignments[0].variantId === variant.id &&
+        sizeAsset?.sellerVisible === true,
+      `HTTP ${variantUpload.status}, ${sizeAsset?.assignments.length ?? 0} claim(s) on ${sizeAsset?.assignments[0]?.variantId === variant.id ? "the ticked size" : "the wrong row"}`
+    );
+    check(
+      "And the two uploads did not become each other — the family claim is not on the size",
+      generalAsset?.assignments[0]?.variantId === null && sizeAsset?.assignments[0]?.variantId !== null,
+      "the radio, not the last file, decides the scope"
+    );
+
+    /*
+     * THE FILE'S OWN SCREEN, WHICH IS WHERE THE REAL ACTIONS ARE. The tab shows
+     * Edit and Activate/Deactivate; the editor behind Edit is where a file is
+     * renamed, made primary, detached or deleted — and those four are asserted
+     * here because they are what replaced Approve and Reject. The general
+     * upload is used rather than the size one: it is the second file in its
+     * scope, so it is not already primary, and "Make primary" is on the screen
+     * rather than correctly absent.
+     */
+    const assetEditor = await get(
+      `/admin/products/${product.id}?tab=media&asset=${generalAsset?.id ?? ""}`,
+      cookie
+    );
+    const editorModeration = MODERATION_CONTROLS.filter((needle) => assetEditor.html.includes(needle));
+    const editorActions = ["media_update", "media_primary", "media_detach"].filter((intent) =>
+      assetEditor.html.includes(`value="${intent}"`)
+    );
+    /*
+     * Delete is asserted by its arming button rather than by its submit, which
+     * the same control deliberately withholds until it is armed — see the
+     * product-list checks above, where the two presses are driven in full. What
+     * this check is for is that the file's screen offers the four actions
+     * instead of the two that were removed.
+     */
+    check(
+      "The file's own screen offers Edit, Make primary, Detach and Delete — and still no moderation",
+      editorModeration.length === 0 &&
+        editorActions.length === 3 &&
+        assetEditor.html.includes("Delete this file"),
+      `moderation controls found: ${editorModeration.join(", ") || "none"}; actions found: ${editorActions.join(", ")}, plus the armed Delete`
     );
 
     /* ------------------------------------------------------------------ */
@@ -968,6 +1238,359 @@ async function main() {
       `${tagById(reread.html, "loc-pickupOpenTime").slice(0, 60)}`
     );
 
+    /* ------------------------------------------------------------------ */
+    /* The address check, and the button that applies Google's answer       */
+    /* ------------------------------------------------------------------ */
+
+    /*
+     * THE DEFECT THIS SECTION EXISTS FOR. The panel used to print Google's
+     * suggestion as text and leave the operator to retype it — a suggestion
+     * with no way to accept it is worse than none, because it looks like an
+     * action and is a paragraph. What is asserted here is the whole of the
+     * corrected behaviour on the screen a person actually uses: the address as
+     * entered and the address Google would have, side by side, with a control
+     * that writes it.
+     *
+     * THE VERDICT IS SEEDED, NOT REQUESTED. Google is not configured in this
+     * deployment and must not be called from a test suite; the stored verdict
+     * is the same shape `recordValidation` writes, and the call itself is the
+     * subject of the places suite. What is under test here is what the screen
+     * does with a verdict once it has one.
+     */
+    const address = {
+      street1: "1200 Water Street",
+      // The unit is the field the directive names by hand, and it is the one a
+      // naive implementation loses: Google returns a street, not an apartment,
+      // so anything that rebuilds the address from its answer drops it.
+      street2: "Unit 7B",
+      city: "Kelowna",
+      /*
+       * SPELLED OUT, WHERE GOOGLE ABBREVIATES. "British Columbia" and "BC" are
+       * the same province, and the comparison rules say so — a spelling
+       * difference is not a change, so this field must NOT appear among the
+       * differences and must NOT be rewritten by Apply. Written as the long
+       * form so that the check below ("left as the person spelled it") is a
+       * real one rather than a comparison of a value with itself.
+       */
+      province: "British Columbia",
+      // A wrong last character, which is the kind of postal mistake a person
+      // makes and Google corrects. Not a formatting difference, so it belongs
+      // in the difference list and is one of the fields Apply writes.
+      postalCode: "V1Y 6V8",
+      country: "CA",
+    };
+    await post("/admin/origins", cookie, {
+      intent: "save_location",
+      id: dock?.id ?? "",
+      code: DOCK_CODE,
+      name: "Verify UI dock",
+      timeZone: "America/Toronto",
+      ...address,
+    });
+    const addressed = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "The dock's address saves from the form, with its unit kept as its own component",
+      addressed?.street1 === address.street1 && addressed?.street2 === address.street2,
+      `${addressed?.street1 ?? "-"} / ${addressed?.street2 ?? "-"}`
+    );
+
+    const suggestion = {
+      street1: "1200 Water St",
+      /*
+       * THE UNIT CARRIES THROUGH UNCHANGED, and it is written that way here
+       * because that is what the application produces rather than a kindness in
+       * the fixture. Google's components are applied over the address as
+       * entered (`suggestedFromComponents` starts from the fallback and
+       * overwrites only the components Google returned), so a suggestion talks
+       * about the street and leaves the apartment alone. A fixture that nulled
+       * this field would be modelling "Google replaced the unit with nothing" —
+       * a thing the API cannot say — and would then be testing that the apply
+       * step writes the blank it had been handed.
+       */
+      street2: "Unit 7B",
+      city: "Kelowna",
+      province: "BC",
+      postalCode: "V1Y 6V7",
+      country: "CA",
+    };
+    /*
+     * The row is written through the shared fixture, which hashes the address
+     * the record actually holds — so `suggestionCurrent` is true by
+     * construction rather than by a copy of the comparison rule. The verdict,
+     * the suggestion, the differences and the coordinates are the shape
+     * `recordValidation` stores when Google answers a check with CORRECTION_REQUIRED.
+     */
+    await recordVerdict(prisma, {
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+      verdict: "CORRECTION_REQUIRED",
+      suggestedAddress: suggestion,
+      /*
+       * THE TWO COMPONENTS THAT GENUINELY DIFFER, and no others. This list is
+       * what the panel prints and what Apply writes, so padding it with the
+       * province — which the comparison rules treat as the same value spelled
+       * differently — would be seeding a verdict the application cannot
+       * produce, and the check that Apply leaves the province alone would then
+       * be measuring the fixture instead of the rule.
+       */
+      differences: [
+        { component: "street1", entered: address.street1, suggested: suggestion.street1 },
+        { component: "postalCode", entered: address.postalCode, suggested: suggestion.postalCode },
+      ],
+    });
+    // The geocode columns are not part of the shared fixture's contract — it
+    // serves suites that book, which never read them — so the point Google
+    // would have returned is attached here, to the row just written.
+    await prisma.addressValidation.updateMany({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "" },
+      data: { latitude: 49.888, longitude: -119.496, granularity: "PREMISE", placeId: "verify-editor-ui-place" },
+    });
+
+    /*
+     * SCOPED TO THIS DOCK'S OWN PANEL, NOT TO THE PAGE. The origins screen
+     * draws an address card for every location it lists, so "the page contains
+     * an Apply button" is a statement about whichever dock happens to have a
+     * suggestion — it would pass for a dock with none, and pass here for the
+     * wrong record. Every assertion below reads the card whose own hidden
+     * subject id is this dock's.
+     */
+    const panel = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    const card = cardFor(panel.html, dock?.id ?? "");
+    check(
+      "The panel shows the address as entered and the address Google suggests, both as addresses",
+      card.includes("Address entered:") &&
+        card.includes("Google suggests:") &&
+        card.includes(address.street1) &&
+        card.includes(suggestion.street1),
+      `this dock's panel found: ${card.length > 0}; ${card.length} characters`
+    );
+    check(
+      "And offers a button that applies it, rather than the text alone",
+      card.includes('value="apply_suggestion"') && card.includes("Apply Google suggestion and save"),
+      "the functional control the reported defect was missing"
+    );
+    check(
+      "The unit is shown in both versions, so it is visibly not part of what would change",
+      (card.match(/Unit 7B/g) ?? []).length >= 2,
+      `${(card.match(/Unit 7B/g) ?? []).length} occurrence(s) in this dock's panel`
+    );
+    check(
+      "And the postal code is the row that is called out, because it is the one that moves a parcel",
+      card.includes("postalCode") &&
+        card.includes("V1Y 6V7") &&
+        card.includes('background:#fef3c7'),
+      "the difference table marks it"
+    );
+
+    /*
+     * NO SECRET IN THE PAGE. The browser key is a referrer-restricted key that
+     * is meant to be public; the SERVER key is the one that must never leave
+     * the credential store, and the address panel is the screen most likely to
+     * leak it by printing the settings it read. Neither is asserted by name
+     * here — the check is that nothing shaped like the stored secret appears at
+     * all, which holds whether or not one is configured.
+     */
+    const serverKey = await getCredential("google", SERVER_KEY_FIELD);
+    check(
+      "The page carries no Google server key, whether it was configured or resolved from the environment",
+      serverKey === null || !panel.html.includes(serverKey),
+      serverKey ? "a server key resolves, and it is not in the markup" : "no server key configured"
+    );
+
+    const applied = await post("/admin/origins", cookie, {
+      intent: "apply_suggestion",
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+    });
+    const corrected = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "Pressing Apply writes Google's structured address onto the record",
+      corrected?.street1 === suggestion.street1 &&
+        corrected?.city === suggestion.city &&
+        corrected?.postalCode === suggestion.postalCode,
+      `${corrected?.street1 ?? "-"}, ${corrected?.city ?? "-"} ${corrected?.province ?? "-"} ${corrected?.postalCode ?? "-"}`
+    );
+    check(
+      "And the unit is preserved — Google asked to change nothing about it, so nothing was written to it",
+      corrected?.street2 === address.street2,
+      `street2 = ${corrected?.street2 ?? "(lost)"}`
+    );
+    check(
+      "The province Google abbreviates is left exactly as the person spelled it",
+      corrected?.province === address.province,
+      `province = ${corrected?.province ?? "(lost)"} — "BC" is the same province, so it is not a correction`
+    );
+    check(
+      "And the postal code Google returned is stored in the form Google wrote it",
+      corrected?.postalCode === suggestion.postalCode,
+      `postal = ${corrected?.postalCode ?? "(lost)"}`
+    );
+    /*
+     * AND ONLY AN OWNER CAN DO IT. The card withholds the button from anyone
+     * else, but a button that is merely absent is not a control — this posts
+     * the same form as a signed-in catalogue-role account and asserts the
+     * address did not move. Whichever layer answers first (the page's
+     * permission, or the OWNER-only rule inside the service), the record is
+     * what is checked, because the record is what a carrier is handed.
+     */
+    const notOwner = await post("/admin/origins", catalogCookie, {
+      intent: "apply_suggestion",
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+    });
+    const afterNotOwner = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "A non-owner cannot apply a suggestion by posting the form themselves",
+      notOwner.status !== 302 &&
+        afterNotOwner?.street1 === corrected?.street1 &&
+        afterNotOwner?.postalCode === corrected?.postalCode,
+      `HTTP ${notOwner.status}, address unchanged=${afterNotOwner?.street1 === corrected?.street1}`
+    );
+    const verdictsAfterApply = await prisma.addressValidation.count({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "" },
+    });
+    const revalidation = await prisma.addressValidation.findFirst({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "" },
+      orderBy: { checkedAt: "desc" },
+    });
+    /*
+     * RE-CHECKED, AND THE ROW SAYS WHICH ADDRESS. A second verdict is the
+     * promise ("the address is saved and then checked with Google"); that its
+     * `originalAddress` is the CORRECTED address is the part that makes the
+     * second verdict about the right thing — a re-check that re-validated the
+     * address it had just replaced would record a verdict for a label nobody
+     * will print.
+     */
+    const revalidated = (revalidation?.originalAddress as Record<string, string> | null) ?? null;
+    check(
+      "The applied address is re-checked, and the new verdict describes the corrected address",
+      verdictsAfterApply >= 2 &&
+        revalidated?.street1 === suggestion.street1 &&
+        revalidated?.postalCode === suggestion.postalCode,
+      `${verdictsAfterApply} verdict(s); latest for ${revalidated?.street1 ?? "?"}, ${revalidated?.postalCode ?? "?"}`
+    );
+    check(
+      "The panel answers the press instead of failing silently",
+      applied.status !== 500,
+      `HTTP ${applied.status}`
+    );
+
+    /*
+     * THE OTHER DIRECTION, AND IT MATTERS AS MUCH. Google answering "this is
+     * already right" must not leave an Apply button on screen: the server
+     * refuses a no-op apply ("differs only in formatting"), so a button that
+     * renders anyway is a control whose only outcome is an error message.
+     */
+    const accepted = await recordVerdict(prisma, {
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+      verdict: "ACCEPTED",
+      suggestedAddress: null,
+      differences: [],
+    });
+    /*
+     * THE ROW JUST WRITTEN IS MADE UNMISTAKABLY THE NEWEST — by pushing the
+     * others back, not by dating this one forward. The panel renders the newest
+     * verdict and the press above has just written one; the two can land in the
+     * same millisecond, and a tie would let either be drawn. A row dated in the
+     * future would fix this check and silently break the next one, which writes
+     * a newer verdict of its own and would then not be the newest at all.
+     */
+    await prisma.addressValidation.updateMany({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "", id: { not: accepted.id } },
+      data: { checkedAt: new Date(Date.now() - 60_000) },
+    });
+    const acceptedPanel = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    const acceptedCard = cardFor(acceptedPanel.html, dock?.id ?? "");
+    check(
+      "An address Google accepted shows no Apply button — there is nothing to apply",
+      acceptedCard.length > 0 &&
+        !acceptedCard.includes('value="apply_suggestion"') &&
+        acceptedCard.includes("Accepted by Google"),
+      `verdict on this dock's panel: ${verdictOnPanel(acceptedCard)}; Apply offered: ${acceptedCard.includes('value="apply_suggestion"')}`
+    );
+
+    /*
+     * AND AN ERROR DOES NOT EAT THE ADDRESS. With no Google key configured the
+     * check cannot be made; the one thing that must not happen is the address
+     * being cleared, replaced or half-written on the way to that answer. This
+     * is the failure mode of "save what the provider returned" — a provider
+     * that returned nothing.
+     */
+    const beforeFailedCheck = await prisma.pickupLocation.findUnique({
+      where: { id: dock?.id ?? "" },
+    });
+    await post("/admin/origins", cookie, {
+      intent: "check_address",
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+    });
+    const afterFailedCheck = await prisma.pickupLocation.findUnique({
+      where: { id: dock?.id ?? "" },
+    });
+    check(
+      "A check that cannot be made leaves the address exactly as it was",
+      afterFailedCheck?.street1 === beforeFailedCheck?.street1 &&
+        afterFailedCheck?.street2 === beforeFailedCheck?.street2 &&
+        afterFailedCheck?.city === beforeFailedCheck?.city &&
+        afterFailedCheck?.province === beforeFailedCheck?.province &&
+        afterFailedCheck?.postalCode === beforeFailedCheck?.postalCode,
+      `${afterFailedCheck?.street1 ?? "-"} / ${afterFailedCheck?.street2 ?? "-"}`
+    );
+    const stillShown = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    check(
+      "And the entered address is still the one on the screen",
+      stillShown.html.includes(afterFailedCheck?.street1 ?? "\u0000") &&
+        stillShown.html.includes(afterFailedCheck?.street2 ?? "\u0000"),
+      "the form does not empty itself when the provider is unreachable"
+    );
+
+    /*
+     * THE OTHER DECISION THE PANEL HAS TO OFFER, posted the way the panel posts
+     * it. The card's override form carries the subject in `subjectId` — it
+     * serves an order's delivery address as well as a dock, so it cannot know
+     * that this page calls the same thing `id` — and the action read `id`. That
+     * mismatch is invisible in the markup and fatal in the press: the owner's
+     * "Keep the entered address" arrived with an empty subject and was answered
+     * "that address could not be found." Asserting on the recorded row rather
+     * than on the button is what catches it, because the button looked right
+     * the whole time.
+     */
+    const override = await post("/admin/origins", cookie, {
+      intent: "override_address",
+      subjectType: "PICKUP",
+      subjectId: dock?.id ?? "",
+      reason: "The dock is known to the carrier by this address, checked on site.",
+    });
+    const overrideHtml = await override.text();
+    const overridden = await prisma.addressValidation.findFirst({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "", verdict: "OVERRIDDEN" },
+      orderBy: { checkedAt: "desc" },
+    });
+    const overriddenLocation = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "Keep the entered address records an owner's acceptance, from the form the panel actually posts",
+      override.status === 200 &&
+        overrideHtml.includes("accepted by an owner") &&
+        overridden !== null &&
+        Boolean(overridden.overrideReason) &&
+        overriddenLocation?.addressOverridden === true,
+      `HTTP ${override.status}, override row=${overridden !== null}, flagged on the dock=${overriddenLocation?.addressOverridden}`
+    );
+    const overridePanel = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    const overrideCard = cardFor(overridePanel.html, dock?.id ?? "");
+    check(
+      "And the panel says it was accepted by an owner, never that Google validated it",
+      overrideCard.includes("Accepted by an owner") && !overrideCard.includes("Accepted by Google"),
+      `verdict on this dock's panel: ${verdictOnPanel(overrideCard)}`
+    );
+
+    // The verdicts this section seeded belong to the dock and go with it. They
+    // are removed by subject rather than by id so a check that threw above
+    // cannot leave one behind for the next run to read as a real result.
+    await prisma.addressValidation.deleteMany({
+      where: { subjectType: "PICKUP", subjectId: dock?.id ?? "" },
+    });
     await prisma.locationHoliday.deleteMany({ where: { locationId: dock?.id ?? "" } });
     await prisma.pickupLocation.deleteMany({ where: { code: DOCK_CODE } });
 
@@ -982,6 +1605,11 @@ async function main() {
     // does not leave a pickup location behind for the next run to trip over.
     await prisma.locationHoliday.deleteMany({ where: { location: { code: DOCK_CODE } } });
     await prisma.pickupLocation.deleteMany({ where: { code: DOCK_CODE } });
+    // Every asset this suite uploaded, by product rather than by the ids a
+    // check happened to keep — a failure part-way through the media section
+    // must not leave a stored file and a row behind for the next run.
+    await prisma.mediaAssetAssignment.deleteMany({ where: { asset: { productId: product.id } } });
+    await prisma.mediaAsset.deleteMany({ where: { productId: product.id } });
     await prisma.variantPackage.deleteMany({ where: { variantId: variant.id } });
     await prisma.productVariant.deleteMany({ where: { productId: product.id } });
     await prisma.product.deleteMany({ where: { id: product.id } });

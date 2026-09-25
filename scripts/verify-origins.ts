@@ -1535,7 +1535,21 @@ async function imageSelectionChecks() {
     data: {
       productId: product.id,
       category: "WHITE_BACKGROUND_IMAGE",
-      title: "Draft",
+      /*
+       * WITHDRAWN, AND STILL SWITCHED ON.
+       *
+       * This row used to be `approvalStatus: "DRAFT"`, which was the old way of
+       * saying "not for sellers": every admin upload arrived a draft and stayed
+       * one until somebody pressed Approve on it. That is no longer a state this
+       * application writes — an admin file lands approved — so a DRAFT row here
+       * would prove nothing about the rule.
+       *
+       * What excludes a file now is a WITHDRAWAL, and the visibility flag being
+       * left on is the point of the fixture: the two disagree, and the withdrawal
+       * has to win. A file that is switched on, finished and rejected must not be
+       * offered to anybody, on any screen.
+       */
+      title: "Withdrawn",
       originalFilename: "c.png",
       storageKey: `verify-origins-${suffix}-c`,
       mimeType: "image/png",
@@ -1543,7 +1557,7 @@ async function imageSelectionChecks() {
       checksum: `checksum-c-${suffix}`,
       sourceUrl: "https://example.test/c.png",
       processingStatus: "READY",
-      approvalStatus: "DRAFT",
+      approvalStatus: "REJECTED",
       sellerVisible: true,
     },
   });
@@ -1553,7 +1567,7 @@ async function imageSelectionChecks() {
 
   const initial = await listSelectableImages(sellerA.id, product.id);
   check(
-    "47 only approved, seller-visible images are offered",
+    "47 a withdrawn image is not offered, and the switch left on does not override the withdrawal",
     initial.images.length === 1 && initial.images[0].mediaAssetId === approved.id,
     `offered=${initial.images.map((image) => image.title).join(", ")}`
   );

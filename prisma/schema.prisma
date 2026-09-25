@@ -2293,6 +2293,15 @@ model AddressValidation {
   /// small set the interface needs.
   granularity       String?
   placeId           String?
+  /// Where Google puts this address on the earth, when it says. Kept beside the
+  /// place id rather than on the location row on purpose: these are Google's
+  /// coordinates for one verdict about one version of an address, not the
+  /// facility's own position — the facility master remains the authority for
+  /// that, and a second writable set of coordinates would eventually disagree
+  /// with it. Null for every row recorded before the columns existed, and for
+  /// any verdict Google answered without a geocode.
+  latitude          Float?
+  longitude         Float?
   /// Why the check could not be completed, when it could not.
   unavailableReason String?
   /// Who accepted an unresolved address, and why. Required for OVERRIDDEN.

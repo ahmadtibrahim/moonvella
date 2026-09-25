@@ -4,6 +4,7 @@ import { prisma } from "../db.server";
 import { authenticate } from "../shopify.server";
 import { listProductMedia } from "../services/media.server";
 import { withMerchantAccess } from "../services/seller.server";
+import { isReadyForSellers } from "../services/mediaState";
 import {
   listTransferStates,
   mediaContentTypeFor,
@@ -15,18 +16,18 @@ import {
  *
  * WHY THIS PAGE EXISTS. A seller could see a product's photographs in the
  * catalogue and choose which ones an import should send, and that was all: a
- * video, a spec sheet or a marketing image was approved by the merchant, marked
+ * video, a spec sheet or a marketing image was uploaded by the merchant, marked
  * seller-visible, and then visible to nobody. The marketing pack answered part
  * of it with one ZIP, which is the wrong shape for "put this video on my product
  * page" — the file has to arrive in the seller's own Shopify store, not in their
  * downloads folder.
  *
- * WHAT IS OFFERED IS WHAT WAS CLEARED. Only approved, seller-visible, finished
- * files on a published product appear, and the same three conditions are
- * re-checked here rather than trusted from the screen that drew the link: a URL
- * can be kept and replayed after an asset is withdrawn. The gate is the one the
- * catalogue and the marketing pack already apply, expressed once more because
- * this route can be reached directly.
+ * WHAT IS OFFERED IS WHAT WAS CLEARED. Only files that are offered to sellers —
+ * switched on, not withdrawn, finished processing — on a published product
+ * appear, and the same conditions are re-checked here rather than trusted from
+ * the screen that drew the link: a URL can be kept and replayed after an asset
+ * is withdrawn. The gate is the one the catalogue and the marketing pack already
+ * apply, expressed once more because this route can be reached directly.
  *
  * A FILE THAT CANNOT BE SENT SAYS SO. An unprocessed video, a file held back
  * from copying, a video on a product the seller has not imported yet — each is
@@ -68,9 +69,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     });
     if (!product) throw new Response("Product not available.", { status: 404 });
 
-    const visible = (await listProductMedia(productId)).filter(
-      (asset) => asset.approvalStatus === "APPROVED" && asset.sellerVisible
-    );
+    const visible = (await listProductMedia(productId)).filter(isReadyForSellers);
 
     const [transfers, mapping] = await Promise.all([
       listTransferStates(

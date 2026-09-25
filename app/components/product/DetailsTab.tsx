@@ -79,7 +79,6 @@ export default function DetailsTab({
   canManage: boolean;
   canPublish: boolean;
 }) {
-  const published = product.status === "PUBLISHED";
   const disabled = !canManage;
 
   return (
@@ -226,24 +225,13 @@ export default function DetailsTab({
                 same rows the catalogue reads, drawn on a tab sellers cannot
                 open. The catalogue itself is the honest answer to "what does a
                 seller see", and it is one click away.
+
+                NOR IS PUBLISH HERE ANY MORE. It is beside the product's name at
+                the top of the page, where the state it changes is displayed —
+                see the note at that control. It was duplicated in this form for
+                a while, which is how the page came to have two buttons that
+                could each be pressed with a form half-filled.
               */}
-              {canPublish ? (
-                <button
-                  type="submit"
-                  name="intent"
-                  value={published ? "unpublish" : "publish"}
-                  style={btn(published ? "#92400e" : "#065f46")}
-                  title={
-                    published
-                      ? "Withdraw this product from sellers. Existing orders are unaffected."
-                      : readiness.ready
-                        ? "Make this product available to sellers."
-                        : "This product does not meet the publication requirements yet."
-                  }
-                >
-                  {published ? "Unpublish" : "Publish to sellers"}
-                </button>
-              ) : null}
             </div>
           ) : (
             <p style={{ ...helpText, marginTop: "0.85rem" }}>

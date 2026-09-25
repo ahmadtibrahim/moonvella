@@ -191,7 +191,7 @@ async function main() {
       | "DOCUMENT"
       | "EDITABLE_TEMPLATE";
     mimeType: string;
-    approvalStatus?: "APPROVED" | "DRAFT";
+    approvalStatus?: "APPROVED" | "DRAFT" | "REJECTED";
     sellerVisible?: boolean;
     downloadAllowed?: boolean;
     processingStatus?: "READY" | "PROCESSING" | "FAILED";
@@ -401,6 +401,42 @@ async function main() {
     check("a second send creates no second transfer row", (await prisma.shopifyFileTransfer.count({
       where: { sellerId: seller.id, mediaAssetId: image.id, kind: "MEDIA" },
     })) === 1);
+
+    /*
+     * ---- an EDIT, then a republish -------------------------------------
+     *
+     * "Republishing must not create duplicates" is a claim about what the
+     * mapping is keyed to. It is keyed to (seller, asset, kind) — the identity
+     * of the file, not the description of it — so retitling a photograph,
+     * rewriting its alt text or moving it to another size leaves the store's
+     * copy findable. Writing it against anything editable would have made a
+     * routine edit look like a new file, and the store would collect a second
+     * copy of the same photograph on every republish.
+     */
+    await prisma.mediaAsset.update({
+      where: { id: image.id },
+      data: { title: `Retitled ${suffix}`, altText: "A description written after the first send" },
+    });
+    const republishUpload = makeUploader();
+    const republished = await transferAsset({
+      sellerId: seller.id,
+      productId: product.id,
+      mediaAssetId: image.id,
+      kind: "MEDIA",
+      admin: imageStore.admin,
+      fetchImpl: republishUpload.fetchImpl,
+    });
+    check(
+      "an edited file is still recognised as already in the store",
+      republished.alreadyTransferred === true && republishUpload.uploads.length === 0,
+      `alreadyTransferred=${republished.alreadyTransferred}, ${republishUpload.uploads.length} upload(s)`
+    );
+    check(
+      "and the edit added no second mapping row",
+      (await prisma.shopifyFileTransfer.count({
+        where: { sellerId: seller.id, mediaAssetId: image.id, kind: "MEDIA" },
+      })) === 1
+    );
 
     // ---- a row for a file the seller deleted ---------------------------
     // The store keeps the id in the row; if the media is no longer on the
@@ -656,7 +692,7 @@ async function main() {
       category: "WHITE_BACKGROUND_IMAGE" | "DOCUMENT" | "PRODUCT_VIDEO";
       mimeType: string;
       kind: "MEDIA" | "FILE";
-      approvalStatus?: "APPROVED" | "DRAFT";
+      approvalStatus?: "APPROVED" | "DRAFT" | "REJECTED";
       sellerVisible?: boolean;
       downloadAllowed?: boolean;
       processingStatus?: "READY" | "PROCESSING" | "FAILED";
@@ -691,17 +727,25 @@ async function main() {
       return { called: store.calls.length, error: outcome.error };
     };
 
-    const notApproved = await refusalFor({
+    /*
+     * A WITHDRAWN FILE, NOT AN UNAPPROVED ONE. Nothing an administrator uploads
+     * is unapproved any more — it is written approved and switched on — so the
+     * only state that still stops a transfer on moderation grounds is a
+     * rejection, which is the deliberate "no" and clears `sellerVisible` with
+     * it. The check below is the same guard the panel has always had; only the
+     * state that trips it has changed name.
+     */
+    const withdrawn = await refusalFor({
       category: "WHITE_BACKGROUND_IMAGE",
       mimeType: "image/png",
       kind: "MEDIA",
-      approvalStatus: "DRAFT",
+      approvalStatus: "REJECTED",
     });
-    check("an unapproved file is refused", notApproved.called === 0 && Boolean(notApproved.error), notApproved.error ?? "");
+    check("a withdrawn file is refused", withdrawn.called === 0 && Boolean(withdrawn.error), withdrawn.error ?? "");
     check(
-      "and the refusal says it is not approved",
-      /not approved/i.test(notApproved.error ?? ""),
-      notApproved.error ?? ""
+      "and the refusal says it has been withdrawn",
+      /withdrawn/i.test(withdrawn.error ?? ""),
+      withdrawn.error ?? ""
     );
 
     const hidden = await refusalFor({

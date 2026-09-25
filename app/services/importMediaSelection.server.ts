@@ -13,9 +13,9 @@
  * stored choice rather than recomputing one. The unique constraint is what makes
  * a retry safe: saving the same decision twice updates one row.
  *
- * THE ELIGIBILITY GATE IS THE SAME ONE THE IMPORT ALREADY USES — approved and
- * seller-visible — and it is applied here as well rather than trusted to the
- * caller. The preview a seller sees must not be able to offer an image the
+ * THE ELIGIBILITY GATE IS THE SAME ONE EVERY OTHER SELLER-FACING SCREEN USES —
+ * offered to sellers, not withdrawn, and finished processing (see `mediaState`)
+ * — and it is applied here as well rather than trusted to the caller. The preview a seller sees must not be able to offer an image the
  * import would then refuse, and the import must not be able to send an image
  * the review process has not cleared. Both sides read this function.
  *
@@ -29,6 +29,7 @@
 import { prisma } from "~/db.server";
 import { redactSecrets } from "./credentials.server";
 import { listProductMedia, type MediaAssetView } from "./media.server";
+import { isReadyForSellers } from "./mediaState";
 import { transferFilename } from "./shopifyTransfer.server";
 
 /** The categories an import may carry. Documents and marketing material are not images. */
@@ -49,6 +50,8 @@ export interface SelectableImage {
   variantIds: string[];
   /** Variants for which this is the primary image. */
   primaryForVariantIds: string[];
+  /** The product-level primary — the picture the product itself leads with. */
+  isProductPrimary: boolean;
   selected: boolean;
   isMain: boolean;
   sortOrder: number;
@@ -91,16 +94,47 @@ export async function listSelectableImages(
 
   const eligible = assets.filter(
     (asset) =>
-      asset.approvalStatus === "APPROVED" &&
-      asset.sellerVisible &&
+      isReadyForSellers(asset) &&
       (IMPORTABLE_IMAGE_CATEGORIES as readonly string[]).includes(asset.category)
   );
 
   const savedByAsset = new Map(saved.map((row) => [row.mediaAssetId, row]));
   const defaulted = saved.length === 0;
 
-  const images: SelectableImage[] = eligible.map((asset, index) => {
+  /**
+   * THE PRODUCT'S OWN PRIMARY IMAGE LEADS THE LIST.
+   *
+   * The import sends images in this order and the store keeps the first as the
+   * product's picture, so whatever comes first here becomes the seller's
+   * storefront image on a first import. "First in the returned list" was an
+   * accident of ordering by id; it is now the image the merchant nominated for
+   * the product, then the rest of the general gallery in the order they set,
+   * then the variant photographs. The seller can still choose a different main
+   * image — this is the default they start from, not a lock.
+   */
+  const rank = (asset: MediaAssetView) => {
+    const general = asset.assignments.filter((assignment) => assignment.variantId === null);
+    if (general.some((assignment) => assignment.isPrimary)) return 0;
+    if (general.length) return 1;
+    return 2;
+  };
+  const ranked = [...eligible].sort((a, b) => {
+    const byRank = rank(a) - rank(b);
+    if (byRank !== 0) return byRank;
+    const orderOf = (asset: MediaAssetView) => {
+      const general = asset.assignments.find((assignment) => assignment.variantId === null);
+      return general ? general.sortOrder : Number.MAX_SAFE_INTEGER;
+    };
+    const byOrder = orderOf(a) - orderOf(b);
+    if (byOrder !== 0) return byOrder;
+    return a.createdAt.getTime() - b.createdAt.getTime();
+  });
+
+  const images: SelectableImage[] = ranked.map((asset, index) => {
     const row = savedByAsset.get(asset.id);
+    const isProductPrimary = asset.assignments.some(
+      (assignment) => assignment.variantId === null && assignment.isPrimary
+    );
     return {
       mediaAssetId: asset.id,
       url: asset.url,
@@ -117,7 +151,11 @@ export async function listSelectableImages(
         .filter((assignment) => assignment.isPrimary && assignment.variantId !== null)
         .map((assignment) => assignment.variantId as string),
       selected: row ? row.selected : true,
-      isMain: row?.isMain ?? false,
+      // A seller who has chosen a main image keeps it. One who has not starts
+      // from the product's own primary rather than from whatever the list
+      // happened to put first.
+      isMain: row?.isMain ?? isProductPrimary,
+      isProductPrimary,
       sortOrder: row?.sortOrder ?? index,
       uploadStatus: row?.uploadStatus ?? "PENDING",
       providerMediaId: row?.providerMediaId ?? null,

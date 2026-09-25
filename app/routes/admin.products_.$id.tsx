@@ -20,7 +20,8 @@ import {
   uploadMediaBatch,
   attachMediaToVariants,
   updateMedia,
-  setMediaApproval,
+  resolveUploadScope,
+  setMediaVisibility,
   deleteMedia,
   detachMedia,
   setPrimaryAssignment,
@@ -29,7 +30,7 @@ import {
   createTemplateAsset,
 } from "~/services/media.server";
 import { retryVideoProbe } from "~/services/mediaProbe.server";
-import { publicationReadiness } from "~/services/publication.server";
+import { publicationReadiness, PublicationRefused } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import {
   getProductPackages,
@@ -237,7 +238,21 @@ function packageRows(form: FormData, unitsPref: UnitPreference) {
 const PACKAGING_INTENTS = new Set(["save_packaging", "save_product_packages"]);
 
 /** The intents whose success is announced on the page they return to. */
-const SAVED_INTENTS = new Set([...PACKAGING_INTENTS, "clear_origin_overrides"]);
+const SAVED_INTENTS = new Set([
+  ...PACKAGING_INTENTS,
+  "clear_origin_overrides",
+  /*
+   * Publishing and unpublishing announce themselves too.
+   *
+   * They used to be the one pair that did not: the page came back with the
+   * readiness strip recoloured, and a merchant who pressed Publish and looked
+   * at the products they had just changed saw a green band where an amber one
+   * had been. That is a state, not an answer to a press — and the reported
+   * complaint was precisely that pressing Publish appeared to do nothing.
+   */
+  "publish",
+  "unpublish",
+]);
 
 /**
  * The sentence to show after a save, from the redirect's own marker.
@@ -259,6 +274,21 @@ function savedPackagingLabel(saved: string | null): string | null {
   }
   if (saved === "clear_origin_overrides") {
     return "Overrides cleared. The variants below now inherit the product's pickup location, which is what the column shows.";
+  }
+  /*
+   * A PUBLISH IS ANNOUNCED AS A FACT ABOUT SELLERS, not as "saved".
+   *
+   * The only thing the merchant cannot verify from this page is whether anyone
+   * else can now see the product, so that is the sentence. It says what became
+   * true, and it does not claim the catalogue has caught up — the seller list
+   * is a separate read and saying "sellers can see it now" would be a promise
+   * about a cache this page does not own.
+   */
+  if (saved === "publish") {
+    return "Published. The product is now offered to sellers, and appears in the seller catalogue.";
+  }
+  if (saved === "unpublish") {
+    return "Unpublished. The product is a draft again and is no longer offered to sellers. Orders already placed are unaffected.";
   }
   return null;
 }
@@ -412,6 +442,16 @@ export async function action({ request, params }: ActionFunctionArgs) {
     if (!form.has(name)) return undefined;
     return enteredToCanonical(String(form.get(name) ?? ""), kind, unitsPref);
   };
+  /**
+   * The variants a NEW upload claims. Read by `resolveUploadScope`, which treats
+   * the scope radio as the decision it looks like and refuses a variant-scoped
+   * file that named no size.
+   *
+   * `media_attach` below does NOT use this. That intent re-points an EXISTING
+   * asset and its form has no scope radio at all — the hidden empty checkbox is
+   * how it says "the family" — so it reads the list as posted.
+   */
+  const uploadScope = () => resolveUploadScope(form);
   const variantScope = () =>
     form
       .getAll("scopeVariantIds")
@@ -535,7 +575,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
             subtype: optional("subtype"),
             title: optional("title"),
             altText: optional("altText"),
-            variantIds: variantScope(),
+            variantIds: uploadScope(),
             documentType: optional("documentType"),
             version: optional("version"),
             effectiveDate: optional("effectiveDate"),
@@ -589,7 +629,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
             subtype: optional("subtype"),
             title: optional("title"),
             altText: optional("altText"),
-            variantIds: variantScope(),
+            /*
+             * NOT READ FROM THE FORM. A replacement version inherits the scope
+             * of the version it replaces, taken from the record — see
+             * `supersedeDocument`, which overwrites whatever arrives here. The
+             * replacement form has no scope control at all, and says so.
+             */
+            variantIds: [],
             documentType: optional("documentType"),
             version: optional("version"),
             effectiveDate: optional("effectiveDate"),
@@ -616,7 +662,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
             title: text("title"),
             templateUrl: text("templateUrl"),
             instructions: optional("instructions"),
-            variantIds: variantScope(),
+            variantIds: uploadScope(),
             sellerVisible: form.get("sellerVisible") === "true",
           },
           actor
@@ -632,7 +678,16 @@ export async function action({ request, params }: ActionFunctionArgs) {
           text("assetId"),
           {
             title: text("title"),
-            altText: optional("altText"),
+            /*
+             * PRESENT BUT EMPTY CLEARS IT; ABSENT LEAVES IT ALONE.
+             *
+             * `optional()` collapses both to null, and for every other caller of
+             * that helper an absent field does mean an empty one — but the write
+             * this feeds treats null as "erase", so a form posted to change one
+             * thing (the seller-visibility switch below) was blanking the alt
+             * text of an image it never mentioned.
+             */
+            altText: form.has("altText") ? optional("altText") : undefined,
             category: form.has("category") ? (text("category") as never) : undefined,
             subtype: form.has("subtype") ? (optional("subtype") as never) : undefined,
             sellerVisible: form.has("sellerVisible") ? form.get("sellerVisible") === "true" : undefined,
@@ -651,12 +706,32 @@ export async function action({ request, params }: ActionFunctionArgs) {
       case "media_attach":
         await attachMediaToVariants(text("assetId"), variantScope(), actor);
         break;
-      case "media_approve":
-        await setMediaApproval(text("assetId"), "APPROVED", actor);
+      /*
+       * THERE IS NO APPROVE OR REJECT INTENT, and that is the correction rather
+       * than an omission. A file an administrator uploads here is decided on
+       * arrival — see `uploadMedia`, which creates it approved and switched on —
+       * so the only moderation the panel used to offer was asking an
+       * administrator to countersign their own upload. The moderation itself is
+       * not gone: `setMediaApproval` remains in the media service, unchanged,
+       * because a seller-submitted file will need exactly that workflow. When
+       * that path is built it gets its own intents, on the interface that
+       * reviews those submissions.
+       *
+       * WITHDRAWING AN ASSET IS STILL POSSIBLE, and it is the honest name for
+       * what an administrator actually wants here: Deactivate (`media_update`
+       * with `sellerVisible=false`) takes a file out of the seller's gallery and
+       * leaves it on the product; Delete removes it under the existing guard,
+       * which refuses to remove a live asset from a published product.
+       */
+      /*
+       * The tile's Activate/Deactivate switch. Its own intent rather than an
+       * `media_update`, because that write describes a whole asset and a form
+       * posting one switch would have to carry every other field back with it.
+       */
+      case "media_visibility":
+        await setMediaVisibility(text("assetId"), form.get("sellerVisible") === "true", actor);
         break;
-      case "media_reject":
-        await setMediaApproval(text("assetId"), "REJECTED", actor);
-        break;
+
       case "media_delete":
         await deleteMedia(text("assetId"), actor);
         break;
@@ -753,6 +828,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     if (error instanceof PackageValidationError) {
       return {
         error: error.message,
+        publishRefused: false,
         tab,
         packageErrors: error.details,
         packageValues: PACKAGING_INTENTS.has(intent) ? packageRows(form, unitsPref) : null,
@@ -763,8 +839,32 @@ export async function action({ request, params }: ActionFunctionArgs) {
         packageVariantId: intent === "save_packaging" ? text("variantId") || null : null,
       };
     }
+
+    /*
+     * A REFUSED PUBLISH IS DRAWN ONCE, AND THE STRIP IS WHERE.
+     *
+     * The refusal carries the same checks the readiness strip already renders
+     * from the loader. Returning its message as `error` as well printed the
+     * list twice on one screen — amber in the strip, red in the alert — with
+     * only the amber copy linking to the tabs that fix anything. So no message
+     * travels here: the flag says the press happened, and the strip is what
+     * says why it did not take. `publishRefused` is what turns the strip from a
+     * statement of readiness into the answer to a button press.
+     */
+    if (error instanceof PublicationRefused) {
+      return {
+        error: null,
+        publishRefused: true,
+        tab,
+        packageErrors: null,
+        packageValues: null,
+        packageVariantId: null,
+      };
+    }
+
     return {
       error: error instanceof Error ? error.message : "Operation failed.",
+      publishRefused: false,
       tab,
       packageErrors: null,
       packageValues: null,
@@ -809,12 +909,67 @@ export default function AdminProductDetail() {
             {media.length === 1 ? "" : "s"}
           </p>
         </div>
+
+        {/*
+          THE PUBLISH CONTROL, BESIDE THE NAME AND THE STATE IT CHANGES.
+
+          It used to live at the bottom of the Details tab, inside that tab's
+          form, several screens below the readiness strip that explains it. Two
+          things were wrong with that, and only one of them is cosmetic. The
+          control was reachable only from one tab, so a merchant who fixed the
+          last outstanding item on the Media tab had to navigate to Details to
+          act on it; and "Publish to sellers" sat under a column of shipping
+          fields, which is not where anybody looks for the switch that puts a
+          product in front of buyers.
+
+          Its own form, not a submit button on the details form: pressing it must
+          not also save a half-typed description, and the details form has its
+          own Save. `tab` travels with it so the page comes back where the
+          reader was rather than jumping to Details.
+
+          The label states the product's state rather than an action name —
+          "Unpublish" when it is live — and the tooltip says what will happen to
+          existing orders, which is the question sellers actually ask.
+        */}
+        {can.publish ? (
+          <Form method="post" style={{ flexShrink: 0 }}>
+            <input type="hidden" name="tab" value={tab} />
+            <button
+              type="submit"
+              name="intent"
+              value={product.status === "PUBLISHED" ? "unpublish" : "publish"}
+              style={{
+                padding: "0.55rem 1rem",
+                border: `1px solid ${product.status === "PUBLISHED" ? "#92400e" : "#065f46"}`,
+                borderRadius: 8,
+                background: product.status === "PUBLISHED" ? "#fffbeb" : "#ecfdf5",
+                color: product.status === "PUBLISHED" ? "#92400e" : "#065f46",
+                fontSize: "0.82rem",
+                fontWeight: 700,
+                cursor: "pointer",
+              }}
+              title={
+                product.status === "PUBLISHED"
+                  ? "Withdraw this product from sellers. Existing orders are unaffected."
+                  : readiness.ready
+                    ? "Make this product available to sellers."
+                    : "This product does not meet the publication requirements yet — the list below says what is missing."
+              }
+            >
+              {product.status === "PUBLISHED" ? "Unpublish" : "Publish to sellers"}
+            </button>
+          </Form>
+        ) : null}
       </div>
 
       {/* Publication state is shown on every tab, because "is this live?" is
           the question a merchant has most often and the answer must not depend
           on which tab they happen to be looking at. */}
-      <ReadinessStrip readiness={readiness} status={product.status} />
+      <ReadinessStrip
+        readiness={readiness}
+        status={product.status}
+        refused={actionData?.publishRefused === true}
+      />
 
       {actionData?.error ? (
         <div
@@ -958,19 +1113,31 @@ export default function AdminProductDetail() {
 function ReadinessStrip({
   readiness,
   status,
+  refused,
 }: {
   readiness: { ready: boolean; checks: { key: string; label: string; ok: boolean; detail: string; tab: TabKey }[]; blockers: { key: string; label: string; detail: string; tab: TabKey }[] };
   status: string;
+  /** The last action was a Publish press that the gate refused. */
+  refused: boolean;
 }) {
   const published = status === "PUBLISHED";
+  /*
+   * REFUSED IS THE RED ONE, and it is the same list. A press that did not take
+   * has to be distinguishable from a page that merely is not ready — otherwise
+   * the button looks broken — and the way to distinguish it is the headline and
+   * the colour, not a second copy of the reasons underneath.
+   */
   const tone = published
     ? { bg: "#ecfdf5", border: "#a7f3d0", fg: "#065f46" }
-    : readiness.ready
-      ? { bg: "#f0f9ff", border: "#bae6fd", fg: "#075985" }
-      : { bg: "#fffbeb", border: "#fde68a", fg: "#92400e" };
+    : refused
+      ? { bg: "#fef2f2", border: "#fecaca", fg: "#991b1b" }
+      : readiness.ready
+        ? { bg: "#f0f9ff", border: "#bae6fd", fg: "#075985" }
+        : { bg: "#fffbeb", border: "#fde68a", fg: "#92400e" };
 
   return (
     <div
+      role={refused ? "alert" : undefined}
       style={{
         background: tone.bg,
         border: `1px solid ${tone.border}`,
@@ -984,9 +1151,11 @@ function ReadinessStrip({
       <div style={{ fontWeight: 700, marginBottom: readiness.blockers.length ? "0.4rem" : 0 }}>
         {published
           ? "Published to sellers."
-          : readiness.ready
-            ? "Ready to publish."
-            : `Not ready to publish — ${readiness.blockers.length} item${readiness.blockers.length === 1 ? "" : "s"} outstanding.`}
+          : refused
+            ? `Publish was refused — ${readiness.blockers.length} check${readiness.blockers.length === 1 ? "" : "s"} did not pass. Nothing was changed.`
+            : readiness.ready
+              ? "Ready to publish."
+              : `Not ready to publish — ${readiness.blockers.length} item${readiness.blockers.length === 1 ? "" : "s"} outstanding.`}
       </div>
       {!published && readiness.blockers.length ? (
         <ul style={{ margin: 0, paddingLeft: "1.1rem", lineHeight: 1.6 }}>
@@ -999,6 +1168,11 @@ function ReadinessStrip({
             </li>
           ))}
         </ul>
+      ) : null}
+      {refused && readiness.blockers.length ? (
+        <p style={{ margin: "0.5rem 0 0", opacity: 0.85 }}>
+          Each line opens the tab that resolves it. The product is still a draft.
+        </p>
       ) : null}
     </div>
   );

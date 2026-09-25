@@ -366,24 +366,25 @@ function DocumentRow({ chain, product }: { chain: DocChain; product: Product }) 
       </div>
 
       <div style={{ display: "flex", gap: "0.35rem", flexWrap: "wrap", marginTop: "0.5rem" }}>
-        {head.approvalStatus !== "APPROVED" ? (
-          <Form method="post">
-            <input type="hidden" name="tab" value="documents" />
-            <input type="hidden" name="assetId" value={head.id} />
-            <button type="submit" name="intent" value="media_approve" style={{ ...btn("#065f46"), padding: "0.25rem 0.5rem" }}>
-              Approve
-            </button>
-          </Form>
-        ) : null}
-        {head.approvalStatus !== "REJECTED" ? (
-          <Form method="post">
-            <input type="hidden" name="tab" value="documents" />
-            <input type="hidden" name="assetId" value={head.id} />
-            <button type="submit" name="intent" value="media_reject" style={{ ...btn("#92400e"), padding: "0.25rem 0.5rem" }}>
-              Reject
-            </button>
-          </Form>
-        ) : null}
+        {/*
+          * APPROVE AND REJECT ARE GONE FROM HERE TOO — see `uploadMedia`. A
+          * document uploaded from this panel is written approved and switched
+          * on, so neither button had anything left to decide. The control that
+          * does something is the switch below.
+          */}
+        <Form method="post">
+          <input type="hidden" name="tab" value="documents" />
+          <input type="hidden" name="assetId" value={head.id} />
+          <input type="hidden" name="sellerVisible" value={head.sellerVisible ? "false" : "true"} />
+          <button
+            type="submit"
+            name="intent"
+            value="media_visibility"
+            style={{ ...btn(head.sellerVisible ? "#92400e" : "#065f46"), padding: "0.25rem 0.5rem" }}
+          >
+            {head.sellerVisible ? "Deactivate" : "Activate"}
+          </button>
+        </Form>
         <Link
           to={`?tab=documents&doc=${encodeURIComponent(head.id)}`}
           style={{ ...btn(MUTED), padding: "0.25rem 0.5rem" }}
@@ -426,7 +427,7 @@ function DocumentRow({ chain, product }: { chain: DocChain; product: Product }) 
 /** Which variants a document applies to, in words. */
 function describeScope(asset: MediaAssetView, product: Product): string {
   if (asset.assignments.length === 0) return "attached to nothing";
-  const shared = asset.assignments.some((assignment) => assignment.variantId === null);
+  const general = asset.assignments.some((assignment) => assignment.variantId === null);
   const names = asset.assignments
     .map((assignment) =>
       assignment.variantId
@@ -436,8 +437,8 @@ function describeScope(asset: MediaAssetView, product: Product): string {
     )
     .filter((name): name is string => Boolean(name));
 
-  if (shared && names.length === 0) return "applies to the whole product";
-  if (shared) return `applies to the whole product and ${names.join(", ")}`;
+  if (general && names.length === 0) return "applies to the product itself";
+  if (general) return `applies to the product itself and ${names.join(", ")}`;
   return `applies to ${names.join(", ")}`;
 }
 
@@ -539,21 +540,26 @@ function UploadPanel({ product }: { product: Product }) {
   );
 }
 
-/** Which variants a document applies to. Shared means one file for all of them. */
+/**
+ * Which variants a document applies to.
+ *
+ * General means the file belongs to the product rather than to one size, and a
+ * size with its own documents shows those instead — not both.
+ */
 function ScopePicker({ product, defaults }: { product: Product; defaults?: Set<string> }) {
   const [params] = useSearchParams();
-  const scope = params.get("scope") ?? "shared";
+  const scope = params.get("scope") ?? "general";
 
   return (
     <fieldset style={{ border: `1px solid ${LINE}`, borderRadius: 8, padding: "0.75rem", marginTop: "0.85rem" }}>
       <legend style={{ fontSize: "0.72rem", color: MUTED, padding: "0 0.35rem" }}>Applies to</legend>
       <label style={{ display: "block", fontSize: "0.8rem", marginBottom: "0.4rem" }}>
-        <input type="radio" name="scopeMode" value="shared" defaultChecked={scope !== "variant"} /> The
-        whole product — one file, offered for every variant
+        <input type="radio" name="scopeMode" value="general" defaultChecked={scope !== "variant"} />{" "}
+        General product media — belongs to the product itself, not to any one size
       </label>
       <label style={{ display: "block", fontSize: "0.8rem", marginBottom: "0.5rem" }}>
         <input type="radio" name="scopeMode" value="variant" defaultChecked={scope === "variant"} />{" "}
-        Selected variants
+        Variant-specific media — belongs to the size(s) ticked below
       </label>
 
       {product.variants.length ? (
@@ -574,7 +580,8 @@ function ScopePicker({ product, defaults }: { product: Product; defaults?: Set<s
         </div>
       ) : (
         <p style={{ ...helpText, paddingLeft: "1.4rem" }}>
-          There are no variants to attach to yet, so this will apply to the whole product.
+          This product has no active variants yet, so there is no size for this file to belong to.
+          Leave the scope on general product media, or add a size first.
         </p>
       )}
     </fieldset>
@@ -700,7 +707,7 @@ function DocumentEditor({ chain, product }: { chain: DocChain; product: Product 
             value=""
             defaultChecked={head.assignments.some((assignment) => assignment.variantId === null)}
           />{" "}
-          The whole product
+          General product media — the product itself
         </label>
         {product.variants.map((variant) => (
           <label key={variant.id} style={{ display: "block", fontSize: "0.78rem" }}>

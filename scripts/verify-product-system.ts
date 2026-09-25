@@ -49,9 +49,12 @@ import {
   detachMedia,
   updateMedia,
   setMediaApproval,
+  setPrimaryAssignment,
+  reorderAssignment,
   supersedeDocument,
   documentHistory,
   listProductMedia,
+  generalGallery,
   orderForVariant,
   inheritanceSummary,
   DuplicateMediaError,
@@ -640,20 +643,31 @@ async function main() {
   const summary = inheritanceSummary(media);
   check(
     21,
-    "The inheritance summary counts shared assets and per-variant assets separately",
-    summary.shared === 1 && summary.perVariant[measured.id] === 1 && summary.perVariant[second.id] === 1,
-    `shared ${summary.shared}, first variant ${summary.perVariant[measured.id] ?? 0}, second ${summary.perVariant[second.id] ?? 0}`
+    "The inheritance summary counts general product assets and per-variant assets separately",
+    summary.general === 1 && summary.perVariant[measured.id] === 1 && summary.perVariant[second.id] === 1,
+    `general ${summary.general}, first variant ${summary.perVariant[measured.id] ?? 0}, second ${summary.perVariant[second.id] ?? 0}`
   );
 
-  // 22
+  /*
+   * 22 — THE GALLERY RULE, AND IT IS A REPLACEMENT RATHER THAN AN ORDER.
+   *
+   * This check used to assert that a variant's own image came FIRST and the
+   * general one followed it. That was the mixing rule, and mixing is what the
+   * seller's storefront must not do: a shopper who has chosen Queen is looking
+   * at Queen, and a photograph of the Standard size next to it reads as a
+   * second, worse picture of the same thing. So the selected size's own media
+   * is the whole gallery, and the general gallery is what a size with nothing
+   * of its own falls back to — which is check 24 below, and check 70.
+   */
   const ordered = orderForVariant(media, measured.id);
   const ownIndex = ordered.findIndex((row) => row.asset.id === lifestyle.id);
-  const inheritedIndex = ordered.findIndex((row) => row.asset.id === shared.id);
+  const generalIndex = ordered.findIndex((row) => row.asset.id === shared.id);
   check(
     22,
-    "A variant's own image is offered before the one it inherits",
-    ownIndex >= 0 && inheritedIndex >= 0 && ownIndex < inheritedIndex,
-    `own at position ${ownIndex}, inherited at ${inheritedIndex}`
+    "A size with its own media shows only its own — the general gallery is not mixed in",
+    ownIndex >= 0 && generalIndex === -1,
+    `own at position ${ownIndex}, general asset at ${generalIndex}` +
+      ` (${ordered.length} entr${ordered.length === 1 ? "y" : "ies"} offered)`
   );
 
   // 23
@@ -668,14 +682,43 @@ async function main() {
   );
 
   // 24
-  // Re-attach, which is also the proof that detaching did not mutate the file.
+  /*
+   * THE FALLBACK NEEDS A SIZE THAT GENUINELY HAS NOTHING OF ITS OWN.
+   *
+   * This check used to read `second` and pass, and it passed for the wrong
+   * reason. Every size in this fixture is attached to `lifestyle` (check 20), so
+   * what it was actually measuring was the old mixing rule — a size's own media
+   * with the general gallery appended after it. That rule is gone, and check 22
+   * above asserts its replacement: a size with its own media shows its own media
+   * and nothing else. So the subject of this check has to be a size with no
+   * media at all, which the fixture does not have until one is made here.
+   *
+   * It is made rather than borrowed because borrowing is what made the check
+   * lie, and because the state it exercises — a size nobody has photographed yet
+   * — is the ordinary state of a new size. Re-attaching `shared` to the family
+   * afterwards is also the proof that detaching did not mutate the file.
+   */
+  const bare = await addVariant(
+    family.id,
+    {
+      name: "Unphotographed size",
+      sku: `${CODE}-BARE`,
+      wholesalePrice: 1799,
+      suggestedRetailPrice: 5900,
+      inventory: 1,
+    },
+    owner
+  );
   await attachMediaToVariants(shared.id, [], owner);
   const mediaAgain = await listProductMedia(family.id);
+  const bareGallery = orderForVariant(mediaAgain, bare.id);
   check(
     24,
-    "A variant with no image of its own is offered the shared one, marked as inherited",
-    orderForVariant(mediaAgain, second.id).some((row) => row.asset.id === shared.id && !row.isOwn),
-    `${orderForVariant(mediaAgain, second.id).length} image(s) for the second size`
+    "A size with no image of its own falls back to the general gallery, marked as not its own",
+    bareGallery.some((row) => row.asset.id === shared.id && !row.isOwn) &&
+      bareGallery.every((row) => !row.isOwn),
+    `${bareGallery.length} image(s) for a size with none of its own: ` +
+      `${bareGallery.map((row) => `${row.asset.title}${row.isOwn ? " (own)" : ""}`).join(", ") || "none"}`
   );
 
   // 25
@@ -796,25 +839,42 @@ async function main() {
   );
   check(31, "Re-using an existing version label is refused", sameVersion.refused, sameVersion.message);
 
-  // 32
-  const draftCreative = await upload(family.id, pngBytes(1080, 1080, 0x55), "square-post.png", "image/png", {
+  /*
+   * 32 — WITHDRAWAL, NOT MODERATION.
+   *
+   * This check used to upload a creative and assert it was excluded for being
+   * unapproved. Nothing is unapproved any more: an upload from the Admin Panel
+   * is written approved and switched on, so a fresh upload belongs in the pack.
+   * The state that still exists — and that a merchant reaches for — is a file
+   * they have switched off, and the reason has to say so rather than leave them
+   * hunting for a missing asset.
+   */
+  const hiddenCreative = await upload(family.id, pngBytes(1080, 1080, 0x55), "square-post.png", "image/png", {
     category: "MARKETING_CREATIVE",
     subtype: "SQUARE_POST",
     title: "Square social post",
     altText: "A square social post",
   });
+  await updateMedia(hiddenCreative.id, { sellerVisible: false }, owner);
   const preview = await previewMarketingPack(family.id);
   const excludedDraft = preview?.excluded.find((row) => row.title === "Square social post");
   check(
     32,
-    "An unapproved creative is left out of the pack, with the reason stated",
-    Boolean(excludedDraft) && /not approved/i.test(excludedDraft!.reason),
-    excludedDraft?.reason ?? "not excluded"
+    "An upload arrives approved and switched on; switched off, it leaves the pack and says why",
+    hiddenCreative.approvalStatus === "APPROVED" &&
+      hiddenCreative.sellerVisible &&
+      Boolean(excludedDraft) &&
+      /not marked visible/i.test(excludedDraft!.reason),
+    `${hiddenCreative.approvalStatus}, sellerVisible=${hiddenCreative.sellerVisible}, ` +
+      `excluded as "${excludedDraft?.reason ?? "not excluded"}"`
   );
 
   // 33
-  // The archive is only produced for a published product, so finish approving
-  // what should ship and publish the family first.
+  // The archive is only produced for a published product, so switch on what
+  // should ship and publish the family first. `setMediaApproval` is called even
+  // though an upload now arrives approved: it is the moderation path a
+  // seller-submitted file will use, and this is what keeps it exercised.
+
   for (const [assetId, visible] of [
     [shared.id, true],
     [careV2.id, true],
@@ -1053,7 +1113,7 @@ async function main() {
     "The refusal names every blocker, not just the first",
     refusedPublish.message.includes("Description is written") &&
       refusedPublish.message.includes("At least one active variant exists") &&
-      refusedPublish.message.includes("At least one approved, seller-visible image"),
+      refusedPublish.message.includes("At least one active, seller-visible product image"),
     `${(refusedPublish.message.match(/•/g) ?? []).length} blockers listed`
   );
 
@@ -1636,10 +1696,333 @@ async function main() {
       : String(secondDuplicate)
   );
 
+
+  /* ======================================================================= */
+  console.log("\nJ. Product media against variant media, and the Publish gate");
+  /* ======================================================================= */
+  /*
+   * THE TWO SCOPES, AND THE FOUR THINGS A SELLER SEES.
+   *
+   * A product has one gallery of its own — general product media, attached to
+   * the family rather than to a size — and each size may have its own. What a
+   * shopper sees is decided by one rule, and these checks are that rule:
+   *
+   *   1. Nothing is selected: the general gallery, the primary image first.
+   *   2. A size is selected that has media: that size's media, and nothing
+   *      else. Not the general gallery, and above all not another size's.
+   *   3. A size is selected that has none: the general gallery.
+   *   4. The selection is cleared: back to 1, unchanged.
+   *
+   * It is built on a fresh product with Standard, Queen and King because the
+   * failure this replaces was reported in exactly those terms, and because the
+   * family used by the earlier groups has been through thirty checks by now.
+   */
+  const gallery = await createProduct(
+    {
+      name: "Gallery Family",
+      productCode: `${CODE}-G`,
+      category: "Test",
+      description: "A family used to verify the product and variant media scopes.",
+    },
+    owner
+  );
+  const standard = await addVariant(
+    gallery.id,
+    { name: "Standard", sku: `${CODE}-G-STD`, wholesalePrice: 1000, suggestedRetailPrice: 2000, inventory: 5 },
+    owner
+  );
+  const queen = await addVariant(
+    gallery.id,
+    { name: "Queen", sku: `${CODE}-G-QN`, wholesalePrice: 1200, suggestedRetailPrice: 2400, inventory: 5 },
+    owner
+  );
+  const king = await addVariant(
+    gallery.id,
+    { name: "King", sku: `${CODE}-G-KG`, wholesalePrice: 1400, suggestedRetailPrice: 2800, inventory: 5 },
+    owner
+  );
+  await setDefaultVariant(standard.id, owner);
+
+  // The picture of the product itself, showing all three sizes — the one the
+  // catalogue card is drawn from.
+  const groupShot = await upload(gallery.id, pngBytes(1600, 900, 0x71), "group-shot.png", "image/png", {
+    category: "WHITE_BACKGROUND_IMAGE",
+    title: "Cooling Pillow",
+    altText: "The cooling pillow in all three sizes",
+  });
+  const roomShot = await upload(gallery.id, pngBytes(1600, 900, 0x72), "room-shot.png", "image/png", {
+    category: "LIFESTYLE_IMAGE",
+    title: "Cooling pillow on a bed",
+    altText: "The cooling pillow on a made bed",
+  });
+  const standardFront = await upload(gallery.id, pngBytes(900, 900, 0x73), "standard-front.png", "image/png", {
+    category: "WHITE_BACKGROUND_IMAGE",
+    title: "Standard front",
+    altText: "The Standard size, front",
+    variantIds: [standard.id],
+  });
+  const queenFront = await upload(gallery.id, pngBytes(900, 900, 0x74), "queen-front.png", "image/png", {
+    category: "WHITE_BACKGROUND_IMAGE",
+    title: "Queen front",
+    altText: "The Queen size, front",
+    variantIds: [queen.id],
+  });
+
+  // 70
+  const galleryMedia = await listProductMedia(gallery.id);
+  const general = generalGallery(galleryMedia);
+  check(
+    70,
+    "The general gallery is the product's own media — no size's photographs appear in it",
+    general.length === 2 &&
+      general.every((row) => !row.isOwn) &&
+      general.some((row) => row.asset.id === groupShot.id) &&
+      general.every((row) => row.asset.id !== standardFront.id && row.asset.id !== queenFront.id),
+    `${general.length} general asset(s): ${general.map((row) => row.asset.title).join(", ")}`
+  );
+
+  // 71
+  await setPrimaryAssignment(
+    (await prisma.mediaAssetAssignment.findFirst({
+      where: { assetId: groupShot.id, variantId: null },
+      select: { id: true },
+    }))!.id,
+    owner
+  );
+  const withPrimary = generalGallery(await listProductMedia(gallery.id));
+  check(
+    71,
+    "The product primary image leads the general gallery",
+    withPrimary[0]?.asset.id === groupShot.id && withPrimary[0].isPrimary,
+    `${withPrimary[0]?.asset.title ?? "nothing"} first, primary=${withPrimary[0]?.isPrimary}`
+  );
+
+  // 72
+  const queenGallery = orderForVariant(await listProductMedia(gallery.id), queen.id);
+  check(
+    72,
+    "Selecting a size shows that size's media alone — no general media, no other size's",
+    queenGallery.length === 1 &&
+      queenGallery[0].asset.id === queenFront.id &&
+      queenGallery[0].isOwn &&
+      !queenGallery.some((row) => row.asset.id === groupShot.id || row.asset.id === standardFront.id),
+    `${queenGallery.length} entr${queenGallery.length === 1 ? "y" : "ies"}: ` +
+      `${queenGallery.map((row) => row.asset.title).join(", ") || "none"}`
+  );
+
+  // 73
+  const kingGallery = orderForVariant(await listProductMedia(gallery.id), king.id);
+  check(
+    73,
+    "A size with no media of its own falls back to the general gallery rather than showing nothing",
+    kingGallery.length === 2 &&
+      kingGallery.every((row) => !row.isOwn) &&
+      kingGallery.some((row) => row.asset.id === groupShot.id),
+    `${kingGallery.length} entr${kingGallery.length === 1 ? "y" : "ies"} for a size with none of its own`
+  );
+
+  // 74
+  const cleared = generalGallery(await listProductMedia(gallery.id));
+  check(
+    74,
+    "Clearing the selection returns the general gallery, unchanged",
+    cleared.length === 2 && cleared[0]?.asset.id === groupShot.id,
+    `${cleared.length} general asset(s), ${cleared[0]?.asset.title ?? "nothing"} first`
+  );
+
+  // 75
+  /*
+   * ONE PRIMARY, AND THE PREVIOUS HOLDER LOSES IT IN THE SAME WRITE.
+   *
+   * Two primaries would make "which picture represents this product" depend on
+   * row order, and the gate blocks publication over it — but the block is the
+   * backstop. This is the write that has to be exclusive.
+   */
+  await setPrimaryAssignment(
+    (await prisma.mediaAssetAssignment.findFirst({
+      where: { assetId: roomShot.id, variantId: null },
+      select: { id: true },
+    }))!.id,
+    owner
+  );
+  const afterSwap = await prisma.mediaAssetAssignment.findMany({
+    where: { variantId: null, isPrimary: true, asset: { productId: gallery.id } },
+    select: { assetId: true },
+  });
+  check(
+    75,
+    "Setting a new product primary clears the previous one in the same transaction",
+    afterSwap.length === 1 && afterSwap[0].assetId === roomShot.id,
+    `${afterSwap.length} primary row(s) after the swap`
+  );
+
+  // 76
+  /*
+   * A VIDEO IS NOT A PICTURE, so it cannot be the product's primary image. The
+   * catalogue card, the storefront thumbnail and the before-a-size-is-chosen
+   * gallery are all image slots; a video in one of them is a blank card with a
+   * play button at best.
+   */
+  const galleryVideo = await prisma.mediaAsset.create({
+    data: {
+      productId: gallery.id,
+      category: "PRODUCT_VIDEO",
+      title: "Product clip",
+      originalFilename: "clip.mp4",
+      storageKey: `gallery-${suffix.toLowerCase()}-clip`,
+      mimeType: "video/mp4",
+      fileSize: 2048,
+      checksum: `gallery-clip-${suffix}`,
+      processingStatus: "READY",
+      durationSeconds: 5,
+      approvalStatus: "APPROVED",
+      sellerVisible: true,
+      altText: "A five second clip of the pillow",
+    },
+  });
+  await attachMediaToVariants(galleryVideo.id, [], owner);
+  const videoAssignment = (
+    await prisma.mediaAssetAssignment.findFirst({
+      where: { assetId: galleryVideo.id, variantId: null },
+      select: { id: true },
+    })
+  )!;
+  const videoPrimary = await refused(() => setPrimaryAssignment(videoAssignment.id, owner));
+  const stillOne = await prisma.mediaAssetAssignment.count({
+    where: { variantId: null, isPrimary: true, asset: { productId: gallery.id } },
+  });
+  check(
+    76,
+    "A video cannot be made the product's primary image, and the refusal says to choose a photograph",
+    videoPrimary.refused && /not an image/.test(videoPrimary.message) && stillOne === 1,
+    videoPrimary.message.split("\n")[0] || "the video was accepted as primary"
+  );
+
+  // 77
+  /*
+   * ORDER IS THE MERCHANT'S, NOT THE DATABASE'S. Moving an image up inside a
+   * scope is what puts the second photograph on the product page second, so it
+   * has to survive a read.
+   */
+  const roomAssignment = (
+    await prisma.mediaAssetAssignment.findFirst({
+      where: { assetId: roomShot.id, variantId: null },
+      select: { id: true },
+    })
+  )!;
+  await reorderAssignment(roomAssignment.id, "down", owner);
+  const reordered = await prisma.mediaAssetAssignment.findMany({
+    where: { variantId: null, asset: { productId: gallery.id } },
+    orderBy: { sortOrder: "asc" },
+    select: { sortOrder: true },
+  });
+  check(
+    77,
+    "Reordering an attachment writes one order for the scope, with no duplicate positions",
+    new Set(reordered.map((row) => row.sortOrder)).size === reordered.length,
+    `positions ${reordered.map((row) => row.sortOrder).join(", ")}`
+  );
+
+  // 78
+  /*
+   * PUBLICATION, AS THE GATE NOW SEES IT.
+   *
+   * The two checks below are the ones the reported failure was about: media
+   * that is READY and switched on satisfies the seller-image rule, and the
+   * product-level primary satisfies the primary rule — with no approve step
+   * anywhere in between.
+   */
+  await updateProduct(
+    gallery.id,
+    {
+      name: "Gallery Family",
+      productCode: `${CODE}-G`,
+      category: "Test",
+      description: "A family used to verify the product and variant media scopes.",
+    },
+    owner
+  );
+  const galleryReport = await publicationReadiness(gallery.id);
+  const imageCheck = galleryReport.checks.find((row) => row.key === "seller_image");
+  const primaryCheck = galleryReport.checks.find((row) => row.key === "primary_image");
+  check(
+    78,
+    "Admin-uploaded READY media satisfies the seller-image rule, and the product primary satisfies the primary rule",
+    imageCheck?.ok === true && primaryCheck?.ok === true,
+    `seller_image=${imageCheck?.ok}, primary_image=${primaryCheck?.ok}`
+  );
+
+  // 79
+  const beforePublish = await prisma.product.findUnique({ where: { id: gallery.id }, select: { status: true } });
+  await setPublished(gallery.id, true, owner);
+  const afterPublish = await prisma.product.findUnique({ where: { id: gallery.id }, select: { status: true } });
+  const publishAudit = await prisma.auditLog.findFirst({
+    where: { entityId: gallery.id, action: "product.published" },
+    orderBy: { createdAt: "desc" },
+    select: { actorId: true, createdAt: true },
+  });
+  check(
+    79,
+    "Publishing moves DRAFT to PUBLISHED and records who did it, in the same transaction",
+    beforePublish?.status === "DRAFT" &&
+      afterPublish?.status === "PUBLISHED" &&
+      Boolean(publishAudit) &&
+      publishAudit?.actorId === owner.actorId,
+    `${beforePublish?.status} → ${afterPublish?.status}, actor recorded=${Boolean(publishAudit)}`
+  );
+
+  // 80
+  const republished = await setPublished(gallery.id, true, owner);
+  const publishAudits = await prisma.auditLog.count({
+    where: { entityId: gallery.id, action: "product.published" },
+  });
+  check(
+    80,
+    "A second Publish is idempotent — the product stays published and nothing else changes",
+    republished.status === "PUBLISHED" && publishAudits === 2,
+    `${republished.status}, ${publishAudits} publish record(s)`
+  );
+
+  // 81
+  /*
+   * PUBLISHING IS PER PRODUCT. A gate that read the catalogue rather than the
+   * product would let a draft through on the strength of somebody else's
+   * finished work, and the check for that is simply that a second, unfinished
+   * family is still a draft after the first one goes live.
+   */
+  const unrelated = await createProduct(
+    {
+      name: "Unrelated Family",
+      productCode: `${CODE}-U`,
+      category: "Test",
+      description: "",
+    },
+    owner
+  );
+  const unrelatedRow = await prisma.product.findUnique({ where: { id: unrelated.id }, select: { status: true } });
+  const unrelatedRefusal = await refused(() => setPublished(unrelated.id, true, owner));
+  check(
+    81,
+    "Publishing one product does not publish another, and an unfinished one is refused",
+    unrelatedRow?.status === "DRAFT" && unrelatedRefusal.refused,
+    `${unrelatedRow?.status}, refused=${unrelatedRefusal.refused}`
+  );
+
+  // 82
+  const refusedReport = await publicationReadiness(unrelated.id);
+  check(
+    82,
+    "The refusal lists every blocker with the tab that resolves it, and none of them is an approval state",
+    refusedReport.blockers.length >= 3 &&
+      refusedReport.blockers.every((row) => Boolean(row.tab) && Boolean(row.detail)) &&
+      !refusedReport.checks.some((row) => /approv/i.test(row.label)),
+    `${refusedReport.blockers.length} blocker(s): ${refusedReport.blockers.map((row) => row.key).join(", ")}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 69) {
+  if (total !== 82) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave and 5 from the shipping-and-media wave`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave and 13 from the media-scope and publication correction`);
   }
 }
 

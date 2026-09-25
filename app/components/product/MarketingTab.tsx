@@ -303,7 +303,10 @@ function CreativeGroup({
         <Form method="post" encType="multipart/form-data" style={{ marginTop: "0.6rem" }}>
           <input type="hidden" name="tab" value="marketing" />
           <input type="hidden" name="category" value={category} />
-          {isTemplate ? null : <input type="hidden" name="scopeMode" value="shared" />}
+          {/* A creative belongs to the product, not to a size. The hidden field
+              is spelled "general" so it means the same thing as the radio on
+              the other two tabs. */}
+          {isTemplate ? null : <input type="hidden" name="scopeMode" value="general" />}
 
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.75rem" }}>
             {isTemplate ? null : (
@@ -437,15 +440,24 @@ function CreativeTile({ asset }: { asset: MediaAssetView }) {
           <Link to={`?tab=marketing&creative=${encodeURIComponent(asset.id)}`} style={{ ...btn(MUTED), padding: "0.25rem 0.5rem" }}>
             Edit
           </Link>
-          {asset.approvalStatus !== "APPROVED" ? (
-            <Form method="post">
-              <input type="hidden" name="tab" value="marketing" />
-              <input type="hidden" name="assetId" value={asset.id} />
-              <button type="submit" name="intent" value="media_approve" style={{ ...btn("#065f46"), padding: "0.25rem 0.5rem" }}>
-                Approve
-              </button>
-            </Form>
-          ) : null}
+          {/*
+            * Approve has gone the same way here as on the media tiles: a
+            * creative uploaded from this panel is written approved and switched
+            * on, so the only thing left to press is the switch itself.
+            */}
+          <Form method="post">
+            <input type="hidden" name="tab" value="marketing" />
+            <input type="hidden" name="assetId" value={asset.id} />
+            <input type="hidden" name="sellerVisible" value={asset.sellerVisible ? "false" : "true"} />
+            <button
+              type="submit"
+              name="intent"
+              value="media_visibility"
+              style={{ ...btn(asset.sellerVisible ? "#92400e" : "#065f46"), padding: "0.25rem 0.5rem" }}
+            >
+              {asset.sellerVisible ? "Deactivate" : "Activate"}
+            </button>
+          </Form>
         </div>
       </div>
     </div>

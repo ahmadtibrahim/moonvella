@@ -25,16 +25,25 @@ import { videoProbeKey } from "./mediaProbe.server";
  * Three ideas hold this module together.
  *
  * 1. A FILE IS STORED ONCE. A MediaAsset is the file; a MediaAssetAssignment is
- *    a claim on it, either by one variant or by the family (variantId null).
- *    Applying one photo to four variants writes four assignment rows and copies
- *    no bytes, which is why a five-size product does not cost five times the
- *    disk.
+ *    a claim on it, either by one variant or by the product family itself
+ *    (variantId null). Applying one photo to four variants writes four
+ *    assignment rows and copies no bytes, which is why a five-size product does
+ *    not cost five times the disk.
  *
- * 2. NOTHING IS VISIBLE BY ACCIDENT. Every asset starts UPLOADING/DRAFT and
- *    reaches a seller only when it is READY, APPROVED and sellerVisible. The
- *    three are independent because they answer different questions: has the
- *    file finished processing, has a person approved it, and should it be in
- *    the seller's kit at all.
+ *    THE TWO SCOPES ARE PRODUCT MEDIA AND VARIANT MEDIA, and they are not the
+ *    same claim. A null variantId means the file describes the FAMILY — the
+ *    product-level gallery, shown before a seller picks a size. It is not
+ *    "shared with every variant": a variant that has its own photographs shows
+ *    its own and nothing else, and only falls back to the family gallery when it
+ *    has none. See `orderForVariant`.
+ *
+ * 2. NOTHING IS VISIBLE BY ACCIDENT. Every asset starts UPLOADING and reaches a
+ *    seller only when it is READY and sellerVisible. `approvalStatus` is the
+ *    separate moderation question and it is NOT part of that pair: an upload
+ *    made through the Admin Panel is a trusted action and is activated on
+ *    arrival, while a future seller-submitted asset would start invisible and
+ *    wait to be approved. Rejecting still withdraws an asset, because
+ *    `setMediaApproval` clears `sellerVisible` when it refuses one.
  *
  * 3. HISTORY IS KEPT. Replacing a document writes a new asset that points back
  *    at the one it replaces rather than overwriting the old row, so a seller
@@ -45,7 +54,60 @@ import { videoProbeKey } from "./mediaProbe.server";
 /* Read                                                                       */
 /* -------------------------------------------------------------------------- */
 
-export type MediaScope = "shared" | "variant";
+/**
+ * Which of the two claims an asset makes.
+ *
+ * `general` is the product family's own media; `variant` is one size's. The
+ * names are the ones the interface uses, because the old pair ("shared" for the
+ * family) described the wrong thing: a family image is not shared out among the
+ * variants, it belongs above them.
+ *
+ * The upload forms still post the historical wire value `shared` for the family
+ * scope, and `parseScopeMode` accepts it — a form rendered before this change is
+ * a form somebody is looking at, and reinterpreting it as `variant` would file
+ * the file against the wrong claim.
+ */
+export type MediaScope = "general" | "variant";
+
+/** Read the form's scope choice, accepting the value the older forms posted. */
+export function parseScopeMode(value: unknown): MediaScope {
+  return String(value ?? "") === "variant" ? "variant" : "general";
+}
+
+/** Raised when an upload's scope cannot be carried out as posted. */
+export class MediaScopeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MediaScopeError";
+  }
+}
+
+/**
+ * The variants an upload claims, from the form that posted it.
+ *
+ * The radio is what decides. It used to be decorative — the server read the
+ * tick-box list and nothing else — so a file uploaded under "selected variants"
+ * with nothing ticked became a general product image without saying so, which is
+ * the one outcome the person choosing that radio was ruling out.
+ *
+ * An empty list from the GENERAL branch is the normal case and means the family
+ * claim (`variantId: null`). An empty list from the VARIANT branch is a refusal:
+ * the file was declared to belong to a size and no size was named, and guessing
+ * "general" for it would file it against the claim the operator had just
+ * declined.
+ */
+export function resolveUploadScope(form: FormData): string[] {
+  if (parseScopeMode(form.get("scopeMode")) === "general") return [];
+
+  const variantIds = form.getAll("scopeVariantIds").map(String).filter(Boolean);
+  if (variantIds.length === 0) {
+    throw new MediaScopeError(
+      "This file was set to variant media, but no size was chosen. Tick the sizes it belongs to, " +
+        "or switch the scope to general product media — a file that names a size has to name one."
+    );
+  }
+  return variantIds;
+}
 
 export interface MediaAssetView {
   id: string;
@@ -176,48 +238,89 @@ export async function getMedia(assetId: string): Promise<MediaAssetView | null> 
   return asset ? toView(asset) : null;
 }
 
+/** One entry of a gallery: the file, and the claim that put it there. */
+export interface GalleryEntry {
+  asset: MediaAssetView;
+  /** True when this came from the variant's own media rather than the family's. */
+  isOwn: boolean;
+  isPrimary: boolean;
+  sortOrder: number;
+}
+
+/** Merchant's order within one scope, then the primary first as the tie-break. */
+function byScopeOrder(a: GalleryEntry, b: GalleryEntry): number {
+  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  return Number(b.isPrimary) - Number(a.isPrimary);
+}
+
+/**
+ * The product-level gallery: the family's own media, in the merchant's order,
+ * with the family primary image first.
+ *
+ * This is what a seller sees before any size is chosen, and what a variant with
+ * no media of its own falls back to.
+ */
+export function generalGallery(assets: MediaAssetView[]): GalleryEntry[] {
+  return assets
+    .filter((asset) => asset.assignments.some((a) => a.variantId === null))
+    .map((asset) => {
+      const claim = asset.assignments.find((a) => a.variantId === null)!;
+      return { asset, isOwn: false, isPrimary: claim.isPrimary, sortOrder: claim.sortOrder };
+    })
+    .sort((a, b) => {
+      // The primary leads whatever its recorded position. It is the image the
+      // catalogue card, the Shopify product and the social fallback all use, so
+      // a gallery that opened on a different one would disagree with them.
+      if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+      return byScopeOrder(a, b);
+    });
+}
+
 /**
  * What a variant actually shows, in the order it should be shown.
  *
- * An asset attached to the variant itself comes first because it is the most
- * specific thing the merchant said about this variant; assets attached to the
- * family follow, because they apply to everything. An asset attached to *both*
- * is reported once, at its variant position — the alternative is the same
- * photograph appearing twice in one gallery.
+ * A VARIANT THAT HAS MEDIA OF ITS OWN SHOWS ONLY THAT. Mixing the family's
+ * photographs into a size's gallery was the old rule and it is the reason a
+ * shopper could look at "Queen" and be shown a picture of a Standard pillow:
+ * "Queen" had none of its own, so the family gallery was reached for one image
+ * at a time and the result read as Queen's. A size's gallery is the most
+ * specific thing the merchant said, and nothing less specific belongs in it.
+ *
+ * A VARIANT WITH NO MEDIA OF ITS OWN FALLS BACK TO THE FAMILY GALLERY rather
+ * than showing nothing. An empty gallery would be a worse answer than a
+ * general one: the product has photographs, they describe the family, and a
+ * shopper who has chosen a size has still chosen a pillow.
+ *
+ * An asset attached to the variant *and* the family is reported once, as the
+ * variant's own — the alternative is the same photograph twice in one gallery.
  */
-export function orderForVariant(
-  assets: MediaAssetView[],
-  variantId: string
-): { asset: MediaAssetView; isOwn: boolean; isPrimary: boolean; sortOrder: number }[] {
-  const rows: { asset: MediaAssetView; isOwn: boolean; isPrimary: boolean; sortOrder: number }[] = [];
+export function orderForVariant(assets: MediaAssetView[], variantId: string): GalleryEntry[] {
+  const own: GalleryEntry[] = [];
 
   for (const asset of assets) {
-    const own = asset.assignments.find((a) => a.variantId === variantId);
-    const shared = asset.assignments.find((a) => a.variantId === null);
-    if (!own && !shared) continue;
-
-    const isOwn = Boolean(own);
-    const chosen = own ?? shared!;
-    rows.push({ asset, isOwn, isPrimary: chosen.isPrimary, sortOrder: chosen.sortOrder });
+    const claim = asset.assignments.find((a) => a.variantId === variantId);
+    if (!claim) continue;
+    own.push({ asset, isOwn: true, isPrimary: claim.isPrimary, sortOrder: claim.sortOrder });
   }
 
-  // Own before shared; within each, the merchant's order; then primary first.
-  return rows.sort((a, b) => {
-    if (a.isOwn !== b.isOwn) return a.isOwn ? -1 : 1;
-    if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
-    return Number(b.isPrimary) - Number(a.isPrimary);
+  if (own.length === 0) return generalGallery(assets);
+
+  // The variant's own primary leads, then the merchant's order.
+  return own.sort((a, b) => {
+    if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+    return byScopeOrder(a, b);
   });
 }
 
 /**
- * Whether any variant has an asset of its own, which is what distinguishes a
- * genuinely variant-specific gallery from one that is only inheriting.
+ * How many files make each claim, which is what distinguishes a gallery built
+ * for the family from one that is only ever inherited.
  */
 export function inheritanceSummary(assets: MediaAssetView[]): {
-  shared: number;
+  general: number;
   perVariant: Record<string, number>;
 } {
-  const shared = assets.filter(
+  const general = assets.filter(
     (asset) => asset.assignments.some((a) => a.variantId === null)
   ).length;
   const perVariant: Record<string, number> = {};
@@ -227,7 +330,7 @@ export function inheritanceSummary(assets: MediaAssetView[]): {
       perVariant[assignment.variantId] = (perVariant[assignment.variantId] ?? 0) + 1;
     }
   }
-  return { shared, perVariant };
+  return { general, perVariant };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -332,7 +435,7 @@ export async function uploadMediaBatch(
         subtype: optional("subtype"),
         title: optional("title"),
         altText: optional("altText"),
-        variantIds: form.getAll("scopeVariantIds").map(String).filter(Boolean),
+        variantIds: resolveUploadScope(form),
         documentType: optional("documentType"),
         version: optional("version"),
         effectiveDate: optional("effectiveDate"),
@@ -445,8 +548,28 @@ export async function uploadMedia(
           // than being called READY on the strength of an assumption.
           processingStatus:
             stored.kind === "video" && stored.durationSeconds === null ? "PROCESSING" : "READY",
-          approvalStatus: "DRAFT",
-          sellerVisible: false,
+          /*
+           * AN UPLOAD FROM THE ADMIN PANEL IS ALREADY DECIDED.
+           *
+           * The only caller of this function is the authenticated Admin Panel,
+           * and asking an administrator to approve the file they just chose
+           * themselves is not a review step — it is the same person pressing a
+           * second button, and the product sits unpublished until they do. So
+           * the asset is approved on arrival and switched on for sellers, and
+           * the moderation state is left free for the content it was built for:
+           * a seller-submitted file, which would arrive unapproved and
+           * invisible and wait for exactly this field to be set by somebody
+           * else. Rejecting still withdraws an asset — see `setMediaApproval`,
+           * which clears `sellerVisible` when it refuses one.
+           *
+           * A video that is still PROCESSING is seller-visible too, and that is
+           * deliberate: the publication gate refuses a seller-visible asset
+           * that has not finished processing, so the honest state is a blocked
+           * publish with a named reason rather than a file that silently is not
+           * there. The probe writes READY when it finishes.
+           */
+          approvalStatus: "APPROVED",
+          sellerVisible: true,
           documentType,
           version: (input.version || "").trim() || null,
           effectiveDate: parseDate(input.effectiveDate),
@@ -580,8 +703,12 @@ export async function createTemplateAsset(
         fileSize: 0,
         checksum: checksumOf(Buffer.from(templateUrl)),
         processingStatus: "READY",
-        approvalStatus: "DRAFT",
-        sellerVisible: input.sellerVisible ?? false,
+        // Approved on arrival for the same reason an uploaded file is: this is
+        // an Admin Panel action, and there is no second person to ask. The
+        // caller may still withhold it from sellers, which is a visibility
+        // decision rather than a moderation one.
+        approvalStatus: "APPROVED",
+        sellerVisible: input.sellerVisible ?? true,
         instructions: (input.instructions || "").trim() || null,
         templateUrl,
         createdById: actor.actorId,
@@ -765,6 +892,14 @@ const MEDIA_CATEGORIES: MediaCategory[] = [
 ];
 
 /**
+ * The categories that are pictures.
+ *
+ * Narrower than MEDIA_CATEGORIES on purpose: these are the two a catalogue card
+ * or a gallery tile can draw, and therefore the only two that may be a primary.
+ */
+const PRIMARY_IMAGE_CATEGORIES: MediaCategory[] = ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"];
+
+/**
  * The subtypes that belong to each category — the whole enum, partitioned.
  *
  * The Media tab has carried this same table for as long as it has offered the
@@ -914,9 +1049,24 @@ export async function updateMedia(
 /**
  * Approve or reject an asset.
  *
- * Approval is what lets an asset reach a seller, so it is recorded with its own
- * audit action rather than folded into an edit — "who approved this, and when"
- * is a question that gets asked after something wrong has been published.
+ * NO LONGER CALLED FROM THE ADMIN PANEL. Every upload there is approved on
+ * arrival (see `uploadMedia`), so there is nobody left to press either button
+ * and the two intents that did were removed. The function stays because the
+ * moderation it performs is the one a SELLER-SUBMITTED file will need: such a
+ * file would arrive unapproved and invisible, and approving it is what would
+ * switch it on. Removing the function would remove the only way that state can
+ * ever be cleared, and the next person to build a seller upload path would
+ * reach for `updateMedia` and set visibility directly, with no record of who
+ * decided.
+ *
+ * Rejecting remains reachable and is the deliberate "no": it withdraws the
+ * asset from sellers in the same stroke, which is also why a rejected asset is
+ * excluded from the publication gate by its visibility rather than by a
+ * separate rule.
+ *
+ * It is recorded with its own audit action rather than folded into an edit —
+ * "who approved this, and when" is a question that gets asked after something
+ * wrong has been published.
  */
 export async function setMediaApproval(
   assetId: string,
@@ -954,6 +1104,69 @@ export async function setMediaApproval(
     entityId: assetId,
     beforeData: { approvalStatus: before.approvalStatus, sellerVisible: before.sellerVisible },
     afterData: { approvalStatus: asset.approvalStatus, sellerVisible: asset.sellerVisible },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  const view = await getMedia(assetId);
+  if (!view) throw new Error("The asset could not be read back.");
+  return view;
+}
+
+/**
+ * Switch one asset on or off for sellers, and nothing else.
+ *
+ * THIS IS WHAT REPLACED APPROVE AND REJECT on the media tile. An administrator
+ * looking at a file they uploaded wants one of two things: put it in the
+ * seller's gallery, or take it out. "Approve" was the first of those wearing a
+ * moderator's word, and "Reject" was the second — but reject also stamped a
+ * verdict on the row, so taking a picture down for an afternoon and deciding a
+ * file was never acceptable were the same button.
+ *
+ * It is deliberately narrower than `updateMedia`, and it is a separate function
+ * for that reason. That write takes a whole asset description, so a control
+ * posting one switch has to carry every other field back with it or erase the
+ * ones it left out; this one can only touch the flag it names.
+ *
+ * Activations are refused while the file is still being measured, because
+ * `sellerVisible` on an unprocessed asset is a state the publication gate has to
+ * work around (`processing` and `video_duration` both exist to catch it).
+ * Switching one OFF is always allowed: withdrawing something must never be the
+ * harder direction.
+ */
+export async function setMediaVisibility(
+  assetId: string,
+  sellerVisible: boolean,
+  actor: CatalogActor
+): Promise<MediaAssetView> {
+  const before = await prisma.mediaAsset.findUnique({
+    where: { id: assetId },
+    select: { id: true, sellerVisible: true, processingStatus: true, approvalStatus: true },
+  });
+  if (!before) throw new Error("Asset not found.");
+
+  if (sellerVisible && before.processingStatus !== "READY") {
+    throw new Error(
+      before.processingStatus === "FAILED"
+        ? "This file did not finish processing. Retry it, or replace it, before putting it in front of sellers."
+        : "This file is still processing, so it cannot be shown to sellers yet. Try again once it has finished."
+    );
+  }
+
+  const asset = await prisma.mediaAsset.update({
+    where: { id: assetId },
+    data: { sellerVisible },
+  });
+
+  await recordAudit({
+    actorType: actor.actorType ?? "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: sellerVisible ? "media.activated" : "media.deactivated",
+    entityType: AUDIT_ENTITY.MEDIA,
+    entityId: assetId,
+    beforeData: { sellerVisible: before.sellerVisible, approvalStatus: before.approvalStatus },
+    afterData: { sellerVisible: asset.sellerVisible, approvalStatus: asset.approvalStatus },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
@@ -1073,9 +1286,32 @@ export async function setPrimaryAssignment(
 ): Promise<{ ok: true }> {
   const assignment = await prisma.mediaAssetAssignment.findUnique({
     where: { id: assignmentId },
-    select: { id: true, assetId: true, variantId: true },
+    select: {
+      id: true,
+      assetId: true,
+      variantId: true,
+      asset: { select: { category: true, title: true } },
+    },
   });
   if (!assignment) throw new Error("Attachment not found.");
+
+  /*
+   * ONLY AN IMAGE CAN BE PRIMARY, because a primary is a thumbnail.
+   *
+   * The primary image is what the catalogue card, the Shopify product and the
+   * social fallback render, and every one of those draws a still. A video has
+   * no poster frame — the column for one exists in the schema but nothing has
+   * ever written it — so a video marked primary would put a blank tile where
+   * the product's picture should be. A document or a marketing creative is not
+   * a picture at all. The product video still belongs in the gallery; it just
+   * cannot be the thing the gallery is represented by.
+   */
+  if (!PRIMARY_IMAGE_CATEGORIES.includes(assignment.asset.category)) {
+    throw new Error(
+      `"${assignment.asset.title}" is not an image, so it cannot be the primary. ` +
+        `Choose one of the product's photographs instead — this file still appears in the gallery.`,
+    );
+  }
 
   await prisma.$transaction(async (tx) => {
     await tx.mediaAssetAssignment.updateMany({
