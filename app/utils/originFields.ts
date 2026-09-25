@@ -241,11 +241,14 @@ export function readPickupWindow(
   const open = readClockPart(openValue, labels.open);
   const close = readClockPart(closeValue, labels.close);
   if (open && close && !windowIsOrdered(open, close)) {
+    // The labels are the field names the form itself shows, quoted verbatim
+    // rather than folded into the sentence: an operator reading "Special
+    // closing time" back is looking at a field with that label above it.
     throw new PickupWindowError(
-      `${labels.close} (${close}) is not after ${labels.open.toLowerCase()} (${open}). A ` +
+      `${labels.close} (${close}) is not after ${labels.open} (${open}). A ` +
         `collection window has to end later on the same day than it starts; a window running ` +
         `past midnight cannot be recorded here. Correct one of the two times, or clear both ` +
-        `until the dock's hours are known.`
+        `until the hours are known.`
     );
   }
   return { open, close };

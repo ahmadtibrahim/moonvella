@@ -582,8 +582,7 @@ async function originChecks() {
   check(
     "6j a special-hours exception is held to the same rule, and the refusal names its own fields",
     specialRefusal !== null &&
-      specialRefusal.message.includes("Special closing time") &&
-      specialRefusal.message.includes("special opening time"),
+      specialRefusal.message.includes("Special closing time (09:00) is not after Special opening time (18:00)"),
     specialRefusal?.message ?? "no refusal"
   );
   const openLate = readPickupWindow("18:00", "", {
