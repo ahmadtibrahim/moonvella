@@ -31,8 +31,10 @@ import { PrismaClient } from "@prisma/client";
 import {
   QUOTE_INVALIDATION,
   bookPreparedShipment,
+  bookShipmentForOrder,
   cancelPickupForShipment,
   invalidateQuotes,
+  packagesForShipment,
   reconcileBookingOutcome,
   resolveUnknownBooking,
   schedulePickupForShipment,
@@ -77,7 +79,15 @@ const created = {
 /* -------------------------------------------------------------------------- */
 
 const realFetch = globalThis.fetch;
-let providerCalls: { method: string; url: string }[] = [];
+/**
+ * Every call the adapter makes, with the body it sent.
+ *
+ * The body is kept because one question cannot be answered from a method and a
+ * URL: whether two cartons went to the carrier in ONE request, or as two. A
+ * booking that buys one label per parcel looks exactly like a correct one from
+ * the count of URLs alone.
+ */
+let providerCalls: { method: string; url: string; body: unknown }[] = [];
 
 type Answer = { status: number; body: unknown } | "timeout" | "unreachable";
 let responder: (url: string, method: string) => Answer = () => ({ status: 200, body: {} });
@@ -109,7 +119,18 @@ function installStub() {
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? "GET";
-    providerCalls.push({ method, url });
+    // Parsed, not stored raw: the checks below read it, and a JSON string that
+    // failed to parse is a fact about the request worth failing on rather than
+    // an error thrown from inside the stub.
+    let body: unknown = null;
+    if (typeof init?.body === "string" && init.body.trim() !== "") {
+      try {
+        body = JSON.parse(init.body);
+      } catch {
+        body = init.body;
+      }
+    }
+    providerCalls.push({ method, url, body });
 
     const host = new URL(url).host;
     const expected = await allowedHost();
@@ -1085,6 +1106,287 @@ async function packingListChecks() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Two lines, two cartons, one booking, one bill                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * THE SCENARIO THE WORK ORDER NAMES: "a two-item order with one box per item
+ * producing two packages, one seller bill and one multi-package carrier
+ * booking."
+ *
+ * Every other fixture in this file books an order whose cartons are recorded on
+ * the ORDER, or derives a single carton from a single line. Neither shape can
+ * show what goes wrong when a booking grows a second parcel — a carton counted
+ * twice, a line quietly left out, a second label bought for the second box, or
+ * the seller charged once per parcel — so this fixture is two lines, each with
+ * its own carton on its own sellable configuration, and no parcel row on the
+ * order at all. The cartons can only come from the lines.
+ *
+ * The second line is entered in INCHES AND POUNDS on purpose. Two cartons
+ * therefore reach the carrier in one request, in different stored units, which
+ * is where a conversion applied once to the whole set instead of once per
+ * carton shows up.
+ */
+async function multiLineBookingChecks() {
+  console.log("\n-- two lines, two cartons, one booking --");
+  /*
+   * Named rather than `close`, which is a global in this environment and is not
+   * the comparison anyone means. The tolerance is the half-unit below the two
+   * decimal places a converted weight is sent in: 3 lb is 1.36 kg, not
+   * 1.36077711.
+   */
+  const near = (a: number, b: number) => Math.abs(a - b) < 0.005;
+  installStub();
+  const seller = await createSeller("multi");
+  const origin = await createOrigin("multi");
+
+  /*
+   * A sellable configuration is a variant with options, and that is what makes
+   * a carton the VARIANT's own rather than the product's — one packaging editor
+   * per sellable configuration. Without the option pair these cartons would be
+   * the wrong shape of fixture and the resolver would (correctly) read past
+   * them.
+   */
+  await prisma.variantOption.create({
+    data: { variantId: origin.variant.id, name: "Size", value: "Standard", sortOrder: 0 },
+  });
+  await prisma.variantPackage.create({
+    data: {
+      variantId: origin.variant.id,
+      label: "Pillow carton",
+      length: 40,
+      width: 30,
+      height: 20,
+      dimensionUnit: "cm",
+      grossWeight: 5,
+      weightUnit: "kg",
+    },
+  });
+
+  const secondProduct = await prisma.product.create({
+    data: {
+      name: `Verify Booking Second Product multi ${suffix}`,
+      productCode: `VB-P2-MULTI-${suffix}`,
+      category: "Verification",
+      pickupLocationId: origin.location.id,
+    },
+  });
+  created.productIds.push(secondProduct.id);
+  const secondVariant = await prisma.productVariant.create({
+    data: {
+      productId: secondProduct.id,
+      sku: `VB-CUSHION-MULTI-${suffix}`,
+      name: "TEST CUSHION",
+      wholesalePrice: 2000,
+      suggestedRetailPrice: 4000,
+      inventory: 20,
+      isDefault: true,
+      variantOptions: { create: [{ name: "Size", value: "Standard", sortOrder: 0 }] },
+    },
+  });
+  await prisma.variantPackage.create({
+    data: {
+      variantId: secondVariant.id,
+      label: "Cushion carton",
+      length: 25,
+      width: 20,
+      height: 15,
+      dimensionUnit: "in",
+      grossWeight: 3,
+      weightUnit: "lb",
+    },
+  });
+
+  const order = await prisma.order.create({
+    data: {
+      sellerId: seller.id,
+      shopifyOrderId: `gid://shopify/Order/multi-${suffix}`,
+      shopifyOrderName: `#VB-multi-${suffix}`,
+      shopifyOrderNumber: 9100 + created.orderIds.length,
+      supplierReference: `VB-multi-${suffix}`,
+      currency: "CAD",
+      subtotal: 9000,
+      totalTax: 1170,
+      totalShipping: 2500,
+      totalDiscounts: 0,
+      totalPrice: 12670,
+      moonvellaSubtotal: 5000,
+      moonvellaTax: 650,
+      moonvellaShipping: 2500,
+      moonvellaDiscounts: 0,
+      moonvellaTotal: 8150,
+      wholesalePaymentStatus: "SUCCEEDED",
+      shopifyCreatedAt: new Date(),
+      shopifyUpdatedAt: new Date(),
+      shippingAddress: JSON.stringify({
+        name: "Verify Customer",
+        address1: "1 Test Street",
+        city: "Toronto",
+        province: "ON",
+        zip: "M5H 2N2",
+        country: "CA",
+      }),
+      customerName: "Verify Customer",
+      items: {
+        create: [
+          {
+            shopifyLineItemId: `line-pillow-${suffix}`,
+            name: "TEST PILLOW",
+            sku: `VB-PILLOW-MULTI-${suffix}`,
+            quantity: 1,
+            price: 5000,
+            wholesalePrice: 3000,
+            totalDiscount: 0,
+            variantId: origin.variant.id,
+          },
+          {
+            shopifyLineItemId: `line-cushion-${suffix}`,
+            name: "TEST CUSHION",
+            sku: `VB-CUSHION-MULTI-${suffix}`,
+            quantity: 1,
+            price: 4000,
+            wholesalePrice: 2000,
+            totalDiscount: 0,
+            variantId: secondVariant.id,
+          },
+        ],
+      },
+      // No `packages` on purpose. There is nowhere for a carton to come from
+      // except the two lines themselves.
+    },
+    include: { items: true },
+  });
+  created.orderIds.push(order.id);
+
+  const quote = await prisma.shippingQuote.create({
+    data: {
+      orderId: order.id,
+      originLocationId: origin.location.id,
+      provider: "eshipper",
+      carrier: "Purolator",
+      serviceCode: "PUR-EXP",
+      serviceName: "Purolator Express",
+      providerQuoteId: `Q-multi-${suffix}`,
+      totalAmount: 4200,
+      currency: "CAD",
+      selected: true,
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      raw: JSON.stringify({ baseCharge: 40, taxes: 2 }),
+    },
+  });
+  await acceptBookingAddresses(prisma, {
+    originLocationId: origin.location.id,
+    orderId: order.id,
+  });
+
+  /* --- what the order resolves to, before anything is bought -------------- */
+  const loaded = await prisma.order.findUniqueOrThrow({
+    where: { id: order.id },
+    include: { items: true, packages: true },
+  });
+  const parcels = await packagesForShipment(
+    { id: "pending", items: loaded.items.map((i) => ({ orderItemId: i.id, quantity: i.quantity })) },
+    loaded,
+  );
+  check(
+    "two lines with a carton each resolve to two cartons",
+    parcels.packages.length === 2,
+    JSON.stringify(parcels.packages)
+  );
+  check(
+    "...derived from the lines themselves, not read from a parcel row on the order",
+    parcels.source === "derived" && loaded.packages.length === 0,
+    `${parcels.source} / ${loaded.packages.length} order row(s)`
+  );
+  const pillow = parcels.packages.find((p) => near(p.length, 40));
+  const cushion = parcels.packages.find((p) => near(p.length, 63.5));
+  check(
+    "...each the carton of the line it belongs to, not one carton used twice",
+    Boolean(pillow) && Boolean(cushion) && near(pillow!.weight, 5),
+    JSON.stringify(parcels.packages.map((p) => [p.length, p.width, p.height, p.weight]))
+  );
+  check(
+    "...with the imperial line converted to the carrier's units, not quoted as inches",
+    Boolean(cushion) && near(cushion!.width, 50.8) && near(cushion!.height, 38.1) && near(cushion!.weight, 1.36),
+    JSON.stringify(cushion)
+  );
+
+  /* --- one booking for both cartons --------------------------------------- */
+  responder = () => ({ status: 200, body: BOOKED_BODY("multi") });
+  providerCalls = [];
+  await bookShipmentForOrder(order.id, { quoteId: quote.id }, ACTOR);
+
+  const shipments = await prisma.shipment.findMany({
+    where: { orderId: order.id },
+    include: { items: true },
+  });
+  check("two cartons go into ONE carrier booking", shipments.length === 1, `${shipments.length} shipment(s)`);
+  const booked = shipments[0];
+  check("...that describes both cartons", booked?.packageCount === 2, String(booked?.packageCount));
+  check(
+    "...and carries both order lines",
+    booked?.items.length === 2,
+    `${booked?.items.length ?? 0} line(s) on the shipment`
+  );
+  check("...bought with one provider call", apiCalls().length === 1, `calls=${apiCalls().length}`);
+  const shipCall = apiCalls()[0];
+  check(
+    "...to the quote that was selected",
+    Boolean(shipCall?.url.endsWith(`/api/v2/ship/${quote.providerQuoteId}`)),
+    shipCall?.url ?? "(no call)"
+  );
+  const wire = shipCall?.body as { packages?: { type?: string; packages?: unknown[] }; packagingUnit?: string } | undefined;
+  check(
+    "...whose own request carried both cartons, in one package block",
+    wire?.packages?.type === "Package" && wire?.packages?.packages?.length === 2,
+    JSON.stringify(wire?.packages ?? null).slice(0, 160)
+  );
+  check(
+    "...which the carrier is told to read as metric",
+    wire?.packagingUnit === "METRIC",
+    String(wire?.packagingUnit)
+  );
+  const frozen = (booked?.packageSnapshot ?? []) as unknown[];
+  check(
+    "...and the two cartons are frozen on the shipment the label and the pickup read from",
+    frozen.length === 2,
+    `${frozen.length} frozen carton(s)`
+  );
+
+  /* --- one bill ------------------------------------------------------------ */
+  /*
+   * ONE BILL. The seller is charged for the order's shipping once, on the
+   * shipment that carries it. A second shipment for the same two lines would be
+   * a second charge for one delivery, which is the failure this asserts
+   * against — and it is why the check reads the shipments rather than the one
+   * booking returned.
+   */
+  const charges = shipments.map((s) => s.sellerShippingCharge);
+  check(
+    "the seller is billed once for the whole order, not once per carton",
+    charges.length === 1 && charges[0] === 2500,
+    JSON.stringify(charges)
+  );
+  check(
+    "...and the one charge is the order's own shipping charge",
+    charges.reduce<number>((sum, c) => sum + (c ?? 0), 0) === order.moonvellaShipping,
+    `${charges.reduce<number>((sum, c) => sum + (c ?? 0), 0)} of ${order.moonvellaShipping}`
+  );
+
+  /* --- and pressing it again buys nothing --------------------------------- */
+  providerCalls = [];
+  await bookShipmentForOrder(order.id, { quoteId: quote.id }, ACTOR);
+  check("a second press on the same two lines buys nothing", apiCalls().length === 0, `calls=${apiCalls().length}`);
+  check(
+    "...and the order still has exactly one booking and one bill",
+    (await prisma.shipment.count({ where: { orderId: order.id } })) === 1,
+    `${await prisma.shipment.count({ where: { orderId: order.id } })} shipment(s)`
+  );
+
+  restoreFetch();
+}
+
+/* -------------------------------------------------------------------------- */
 /* §1 the gate: no dock, no label                                             */
 /* -------------------------------------------------------------------------- */
 
@@ -1871,6 +2173,7 @@ async function main() {
   await quoteWithdrawalWiringChecks();
   await addressChangeChecks();
   await bookingOutcomeChecks();
+  await multiLineBookingChecks();
   await originGateChecks();
   await addressGateChecks();
   await pickupChecks();
