@@ -17,7 +17,7 @@ import {
 import {
   listProductMedia,
   uploadMedia,
-  DuplicateMediaError,
+  uploadMediaBatch,
   attachMediaToVariants,
   updateMedia,
   setMediaApproval,
@@ -549,12 +549,20 @@ export async function action({ request, params }: ActionFunctionArgs) {
       /*
        * ONE FILE PER REQUEST, AND AN ANSWER PER FILE.
        *
-       * The batch uploader sends each file on its own, so this intent exists to
-       * be answered in JSON rather than with a redirect: a redirect would throw
-       * away the outcome of every other file in the queue, and the uploader
-       * could not tell which of ten files needed retrying. It is deliberately
-       * separate from `media_upload`, which stays exactly as it is — an older
-       * bundle in a browser tab still posts to that one, and it still works.
+       * WHAT THIS CASE IS FOR, NOW THAT IT IS NOT WHAT THE UPLOADER CALLS. The
+       * uploader sends each file on its own and parses the answer with
+       * `JSON.parse`, which a rendered document defeats and which this action
+       * ALSO cannot answer, whatever URL it is reached by: React Router
+       * serialises an action's result into its own envelope for the editor's
+       * path, and into the same envelope for its `.data` twin. Neither is JSON
+       * the uploader can read — the `.data` body is a turbo-stream array, which
+       * `JSON.parse` accepts and which then has no `ok` on it. Measured, both.
+       *
+       * So the uploader has its own endpoint — the resource route at
+       * `/admin/products/:id/media-batch`, which returns `Response.json`
+       * verbatim — and this case remains for the tab that is still holding the
+       * previous bundle. It does the same work through the same shared
+       * function, so the two doors cannot refuse different things.
        *
        * EVERY OUTCOME IS A 200 WITH `ok` IN THE BODY, including the refusals.
        * A non-2xx would be handled by the browser's XHR error path, where the
@@ -562,51 +570,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
        * as "upload failed" — the one message that would have the uploader retry
        * a file that can never succeed.
        */
-      case "media_upload_batch": {
-        const file = form.get("file");
-        if (!(file instanceof File) || file.size === 0) {
-          return Response.json({ ok: false, error: "No file arrived with this request. Choose it again." });
-        }
-        try {
-          const asset = await uploadMedia(
-            productId,
-            file,
-            {
-              category: (optional("category") ?? "PRODUCT_IMAGE") as never,
-              subtype: optional("subtype"),
-              title: optional("title"),
-              altText: optional("altText"),
-              variantIds: variantScope(),
-              documentType: optional("documentType"),
-              version: optional("version"),
-              effectiveDate: optional("effectiveDate"),
-              language: optional("language"),
-              downloadAllowed: form.get("downloadAllowed") !== "false",
-              instructions: optional("instructions"),
-              templateUrl: optional("templateUrl"),
-            },
-            actor
-          );
-          return Response.json({ ok: true, assetId: asset.id, title: asset.title });
-        } catch (error) {
-          // A duplicate is a refusal the uploader must NOT offer to retry, and
-          // the existing asset is named so the file can be retired with a link
-          // to what it duplicates instead of looking like a failure.
-          if (error instanceof DuplicateMediaError) {
-            return Response.json({
-              ok: false,
-              duplicate: true,
-              assetId: error.assetId,
-              title: error.existingTitle,
-              error: error.message,
-            });
-          }
-          return Response.json({
-            ok: false,
-            error: error instanceof Error ? error.message : "That file could not be stored.",
-          });
-        }
-      }
+      case "media_upload_batch":
+        return Response.json(await uploadMediaBatch(productId, form, actor));
 
       case "document_supersede": {
         const file = form.get("file");

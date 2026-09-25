@@ -243,6 +243,96 @@ export interface UploadMediaInput {
 }
 
 /**
+ * What the batch uploader is told about one file.
+ *
+ * A refusal is an ANSWER, not an error status. The uploader is a raw XHR: a
+ * non-2xx lands in its error path, where the body is often unreadable, and
+ * "this file is already on the product" would reach the operator as "upload
+ * failed" — the one message that makes them retry a file that can never
+ * succeed. So every outcome, including every refusal, travels as a result.
+ *
+ * `duplicate` is its own outcome rather than a failure because the two need
+ * different treatment: a failed card is kept and offered for retry, a duplicate
+ * is kept and never offered, because retrying it could only refuse again.
+ */
+export type BatchUploadOutcome =
+  | { ok: true; assetId: string; title: string }
+  | { ok: false; duplicate: true; assetId: string; title: string; error: string }
+  | { ok: false; duplicate?: false; error: string };
+
+/**
+ * One file from the batch uploader.
+ *
+ * SHARED BY BOTH DOORS. The editor's action handles `media_upload_batch` for a
+ * form post, and the resource route serves the uploader's own XHR; both call
+ * this, so the two cannot drift into refusing different things. It lived in the
+ * action first, and the uploader could not be answered with JSON from there —
+ * see the note on the resource route for why that is a property of the router
+ * and not of this code.
+ *
+ * The category is required rather than defaulted. It used to fall back to
+ * `PRODUCT_IMAGE`, which is not a value the enum has, so a request that omitted
+ * it was refused with "Unknown media category" — a message about the category
+ * when the real problem was that none arrived.
+ */
+export async function uploadMediaBatch(
+  productId: string,
+  form: FormData,
+  actor: CatalogActor
+): Promise<BatchUploadOutcome> {
+  const file = form.get("file");
+  if (!(file instanceof File) || file.size === 0) {
+    return { ok: false, error: "No file arrived with this request. Choose it again." };
+  }
+
+  const optional = (name: string) => {
+    const value = String(form.get(name) ?? "").trim();
+    return value === "" ? null : value;
+  };
+  const category = optional("category");
+  if (!category) return { ok: false, error: "Choose a category for this file." };
+
+  try {
+    const asset = await uploadMedia(
+      productId,
+      file,
+      {
+        category: category as MediaCategory,
+        subtype: optional("subtype"),
+        title: optional("title"),
+        altText: optional("altText"),
+        variantIds: form.getAll("scopeVariantIds").map(String).filter(Boolean),
+        documentType: optional("documentType"),
+        version: optional("version"),
+        effectiveDate: optional("effectiveDate"),
+        language: optional("language"),
+        downloadAllowed: form.get("downloadAllowed") !== "false",
+        instructions: optional("instructions"),
+        templateUrl: optional("templateUrl"),
+      },
+      actor
+    );
+    return { ok: true, assetId: asset.id, title: asset.title };
+  } catch (error) {
+    if (error instanceof DuplicateMediaError) {
+      // The asset it duplicates is named, so the uploader can offer to open it
+      // instead of leaving the operator to guess what they already have.
+      return {
+        ok: false,
+        duplicate: true,
+        assetId: error.assetId,
+        title: error.existingTitle,
+        error: error.message,
+      };
+    }
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "That file could not be stored.",
+    };
+  }
+}
+
+/**
  * Upload a file and attach it.
  *
  * The bytes are stored first and the row written second, so a row never points

@@ -28,8 +28,28 @@ import { createHash } from "node:crypto";
 import { getCredentials, redactSecrets } from "./credentials.server";
 
 export interface RateRequest {
-  shipFrom: { name?: string; address: string; city?: string; province?: string; postalCode: string; country: string };
-  shipTo: { name?: string; address: string; city?: string; province?: string; postalCode: string; country: string; residential?: boolean };
+  shipFrom: {
+    name?: string;
+    address: string;
+    city?: string;
+    province?: string;
+    postalCode: string;
+    country: string;
+    /** Carriers accept these; they are not required to price. */
+    phone?: string | null;
+    email?: string | null;
+  };
+  shipTo: {
+    name?: string;
+    address: string;
+    city?: string;
+    province?: string;
+    postalCode: string;
+    country: string;
+    residential?: boolean;
+    phone?: string | null;
+    email?: string | null;
+  };
   packages: { count: number; length: number; width: number; height: number; weight: number; units: string }[];
   declaredValue?: number;
   insurance?: boolean;
@@ -678,6 +698,166 @@ async function eshipperFetch(method: string, path: string, body?: unknown, opera
   return JSON.parse(text);
 }
 
+/**
+ * The provider's quote envelope, established by asking the API.
+ *
+ * The published documentation is wrong on every name below, and wrong SILENTLY:
+ * Jackson ignores a property it does not recognise, so a misspelled field is not
+ * rejected -- it is dropped and a default takes its place. That is how a request
+ * missing its postal code still answered HTTP 201 while ten carriers rated
+ * "00000", and how a wholly malformed envelope looked like a successful call.
+ *
+ *   shipFrom / shipTo   ->  from / to
+ *   packages: [ ... ]   ->  packages: { type, packages: [ ... ] }
+ *   address             ->  address1      (the only address line required)
+ *   postalCode          ->  zip
+ *   name                ->  attention     (the Address type has no `name`)
+ *
+ * `address2` is real, so a unit number survives. `residential` is a Boolean on
+ * the address. `packagingUnit` is the enum [METRIC, IMPERIAL].
+ *
+ * `declaredValue` and `insurance` are NOT properties of this request under any
+ * name -- every near-miss was tested and ignored. They cannot be transmitted
+ * here, and no separate endpoint has been verified, so this file must not imply
+ * that a declared value is being sent. Recorded as open, not worked around.
+ */
+const WIRE_PACKAGING_UNIT = "METRIC";
+const WIRE_DIMENSION_UNIT = "CM";
+const WIRE_WEIGHT_UNIT = "KG";
+/** The one unit the app ever stores; see the guard in buildQuoteRequest. */
+const CANONICAL_PACKAGE_UNITS = "cm_kg";
+
+interface WireAddress {
+  address1: string;
+  city?: string;
+  province?: string;
+  zip: string;
+  country: string;
+  residential?: boolean;
+  attention?: string;
+  phone?: string;
+  email?: string;
+}
+
+interface WireParcel {
+  length: number;
+  width: number;
+  height: number;
+  weight: number;
+  description: string;
+  dimensionUnit: string;
+  weightUnit: string;
+}
+
+export interface WireQuoteRequest {
+  from: WireAddress;
+  to: WireAddress;
+  scheduledShipDate: string;
+  packagingUnit: string;
+  packages: { type: string; packages: WireParcel[] };
+}
+
+/**
+ * "yyyy-MM-dd HH:mm" -- the only shape the provider binds.
+ *
+ * The field is a java.time.LocalDateTime read by a pattern that stops at
+ * minutes: ISO 8601 fails at index 10, and a value carrying seconds fails too.
+ *
+ * Formatted in UTC because the type carries no zone, so there is no way to tell
+ * the provider which wall clock a reading belongs to. For an Eastern-time
+ * warehouse this dates a late-evening request tomorrow. That is tolerable for a
+ * scheduled ship DATE and it is what was proven to parse, but it is an
+ * assumption rather than a verified reading of the provider's intent, and it is
+ * recorded as open rather than presented as settled.
+ */
+function wireShipDate(when: Date): string {
+  return when.toISOString().slice(0, 16).replace("T", " ");
+}
+
+function toWireAddress(source: RateRequest["shipFrom"] | RateRequest["shipTo"]): WireAddress {
+  const address: WireAddress = {
+    address1: source.address,
+    city: source.city,
+    province: source.province,
+    zip: source.postalCode,
+    country: source.country,
+    // `attention`, not `name`: the Address type has no `name` property, so a
+    // recipient sent under that key is dropped and the label prints with nobody
+    // to deliver to. Whether `attention` renders as the recipient is confirmed
+    // on a label, not by a quote -- recorded as open.
+    attention: source.name,
+    residential: "residential" in source ? source.residential : undefined,
+  };
+  if (source.phone) address.phone = source.phone;
+  if (source.email) address.email = source.email;
+  return address;
+}
+
+/**
+ * The app's request, expressed the way the provider actually reads it.
+ *
+ * Units are REFUSED rather than coerced. The per-parcel unit tokens are not
+ * validated by the provider -- an unrecognised value is silently defaulted -- so
+ * a parcel sent in the wrong unit would be priced on a wrong figure with no
+ * error anywhere to show for it. This app stores one canonical unit, so any
+ * other value is a bug upstream and belongs here, loudly, not on the wire.
+ */
+export function buildQuoteRequest(req: RateRequest, when: Date): WireQuoteRequest {
+  const parcels: WireParcel[] = [];
+  for (const p of req.packages) {
+    if (p.units !== CANONICAL_PACKAGE_UNITS) {
+      throw new Error(
+        `Package units "${p.units}" cannot be sent to eShipper. This app stores ${CANONICAL_PACKAGE_UNITS} only, ` +
+          `and the provider does not reject an unknown unit -- it silently defaults it -- so a wrong unit would be priced without complaint.`
+      );
+    }
+    /*
+     * The last gate before a carrier is asked to move something. The forms and
+     * the write layer already refuse these, so anything reaching here is a bad
+     * row from before those rules existed or a path nobody has thought of yet.
+     * It is checked anyway because of what the provider does with it: a zero or
+     * a NaN is not rejected upstream, it is priced, and the answer looks
+     * exactly like a real quote.
+     */
+    for (const [field, value] of Object.entries({
+      length: p.length,
+      width: p.width,
+      height: p.height,
+      weight: p.weight,
+    })) {
+      if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(
+          `A parcel cannot be sent to eShipper with ${field} = ${String(value)}: ` +
+            `the provider prices what it is given rather than refusing it, so this would become a real quote for a parcel that cannot exist.`
+        );
+      }
+    }
+    // `count` is N identical parcels; the provider takes them enumerated.
+    const copies = Math.max(1, Math.floor(p.count));
+    for (let i = 0; i < copies; i += 1) {
+      parcels.push({
+        length: p.length,
+        width: p.width,
+        height: p.height,
+        weight: p.weight,
+        description: "Carton",
+        dimensionUnit: WIRE_DIMENSION_UNIT,
+        weightUnit: WIRE_WEIGHT_UNIT,
+      });
+    }
+  }
+  if (parcels.length === 0) {
+    throw new Error("A quote needs at least one parcel; none were supplied.");
+  }
+  return {
+    from: toWireAddress(req.shipFrom),
+    to: toWireAddress(req.shipTo),
+    scheduledShipDate: wireShipDate(when),
+    packagingUnit: WIRE_PACKAGING_UNIT,
+    packages: { type: "Package", packages: parcels },
+  };
+}
+
 function simulatedRates(req: RateRequest): RateQuote[] {
   const totalWeight = req.packages.reduce((s, p) => s + p.weight * p.count, 0);
   const totalCount = req.packages.reduce((s, p) => s + p.count, 0);
@@ -703,29 +883,56 @@ export async function getRates(req: RateRequest): Promise<RateQuote[]> {
     return simulatedRates(req);
   }
   await requireRealMode("getRates");
-  const raw = await eshipperFetch("POST", "/api/v2/quote", req);
-  return normalizeRates(raw);
+  const raw = await eshipperFetch("POST", "/api/v2/quote", buildQuoteRequest(req, new Date()));
+  const envelope = raw as { uuid?: unknown; warnings?: unknown[] } | null;
+  const quotes = normalizeRates(raw, envelope?.uuid == null ? null : String(envelope.uuid));
+  if (quotes.length === 0) {
+    /*
+     * An empty list is not "no coverage" -- it is the provider declining to
+     * price, and it says why in `warnings`, one line per carrier. Returning []
+     * discarded those reasons, which is what let a wholly malformed envelope
+     * look like a successful call with nothing available. The reasons are
+     * raised instead, so the operator reads "Canada Post: The Postal Code is
+     * invalid" rather than an unexplained blank.
+     */
+    const reasons = (envelope?.warnings ?? []).map((w) => String(w).trim()).filter(Boolean);
+    throw new Error(
+      reasons.length
+        ? `eShipper returned no rates. ${reasons.length} carrier(s) declined: ${reasons.join(" | ")}`
+        : "eShipper returned no rates and offered no reason."
+    );
+  }
+  return quotes;
 }
 
-function normalizeRates(raw: unknown): RateQuote[] {
-  const list = Array.isArray(raw) ? raw : (raw as { rates?: unknown[] })?.rates ?? [];
+/**
+ * The provider's answer, read by its real names.
+ *
+ * `totalCharge` is the figure to bill on. It was previously read as `total`,
+ * which does not exist in the response, so every quote priced at zero. The
+ * service handle is the numeric `serviceId`; there is no `serviceCode`.
+ *
+ * The quote id is the envelope's `uuid`, not a per-quote field: ONE uuid covers
+ * every quote in a response, which is why it is passed in rather than searched
+ * for. It is the handle a booking names, and it is absent on responses that
+ * carry no id at all -- hence nullable rather than invented.
+ */
+export function normalizeRates(raw: unknown, quoteId: string | null): RateQuote[] {
+  const list = Array.isArray(raw) ? raw : (raw as { quotes?: unknown[] })?.quotes ?? [];
   return list.map((r) => {
     const rate = r as Record<string, unknown>;
     const transit = rate.transitDays ?? rate.transit_days ?? null;
     const delivery = rate.estimatedDelivery ?? rate.deliveryDate ?? null;
-    // Coerced rather than passed through: this arrives as unknown JSON and
-    // booking by id needs a string. Absent stays null, meaning "no id issued".
-    const quoteId = rate.quoteId ?? rate.quote_id ?? rate.id ?? null;
     return {
-      carrier: String(rate.carrier ?? rate.carrierName ?? "Unknown"),
-      serviceCode: String(rate.serviceCode ?? rate.service_code ?? ""),
+      carrier: String(rate.carrierName ?? rate.carrier ?? "Unknown"),
+      serviceCode: String(rate.serviceId ?? rate.serviceCode ?? ""),
       serviceName: String(rate.serviceName ?? rate.service_name ?? ""),
-      totalAmount: Math.round(Number(rate.total ?? rate.cost ?? 0) * 100),
+      totalAmount: Math.round(Number(rate.totalCharge ?? rate.totalChargedAmount ?? 0) * 100),
       currency: String(rate.currency ?? "CAD"),
       transitDays: transit === null ? null : Number(transit),
       estimatedDelivery: delivery ? new Date(String(delivery)) : null,
       expiresAt: rate.expiresAt ? new Date(String(rate.expiresAt)) : null,
-      providerQuoteId: quoteId === null ? null : String(quoteId),
+      providerQuoteId: quoteId,
       raw: rate,
     };
   });
@@ -734,15 +941,15 @@ function normalizeRates(raw: unknown): RateQuote[] {
 export async function saveQuote(quoteId: string, req: RateRequest): Promise<RateQuote> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("saveQuote");
-  const raw = await eshipperFetch("PUT", `/api/v2/quote/${quoteId}`, req);
-  return normalizeRates([raw])[0];
+  const raw = await eshipperFetch("PUT", `/api/v2/quote/${quoteId}`, buildQuoteRequest(req, new Date()));
+  return normalizeRates([raw], quoteId)[0];
 }
 
 export async function getQuote(quoteId: string): Promise<RateQuote | null> {
   if (!(await eshipperConfigured())) return null;
   await requireRealMode("getQuote");
   const raw = await eshipperFetch("GET", `/api/v2/quote/${quoteId}`);
-  const quotes = normalizeRates([raw]);
+  const quotes = normalizeRates([raw], quoteId);
   return quotes[0] ?? null;
 }
 
@@ -773,12 +980,24 @@ export async function bookShipment(input: {
       "This quote has no eShipper quote id. Re-request quotes so the booking can reference the provider quote."
     );
   }
+  /*
+   * The same corrected envelope the quote was priced with, so the label cannot
+   * describe a parcel the price was not based on, plus the service being bought.
+   *
+   * NOTE: the booking contract is NOT yet verified the way the quote contract
+   * is. The quote endpoint was driven to a successful answer and its names are
+   * established; this endpoint has only been reasoned about from the corrected
+   * envelope, and every field here is inherited from that work rather than
+   * proven against a response. It is exercised by the sandbox booking test
+   * before it is relied on.
+   */
+  const serviceId = Number(input.quote.serviceCode);
   const raw = await eshipperFetch(
     "POST",
     `/api/v2/ship/${encodeURIComponent(input.quote.providerQuoteId)}`,
     {
-      ...input.rateRequest,
-      serviceCode: input.quote.serviceCode,
+      ...buildQuoteRequest(input.rateRequest, new Date()),
+      serviceId: Number.isFinite(serviceId) ? serviceId : input.quote.serviceCode,
     },
     // Named, because this is the one call whose timeout means "you may own a
     // label you cannot see" rather than "nothing happened".
@@ -1023,8 +1242,8 @@ export async function getReturnQuote(req: RateRequest): Promise<ReturnQuote[]> {
 export async function saveReturnQuote(quoteId: string, req: RateRequest): Promise<ReturnQuote> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("saveReturnQuote");
-  const raw = await eshipperFetch("PUT", `/api/v2/returns/quote/${quoteId}`, req);
-  return normalizeRates([raw])[0] as ReturnQuote;
+  const raw = await eshipperFetch("PUT", `/api/v2/returns/quote/${quoteId}`, buildQuoteRequest(req, new Date()));
+  return normalizeRates([raw], quoteId)[0] as ReturnQuote;
 }
 
 export async function bookReturn(input: {
@@ -1048,9 +1267,17 @@ export async function bookReturn(input: {
     };
   }
   await requireRealMode("bookReturn");
+  /*
+   * The corrected envelope, plus the two fields that are this endpoint's own.
+   * Like the outbound booking, the returns contract is inherited from the
+   * verified quote envelope rather than proven against this endpoint's
+   * response, and it is exercised by a sandbox return before it is relied on.
+   */
   const raw = await eshipperFetch("POST", `/api/v2/returns/create/${input.quote.serviceCode}`, {
-    ...input.rateRequest,
-    serviceCode: input.quote.serviceCode,
+    ...buildQuoteRequest(input.rateRequest, new Date()),
+    serviceId: Number.isFinite(Number(input.quote.serviceCode))
+      ? Number(input.quote.serviceCode)
+      : input.quote.serviceCode,
     returnItems: input.returnItems,
     returnAddress: input.returnAddress,
   }) as Record<string, unknown>;

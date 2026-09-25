@@ -433,14 +433,7 @@ export function validatePreset(input: PresetInput, otherNames: string[]): string
   }
 
   for (const field of ["length", "width", "height"] as const) {
-    const raw = input[field];
-    if (raw === undefined || raw === null || String(raw).trim() === "") {
-      problems.push(`${field} is required`);
-      continue;
-    }
-    const value = Number(raw);
-    if (!Number.isFinite(value)) problems.push(`${field} is not a number`);
-    else if (value <= 0) problems.push(`${field} must be greater than zero`);
+    problems.push(...dimensionProblems(field, input[field]));
   }
 
   const empty = optionalWeight(input.emptyWeight);
@@ -453,6 +446,79 @@ export function validatePreset(input: PresetInput, otherNames: string[]): string
 
   if (typeof empty === "number" && typeof max === "number" && max < empty) {
     problems.push("a pack cannot hold less than it weighs empty");
+  }
+
+  return problems;
+}
+
+/**
+ * What is wrong with one dimension, or nothing.
+ *
+ * Shared by a pack and by a parcel, because they describe the same physical box:
+ * a rule that held for one and not the other would let a pack be saved and then
+ * quoted as a parcel that could never exist. The messages are the ones the
+ * operator already sees on the pack form, so the same mistake reads the same way
+ * on both.
+ *
+ * Zero is refused rather than read as "unset". A parcel with no length is not a
+ * small parcel — it is a missing measurement, and a carrier prices it as
+ * whatever it defaults to, silently. A negative dimension can only come from a
+ * typo or a bad import, and prices as nonsense.
+ */
+export function dimensionProblems(field: string, raw: unknown): string[] {
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return [`${field} is required`];
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return [`${field} is not a number`];
+  if (value <= 0) return [`${field} must be greater than zero`];
+  return [];
+}
+
+export class ParcelValidationError extends Error {
+  readonly problems: string[];
+  constructor(problems: string[]) {
+    super(`The parcel was not saved: ${problems.join("; ")}`);
+    this.name = "ParcelValidationError";
+    this.problems = problems;
+  }
+}
+
+/**
+ * Every reason a parcel's measurements are not usable, returned together.
+ *
+ * A parcel is a physical object a carrier will be asked to move, so all four
+ * figures must be real and positive: a zero or a blank is a missing measurement,
+ * not a light one. `count` is checked when supplied, because a parcel row
+ * stands for `count` identical boxes and a fractional or absent count would
+ * quote a number of boxes nobody asked for.
+ */
+export function parcelProblems(input: {
+  length?: unknown;
+  width?: unknown;
+  height?: unknown;
+  weight?: unknown;
+  count?: unknown;
+}): string[] {
+  const problems: string[] = [];
+  for (const field of ["length", "width", "height"] as const) {
+    problems.push(...dimensionProblems(field, input[field]));
+  }
+
+  const rawWeight = input.weight;
+  if (rawWeight === undefined || rawWeight === null || String(rawWeight).trim() === "") {
+    problems.push("weight is required");
+  } else {
+    const weight = Number(rawWeight);
+    if (!Number.isFinite(weight)) problems.push("weight is not a number");
+    else if (weight <= 0) problems.push("weight must be greater than zero");
+  }
+
+  if (input.count !== undefined && input.count !== null && String(input.count).trim() !== "") {
+    const count = Number(input.count);
+    if (!Number.isInteger(count) || count < 1) {
+      problems.push("the number of parcels must be a whole number of at least one");
+    }
   }
 
   return problems;

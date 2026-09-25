@@ -726,6 +726,55 @@ async function main() {
       !("isActive" in typedHere),
     `an update writes: ${Object.keys(typedHere).join(", ")}`,
   );
+  /*
+   * MEDIA AND PACKAGING, PRESERVED BY THERE BEING NO CODE PATH AT ALL.
+   *
+   * Checks 29 and 30 read ONE object — the create's `productFields` — so what
+   * they establish is narrower than the claim the directive makes ("a re-sync
+   * must not blank MoonVella-added media"). The difference is not pedantry: a
+   * literal that merely omits `media` today can gain it tomorrow, whereas a
+   * module that never names the table has no way to write to it at all. So this
+   * asserts the module-wide absence, across BOTH files, rather than the omission
+   * in a single literal.
+   */
+  const syncSource = readFileSync(WITHDRAWAL_PATH, "utf8");
+  const mediaAndPackaging = [
+    "MediaAsset",
+    "MediaAssetAssignment",
+    "ImportMediaSelection",
+    "VariantPackage",
+    "ProductPackage",
+  ];
+  const tablesNamed = mediaAndPackaging.filter(
+    (table) => new RegExp(`\\b${table}\\b`).test(source) || new RegExp(`\\b${table}\\b`).test(syncSource)
+  );
+  check(
+    30.4,
+    "Neither the import nor the sync names a media or packaging table, so a re-import has no way to blank MoonVella's media or packaging",
+    tablesNamed.length === 0,
+    tablesNamed.length
+      ? `named: ${tablesNamed.join(", ")}`
+      : "no media or packaging table is referenced in either module",
+  );
+  /*
+   * THE OTHER HALF OF THE SPLIT, and the half that would be just as wrong to
+   * get backwards. A rule that preserved identity, price and stock would stop
+   * the catalogue tracking Odoo and nothing on the page would say so — the
+   * figures would simply be stale. So what Odoo owns is asserted to be WRITTEN
+   * from the Odoo read on every import, in the same object that preserves the
+   * editorial fields.
+   */
+  check(
+    30.5,
+    "Identity, sale price and stock are written from the Odoo read on every import — a price or a count typed here does not survive",
+    /wholesalePrice: toCents\(wholesale\)/.test(source) &&
+      /inventory: variant\.available/.test(source) &&
+      /reserved: variant\.reserved/.test(source) &&
+      /isActive: variant\.active/.test(source) &&
+      /sku/.test(source) &&
+      /name: variantName\(template\.odooName, variant\)/.test(source),
+    "wholesalePrice, inventory, reserved, isActive and the name all come from the variant read",
+  );
   /* -------------------------------------------------------------------- */
   /* This module never writes to Odoo                                      */
   /* -------------------------------------------------------------------- */

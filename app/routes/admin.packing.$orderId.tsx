@@ -3,7 +3,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
-import { getVariantPackages, toCm, toKg } from "~/services/packaging.server";
+import { getVariantPackages, toCm, toKg, parcelProblems, ParcelValidationError } from "~/services/packaging.server";
 import {
   createPackingShipment,
   markShipmentPacked,
@@ -140,18 +140,24 @@ export async function action({ request, params }: ActionFunctionArgs) {
       if (!item.variantId) throw new Error("This item has no variant packaging to reference.");
       const rows = await getVariantPackages(item.variantId);
       if (rows.length === 0) throw new Error("No variant packaging rows exist for this item.");
+      const parcels = rows.map((r) => ({
+        count: Math.max(1, item.quantity * r.packagesPerUnit),
+        length: Number(toCm(r.length, r.dimensionUnit).toFixed(2)),
+        width: Number(toCm(r.width, r.dimensionUnit).toFixed(2)),
+        height: Number(toCm(r.height, r.dimensionUnit).toFixed(2)),
+        weight: Number(toKg(r.grossWeight, r.weightUnit).toFixed(3)),
+      }));
+      // Checked here as well as in addOrderPackage, because this is the one
+      // parcel write that does not go through it. The values are converted, not
+      // typed, so a packaging row stored before its own rules existed — or
+      // stored with a unit the conversion does not know — can arrive as a zero
+      // or a NaN, and either would be quoted rather than refused.
+      const problems = parcels.flatMap((p) => parcelProblems(p));
+      if (problems.length > 0) throw new ParcelValidationError(problems);
       const created = await prisma.$transaction(
-        rows.map((r) =>
+        parcels.map((p) =>
           prisma.orderPackage.create({
-            data: {
-              orderId,
-              count: Math.max(1, item.quantity * r.packagesPerUnit),
-              length: Number(toCm(r.length, r.dimensionUnit).toFixed(2)),
-              width: Number(toCm(r.width, r.dimensionUnit).toFixed(2)),
-              height: Number(toCm(r.height, r.dimensionUnit).toFixed(2)),
-              weight: Number(toKg(r.grossWeight, r.weightUnit).toFixed(3)),
-              units: "cm_kg",
-            },
+            data: { orderId, ...p, units: "cm_kg" },
           })
         )
       );

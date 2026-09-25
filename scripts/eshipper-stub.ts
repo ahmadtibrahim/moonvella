@@ -38,16 +38,27 @@ function isEshipper(url: string): boolean {
 }
 
 /**
- * Three rates with deliberately different shapes:
+ * Three quotes with deliberately different shapes:
  *   UPS         cheapest, so "cheapest" has something unambiguous to pick.
  *   Purolator   fastest of those with a known estimate.
  *   Canada Post no transit estimate, so the unknown-estimate path is exercised.
+ *
+ * THE FIELD NAMES ARE THE PROVIDER'S, read off a real 201 response rather than
+ * assumed: `carrierName`, the numeric `serviceId`, `totalCharge`, and
+ * `transitDays` as a STRING. They were previously `carrier`/`serviceCode`/
+ * `total`/number, which is what the adapter read before the contract was
+ * verified — so this stub agreed with a broken adapter and both looked right.
+ * The quote id is not a per-quote field at all: the response envelope carries
+ * one `uuid` covering every quote in it.
  */
 const RATES = [
-  { carrier: "UPS", serviceCode: "UPS-STD", serviceName: "Standard", total: 12.0, currency: "CAD", transitDays: 5, quoteId: "STUB-Q-1" },
-  { carrier: "Purolator", serviceCode: "PUR-EXP", serviceName: "Express", total: 18.0, currency: "CAD", transitDays: 2, quoteId: "STUB-Q-2" },
-  { carrier: "Canada Post", serviceCode: "CP-EXP", serviceName: "Expedited", total: 15.0, currency: "CAD", transitDays: null, quoteId: "STUB-Q-3" },
+  { carrierName: "UPS", serviceId: 5000001, serviceName: "Standard", totalCharge: 12.0, currency: "CAD", transitDays: "5" },
+  { carrierName: "Purolator", serviceId: 5000002, serviceName: "Express", totalCharge: 18.0, currency: "CAD", transitDays: "2" },
+  { carrierName: "Canada Post", serviceId: 5000003, serviceName: "Expedited", totalCharge: 15.0, currency: "CAD", transitDays: null },
 ];
+
+/** One envelope uuid covers every quote returned with it — this is the booking handle. */
+const QUOTE_UUID = "STUB-QUOTE-UUID-1";
 
 function responseFor(url: string): { status: number; body: unknown } {
   if (url.includes("/authenticate")) {
@@ -63,10 +74,14 @@ function responseFor(url: string): { status: number; body: unknown } {
     };
   }
   if (url.includes("/api/v2/returns/quote")) {
-    return { status: 200, body: { rates: RATES.map((r) => ({ ...r, quoteId: `${r.quoteId}-R` })) } };
+    // The adapter wraps a return quote in an array itself rather than reading a
+    // list, so this answer is the bare quote object. That shape is inherited
+    // from the outbound quote envelope and is NOT yet confirmed against a real
+    // returns response — see the note on `saveReturnQuote` in the adapter.
+    return { status: 200, body: { ...RATES[0], carrierName: "UPS Returns", serviceName: "Return" } };
   }
   if (url.includes("/api/v2/quote")) {
-    return { status: 200, body: { rates: RATES } };
+    return { status: 200, body: { quotes: RATES, uuid: QUOTE_UUID, warnings: [] } };
   }
   // Sub-resources first: they are also under /api/v2/ship/.
   if (url.includes("/api/v2/ship/") && url.endsWith("/label")) {

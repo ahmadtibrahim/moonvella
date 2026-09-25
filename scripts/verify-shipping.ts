@@ -228,22 +228,53 @@ async function main() {
   installFetch((url) => {
     if (url.includes("/authenticate")) return { body: { token: "test-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-1", refresh_expires_in: "7200" } };
     if (url.includes("/refresh-token")) return { body: { token: "refreshed-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-2", refresh_expires_in: "7200" } };
-    if (url.includes("/api/v2/quote")) return { body: { rates: [{ carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", total: 15.5, currency: "CAD", transitDays: 3, quoteId: "Q-1" }] } };
+    if (url.includes("/api/v2/quote")) return { body: { quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 15.5, currency: "CAD", transitDays: "3" }], uuid: "Q-1", warnings: [] } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/label")) return { body: { url: "https://labels.example/L.pdf", format: "PDF" } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/order-details")) return { body: { orderId: "O", details: { weight: 2 } } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/customs-invoice")) return { body: { url: "https://labels.example/C.pdf" } };
     if (url.includes("/api/v2/ship/")) return { body: { shipmentId: "SHIP-1", carrier: "Canada Post", serviceName: "Expedited", trackingNumber: "TRK1", trackingUrl: "https://track/TRK1", labelUrl: "https://labels/L.pdf", cost: 15.5, currency: "CAD" } };
     if (url.includes("/api/v2/track/tracking-number/bulk")) return { body: { results: [] } };
     if (url.includes("/api/v2/track/tracking-number/")) return { body: { trackingUrl: "https://track/TN", trackingDetails: [{ dateTime: "2026-01-01T00:00:00Z", location: "Toronto", description: "In transit", carrierEventCode: "IT", statusText: "inTransit" }], inTransit: true } };
-    if (url.includes("/api/v2/returns/quote")) return { body: { rates: [{ carrier: "UPS", serviceCode: "UP", serviceName: "Return", total: 9.25, currency: "CAD", transitDays: 5, quoteId: "RQ-1" }] } };
+    if (url.includes("/api/v2/returns/quote")) return { body: { carrierName: "UPS", serviceId: 5000200, serviceName: "Return", totalCharge: 9.25, currency: "CAD", transitDays: "5" } };
     if (url.includes("/api/v2/pickup")) return { body: { pickupId: "PK-1", scheduledDate: "2026-02-01", status: "SCHEDULED" } };
     return { status: 500, body: { error: "unexpected url" } };
   });
 
   const rates = await getRates(rateRequest);
   check("getRates: POST /api/v2/quote", lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/quote"), `${lastCall().method} ${lastCall().url}`);
-  check("getRates: provider quote id is preserved", rates[0]?.providerQuoteId === "Q-1", JSON.stringify(rates[0]?.providerQuoteId));
-  check("getRates: request carries the packages", Array.isArray((lastCall().body as { packages?: unknown[] })?.packages));
+  check(
+    "getRates: the provider quote id is the envelope's uuid, not a per-quote field",
+    rates[0]?.providerQuoteId === "Q-1",
+    JSON.stringify(rates[0]?.providerQuoteId)
+  );
+  /*
+   * The WIRE shape, asserted as the provider defines it. Every name checked
+   * here was established by asking the sandbox API; the provider ignores an
+   * unknown property silently, so a regression to `shipFrom`/`packages: [...]`
+   * would not raise an error anywhere -- it would simply price nothing. These
+   * assertions are what stand between that and a release.
+   */
+  const quoteBody = lastCall().body as {
+    from?: unknown;
+    to?: unknown;
+    packagingUnit?: string;
+    packages?: { type?: string; packages?: unknown[] };
+  };
+  check(
+    "getRates: addresses go out as from/to, the names the provider reads",
+    !!quoteBody.from && !!quoteBody.to && !("shipFrom" in quoteBody) && !("shipTo" in quoteBody),
+    `from=${!!quoteBody.from} to=${!!quoteBody.to}`
+  );
+  check(
+    "getRates: parcels are nested under packages.packages, not a bare array",
+    quoteBody.packages?.type === "Package" && Array.isArray(quoteBody.packages?.packages),
+    `type=${quoteBody.packages?.type} packages=${Array.isArray(quoteBody.packages?.packages)}`
+  );
+  check(
+    "getRates: the request declares its packaging unit",
+    quoteBody.packagingUnit === "METRIC",
+    String(quoteBody.packagingUnit)
+  );
 
   // 7a. The authentication request is the DOCUMENTED one ----------------------
   // POST /api/v2/authenticate takes AuthenticationRequest: required properties
@@ -344,7 +375,16 @@ async function main() {
       return { body: { token: "short-lived", expires_in: "1", token_type: "Bearer", refresh_token: "refresh-token-abc", refresh_expires_in: "7200" } };
     if (url.includes("/refresh-token"))
       return { body: { token: "renewed", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-token-def", refresh_expires_in: "7200" } };
-    if (url.includes("/api/v2/quote")) return { body: { rates: [] } };
+    /*
+     * This section is about the TOKEN, not the quote, but the reply still has
+     * to be a real one: `getRates` now raises an empty answer as a failure
+     * naming the carriers' own reasons, because a silently empty list is what
+     * let a wholly malformed request look like a successful call. A stub that
+     * returned nothing would now stop the test before it reached the assertion
+     * it is actually making.
+     */
+    if (url.includes("/api/v2/quote"))
+      return { body: { quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 15.5, currency: "CAD", transitDays: "3" }], uuid: "Q-3", warnings: [] } };
     return { status: 500, body: { error: "unexpected url" } };
   });
 
@@ -406,7 +446,7 @@ async function main() {
    */
   installFetch((url) => {
     if (url.includes("/authenticate")) return { body: { token: "t", expires_in: "3600", token_type: "Bearer", refresh_token: "r", refresh_expires_in: "7200" } };
-    if (url.includes("/api/v2/quote")) return { body: { rates: [{ carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", total: 20, currency: "CAD", transitDays: 3, quoteId: "Q-2" }] } };
+    if (url.includes("/api/v2/quote")) return { body: { quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 20, currency: "CAD", transitDays: "3" }], uuid: "Q-2", warnings: [] } };
     if (url.includes("/api/v2/ship/")) return { body: { shipmentId: "SHIP-2", carrier: "Canada Post", serviceName: "Expedited", trackingNumber: "TRK2", labelUrl: "https://labels/L2.pdf", cost: 20, currency: "CAD" } };
     return { status: 500, body: { error: "unexpected url" } };
   });
@@ -422,23 +462,31 @@ async function main() {
   const converted = parcelRowsToQuotePackages(storedRows);
   const multiRequest = { ...rateRequest, packages: converted.packages };
   await getRates(multiRequest);
-  const sent = ((lastCall().body as { packages?: Record<string, unknown>[] })?.packages ?? []) as Record<string, unknown>[];
+  const multiBody = lastCall().body as {
+    packages?: { packages?: Record<string, unknown>[] };
+    packagingUnit?: string;
+    scheduledShipDate?: string;
+  };
+  // The provider takes parcels enumerated, not as a count: the two stored rows
+  // (count 1 and count 2) become three parcels on the wire.
+  const sent = multiBody.packages?.packages ?? [];
   check(
-    "a two-parcel order sends BOTH parcels, not only the first",
-    sent.length === 2 && converted.refused.length === 0,
-    `${sent.length} parcel row(s) on the wire`,
+    "every stored parcel reaches the wire, in row order",
+    sent.length === 3 && converted.refused.length === 0,
+    `${sent.length} parcel(s) from 2 rows (count 1 + count 2)`,
   );
   check(
-    "each parcel keeps its own dimensions and count, and its own row order",
+    "each parcel keeps its own dimensions, and `count` is expanded to that many parcels",
     sent[0]?.length === 60.96 &&
       sent[0]?.width === 45.72 &&
       sent[0]?.height === 15.24 &&
       sent[0]?.weight === 1.134 &&
-      sent[0]?.count === 1 &&
       sent[1]?.length === 30 &&
       sent[1]?.weight === 1 &&
-      sent[1]?.count === 2,
-    sent.map((p) => `${p.count}× ${p.length}×${p.width}×${p.height} ${p.weight}kg`).join(" | "),
+      sent[2]?.length === 30 &&
+      sent[2]?.weight === 1 &&
+      !("count" in (sent[0] ?? {})),
+    sent.map((p) => `${p.length}×${p.width}×${p.height} ${p.weight}kg`).join(" | "),
   );
   check(
     "the figures on the wire are centimetres and kilograms, whatever unit they were recorded in",
@@ -446,40 +494,68 @@ async function main() {
     `24in/2.5lb was sent as ${sent[0]?.length}/${sent[0]?.weight}`,
   );
   /*
-   * The unit TOKEN is asserted as "one token, on every row, and not empty"
-   * rather than pinned to a literal. What eShipper's documentation calls this
-   * value could not be established from this environment — the vendor's public
-   * material describes an XML request with unit-less numeric attributes and no
-   * unit field at all — so pinning a literal here would dress an unverified
-   * guess up as a verified one. What IS enforced is that no caller can send two
-   * rows with different readings, and that a row whose recorded unit cannot be
-   * converted never reaches this point (see verify-packaging). Confirming the
-   * token with eShipper is an open item, reported as such.
+   * The unit tokens, now VERIFIED against the provider rather than assumed.
+   *
+   * This block used to record that the token could not be established from this
+   * environment. It has since been established by asking the sandbox: the same
+   * box sent as CM and as IN does not price the same, and ten kilograms does not
+   * price as ten pounds, so the provider reads these tokens rather than ignoring
+   * them. `packagingUnit` is an enum, and the validator names its members
+   * outright -- [METRIC, IMPERIAL].
+   *
+   * The per-parcel tokens are the ones to watch, because they are NOT validated:
+   * an unrecognised value is silently defaulted, so a misspelling mis-prices with
+   * no error anywhere. That is why buildQuoteRequest refuses anything but the one
+   * spelling proven to price in centimetres and kilograms, and why these
+   * assertions are pinned to literals rather than to "some non-empty token".
    */
-  const tokens = new Set(sent.map((p) => String(p.units ?? "")));
+  const dimensionUnits = new Set(sent.map((p) => String(p.dimensionUnit ?? "")));
+  const weightUnits = new Set(sent.map((p) => String(p.weightUnit ?? "")));
   check(
-    "every parcel carries the same, non-empty unit token (the token itself is unverified with the provider)",
-    tokens.size === 1 && !tokens.has("") && tokens.has("cm_kg"),
-    [...tokens].join(", ") || "(none)",
+    "every parcel carries the verified centimetre token",
+    dimensionUnits.size === 1 && dimensionUnits.has("CM"),
+    [...dimensionUnits].join(", ") || "(none)"
+  );
+  check(
+    "every parcel carries the verified kilogram token",
+    weightUnits.size === 1 && weightUnits.has("KG"),
+    [...weightUnits].join(", ") || "(none)"
+  );
+  check(
+    "the request declares the packaging unit those tokens belong to",
+    multiBody.packagingUnit === "METRIC",
+    String(multiBody.packagingUnit)
+  );
+  check(
+    "the ship date is written in the one format the provider parses",
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(String(multiBody.scheduledShipDate)),
+    String(multiBody.scheduledShipDate)
   );
   check(
     "the totals a carrier reads from the request match the parcels it describes",
-    sent.reduce((sum, p) => sum + Number(p.count), 0) === 3 &&
-      Math.abs(sent.reduce((sum, p) => sum + Number(p.weight) * Number(p.count), 0) - (1.134 + 2)) < 1e-9,
+    sent.length === 3 &&
+      Math.abs(sent.reduce((sum, p) => sum + Number(p.weight), 0) - (1.134 + 1 + 1)) < 1e-9,
     `3 parcels, ${(1.134 + 2).toFixed(3)} kg`,
   );
 
   await bookShipment({
-    quote: { carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", providerQuoteId: "Q-2" },
+    quote: { carrier: "Canada Post", serviceCode: "5000026", serviceName: "Expedited", providerQuoteId: "Q-2" },
     rateRequest: multiRequest,
   });
-  const bookedPackages = ((lastCall().body as { packages?: Record<string, unknown>[] })?.packages ?? []) as Record<string, unknown>[];
+  const bookedBody = lastCall().body as {
+    packages?: { packages?: Record<string, unknown>[] };
+    serviceId?: unknown;
+  };
+  const bookedPackages = bookedBody.packages?.packages ?? [];
   check(
     "booking re-sends the same parcels: the label describes the boxes that were quoted",
-    bookedPackages.length === 2 &&
-      bookedPackages[0]?.length === 60.96 &&
-      bookedPackages[1]?.count === 2,
-    `${bookedPackages.length} parcel row(s) at booking`,
+    bookedPackages.length === 3 && bookedPackages[0]?.length === 60.96,
+    `${bookedPackages.length} parcel(s) at booking`,
+  );
+  check(
+    "booking names the service by the id the provider issued, not a reassembled code",
+    bookedBody.serviceId === 5000026,
+    String(bookedBody.serviceId),
   );
 
   // 11. A shipment books its OWN cartons, not the whole order's ---------------

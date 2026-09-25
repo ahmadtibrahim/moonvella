@@ -157,6 +157,8 @@ function buildRateRequest(
       province: from.province,
       postalCode: from.postalCode,
       country: from.country,
+      phone: from.phone,
+      email: from.email,
     },
     shipTo: {
       name: to.name,
@@ -166,6 +168,11 @@ function buildRateRequest(
       postalCode: to.zip || to.postalCode || "",
       country: to.country || to.countryCode || "CA",
       residential: to.residential === undefined ? true : to.residential !== "false",
+      // Only when the stored address carries them: a destination that has no
+      // phone number is still a destination, and inventing one puts a wrong
+      // number on a label.
+      phone: to.phone || to.phoneNumber || null,
+      email: to.email || null,
     },
     packages,
     declaredValue: order.moonvellaTotal,

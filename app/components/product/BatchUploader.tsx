@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useLocation, useRevalidator } from "react-router";
+import { Link, useRevalidator } from "react-router";
 import { card, input, btn, sectionTitle, sectionNote, Field, INK, MUTED, LINE, helpText } from "./ui";
 
 /**
@@ -71,16 +71,23 @@ function readableSize(bytes: number): string {
 let keySeed = 0;
 
 export default function BatchUploader({
+  productId,
   categories,
   variants,
   defaultCategory,
 }: {
+  /**
+   * Which product the files belong to. Named rather than read off the current
+   * path, because the endpoint it addresses is a route of its own and the path
+   * this component happens to be rendered at is not what says where the file
+   * goes — the product does.
+   */
+  productId: string;
   categories: UploadCategory[];
   variants: UploadVariant[];
   /** The category a new file starts as, before the operator changes anything. */
   defaultCategory: string;
 }) {
-  const location = useLocation();
   const revalidator = useRevalidator();
 
   /*
@@ -190,7 +197,21 @@ export default function BatchUploader({
         const xhr = new XMLHttpRequest();
         // The action checks the request's origin, and the session cookie is what
         // says who is asking. Both are needed and neither is optional.
-        xhr.open("POST", location.pathname);
+        //
+        // A RESOURCE ROUTE OF ITS OWN, because this component parses the reply
+        // with JSON.parse and nothing on the product route can be made to answer
+        // with JSON. React Router decides how to answer from the path and the
+        // matched route, and consults no header -- so the page's own path
+        // rendered a document, and its `.data` twin returned the framework's own
+        // turbo-stream envelope (`text/x-script`, a JSON *array* that parses and
+        // then has no `ok` on it). Both stored the file and reported failure, so
+        // the queue never drained and the retry found its own upload already
+        // there as a duplicate.
+        //
+        // A route with no component returns its Response verbatim. That is the
+        // documented contract for resource routes, and the endpoint below is a
+        // resource route precisely so this line can be plain JSON.
+        xhr.open("POST", `/admin/products/${productId}/media-batch`);
         xhr.withCredentials = true;
 
         xhr.upload.onprogress = (event) => {
@@ -210,9 +231,9 @@ export default function BatchUploader({
           try {
             answer = JSON.parse(xhr.responseText || "{}");
           } catch {
-            // A body that is not JSON is not an answer this component can read —
-            // most often an HTML error page from something in front of the app.
-            // Reported as a failure of the file rather than as a silent success.
+            // A body that is not JSON is not an answer this component can read.
+            // Reported as a failure of the file rather than as a silent success,
+            // because a body nobody can parse must never be counted as stored.
             answer = { ok: false, error: `The server replied with ${xhr.status} and no result for this file.` };
           }
 
@@ -251,7 +272,7 @@ export default function BatchUploader({
         update(card.key, { status: "uploading", progress: 0, error: null });
         xhr.send(body);
       }),
-    [location.pathname, removeCard, update],
+    [productId, removeCard, update],
   );
 
   /*

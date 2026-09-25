@@ -121,6 +121,7 @@ export default function MediaTab({
         answer, which a browser tab holding an older bundle still posts to.
       */}
       <BatchUploader
+        productId={product.id}
         categories={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({ value, label }))}
         variants={product.variants.map((variant) => ({
           id: variant.id,

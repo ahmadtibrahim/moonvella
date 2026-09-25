@@ -3,6 +3,7 @@ import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
 import { isFulfillmentMilestone } from "./shippingLogic";
 import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
+import { parcelProblems, ParcelValidationError } from "./packaging.server";
 
 export interface ShipmentInput {
   carrier: string;
@@ -348,8 +349,20 @@ export interface OrderPackageInput {
   weight: number;
 }
 
-/** Record a parcel dimension/weight row used for quoting and packing review. */
+/**
+ * Record a parcel dimension/weight row used for quoting and packing review.
+ *
+ * The measurements are REFUSED, not coerced, and the refusal is here rather than
+ * on each form. Every page that adds a parcel comes through this function, so a
+ * form cannot forget the rule — and a zero or negative dimension that reached
+ * the table would not fail loudly, it would be priced: the carriers accept what
+ * they are given and answer with a number, so a parcel of length 0 quietly
+ * becomes a quote for a parcel that does not exist, and eventually a label.
+ */
 export async function addOrderPackage(orderId: string, input: OrderPackageInput, actor: Actor) {
+  const problems = parcelProblems(input);
+  if (problems.length > 0) throw new ParcelValidationError(problems);
+
   const order = await prisma.order.findUnique({ where: { id: orderId } });
   if (!order) throw new Error("Order not found.");
   const pkg = await prisma.orderPackage.create({
