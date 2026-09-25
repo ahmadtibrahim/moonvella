@@ -8,7 +8,16 @@ import type {
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import type { CatalogActor } from "./products.server";
-import { saveUpload, deleteObject, type StoredObject } from "./storage.server";
+import {
+  saveUpload,
+  deleteObject,
+  checksumOf,
+  newStorageKey,
+  sanitizeDisplayName,
+  type StoredObject,
+} from "./storage.server";
+import { JOB_KIND, enqueueJob } from "./jobs.server";
+import { videoProbeKey } from "./mediaProbe.server";
 
 /**
  * Media, documents and marketing assets.
@@ -56,6 +65,13 @@ export interface MediaAssetView {
   durationSeconds: number | null;
   aspectRatio: string | null;
   processingStatus: string;
+  /**
+   * Why processing stopped without finishing, when it stopped. Null while a
+   * video is still being measured and after a measurement succeeds; the text
+   * is fixed rather than a raw tool error, and it is what a failed tile shows
+   * beside its Retry.
+   */
+  processingError: string | null;
   approvalStatus: ApprovalStatus;
   sellerVisible: boolean;
   documentType: string | null;
@@ -91,6 +107,7 @@ const ASSET_SELECT = {
   durationSeconds: true,
   aspectRatio: true,
   processingStatus: true,
+  processingError: true,
   approvalStatus: true,
   sellerVisible: true,
   documentType: true,
@@ -117,9 +134,23 @@ type AssetRow = Prisma.MediaAssetGetPayload<{ select: typeof ASSET_SELECT }>;
  * stored bytes — the file was never in our storage — so its original URL is
  * used instead and the interface marks it as legacy. Falling back to the key
  * would render a broken image and look like corruption rather than history.
+ *
+ * An editable template is a third case: it is a LINK, and its key names no
+ * object at all. Handing back `/uploads/<key>` for one would be a URL that
+ * 404s, so the link is returned instead — the only URL a template has ever
+ * had. Nothing renders a template as an image, but a caller that did would
+ * still get somewhere real.
  */
-export function assetUrl(asset: { storageKey: string; sourceUrl: string | null }): string {
-  return asset.sourceUrl?.trim() || `/uploads/${asset.storageKey}`;
+export function assetUrl(asset: {
+  storageKey: string;
+  sourceUrl: string | null;
+  templateUrl?: string | null;
+}): string {
+  return (
+    asset.sourceUrl?.trim() ||
+    asset.templateUrl?.trim() ||
+    `/uploads/${asset.storageKey}`
+  );
 }
 
 function toView(asset: AssetRow): MediaAssetView {
@@ -458,8 +489,127 @@ export async function uploadMedia(
     userAgent: actor.userAgent,
   });
 
+  /*
+   * A video that the upload path could not measure goes on the queue, because
+   * "PROCESSING" is a promise that something is still working on it. The
+   * enqueue is best-effort on purpose: the bytes are stored and the row is
+   * written, and failing the whole upload because the queue was unreachable
+   * would lose work over a step the five-minute sweep repeats anyway.
+   */
+  if (stored.kind === "video" && stored.durationSeconds === null) {
+    await enqueueJob({
+      kind: JOB_KIND.MEDIA_VIDEO_PROBE,
+      idempotencyKey: videoProbeKey(asset),
+      payload: { assetId: asset, upload: true },
+    }).catch(() => undefined);
+  }
+
   const view = await getMedia(asset);
   if (!view) throw new Error("The upload could not be read back.");
+  return view;
+}
+
+/** What a template needs: a title, and the link the seller will open. */
+export interface CreateTemplateInput {
+  title: string;
+  templateUrl: string;
+  instructions?: string | null;
+  variantIds?: string[] | null;
+  sellerVisible?: boolean;
+}
+
+/**
+ * Create an editable-template asset.
+ *
+ * A template is a link to a design file — a Canva board, a Figma page — and
+ * there is nothing to upload. Until now the only way to get one was to upload
+ * some file first and then paste a link into the row, which is why the
+ * template section of the marketing tab was effectively unreachable. This
+ * writes the row without pretending a file exists behind it: READY, because
+ * there is nothing to process, and no bytes anywhere.
+ *
+ * The row still gets a storage key, because the column is unique and not
+ * nullable, and the key is a real random key of the usual shape that names no
+ * object — the uploads route answers 404 for it, which is the truthful answer
+ * to "give me the file under this key". The checksum is taken over the link
+ * itself, so the same template pasted twice is caught by the same duplicate
+ * rule as a file uploaded twice.
+ */
+export async function createTemplateAsset(
+  productId: string,
+  input: CreateTemplateInput,
+  actor: CatalogActor
+): Promise<MediaAssetView> {
+  const title = (input.title || "").trim();
+  if (!title) throw new Error("A template needs a title.");
+
+  const templateUrl = validateTemplateUrl(input.templateUrl);
+  if (!templateUrl) throw new Error("An editable template needs the link the seller will open.");
+
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    select: { id: true, variants: { select: { id: true } } },
+  });
+  if (!product) throw new Error("Product not found.");
+
+  const variantIds = await resolveVariantIds(product.variants.map((v) => v.id), input.variantIds ?? []);
+
+  const parsed = new URL(templateUrl);
+  const host = parsed.hostname.replace(/^www\./, "");
+  const lastSegment = parsed.pathname.split("/").filter(Boolean).pop();
+
+  const duplicate = await prisma.mediaAsset.findFirst({
+    where: { productId, mimeType: TEMPLATE_MIME, checksum: checksumOf(Buffer.from(templateUrl)) },
+    select: { id: true, title: true },
+  });
+  if (duplicate) throw new DuplicateMediaError(duplicate.id, duplicate.title);
+
+  const asset = await prisma.$transaction(async (tx) => {
+    const created = await tx.mediaAsset.create({
+      data: {
+        productId,
+        category: "EDITABLE_TEMPLATE",
+        subtype: "EDITABLE_TEMPLATE",
+        title,
+        altText: null,
+        originalFilename: sanitizeDisplayName(lastSegment ? `${host}-${lastSegment}` : host),
+        storageKey: newStorageKey(),
+        mimeType: TEMPLATE_MIME,
+        // No bytes, so no size. Zero is the honest number for "nothing was
+        // uploaded", and every screen that shows a size says "link" instead.
+        fileSize: 0,
+        checksum: checksumOf(Buffer.from(templateUrl)),
+        processingStatus: "READY",
+        approvalStatus: "DRAFT",
+        sellerVisible: input.sellerVisible ?? false,
+        instructions: (input.instructions || "").trim() || null,
+        templateUrl,
+        createdById: actor.actorId,
+      },
+      select: { id: true },
+    });
+
+    await attach(tx, created.id, productId, variantIds);
+    return created.id;
+  });
+
+  await recordAudit({
+    actorType: actor.actorType ?? "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "media.template_created",
+    entityType: AUDIT_ENTITY.MEDIA,
+    entityId: asset,
+    // The link is a URL the owner put on a seller's screen, not a credential,
+    // and it is the only thing that distinguishes one template row from
+    // another in the audit trail.
+    afterData: { productId, templateUrl, variants: variantIds.length },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  const view = await getMedia(asset);
+  if (!view) throw new Error("The template could not be read back.");
   return view;
 }
 
@@ -593,6 +743,17 @@ export interface UpdateMediaInput {
   instructions?: string | null;
   templateUrl?: string | null;
 }
+
+/**
+ * The type recorded for an editable template.
+ *
+ * A template is a link, not a file, so there is no media type to record — but
+ * the column is not nullable and "application/pdf" or "image/*" would be a
+ * lie that a screen might act on. `text/uri-list` is the registered type for a
+ * list of URIs, which is exactly what the row holds, and it is deliberately
+ * not an image or a video so nothing can mistake it for one.
+ */
+const TEMPLATE_MIME = "text/uri-list";
 
 const MEDIA_CATEGORIES: MediaCategory[] = [
   "WHITE_BACKGROUND_IMAGE",

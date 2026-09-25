@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 import { Form, Link, useSearchParams } from "react-router";
 import {
   card,
@@ -145,7 +145,7 @@ export default function MediaTab({
 
       <Group
         title="Product video"
-        note="Optional. A video whose length could not be measured stays in Processing until someone confirms it, rather than being treated as reviewed."
+        note="Optional. A video is measured when it is uploaded; a video that could not be measured says why on its tile and cannot be approved or published until a retry succeeds."
         assets={videos}
         product={product}
         editing={editing}
@@ -316,13 +316,22 @@ function UploadPanel({ product }: { product: Product }) {
    */
   const [category, setCategory] = useState("WHITE_BACKGROUND_IMAGE");
   const altRequired = IMAGE_CATEGORIES.includes(category);
+  /**
+   * A template is a link, and asking for a file beside the link would be asking
+   * for something the row does not have. The form swaps one field for the other
+   * and posts a different intent, because the two paths write different things:
+   * pretending they were one would mean storing a file nobody wants in order to
+   * reach a link.
+   */
+  const isTemplate = category === "EDITABLE_TEMPLATE";
 
   return (
     <div style={card}>
-      <h2 style={sectionTitle}>Upload</h2>
+      <h2 style={sectionTitle}>{isTemplate ? "Add a template" : "Upload"}</h2>
       <p style={sectionNote}>
-        The product must be saved before a file can be attached to it, which it already is on
-        this screen. Choose the file, then choose what it applies to.
+        {isTemplate
+          ? "An editable template is a link to a design file — a Canva board, a Figma page. There is no file to upload and nothing to process."
+          : "The product must be saved before a file can be attached to it, which it already is on this screen. Choose the file, then choose what it applies to."}
       </p>
 
       <Form method="post" encType="multipart/form-data">
@@ -330,16 +339,33 @@ function UploadPanel({ product }: { product: Product }) {
 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0.85rem" }}>
           <div style={{ gridColumn: "1 / -1" }}>
-            <Field id="m-file" label="File" hint="Images up to 20 MB, PDFs up to 25 MB, video up to 200 MB.">
-              <input
-                style={input}
-                id="m-file"
-                name="file"
-                type="file"
-                required
-                accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4,video/webm"
-              />
-            </Field>
+            {isTemplate ? (
+              <Field
+                id="m-template-url"
+                label="Template link"
+                hint="https only. The seller opens this link from their media kit — nothing is uploaded, and no file is stored."
+              >
+                <input
+                  style={input}
+                  id="m-template-url"
+                  name="templateUrl"
+                  type="url"
+                  required
+                  placeholder="https://www.canva.com/design/…"
+                />
+              </Field>
+            ) : (
+              <Field id="m-file" label="File" hint="Images up to 20 MB, PDFs up to 25 MB, video up to 200 MB.">
+                <input
+                  style={input}
+                  id="m-file"
+                  name="file"
+                  type="file"
+                  required
+                  accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,video/mp4,video/webm"
+                />
+              </Field>
+            )}
           </div>
 
           <Field id="m-category" label="Category">
@@ -432,8 +458,13 @@ function UploadPanel({ product }: { product: Product }) {
         </fieldset>
 
         <div style={{ marginTop: "0.85rem" }}>
-          <button type="submit" name="intent" value="media_upload" style={btn(INK, { solid: true })}>
-            Upload
+          <button
+            type="submit"
+            name="intent"
+            value={isTemplate ? "media_upload_template" : "media_upload"}
+            style={btn(INK, { solid: true })}
+          >
+            {isTemplate ? "Add template" : "Upload"}
           </button>
         </div>
       </Form>
@@ -522,9 +553,100 @@ function PlaceholderTile({ variantName }: { variantName: string }) {
   );
 }
 
-function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product }) {
+/**
+ * How an asset is drawn, chosen by what the file IS.
+ *
+ * MIME TYPE, NOT CATEGORY. This branch used to be taken on
+ * `category === "PRODUCT_VIDEO"`, so a video filed as a marketing creative fell
+ * through to the image branch and was rendered as a broken <img> — a tile that
+ * looked like corruption when the file itself was perfectly good. The category
+ * says what a file is FOR; the mime type says what it is, and only the second
+ * one can choose a player.
+ *
+ * A template is a third thing: a link with no bytes behind it. Its storage key
+ * names no object at all, so it is drawn as the link it is — as an image or a
+ * player it could only ever be a broken box.
+ */
+function AssetPreview({ asset, style }: { asset: MediaAssetView; style?: CSSProperties }) {
+  const isVideo = asset.mimeType.startsWith("video/");
+  const isImage = asset.mimeType.startsWith("image/");
   const isPdf = asset.mimeType === "application/pdf";
-  const isVideo = asset.category === "PRODUCT_VIDEO";
+
+  if (asset.category === "EDITABLE_TEMPLATE") {
+    return (
+      <div style={{ padding: "0.5rem", textAlign: "center" }}>
+        <div style={{ fontSize: "0.72rem", fontWeight: 600, color: INK }}>Editable template</div>
+        <div style={{ fontSize: "0.66rem", color: MUTED, marginTop: "0.15rem" }}>
+          A link, not a file
+        </div>
+        {asset.templateUrl ? (
+          <a
+            href={asset.templateUrl}
+            target="_blank"
+            rel="noreferrer"
+            style={{ fontSize: "0.7rem", color: INK, display: "inline-block", marginTop: "0.3rem" }}
+          >
+            Open the template ↗
+          </a>
+        ) : (
+          <div style={{ fontSize: "0.66rem", color: "#92400e", marginTop: "0.3rem" }}>
+            No link recorded — this template opens nowhere.
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (isVideo) {
+    return (
+      <video src={asset.url} style={style} controls preload="metadata">
+        {/*
+          A DECLARED, EMPTY CAPTIONS TRACK. There are no captions to ship —
+          this is the merchant's own working file, played back so they can
+          check it — but the track is what tells assistive technology that this
+          player has a captions channel at all, and its absence is the
+          accessibility defect the lint rule names.
+        */}
+        <track kind="captions" />
+      </video>
+    );
+  }
+
+  if (isPdf) {
+    return (
+      <div style={{ textAlign: "center" }}>
+        <div style={{ color: MUTED, fontSize: "0.75rem" }}>PDF document</div>
+        {/* Documents are stored as attachments, so this downloads rather than
+            opening a viewer inside the tile. */}
+        <a href={asset.url} style={{ fontSize: "0.7rem", color: INK }}>
+          Download PDF
+        </a>
+      </div>
+    );
+  }
+
+  if (isImage) {
+    return <img src={asset.url} alt={asset.altText ?? asset.title} style={style} />;
+  }
+
+  // Anything else: a file we can serve but cannot draw. Named by its type, and
+  // offered as a link rather than as a box that failed to load.
+  return (
+    <div style={{ padding: "0.5rem", textAlign: "center" }}>
+      <div style={{ fontSize: "0.72rem", fontWeight: 600, color: INK }}>File</div>
+      <div style={{ fontSize: "0.66rem", color: MUTED, marginTop: "0.15rem" }}>
+        {asset.mimeType}
+      </div>
+      <a href={asset.url} style={{ fontSize: "0.7rem", color: INK }}>
+        Open
+      </a>
+    </div>
+  );
+}
+
+function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product }) {
+  const isVideo = asset.mimeType.startsWith("video/");
+  const failed = asset.processingStatus === "FAILED";
   const assignmentLabel = describeAssignments(asset, product);
   const legacy = asset.isLegacy;
 
@@ -541,24 +663,12 @@ function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product
           position: "relative",
         }}
       >
-        {isVideo ? (
-          <video
-            src={asset.url}
-            style={{ width: "100%", height: "100%", objectFit: "cover" }}
-            // Not autoPlayed: a grid of playing video is unreadable and would
-            // fetch every stored byte on page load.
-            controls
-            preload="metadata"
-          />
-        ) : isPdf ? (
-          <span style={{ color: MUTED, fontSize: "0.75rem" }}>PDF document</span>
-        ) : (
-          <img
-            src={asset.url}
-            alt={asset.altText ?? asset.title}
-            style={{ width: "100%", height: "100%", objectFit: "cover" }}
-          />
-        )}
+        {/*
+          Not autoPlayed: a grid of playing video is unreadable and would fetch
+          every stored byte on page load. The style is inline because the box
+          is a fixed 150 px and a video has to fill it like an image does.
+        */}
+        <AssetPreview asset={asset} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
         {legacy ? (
           <span
             style={{
@@ -609,6 +719,53 @@ function AssetTile({ asset, product }: { asset: MediaAssetView; product: Product
         {asset.subtype && SUBTYPE_SPEC[asset.subtype] ? (
           <div style={{ fontSize: "0.68rem", color: FAINT, marginTop: "0.2rem" }}>
             {SUBTYPE_SPEC[asset.subtype].label} — {SUBTYPE_SPEC[asset.subtype].size}
+          </div>
+        ) : null}
+
+        {/*
+          WHAT PROCESSING ACTUALLY MEANS, SAID OUT LOUD. A video whose length
+          has not been measured is not "processing" in the sense of a progress
+          bar that will finish on its own; it is waiting for a probe, and if the
+          probe failed it will wait forever until someone presses Retry. Both
+          states are stated, with the reason, in place of the silent tile that
+          used to sit here.
+        */}
+        {failed ? (
+          <div
+            style={{
+              marginTop: "0.4rem",
+              padding: "0.4rem 0.5rem",
+              background: "#fef2f2",
+              border: "1px solid #fecaca",
+              borderRadius: 6,
+            }}
+          >
+            <div style={{ fontSize: "0.68rem", color: "#991b1b" }}>
+              {asset.processingError ?? "Processing failed."}
+            </div>
+            {isVideo ? (
+              <Form method="post" style={{ marginTop: "0.3rem" }}>
+                <input type="hidden" name="tab" value="media" />
+                <input type="hidden" name="assetId" value={asset.id} />
+                <button
+                  type="submit"
+                  name="intent"
+                  value="media_probe_retry"
+                  style={{ ...btn("#991b1b"), padding: "0.2rem 0.45rem" }}
+                >
+                  Retry measuring
+                </button>
+              </Form>
+            ) : null}
+          </div>
+        ) : asset.processingStatus === "PROCESSING" && isVideo ? (
+          <div style={{ fontSize: "0.68rem", color: "#92400e", marginTop: "0.3rem" }}>
+            Waiting to be measured — the length is not known yet, so this video cannot be
+            approved or published.
+          </div>
+        ) : asset.processingStatus === "PROCESSING" ? (
+          <div style={{ fontSize: "0.68rem", color: "#92400e", marginTop: "0.3rem" }}>
+            Still processing.
           </div>
         ) : null}
 
@@ -693,6 +850,7 @@ function AssetEditor({
       .filter((id): id is string => Boolean(id))
   );
   const isShared = asset.assignments.some((assignment) => assignment.variantId === null);
+  const isVideo = asset.mimeType.startsWith("video/");
 
   return (
     <div style={{ border: `2px solid ${INK}`, borderRadius: 10, padding: "0.75rem", gridColumn: "1 / -1" }}>
@@ -705,23 +863,15 @@ function AssetEditor({
 
       <div style={{ display: "flex", gap: "1rem", marginTop: "0.75rem", flexWrap: "wrap" }}>
         <div style={{ width: 160 }}>
-          {asset.category === "PRODUCT_VIDEO" ? (
-            <video src={asset.url} style={{ width: "100%", borderRadius: 8 }} controls preload="metadata" />
-          ) : asset.mimeType === "application/pdf" ? (
-            <div style={{ ...helpText }}>PDF</div>
-          ) : (
-            <img
-              src={asset.url}
-              alt={asset.altText ?? asset.title}
-              style={{ width: "100%", borderRadius: 8 }}
-            />
-          )}
+          <AssetPreview asset={asset} style={{ width: "100%", borderRadius: 8 }} />
           <div style={{ fontSize: "0.68rem", color: FAINT, marginTop: "0.35rem" }}>
             {asset.originalFilename}
             <br />
             {asset.width && asset.height ? `${asset.width} × ${asset.height} · ` : ""}
-            {fileSize(asset.fileSize)}
-            {asset.category === "PRODUCT_VIDEO" ? ` · ${duration(asset.durationSeconds)}` : ""}
+            {/* A template is a link: it has no bytes, so it has no size, and
+                showing "0 B" would read as an empty file rather than none. */}
+            {asset.category === "EDITABLE_TEMPLATE" ? "link" : fileSize(asset.fileSize)}
+            {isVideo ? ` · ${duration(asset.durationSeconds)}` : ""}
           </div>
         </div>
 

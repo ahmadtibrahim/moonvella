@@ -34,9 +34,16 @@
  * Usage, inside the app image:
  *   node scripts/run-verify.mjs scripts/verify-media-parcels-http.ts
  */
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import { ADMIN_SESSION_COOKIE } from "~/utils/adminAuth.server";
+import { JOB_KIND } from "~/services/jobs.server";
+import { videoProbeKey } from "~/services/mediaProbe.server";
+import { deleteObject, saveUpload } from "~/services/storage.server";
 
 const prisma = new PrismaClient();
 const BASE = process.env.APP_BASE || "http://localhost:62259";
@@ -90,6 +97,24 @@ async function cleanup() {
   await prisma.orderPackage.deleteMany({ where: { order: { shopifyOrderId: { startsWith: "mp-" } } } });
   await prisma.shipment.deleteMany({ where: { order: { shopifyOrderId: { startsWith: "mp-" } } } });
   await prisma.order.deleteMany({ where: { shopifyOrderId: { startsWith: "mp-" } } });
+  // Deleting the product cascades to its assets, but an asset's ROW and its
+  // OBJECT are two different things: the row goes with the product and the
+  // bytes stay on disk. This suite stores real videos now, so the keys are read
+  // out first and the files removed by name — a megabyte of orphaned clip per
+  // run, otherwise, in a directory nothing ever sweeps.
+  const orphans = await prisma.mediaAsset.findMany({
+    where: { product: { productCode: { startsWith: "VERIFY-MP-" } } },
+    select: { id: true, storageKey: true },
+  });
+  for (const orphan of orphans) await deleteObject(orphan.storageKey).catch(() => undefined);
+  // The Retry this suite presses queues a probe against one of those assets.
+  // The asset row is gone with its product, so the job would be claimed by the
+  // next suite that drains the queue and would find nothing to measure.
+  if (orphans.length) {
+    await prisma.backgroundJob.deleteMany({
+      where: { OR: orphans.map((orphan) => ({ idempotencyKey: { contains: orphan.id } })) },
+    });
+  }
   await prisma.product.deleteMany({ where: { productCode: { startsWith: "VERIFY-MP-" } } });
   await prisma.seller.deleteMany({ where: { shopDomain: { startsWith: "media-parcels-" } } });
 }
@@ -393,19 +418,15 @@ function pngBytes(): ArrayBuffer {
   return out;
 }
 
-async function uploadTo(path: string, cookie: string, filename: string) {
-  const body = new FormData();
-  body.set("intent", "media_upload_batch");
-  body.set("tab", "media");
-  // A real member of the MediaCategory enum. "PRODUCT_IMAGE" is not one, and
-  // the first run of this suite spent its whole upload section being correctly
-  // refused for that reason — see the enum in prisma/schema.prisma.
-  body.set("category", "WHITE_BACKGROUND_IMAGE");
-  body.set("title", "Verify upload");
-  body.set("altText", "A one pixel image");
-  body.set("scopeMode", "shared");
-  body.set("file", new Blob([pngBytes()], { type: "image/png" }), filename);
-
+/**
+ * Post a multipart form at an admin path and read the answer both ways.
+ *
+ * The reply is parsed as JSON *and* kept as text, because one of the two
+ * defects this suite covers is precisely that the answer was HTML: a check that
+ * only looked at the parsed value could not tell "not JSON" from "JSON that
+ * says no".
+ */
+async function postForm(path: string, cookie: string, body: FormData) {
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
     redirect: "manual",
@@ -419,7 +440,79 @@ async function uploadTo(path: string, cookie: string, filename: string) {
   } catch {
     json = null;
   }
-  return { status: res.status, text, json, type: res.headers.get("content-type") ?? "" };
+  return {
+    status: res.status,
+    location: res.headers.get("location") ?? "",
+    text,
+    json,
+    type: res.headers.get("content-type") ?? "",
+  };
+}
+
+async function uploadTo(path: string, cookie: string, filename: string) {
+  const body = new FormData();
+  body.set("intent", "media_upload_batch");
+  body.set("tab", "media");
+  // A real member of the MediaCategory enum. "PRODUCT_IMAGE" is not one, and
+  // the first run of this suite spent its whole upload section being correctly
+  // refused for that reason — see the enum in prisma/schema.prisma.
+  body.set("category", "WHITE_BACKGROUND_IMAGE");
+  body.set("title", "Verify upload");
+  body.set("altText", "A one pixel image");
+  body.set("scopeMode", "shared");
+  body.set("file", new Blob([pngBytes()], { type: "image/png" }), filename);
+
+  return postForm(path, cookie, body);
+}
+
+/**
+ * Encode a real video with the image's own ffmpeg, and read it back.
+ *
+ * Nothing here is stubbed. The defect this section covers is that a video could
+ * never become READY, and "ready" means a length was measured from actual
+ * bytes by the same tool the server uses — so the bytes are made here, by
+ * ffmpeg, and uploaded through the same endpoint the editor's uploader calls.
+ * If ffmpeg is missing from this image the check fails and says so, which is
+ * the correct outcome: an image without ffmpeg is an image where every video
+ * stays PROCESSING.
+ *
+ * `crf` and `scale` are exposed because the last check in this section needs a
+ * file larger than the 64 MB `tmpfs` the test deployment mounts over `/tmp` —
+ * the smallest clip that cannot fit there is a deliberately fat one.
+ */
+async function makeVideo(
+  seconds: number,
+  options: { scale?: string; rate?: number; crf?: string; preset?: string; noise?: boolean } = {}
+): Promise<Buffer> {
+  const dir = await mkdtemp(join(tmpdir(), "verify-http-video-"));
+  const path = join(dir, "clip.mp4");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      execFile(
+        "ffmpeg",
+        [
+          "-v", "error",
+          "-f", "lavfi",
+          "-i",
+          `testsrc=size=${options.scale ?? "64x48"}:rate=${options.rate ?? 10}:duration=${seconds}`,
+          // A test pattern compresses to almost nothing — which is why the
+          // size check below needs noise: film grain is the one thing an
+          // encoder cannot predict, so it is what makes a file big.
+          ...(options.noise ? ["-vf", "noise=alls=100:allf=t"] : []),
+          "-c:v", "libx264",
+          "-preset", options.preset ?? "ultrafast",
+          "-crf", options.crf ?? "28",
+          "-pix_fmt", "yuv420p",
+          "-y", path,
+        ],
+        { timeout: 300000, maxBuffer: 4 * 1024 * 1024 },
+        (error) => (error ? reject(new Error(String(error.message).split("\n")[0])) : resolve())
+      );
+    });
+    return Buffer.from(await readFile(path));
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function defect2(cookie: string, productId: string) {
@@ -576,6 +669,315 @@ function defect2ClientSource() {
   );
 }
 
+/**
+ * THE VIDEO PIPELINE, OVER HTTP, AGAINST A DEPLOYMENT THAT HAS A 64 MB /tmp.
+ *
+ * What went wrong: every uploaded video stayed at PROCESSING forever, because
+ * the image had no ffprobe and nothing ever tried again. An asset in that state
+ * cannot be approved, cannot be published, and — the part a person notices —
+ * its tile is drawn as a broken image, because the preview branched on the
+ * asset's CATEGORY rather than on what the file actually is.
+ *
+ * So this section drives the three things that were broken, through the same
+ * endpoints the screens call:
+ *
+ *   1. An upload of a real clip, encoded here by this image's own ffmpeg, must
+ *      come back READY with a length.
+ *   2. The stored object must be servable the way a player needs it — a range
+ *      request answered 206, a whole request answered 200, a bad range refused
+ *      with 416 — and the media tab must render a <video> for it, not an <img>.
+ *   3. A clip too large for the 64 MB tmpfs the deployment mounts over /tmp
+ *      must still be measured, which is only possible if the probe scratches on
+ *      the uploads volume.
+ */
+async function videoPipeline(cookie: string, productId: string) {
+  console.log("\n— A video must be measured, playable, and drawn as what it is —");
+
+  const productPath = `/admin/products/${productId}`;
+  const dataPath = `${productPath}/media-batch`;
+  const mediaTab = `${productPath}?tab=media`;
+
+  const upload = async (filename: string, bytes: Buffer, title: string) => {
+    const body = new FormData();
+    body.set("intent", "media_upload_batch");
+    body.set("tab", "media");
+    body.set("category", "PRODUCT_VIDEO");
+    body.set("title", title);
+    body.set("scopeMode", "shared");
+    body.set("file", new Blob([new Uint8Array(bytes)], { type: "video/mp4" }), filename);
+    return postForm(dataPath, cookie, body);
+  };
+
+  const seconds = 2;
+  const filename = `verify-mp-${Date.now()}.mp4`;
+  let uploaded: Awaited<ReturnType<typeof upload>>;
+  try {
+    uploaded = await upload(filename, await makeVideo(seconds), "Verify video");
+  } catch (error) {
+    check(
+      "This image can encode a test clip (ffmpeg is present)",
+      false,
+      error instanceof Error ? error.message : "ffmpeg failed"
+    );
+    return;
+  }
+
+  check(
+    "A video uploads through the same endpoint as every other file",
+    uploaded.json?.ok === true,
+    `HTTP ${uploaded.status} · ${uploaded.text.slice(0, 80)}`
+  );
+  const videoId = typeof uploaded.json?.assetId === "string" ? uploaded.json.assetId : "";
+  const video = videoId
+    ? await prisma.mediaAsset.findUnique({
+        where: { id: videoId },
+        select: {
+          mimeType: true,
+          processingStatus: true,
+          durationSeconds: true,
+          processingError: true,
+          width: true,
+          height: true,
+          storageKey: true,
+          fileSize: true,
+        },
+      })
+    : null;
+
+  check(
+    "It is READY, because the upload measured it rather than promising to measure it",
+    video?.processingStatus === "READY",
+    `${video?.processingStatus} · ${video?.processingError ?? "no error"}`
+  );
+  check(
+    "And it carries the length of the clip that was actually uploaded",
+    video?.durationSeconds === seconds,
+    `${video?.durationSeconds}s for a ${seconds}s clip`
+  );
+  check(
+    "And the frame size, so the tile can reserve the right box",
+    video?.width === 64 && video?.height === 48,
+    `${video?.width}×${video?.height}`
+  );
+  check(
+    "No probe is queued for a video that is already measured",
+    (await prisma.backgroundJob.count({ where: { idempotencyKey: videoProbeKey(videoId) } })) === 0,
+    videoId || "no asset"
+  );
+
+  /* ---- The bytes, served the way a player asks for them ---------------- */
+
+  const key = video?.storageKey ?? "";
+  const size = video?.fileSize ?? 0;
+  const getRange = (range?: string) =>
+    fetch(`${BASE}/uploads/${key}`, {
+      headers: range ? { Range: range, Cookie: cookie } : { Cookie: cookie },
+    });
+
+  const partial = await getRange("bytes=0-1");
+  const partialBody = new Uint8Array(await partial.arrayBuffer());
+  check(
+    "A range request is answered 206 with exactly the bytes asked for",
+    partial.status === 206 && partialBody.byteLength === 2,
+    `HTTP ${partial.status} · ${partialBody.byteLength} bytes`
+  );
+  check(
+    "And names the range it sent, which is what a player seeks by",
+    partial.headers.get("content-range") === `bytes 0-1/${size}`,
+    partial.headers.get("content-range") ?? "no Content-Range"
+  );
+  check(
+    "And says, on that response, that ranges are supported at all",
+    partial.headers.get("accept-ranges") === "bytes",
+    partial.headers.get("accept-ranges") ?? "no Accept-Ranges"
+  );
+
+  const whole = await getRange();
+  check(
+    "With no range the whole clip is served, as video, with its length declared",
+    whole.status === 200 &&
+      whole.headers.get("content-type") === "video/mp4" &&
+      whole.headers.get("accept-ranges") === "bytes" &&
+      whole.headers.get("content-length") === String(size),
+    `HTTP ${whole.status} · ${whole.headers.get("content-type")} · ${whole.headers.get("content-length")}/${size}`
+  );
+  await whole.arrayBuffer();
+
+  const tooFar = await getRange(`bytes=${size + 10}-`);
+  check(
+    "A range past the end is refused with 416 and the real length, not answered 200",
+    tooFar.status === 416 && tooFar.headers.get("content-range") === `bytes */${size}`,
+    `HTTP ${tooFar.status} · ${tooFar.headers.get("content-range") ?? "no Content-Range"}`
+  );
+
+  /* ---- What the screen draws ------------------------------------------- */
+
+  const tabRes = await fetch(`${BASE}${mediaTab}`, { headers: { Cookie: cookie } });
+  const tabHtml = await tabRes.text();
+  const keyPattern = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  check(
+    "The media tab renders a video element pointing at the stored object",
+    new RegExp(`<video[^>]*src="/uploads/${keyPattern}"`).test(tabHtml),
+    `HTTP ${tabRes.status}`
+  );
+  check(
+    "And does not draw that same object as an image, which is the defect this covers",
+    !new RegExp(`<img[^>]*src="/uploads/${keyPattern}"`).test(tabHtml)
+  );
+  check(
+    "And declares a captions channel, so the player is not silent to assistive technology",
+    /<track[^>]*kind="captions"/.test(tabHtml)
+  );
+
+  /* ---- A template is a link, and is created as one --------------------- */
+
+  const templateUrl = `https://www.canva.com/design/verify-http-${Date.now()}/view`;
+  const templateForm = new FormData();
+  templateForm.set("intent", "media_upload_template");
+  templateForm.set("tab", "marketing");
+  templateForm.set("title", "Verify template");
+  templateForm.set("templateUrl", templateUrl);
+  templateForm.set("instructions", "Keep the palette.");
+  templateForm.set("scopeMode", "shared");
+  const templateRes = await postForm(productPath, cookie, templateForm);
+
+  const templateRow = await prisma.mediaAsset.findFirst({
+    where: { productId, templateUrl },
+    select: { id: true, category: true, mimeType: true, processingStatus: true, fileSize: true },
+  });
+  check(
+    "A template is created from a link alone, with no file to upload",
+    templateRow !== null,
+    `HTTP ${templateRes.status} · ${templateRow?.id ?? "no row written"}`
+  );
+  check(
+    "The template row is a link, not a file waiting to be processed",
+    templateRow?.category === "EDITABLE_TEMPLATE" &&
+      templateRow?.mimeType === "text/uri-list" &&
+      templateRow?.processingStatus === "READY" &&
+      templateRow?.fileSize === 0,
+    JSON.stringify(templateRow)
+  );
+
+  const marketingRes = await fetch(`${BASE}${productPath}?tab=marketing`, {
+    headers: { Cookie: cookie },
+  });
+  check(
+    "And it is rendered as a link the operator can open, not as an image",
+    (await marketingRes.text()).includes(templateUrl),
+    `HTTP ${marketingRes.status}`
+  );
+
+  /* ---- A video that failed, and the Retry a person presses ------------- */
+
+  /*
+   * The row is made here rather than uploaded, because the uploader refuses a
+   * file it cannot identify and a video only reaches FAILED by being damaged
+   * after it was accepted. Its stored copy is a real clip cut short — the same
+   * shape of damage as a truncated transfer.
+   */
+  const damaged = (await makeVideo(seconds)).subarray(0, 512);
+  const storedDamaged = await saveUpload(
+    new File([new Uint8Array(damaged)], "damaged.mp4", { type: "video/mp4" })
+  );
+  const broken = await prisma.mediaAsset.create({
+    data: {
+      productId,
+      category: "PRODUCT_VIDEO",
+      title: "Verify damaged video",
+      originalFilename: "damaged.mp4",
+      storageKey: storedDamaged.key,
+      mimeType: "video/mp4",
+      fileSize: storedDamaged.size,
+      checksum: storedDamaged.checksum,
+      processingStatus: "FAILED",
+      processingError: "the file could not be read as a video",
+      approvalStatus: "DRAFT",
+      sellerVisible: false,
+    },
+    select: { id: true },
+  });
+
+  const failedHtml = await (await fetch(`${BASE}${mediaTab}`, { headers: { Cookie: cookie } })).text();
+  check(
+    "A failed video shows why it failed, on the screen, in words",
+    failedHtml.includes("the file could not be read as a video")
+  );
+  check(
+    "And offers a Retry that names the asset it is for",
+    new RegExp(`name="assetId"[^>]*value="${broken.id}"`).test(failedHtml) &&
+      failedHtml.includes("media_probe_retry")
+  );
+
+  const retryForm = new FormData();
+  retryForm.set("intent", "media_probe_retry");
+  retryForm.set("tab", "media");
+  retryForm.set("assetId", broken.id);
+  const retryRes = await postForm(productPath, cookie, retryForm);
+
+  const afterRetry = await prisma.mediaAsset.findUnique({
+    where: { id: broken.id },
+    select: { processingStatus: true, processingError: true },
+  });
+  check(
+    "Pressing Retry puts the video back to processing and clears the old failure",
+    afterRetry?.processingStatus === "PROCESSING" && afterRetry?.processingError === null,
+    `HTTP ${retryRes.status} · ${JSON.stringify(afterRetry)}`
+  );
+  const retryJobs = await prisma.backgroundJob.findMany({
+    where: { idempotencyKey: { startsWith: videoProbeKey(broken.id) } },
+    select: { idempotencyKey: true, kind: true },
+  });
+  check(
+    "And queues a probe of the right kind, named by attempt",
+    retryJobs.length === 1 &&
+      retryJobs[0].kind === JOB_KIND.MEDIA_VIDEO_PROBE &&
+      retryJobs[0].idempotencyKey !== videoProbeKey(broken.id),
+    JSON.stringify(retryJobs)
+  );
+
+  /* ---- A clip too big for the tmpfs ------------------------------------ */
+
+  /*
+   * THE ONE THAT PROVES THE SCRATCH LOCATION. This deployment mounts a 64 MB
+   * tmpfs over /tmp, which is where a probe would naturally write its working
+   * copy. The clip below is larger than that, so a probe that reached for /tmp
+   * would fail to write it, the video would come back PROCESSING, and this
+   * check would fail — which is the whole point of making it.
+   */
+  let bigUploaded: Awaited<ReturnType<typeof upload>>;
+  try {
+    const big = await makeVideo(2, { scale: "1280x720", rate: 25, crf: "0", noise: true });
+    const mb = Math.round(big.byteLength / (1024 * 1024));
+    bigUploaded = await upload(`verify-mp-big-${Date.now()}.mp4`, big, "Verify large video");
+    check(
+      "The large clip really is larger than the tmpfs the deployment mounts over /tmp",
+      mb > 64,
+      `${mb} MB`
+    );
+  } catch (error) {
+    bigUploaded = { status: 0, location: "", text: "", json: null, type: "" };
+    check(
+      "A clip larger than the 64 MB /tmp can be encoded and uploaded",
+      false,
+      error instanceof Error ? error.message : "failed"
+    );
+  }
+
+  const bigId = typeof bigUploaded.json?.assetId === "string" ? bigUploaded.json.assetId : "";
+  const bigRow = bigId
+    ? await prisma.mediaAsset.findUnique({
+        where: { id: bigId },
+        select: { processingStatus: true, durationSeconds: true, fileSize: true },
+      })
+    : null;
+  check(
+    "And it is measured anyway — the probe wrote its working copy somewhere that had the room",
+    bigRow?.processingStatus === "READY" && bigRow?.durationSeconds === 2,
+    JSON.stringify(bigRow ?? bigUploaded.text.slice(0, 120))
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 
 async function main() {
@@ -621,6 +1023,7 @@ async function main() {
   made.productIds.push(product.id);
   await defect2(cookie, product.id);
   defect2ClientSource();
+  await videoPipeline(cookie, product.id);
 
   await cleanup();
 

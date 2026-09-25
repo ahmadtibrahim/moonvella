@@ -394,7 +394,16 @@ function CreativeTile({ asset }: { asset: MediaAssetView }) {
             Link only
           </span>
         ) : asset.mimeType.startsWith("video/") ? (
-          <video src={asset.url} style={{ width: "100%", height: "100%", objectFit: "cover" }} controls preload="metadata" />
+          <video
+            src={asset.url}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+            controls
+            preload="metadata"
+          >
+            {/* Declared, empty: the merchant's own working file, with no
+                captions to ship and no player that could show them. */}
+            <track kind="captions" />
+          </video>
         ) : (
           <img
             src={asset.url}

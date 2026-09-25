@@ -319,6 +319,7 @@ model Seller {
   brandKit           SellerBrandKit?
   contactMappings    ExternalContactMapping[]
   jobs               BackgroundJob[]
+  fileTransfers      ShopifyFileTransfer[]
 
   @@index([status])
   @@index([shopDomain])
@@ -1773,6 +1774,12 @@ model MediaAsset {
   aspectRatio     String?
 
   processingStatus ProcessingStatus @default(UPLOADING)
+  /// WHY PROCESSING STOPPED, when it stopped without finishing. Written by the
+  /// video probe and cleared when a retry is queued, so the screen can say what
+  /// went wrong instead of leaving a tile that says "processing" forever. Free
+  /// text chosen by us, never an error object: ffprobe's own message quotes the
+  /// path it was given, and a path is not something a page should carry.
+  processingError String?
   approvalStatus   ApprovalStatus   @default(DRAFT)
   /// Seller visibility is a separate switch from approval on purpose: an
   /// approved asset may still be held back from the Media Kit.
@@ -1802,13 +1809,68 @@ model MediaAsset {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  supersedes   MediaAsset?            @relation("AssetSupersession", fields: [supersedesId], references: [id])
-  supersededBy MediaAsset[]           @relation("AssetSupersession")
-  assignments  MediaAssetAssignment[]
+  supersedes    MediaAsset?            @relation("AssetSupersession", fields: [supersedesId], references: [id])
+  supersededBy  MediaAsset[]           @relation("AssetSupersession")
+  assignments   MediaAssetAssignment[]
+  /// One row per seller who has taken this asset into their own Shopify store.
+  fileTransfers ShopifyFileTransfer[]
 
   @@index([productId, category])
   @@index([checksum])
   @@index([approvalStatus])
+}
+
+/// One seller's copy of one asset in their own Shopify store.
+///
+/// WHY A ROW AND NOT A FLAG. "Add this video to my product" is a request that
+/// can fail halfway — Shopify accepts the upload and then processes it, or
+/// refuses the file after the bytes have already been sent — and the merchant
+/// will press the button again. The unique key below is what makes the second
+/// press a retry of the same transfer rather than a second copy in their store;
+/// without it, every press is a duplicate the merchant has to clean up by hand.
+///
+/// `providerObjectId` is the id Shopify gave back, stored so a later request
+/// can tell "already there" from "mine to create".
+model ShopifyFileTransfer {
+  id          String @id @default(cuid())
+  sellerId    String
+  seller      Seller @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  /// Named for the table it points at rather than "assetId", because a caller
+  /// reading a transfer should be able to see what kind of thing it moved.
+  mediaAssetId String
+  mediaAsset   MediaAsset @relation(fields: [mediaAssetId], references: [id], onDelete: Cascade)
+
+  /// Which Shopify operation this was: product media, or a file in Files.
+  kind   ShopifyTransferKind
+  status ShopifyTransferStatus @default(PENDING)
+
+  /// The object Shopify created — a media id or a file id. Null until it is
+  /// known, and it is what proves a retry has nothing left to do.
+  providerObjectId String?
+  /// Why the last attempt failed, in the merchant's terms. Cleared on retry.
+  error            String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// ONE TRANSFER PER ASSET PER SELLER PER KIND. This is the dedupe: a retry
+  /// updates this row, and a second press cannot create a second copy.
+  @@unique([sellerId, mediaAssetId, kind])
+  @@index([sellerId, status])
+}
+
+/// The two supported destinations. Both take the same bytes by different
+/// routes: MEDIA attaches to the seller's imported product, FILE goes to the
+/// store's file library, where a merchant can place it themselves.
+enum ShopifyTransferKind {
+  MEDIA
+  FILE
+}
+
+enum ShopifyTransferStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
 }
 
 /// Which variants an asset is shown for.

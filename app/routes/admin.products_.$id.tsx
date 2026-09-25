@@ -26,7 +26,9 @@ import {
   setPrimaryAssignment,
   reorderAssignment,
   supersedeDocument,
+  createTemplateAsset,
 } from "~/services/media.server";
+import { retryVideoProbe } from "~/services/mediaProbe.server";
 import { publicationReadiness } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import {
@@ -597,6 +599,33 @@ export async function action({ request, params }: ActionFunctionArgs) {
         );
         break;
       }
+
+      /*
+       * A TEMPLATE HAS NO FILE TO UPLOAD.
+       *
+       * `media_upload` above insists on one, so a link with nothing behind it
+       * had to be smuggled in as a throwaway file and then described as a
+       * template — which is why the template section of the marketing tab was
+       * effectively unreachable. This case writes the row the row is: a title
+       * and a link, with no bytes anywhere.
+       */
+      case "media_upload_template":
+        await createTemplateAsset(
+          productId,
+          {
+            title: text("title"),
+            templateUrl: text("templateUrl"),
+            instructions: optional("instructions"),
+            variantIds: variantScope(),
+            sellerVisible: form.get("sellerVisible") === "true",
+          },
+          actor
+        );
+        break;
+
+      case "media_probe_retry":
+        await retryVideoProbe(text("assetId"), actor);
+        break;
 
       case "media_update":
         await updateMedia(

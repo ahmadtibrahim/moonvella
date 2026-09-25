@@ -501,6 +501,32 @@ const CHECKS = [
     file: "scripts/verify-units.ts",
     requires: [],
   },
+  // The video pipeline: what makes an uploaded clip reach READY, and what a
+  // template link really is.
+  //
+  // It encodes one second of real video with the image's own ffmpeg and
+  // measures it through the same code the upload path calls, because the defect
+  // this covers was "every video sits at PROCESSING forever" — a fact about the
+  // image, not about a stub. A missing ffmpeg or ffprobe therefore FAILS this
+  // suite on its first check rather than skipping it: `moonvella:local` before
+  // the ffmpeg layer landed is exactly the image where the bug was live, and a
+  // green report from it would be a green report about a build nobody runs.
+  //
+  // It writes to the uploads volume — `mv-verify.sh` points that at a scratch
+  // directory rather than the deployment's — and removes every object and row
+  // it made. It does NOT drain the job queue: the sweep is a catalogue-wide
+  // operation and running the runner here would also run tracking and Odoo
+  // work against providers this suite promises not to reach. What it pins
+  // instead is that the job the sweep queues is the job a handler is
+  // registered for, and that handing that job to that handler ends the row.
+  //
+  // No network. No Shopify, no Odoo, no Google, no carrier.
+  {
+    name: "media",
+    kind: "ts",
+    file: "scripts/verify-media.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

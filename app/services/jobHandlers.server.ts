@@ -13,6 +13,7 @@ import { runContactSyncJob } from "./odooContacts.server";
 import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
 import { syncOdooCatalog } from "./odooSync.server";
+import { probeVideoAsset, sweepVideoProbes } from "./mediaProbe.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
@@ -180,6 +181,57 @@ export const jobHandlers: Record<string, JobHandler> = {
         skipped: summary.skipped,
         errors: summary.errors,
         missedPickups: flagged.flagged,
+      },
+    };
+  },
+
+  /**
+   * Measure one video.
+   *
+   * The handler never throws for a video it cannot measure. A file ffprobe
+   * cannot decode would fail identically on all five attempts, so the answer is
+   * recorded on the asset — FAILED, with the reason — and the job reports
+   * success at having reached that answer. Retrying is then a decision a person
+   * makes by pressing Retry, which is the only thing that re-queues a failed
+   * probe.
+   */
+  [JOB_KIND.MEDIA_VIDEO_PROBE]: async (job) => {
+    const assetId = (job.payload as { assetId?: unknown } | null)?.assetId;
+    if (typeof assetId !== "string" || !assetId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no assetId, so there is no video to measure.`,
+      );
+    }
+
+    const outcome = await probeVideoAsset(assetId);
+    const summary =
+      outcome.status === "READY"
+        ? `Measured video ${assetId} (${outcome.seconds}s).`
+        : outcome.status === "FAILED"
+          ? `Video ${assetId} could not be measured: ${outcome.reason}.`
+          : `Video ${assetId} was not probed: ${outcome.reason}.`;
+    return { summary, detail: { ...outcome } };
+  },
+
+  /**
+   * The sweep that rescues videos left PROCESSING.
+   *
+   * Idempotent through the per-asset key: a second sweep before the first
+   * probe has run finds each job already queued and adds nothing, and an asset
+   * that has since reached READY or FAILED is out of scope. A probe that could
+   * not be queued is reported rather than thrown, so one bad row does not stop
+   * the rest of the catalogue from being measured.
+   */
+  [JOB_KIND.MEDIA_VIDEO_PROBE_SWEEP]: async (job) => {
+    const swept = await sweepVideoProbes();
+    return {
+      summary:
+        `${swept.considered} video(s) still processing: ${swept.enqueued} probe(s) queued` +
+        (swept.alreadyQueued ? `, ${swept.alreadyQueued} already queued` : "") +
+        (swept.errors.length ? `, ${swept.errors.length} could not be queued` : ""),
+      detail: {
+        bucket: (job.payload as { bucket?: unknown } | null)?.bucket ?? null,
+        ...swept,
       },
     };
   },

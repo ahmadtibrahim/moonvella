@@ -1,7 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 
 /**
@@ -59,7 +58,16 @@ export interface StoredObject {
  * publishing a clip nobody has checked.
  */
 export type DurationProbe =
-  | { status: "measured"; seconds: number }
+  | {
+      status: "measured";
+      seconds: number;
+      /**
+       * The frame size, which came back from the same probe. Null when the
+       * container did not report one, which is unusual but not an error.
+       */
+      width: number | null;
+      height: number | null;
+    }
   | { status: "not-video" }
   | { status: "unavailable"; reason: string };
 
@@ -314,7 +322,7 @@ function imageDimensions(mimeType: string, bytes: Buffer): Dimensions | null {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Video duration                                                             */
+/* Video probing                                                              */
 /* -------------------------------------------------------------------------- */
 
 /** Cached answer to "is ffprobe usable here?" — undefined until first asked. */
@@ -330,36 +338,52 @@ async function hasFfprobe(): Promise<boolean> {
 }
 
 /**
- * Duration of a video, measured with ffprobe when this image has it.
- *
- * ffprobe is NOT installed in the moonvella image (node:22-alpine, with only
- * openssl and libc6-compat added), so in production this reports
- * `unavailable` and no duration is recorded. That is the honest outcome: a
- * duration parsed by hand out of a container header would be an unverified
- * number stored next to verified ones, and the caller can gate publication on
- * the probe status instead. Set UPLOAD_VIDEO_PROBE=off to skip the attempt
- * entirely.
- *
- * The probe reads a private copy: ffprobe is given a path inside a fresh
- * temporary directory rather than anything that encodes a real object key, its
- * stderr is never propagated (it quotes the input path), and the directory is
- * removed whatever happens. Note that /tmp in this container is a 64 MB tmpfs,
- * so a video far larger than that cannot be probed even where ffprobe exists.
+ * What a video probe can report. `width`/`height` are null when the file has a
+ * video stream that declares no frame size — stored as "unknown", never as
+ * zero, so a later reader cannot mistake the absence of a measurement for a
+ * measurement of nothing.
  */
-async function probeVideoDuration(bytes: Buffer): Promise<DurationProbe> {
+export type VideoProbe =
+  | { status: "measured"; seconds: number; width: number | null; height: number | null }
+  | { status: "unavailable"; reason: string };
+
+/**
+ * Which fixed sentence a failed probe gets. A probe that ran out of time and a
+ * file ffprobe cannot decode ask different things of whoever reads the message
+ * — wait, or replace the file — so they are told apart. Nothing from ffprobe
+ * itself is propagated: its stderr quotes the input path.
+ */
+function probeFailureReason(error: unknown): string {
+  const failure = error as { killed?: boolean; code?: unknown; signal?: unknown } | null;
+  if (failure?.killed || failure?.signal || failure?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return "the video probe ran out of time reading the file";
+  }
+  return "the file could not be read as a video";
+}
+
+/**
+ * Measure a video file with ffprobe, in place.
+ *
+ * ffmpeg is installed in the moonvella image (the runner stage's `apk add`),
+ * so a clip uploaded by this build is measured and stored READY. Images built
+ * before that reported `unavailable` for every video, which is what the sweep
+ * job in `mediaProbe.server.ts` exists to repair. Set UPLOAD_VIDEO_PROBE=off
+ * to skip probing: an asset then stays PROCESSING until someone looks at it,
+ * which is honest — a duration parsed by hand out of a container header would
+ * be an unverified number stored next to verified ones.
+ *
+ * The caller passes a path, so a stored object is probed where it lies. Every
+ * failure becomes fixed text, and none of it reaches a user unexamined.
+ */
+async function probeVideoFile(path: string): Promise<VideoProbe> {
   if (process.env.UPLOAD_VIDEO_PROBE === "off") {
-    return { status: "unavailable", reason: "the duration probe is switched off by configuration" };
+    return { status: "unavailable", reason: "the video probe is switched off by configuration" };
   }
   if (!(await hasFfprobe())) {
     return { status: "unavailable", reason: "ffprobe is not installed in this image" };
   }
 
-  let workspace: string | null = null;
   try {
-    workspace = await mkdtemp(join(tmpdir(), "moonvella-probe-"));
-    const input = join(workspace, "input");
-    await writeFile(input, bytes);
-
     const stdout = await new Promise<string>((resolveProbe, rejectProbe) => {
       execFile(
         "ffprobe",
@@ -369,27 +393,144 @@ async function probeVideoDuration(bytes: Buffer): Promise<DurationProbe> {
           "-select_streams",
           "v:0",
           "-show_entries",
-          "format=duration",
+          "stream=width,height:format=duration",
           "-of",
-          "default=noprint_wrappers=1:nokey=1",
-          input,
+          "json",
+          path,
         ],
-        { timeout: 20000, maxBuffer: 64 * 1024 },
+        { timeout: 60000, maxBuffer: 256 * 1024 },
         (error, out) => (error ? rejectProbe(error) : resolveProbe(out))
       );
     });
 
-    const seconds = Number(stdout.trim());
+    const parsed = JSON.parse(stdout) as {
+      streams?: Array<{ width?: unknown; height?: unknown }>;
+      format?: { duration?: unknown };
+    };
+    const seconds = Number(parsed.format?.duration);
     if (!Number.isFinite(seconds) || seconds <= 0) {
-      return { status: "unavailable", reason: "the duration probe returned no usable value" };
+      return { status: "unavailable", reason: "the video probe returned no usable duration" };
     }
-    return { status: "measured", seconds };
+    const stream = parsed.streams?.[0] ?? {};
+    const width = Math.round(Number(stream.width));
+    const height = Math.round(Number(stream.height));
+    return {
+      status: "measured",
+      seconds,
+      width: Number.isFinite(width) && width > 0 ? width : null,
+      height: Number.isFinite(height) && height > 0 ? height : null,
+    };
+  } catch (error) {
+    return { status: "unavailable", reason: probeFailureReason(error) };
+  }
+}
+
+/**
+ * Scratch space for probing bytes that are not stored yet. It lives inside the
+ * uploads volume — the only writable mount this container has — rather than in
+ * /tmp, which is a 64 MB tmpfs and cannot hold a video anywhere near the
+ * upload ceiling. The random directory name comes from `mkdtemp`, never from
+ * an object key, and callers remove it whatever happens. Nothing reads this
+ * directory back: a `.probe` name cannot match the storage key pattern, so no
+ * request can serve a file out of it.
+ */
+async function probeScratchDir(): Promise<string> {
+  const root = probeScratchRoot();
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  return mkdtemp(join(root, "run-"));
+}
+
+/**
+ * Where byte-based probing writes its scratch files: a fixed subdirectory of
+ * the uploads volume.
+ *
+ * Exported so a suite can assert the one property that matters about it — that
+ * it is not /tmp. This container's /tmp is a 64 MB tmpfs and the upload ceiling
+ * is 200 MB, so a probe that copied its input there would fail on precisely the
+ * videos it exists to measure, and it would fail with a disk-full error that
+ * says nothing about video.
+ */
+export function probeScratchRoot(): string {
+  return join(process.env.UPLOAD_DIR || DEFAULT_UPLOAD_DIR, ".probe");
+}
+
+/**
+ * Measure video bytes that are in hand and not stored anywhere. Used during
+ * upload, before the object exists, and by the probe service for a backend
+ * that offers no filesystem path.
+ *
+ * The bytes go to a private scratch file first: ffprobe is given a path, and
+ * this one encodes no object key.
+ */
+export async function probeVideoBytes(bytes: Uint8Array): Promise<VideoProbe> {
+  if (process.env.UPLOAD_VIDEO_PROBE === "off") {
+    return { status: "unavailable", reason: "the video probe is switched off by configuration" };
+  }
+  if (!(await hasFfprobe())) {
+    return { status: "unavailable", reason: "ffprobe is not installed in this image" };
+  }
+
+  let workspace: string | null = null;
+  try {
+    workspace = await probeScratchDir();
+    const input = join(workspace, "input");
+    await writeFile(input, bytes);
+    return await probeVideoFile(input);
   } catch {
-    // Fixed text: the underlying error quotes the temporary path.
-    return { status: "unavailable", reason: "the duration probe could not run" };
+    // Fixed text: the underlying error quotes the scratch path.
+    return { status: "unavailable", reason: "the video probe could not run" };
   } finally {
     if (workspace) await rm(workspace, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/**
+ * The same measurement, in the shape `saveUpload` records.
+ *
+ * The frame size is kept, not discarded. It arrives in the same ffprobe answer
+ * as the length, and throwing it away was a real defect: a video uploaded to an
+ * image WITH ffprobe came back READY with a duration and a null frame size, and
+ * nothing ever went back to fill it in — the probe job skips a video that is
+ * already measured, so the number was simply never learned. Keeping it here
+ * means the one measurement an upload makes is the whole measurement.
+ */
+async function probeVideoDuration(bytes: Buffer): Promise<DurationProbe> {
+  const probe = await probeVideoBytes(bytes);
+  return probe.status === "measured"
+    ? {
+        status: "measured",
+        seconds: probe.seconds,
+        width: probe.width,
+        height: probe.height,
+      }
+    : probe;
+}
+
+/**
+ * The filesystem path of a stored object, when the backend has one. Null for
+ * an object store — S3 and its kin have no path — and null for anything that
+ * is not a storage key. The local backend is the only one that answers, and it
+ * answers so a stored video can be probed where it lies instead of being read
+ * back through a temp file that has to be as large as the video.
+ */
+export function storedObjectPath(key: string): string | null {
+  return getStorage().pathFor?.(key) ?? null;
+}
+
+/**
+ * Measure a stored video in place. Null means "there is nothing here to probe"
+ * — a missing object, or a backend with no path — which the caller reports as
+ * such rather than storing as a video of unknown length.
+ */
+export async function probeStoredVideo(key: string): Promise<VideoProbe | null> {
+  const path = storedObjectPath(key);
+  if (!path) return null;
+  try {
+    await stat(path);
+  } catch {
+    return null;
+  }
+  return probeVideoFile(path);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -407,6 +548,15 @@ export interface StorageBackend {
   get(key: string): Promise<Uint8Array | null>;
   remove(key: string): Promise<boolean>;
   has(key: string): Promise<boolean>;
+  /**
+   * Where the object physically sits, when the backend is a filesystem. Absent
+   * for an object store. This is the one leak in the abstraction and it is
+   * deliberate: it lets a video be measured in place, and the alternative —
+   * reading a 200 MB clip back through memory into a temp file — is how the
+   * probe failed before ffmpeg was installed. Callers must treat a null answer
+   * as "no path", never as "missing", and must not build a response from it.
+   */
+  pathFor?(key: string): string | null;
 }
 
 /**
@@ -494,6 +644,12 @@ export function createLocalBackend(root: string = process.env.UPLOAD_DIR || DEFA
         return false;
       }
     },
+
+    pathFor(key) {
+      // A legacy key is not an object here — `get` answers null for it too — so
+      // the honest path answer is "none".
+      return isStorageKey(key) ? pathFor(key) : null;
+    },
   };
 }
 
@@ -521,6 +677,19 @@ export function getStorage(): StorageBackend {
 /* -------------------------------------------------------------------------- */
 
 /** sha256 of the stored bytes, hex. The value MediaAsset.checksum holds. */
+/**
+ * A fresh storage key.
+ *
+ * Exported for the one asset that is a link rather than a file: an editable
+ * template has no bytes to store, but it still needs a key — the column is
+ * unique and not nullable — and generating it here keeps every key in the
+ * table the same shape, so nothing downstream has to special-case a row whose
+ * key is a sentence.
+ */
+export function newStorageKey(extension = "url"): string {
+  return `${randomBytes(16).toString("hex")}.${extension}`;
+}
+
 export function checksumOf(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
@@ -668,13 +837,18 @@ export async function saveUpload(file: File, options: SaveUploadOptions = {}): P
         throw new Error(tooLongMessage(maxSeconds));
       }
       durationSeconds = Math.round(durationProbe.seconds);
+      // Written from the same measurement as the length. A null here on a
+      // measured video would leave the tile with no aspect ratio to reserve
+      // space for, and nothing would ever fill it in.
+      width = durationProbe.width;
+      height = durationProbe.height;
     }
   }
 
   // Random, flat, extension from the verified type. Nothing here derives from
   // the uploader, so no name — "../../etc/passwd", "/etc/shadow", a 4 kB of
   // emoji — can reach a path.
-  const key = `${randomBytes(16).toString("hex")}.${allowed.extension}`;
+  const key = newStorageKey(allowed.extension);
   await (options.backend ?? getStorage()).put(key, bytes);
 
   return {

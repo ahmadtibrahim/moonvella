@@ -40,7 +40,12 @@ RUN npm run build
 
 FROM node:${NODE_VERSION} AS runner
 
-RUN apk add --no-cache openssl libc6-compat
+# openssl and libc6-compat as in the builder; ffmpeg here because the runner is
+# the stage that has to measure video. ffprobe — the part the app calls — is
+# shipped in the ffmpeg package on Alpine; there is no separate ffprobe
+# package. Without it every uploaded video stayed PROCESSING forever, so the
+# probe belongs in the image, not in an operator's to-do list.
+RUN apk add --no-cache openssl libc6-compat ffmpeg
 
 WORKDIR /app
 

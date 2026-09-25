@@ -73,6 +73,22 @@ export const JOB_KIND = {
    * untracked until somebody looked.
    */
   SHIPMENT_TRACKING_SWEEP: "SHIPMENT_TRACKING_SWEEP",
+  /**
+   * Measure one video so it can stop being PROCESSING.
+   *
+   * Queued when an upload could not measure the clip itself (no ffprobe in the
+   * image that took the upload, most often) and by the Retry on a failed tile.
+   * The job is idempotent — the same bytes give the same answer — and every
+   * run ends the row in READY or FAILED, so nothing here can loop.
+   */
+  MEDIA_VIDEO_PROBE: "MEDIA_VIDEO_PROBE",
+  /**
+   * Queue a probe for every video still stuck at PROCESSING.
+   *
+   * RECURRING — see RECURRING_JOBS — because the videos that need it were
+   * uploaded before the fix shipped and will never ask for it themselves.
+   */
+  MEDIA_VIDEO_PROBE_SWEEP: "MEDIA_VIDEO_PROBE_SWEEP",
 } as const;
 
 export type JobKind = (typeof JOB_KIND)[keyof typeof JOB_KIND];
@@ -227,6 +243,14 @@ export const RECURRING_JOBS: readonly RecurringJob[] = [
     kind: JOB_KIND.SHIPMENT_TRACKING_SWEEP,
     everyMs: 5 * 60 * 1000,
     summary: "Poll carriers for shipments that are due a tracking check.",
+  },
+  {
+    kind: JOB_KIND.MEDIA_VIDEO_PROBE_SWEEP,
+    // Five minutes, the same beat as tracking. A video stuck at PROCESSING is
+    // visible to a seller as a file that never becomes usable, so the wait
+    // after a deploy that fixes the probe should be measured in minutes.
+    everyMs: 5 * 60 * 1000,
+    summary: "Queue a probe for every video still waiting to be measured.",
   },
   {
     kind: JOB_KIND.ODOO_CATALOG_SYNC,
