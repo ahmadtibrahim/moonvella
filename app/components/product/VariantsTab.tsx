@@ -142,10 +142,20 @@ export default function VariantsTab({
   canEditCost,
   units,
   refused = null,
+  selectable,
 }: {
   product: Product;
   presets: Preset[];
   canEditCost: boolean;
+  /**
+   * ONE PACKAGING EDITOR PER SELLABLE CONFIGURATION — see
+   * `productHasSelectableVariants` in the service, which is where this is
+   * resolved. True when a seller chooses between this product's variants: the
+   * cartons then belong to the variant and are edited below. False when the
+   * product is sold as one thing whatever the database holds underneath, and
+   * the cartons are edited once, on the Shipping tab.
+   */
+  selectable: boolean;
   /** The admin's unit preference, resolved by the route and rendered here. */
   units: UnitsView;
   /**
@@ -231,6 +241,7 @@ export default function VariantsTab({
             canEditCost={canEditCost}
             presets={presets}
             units={units}
+            selectable={selectable}
             refused={refused && refused.variantId === variant.id ? refused : null}
             /*
               What a carton row added to THIS variant starts out saying. Built
@@ -261,6 +272,7 @@ function VariantCard({
   units,
   refused,
   cartonDefaults,
+  selectable,
 }: {
   variant: Variant;
   currency: string;
@@ -270,6 +282,8 @@ function VariantCard({
   refused: RefusedPackaging | null;
   /** What a carton row added here starts out saying. See `newCartonText`. */
   cartonDefaults: { label: string; description: string };
+  /** Whether cartons are edited here at all. See the tab's own prop. */
+  selectable: boolean;
 }) {
   const carton = variant.packages[0] ?? null;
   const margin =
@@ -357,12 +371,25 @@ function VariantCard({
           * inches, which is the point of the setting — and the conversion is for
           * reading only: nothing here is written back.
           */}
+        {/*
+          * WHAT A CARTON SAYS WHEN THERE IS NO CARTON HERE TO READ.
+          *
+          * A variant of a product sold as one configuration has no cartons of
+          * its own by design — they live on the product, and the Shipping tab is
+          * where they are edited. "not set" would be read as "somebody must fill
+          * this in", and the person reading it would go looking for a control
+          * that is deliberately not on this page. When the product IS sold in
+          * choices the variant's own rows are the answer and they are shown as
+          * they always were.
+          */}
         <Fact
           label="Shipping carton"
           value={
             carton
               ? `${convertedDisplay(carton.length, carton.dimensionUnit, units.dimensionUnit, "length")} × ${convertedDisplay(carton.width, carton.dimensionUnit, units.dimensionUnit, "length")} × ${convertedDisplay(carton.height, carton.dimensionUnit, units.dimensionUnit, "length")} ${units.dimensionUnit}, ${convertedDisplay(carton.grossWeight, carton.weightUnit, units.weightUnit, "weight")} ${units.weightUnit}`
-              : "not set"
+              : selectable
+                ? "not set"
+                : "set once on the Shipping tab"
           }
         />
       </dl>
@@ -377,19 +404,34 @@ function VariantCard({
             </button>
           </Form>
         ) : null}
-        <a href={`#packaging-${variant.id}`} style={{ ...btn(MUTED), lineHeight: "1.2" }}>
-          Packaging
-        </a>
+        {/*
+          * The link follows the editor. A jump link to an anchor that this
+          * product does not draw any more is worse than no link: it scrolls
+          * nowhere and reads as a page that failed to load.
+          */}
+        {selectable ? (
+          <a href={`#packaging-${variant.id}`} style={{ ...btn(MUTED), lineHeight: "1.2" }}>
+            Packaging
+          </a>
+        ) : (
+          <Link to="?tab=shipping" style={{ ...btn(MUTED), lineHeight: "1.2" }}>
+            Packaging
+          </Link>
+        )}
       </div>
 
-      <PackagingEditor
-        variant={variant}
-        presets={presets}
-        units={units}
-        refused={refused}
-        // Only ever read by a row that does not exist yet — see `newCartonText`.
-        defaults={cartonDefaults}
-      />
+      {selectable ? (
+        <PackagingEditor
+          variant={variant}
+          presets={presets}
+          units={units}
+          refused={refused}
+          // Only ever read by a row that does not exist yet — see `newCartonText`.
+          defaults={cartonDefaults}
+        />
+      ) : (
+        <PackagingElsewhere />
+      )}
     </div>
   );
 }
@@ -430,6 +472,39 @@ function Fact({ label: text, value }: { label: string; value: string }) {
  * each sentence sit under the control that has to change rather than in a list
  * at the top of the page — see `fieldError` in `./packagingRows`.
  */
+/**
+ * Where the cartons are, for a product that has only one configuration to ship.
+ *
+ * Sellers cannot choose between this product's variants, so there is one box
+ * and one place to record it. Drawing an editor per variant here would offer a
+ * second answer to the question the Shipping tab already answers — and the
+ * answer nobody is looking at is the one that would be quoted, which is exactly
+ * the shadow packaging this rule removes.
+ *
+ * It says where to go and why, because "not available here" on its own sends
+ * the reader hunting through six tabs.
+ */
+function PackagingElsewhere() {
+  return (
+    <div
+      style={{
+        marginTop: "0.85rem",
+        borderTop: `1px solid ${LINE}`,
+        paddingTop: "0.6rem",
+        fontSize: "0.75rem",
+        color: MUTED,
+      }}
+    >
+      <strong style={{ color: INK }}>Shipping and packaging</strong> — sellers choose no option on
+      this product, so it ships in one carton and that carton is recorded once, on the{" "}
+      <Link to="?tab=shipping" style={{ color: INK, fontWeight: 600 }}>
+        Shipping tab
+      </Link>
+      . A quote uses the measurements saved there.
+    </div>
+  );
+}
+
 function PackagingEditor({
   variant,
   presets,

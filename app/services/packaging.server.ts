@@ -302,6 +302,62 @@ function assertClearWasIntended(submitted: number, drawnRows: number | undefined
 }
 
 /**
+ * ONE EDITOR PER SELLABLE CONFIGURATION, ENFORCED AT THE WRITE.
+ *
+ * The interface already draws a single editor — cartons under each variant for
+ * a product sold in choices, cartons on the product for a simple one — but a
+ * hidden control is not a rule. The same POST can be assembled by hand, and a
+ * row written that way is exactly the shadow state this change exists to
+ * remove: a product's cartons quietly overridden by a variant row nobody can
+ * see, or a variant's cartons silently ignored because the product is simple.
+ *
+ * So the save paths ask this question too, and refuse in the terms of the
+ * editor the person was NOT looking at. The message names the page to use,
+ * because "not permitted" without a destination is a dead end.
+ *
+ * `saveProductPackages` is checked the same way round: a product-level row for
+ * a product sold in choices is refused for the same reason a variant row is
+ * refused for a simple one.
+ */
+async function assertOneEditor(
+  subject: { variantId: string } | { productId: string },
+  side: "variant" | "product"
+) {
+  if (side === "product") {
+    const { productId } = subject as { productId: string };
+    if (!(await productHasSelectableVariants(productId))) return;
+    throw new PackageValidationError([
+      {
+        index: -1,
+        field: "pkg_rowCount",
+        message:
+          "This product is sold in selectable configurations, so its cartons live on the variants. Add them under each variant on the Variants tab — a product-level carton would be inherited by every variant that has none, which is the second answer this page no longer keeps.",
+      },
+    ]);
+  }
+
+  const { variantId } = subject as { variantId: string };
+  const variant = await prisma.productVariant.findUnique({
+    where: { id: variantId },
+    select: { productId: true },
+  });
+  if (!variant) {
+    throw new PackageValidationError([
+      { index: -1, field: "pkg_rowCount", message: "That variant no longer exists." },
+    ]);
+  }
+  if (await productHasSelectableVariants(variant.productId)) return;
+  throw new PackageValidationError([
+    {
+      index: -1,
+      field: "pkg_rowCount",
+      message:
+        "This product is not sold in selectable configurations, so it has one packaging editor and it is on the Shipping tab. Cartons saved against a single variant here would be invisible on the page that edits them.",
+    },
+  ]);
+}
+
+/**
  * Replace a variant's package rows.
  *
  * Rows are rejected as a set, before anything is deleted. The previous version
@@ -318,6 +374,7 @@ export async function saveVariantPackages(
   const problems = rows.flatMap((row, index) => packageProblems(row, index));
   if (problems.length > 0) throw new PackageValidationError(problems);
   assertClearWasIntended(rows.length, options.drawnRows);
+  await assertOneEditor({ variantId }, "variant");
 
   await prisma.$transaction([
     prisma.variantPackage.deleteMany({ where: { variantId } }),
@@ -328,6 +385,13 @@ export async function saveVariantPackages(
   return rows.length;
 }
 
+/**
+ * Replace a product's package rows — the cartons a simple product ships in.
+ *
+ * The same one-editor rule as the variant twin, from the other side: a product
+ * sold in selectable configurations keeps its cartons on those variants, so a
+ * write here would be a fallback rather than a fact. See `assertOneEditor`.
+ */
 export async function saveProductPackages(
   productId: string,
   rows: PackageRowInput[],
@@ -336,6 +400,7 @@ export async function saveProductPackages(
   const problems = rows.flatMap((row, index) => packageProblems(row, index));
   if (problems.length > 0) throw new PackageValidationError(problems);
   assertClearWasIntended(rows.length, options.drawnRows);
+  await assertOneEditor({ productId }, "product");
 
   await prisma.$transaction([
     prisma.productPackage.deleteMany({ where: { productId } }),
@@ -725,16 +790,71 @@ export interface ResolvedPackages {
 }
 
 /**
- * Resolve packaging for one variant: its own rows, else the product's.
+ * Is this product sold in customer-selectable configurations?
+ *
+ * THIS ONE QUESTION DECIDES WHERE PACKAGING LIVES, and the rule is the owner's:
+ * one packaging editor per sellable configuration. A product whose sellers
+ * choose between sizes keeps its cartons on the variants, because a queen
+ * pillow and a king pillow ship in different boxes and a single product-level
+ * box would have to be one of them or a wrong average. A simple product — no
+ * options for a seller to choose — keeps its cartons on the product, even
+ * though the database represents it with one internal default variant underneath.
+ *
+ * The definition is the one the rest of the codebase already uses for "a real
+ * choice": an ACTIVE variant carrying at least one option whose name and value
+ * are both non-blank. `orderIntake.server.ts` filters option pairs exactly this
+ * way when it snapshots what a seller selected, so a variant with a blank pair
+ * is not selectable there and is not selectable here — one rule, two readers.
+ *
+ * The `isActive` half matters for the same reason: a variant that has been
+ * switched off is not something a seller can pick, so a product whose only
+ * option-bearing variant is inactive is a simple product as far as packaging is
+ * concerned.
+ *
+ * This is also the definition migration 20260925010000 uses to decide which
+ * rows to move, which is why it is a function rather than a predicate written
+ * inline: the migration and the resolver disagreeing is the bug class this
+ * whole change exists to close.
+ */
+export async function productHasSelectableVariants(productId: string): Promise<boolean> {
+  const variants = await prisma.productVariant.findMany({
+    where: { productId, isActive: true },
+    select: { variantOptions: { select: { name: true, value: true } } },
+  });
+  return variants.some((variant) =>
+    variant.variantOptions.some((option) => option.name.trim() && option.value.trim())
+  );
+}
+
+/**
+ * Resolve packaging for one variant.
+ *
+ * WHERE THE ROWS COME FROM DEPENDS ON WHETHER THE PRODUCT IS SOLD IN CHOICES,
+ * and that symmetry is the point rather than a detail (see
+ * `productHasSelectableVariants`):
+ *
+ *   SELECTABLE — the variant's own rows, and nothing else. A product sold in
+ *   sizes keeps its cartons on the variants, so the product's own rows are not
+ *   a fallback here; they would be a second answer that a variant without
+ *   cartons would silently inherit. Migration 20260925010000 deletes the ones
+ *   that existed (after moving them onto the variants that had none), and the
+ *   editors no longer offer a product-level carton row for these products.
+ *
+ *   SIMPLE — the product's rows. There is one sellable configuration, so there
+ *   is one box, and the product holds it. A variant row is still read first if
+ *   one exists, because that is what is effective TODAY for any surviving row:
+ *   the migration moves the single-variant case up to the product, and a shape
+ *   it cannot collapse faithfully is left alone rather than flattened. Nothing
+ *   that ships in its own box ever starts shipping in somebody else's because of
+ *   this change.
  *
  * INHERITANCE IS WHOLE-ROW, NOT PER-FIELD, and that is a deliberate limit
- * rather than a shortcut. A VariantPackage row carries all four numbers as
- * required columns, so a variant row that inherited only the weight would have
- * to leave its own dimensions null — and a null dimension is exactly the
- * "quoted as nothing" failure the validation above exists to stop. So a
- * variant either has its own complete packaging or it inherits the product's
- * complete packaging, and `productDefault` is returned alongside so the
- * interface can say which and show the difference.
+ * rather than a shortcut. A package row carries all four numbers as required
+ * columns, so a row that inherited only the weight would have to leave its own
+ * dimensions null — and a null dimension is exactly the "quoted as nothing"
+ * failure the validation above exists to stop. `productDefault` is returned
+ * alongside so the interface can say which rows answered and show the
+ * difference.
  */
 export async function resolvePackagesForVariant(variantId: string): Promise<ResolvedPackages> {
   const variant = await prisma.productVariant.findUnique({
@@ -743,7 +863,8 @@ export async function resolvePackagesForVariant(variantId: string): Promise<Reso
   });
   if (!variant) return { source: "none", packages: [], productDefault: null };
 
-  const [variantRows, productRows] = await Promise.all([
+  const [selectable, variantRows, productRows] = await Promise.all([
+    productHasSelectableVariants(variant.productId),
     prisma.variantPackage.findMany({
       where: { variantId },
       orderBy: { sortOrder: "asc" },
@@ -757,9 +878,14 @@ export async function resolvePackagesForVariant(variantId: string): Promise<Reso
   ]);
 
   const productDefault = productRows.length > 0 ? productRows : null;
-  if (variantRows.length > 0) {
-    return { source: "variant", packages: variantRows, productDefault };
+
+  if (selectable) {
+    return variantRows.length > 0
+      ? { source: "variant", packages: variantRows, productDefault }
+      : { source: "none", packages: [], productDefault };
   }
+
+  if (variantRows.length > 0) return { source: "variant", packages: variantRows, productDefault };
   if (productDefault) return { source: "product", packages: productDefault, productDefault };
   return { source: "none", packages: [], productDefault: null };
 }

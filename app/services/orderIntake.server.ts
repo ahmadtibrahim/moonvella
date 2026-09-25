@@ -2,7 +2,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
-import { toCm, toKg } from "./packaging.server";
+import { resolvePackagesForVariant, toCm, toKg } from "./packaging.server";
 import { addressMateriallyDiffers } from "./addressValidation.server";
 import { invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
 
@@ -103,16 +103,24 @@ interface VariantSnapshotSource {
   currency: string;
   variantOptions: { name: string; value: string }[];
   product: { productCode: string } | null;
-  packages: {
-    length: number;
-    width: number;
-    height: number;
-    dimensionUnit: string;
-    grossWeight: number;
-    weightUnit: string;
-    unitsPerPackage: number;
-    sortOrder: number;
-  }[];
+}
+
+/**
+ * The one carton a line records, in whatever shape the resolver returned it.
+ *
+ * Structural rather than an import of the resolver's own type, for the same
+ * reason `VariantSnapshotSource` is: this file only ever reads these four
+ * measurements and the unit they are in, and naming exactly that keeps a
+ * change to the packaging tables from reaching into order intake.
+ */
+interface ResolvedCarton {
+  length: number;
+  width: number;
+  height: number;
+  dimensionUnit: string;
+  grossWeight: number;
+  weightUnit: string;
+  unitsPerPackage: number;
 }
 
 export interface IntakeResult {
@@ -205,19 +213,31 @@ function decimal(value: unknown): string | null {
 /**
  * The carton actually used, resolved from the variant's first package.
  *
- * Packaging is stored per variant and a variant may have several cartons; the
- * first is the one the shipping feature quotes from, so it is the one an order
- * should record. A package measured in inches is converted rather than copied,
- * because the snapshot columns are canonical cm/kg and a mixed-unit column
- * would be unreadable a year from now.
+ * WHICH CARTON IS NOT A QUESTION THIS FILE ANSWERS ITSELF. It used to read the
+ * variant's own rows and take the first, which was the whole answer while every
+ * product could inherit a product-level default — the fallback rows were read by
+ * the quote and never by the order line, so a simple product's orders recorded
+ * no carton at all. One packaging editor per sellable configuration makes that
+ * the ordinary case rather than an edge: a product whose sellers choose nothing
+ * keeps its carton on the PRODUCT, and this must record it.
  *
- * The conversion itself is `packaging.server`'s, imported rather than repeated:
- * one unit conversion, in one place, is the only way the quote and the order
- * line can be guaranteed to agree.
+ * So the resolution goes through `resolvePackagesForVariant` — the same function
+ * the quote, the editors and the migration use. A second reading of "which
+ * cartons apply" here is precisely the disagreement this change exists to
+ * remove, and it would show up as an order line that quotes from one box and
+ * records another.
+ *
+ * A package measured in inches is converted rather than copied, because the
+ * snapshot columns are canonical cm/kg and a mixed-unit column would be
+ * unreadable a year from now. The conversion is `packaging.server`'s, imported
+ * rather than repeated: one unit conversion, in one place, is the only way the
+ * quote and the order line can be guaranteed to agree.
  */
-function snapshotFor(variant: VariantSnapshotSource, chargedRetailCents: number) {
-  const packages = [...variant.packages].sort((a, b) => a.sortOrder - b.sortOrder);
-  const carton = packages[0] ?? null;
+function snapshotFor(
+  variant: VariantSnapshotSource,
+  carton: ResolvedCarton | null,
+  chargedRetailCents: number
+) {
   const options = variant.variantOptions
     .filter((option) => option.name.trim() && option.value.trim())
     .map((option) => ({ name: option.name, value: option.value }));
@@ -259,11 +279,11 @@ function snapshotFor(variant: VariantSnapshotSource, chargedRetailCents: number)
  * reach back into an order that has already been billed. A line the map does
  * not know is genuinely new, and it takes the price in force now.
  */
-function buildItems(
+async function buildItems(
   items: LineItem[],
   byVariant: Map<string, VariantMapping>,
   frozenUnitPrices?: Map<string, number>
-): BuiltItems {
+): Promise<BuiltItems> {
   const moonvellaItems = items.filter((li) => li.variant_id && byVariant.has(String(li.variant_id)));
   let moonvellaSubtotal = 0;
   let retailTotal = 0;
@@ -271,7 +291,7 @@ function buildItems(
   let lineTaxTotal = 0;
   const priceSource = new Map<string, "SNAPSHOT" | "CATALOGUE">();
 
-  const rows = moonvellaItems.map((li) => {
+  const rows = await Promise.all(moonvellaItems.map(async (li) => {
     const mapping = byVariant.get(String(li.variant_id))!;
     const variant = mapping.productVariant;
     const quantity = Number(li.quantity) || 0;
@@ -285,6 +305,14 @@ function buildItems(
     moonvellaSubtotal += wholesaleUnit * quantity;
     lineDiscountTotal += lineDiscount;
     lineTaxTotal += sumTaxes(li);
+    /*
+     * WHICH CARTON, ANSWERED BY THE ONE FUNCTION THAT ANSWERS IT. The resolver
+     * reads the variant's own rows for a product sold in choices and the
+     * product's for one sold as a single configuration, which is the rule the
+     * editors enforce and the migration guarantees. Reading the variant's rows
+     * here instead — as this did — recorded no carton at all for the second kind.
+     */
+    const resolved = await resolvePackagesForVariant(mapping.productVariantId);
     return {
       name: li.title || variant.name,
       sku: li.sku || variant.sku,
@@ -295,9 +323,9 @@ function buildItems(
       shopifyLineItemId: String(li.id ?? ""),
       variantId: mapping.productVariantId,
       sellerProductId: mapping.sellerProductId,
-      ...snapshotFor(variant, retailUnit),
+      ...snapshotFor(variant, resolved.packages[0] ?? null, retailUnit),
     };
-  });
+  }));
 
   return { rows, moonvellaSubtotal, retailTotal, lineDiscountTotal, lineTaxTotal, priceSource };
 }
@@ -538,15 +566,16 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
         shopifyVariantId: { in: variantIds },
       },
       // Read once, at intake, and copied onto the order line. The relations are
-      // included because the snapshot needs the option pairs, the family code
-      // and the carton — all of which can change later, which is exactly why
-      // the copy exists.
+      // included because the snapshot needs the option pairs and the family
+      // code — both of which can change later, which is exactly why the copy
+      // exists. The carton is NOT included: it is resolved by
+      // `resolvePackagesForVariant`, because for a product whose sellers choose
+      // nothing it lives on the product rather than the variant.
       include: {
         productVariant: {
           include: {
             variantOptions: { orderBy: { sortOrder: "asc" } },
             product: { select: { productCode: true } },
-            packages: { orderBy: { sortOrder: "asc" } },
           },
         },
         sellerProduct: true,
@@ -561,7 +590,7 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
       return await handleUpdated(event.id, shop, existingOrder, payload, byVariant);
     }
 
-    const built = buildItems(items, byVariant);
+    const built = await buildItems(items, byVariant);
     if (built.rows.length === 0) {
       await finishEvent(event.id, "SUCCESS", "No MoonVella items");
       return { ok: true, moonvellaItems: 0 };
@@ -750,7 +779,7 @@ async function handleUpdated(
   byVariant: Map<string, VariantMapping>
 ): Promise<IntakeResult> {
   const frozenUnitPrices = new Map(order.items.map((i) => [i.shopifyLineItemId, i.wholesalePrice]));
-  const built = buildItems(payload.line_items ?? [], byVariant, frozenUnitPrices);
+  const built = await buildItems(payload.line_items ?? [], byVariant, frozenUnitPrices);
   const amounts = computeAmounts(payload, built);
   const charged = CHARGED_PAYMENT_STATUSES.has(order.wholesalePaymentStatus);
 

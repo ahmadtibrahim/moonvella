@@ -33,6 +33,7 @@ import {
   getProductPackages,
   listPresetsForChoice,
   PackageValidationError,
+  productHasSelectableVariants,
   resolvePackagesForVariant,
   saveProductPackages,
   saveVariantPackages,
@@ -114,6 +115,18 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
    */
   const unitsPreference = await getUnitsPreference();
 
+  /*
+   * WHICH OF THE TWO EDITORS THIS PAGE DRAWS.
+   *
+   * One packaging editor per sellable configuration is the owner's rule, and
+   * this single boolean is what both tabs obey: a product the seller chooses
+   * between options keeps its cartons on the variants, and a simple one keeps
+   * its carton on the product. Resolved here rather than inside either tab so
+   * the two cannot disagree about which page owns the cartons — the same call
+   * the quoting resolver and the migration make, from the same function.
+   */
+  const selectable = await productHasSelectableVariants(productId);
+
   return {
     product,
     presets,
@@ -122,6 +135,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     pack,
     unitsPreference,
     units: unitsView(unitsPreference),
+    selectable,
     /**
      * Resolving every variant's origin and packaging costs a query per variant
      * per question, so it is only done when the Shipping tab is open. It goes
@@ -235,7 +249,11 @@ function savedPackagingLabel(saved: string | null): string | null {
     return "Variant packaging saved. The cartons below are what is stored, and what a shipping quote will use.";
   }
   if (saved === "save_product_packages") {
-    return "Product packaging defaults saved. Variants with no packaging of their own inherit these.";
+    // Only reachable for a product sold as one configuration — a product sold
+    // in choices keeps its cartons on the variants, and the save is refused
+    // there (see `assertOneEditor`). Saying "variants inherit these" would
+    // describe a rule that no longer exists.
+    return "Product packaging saved. This product is sold as a single configuration, so these cartons are what a shipping quote uses.";
   }
   if (saved === "clear_origin_overrides") {
     return "Overrides cleared. The variants below now inherit the product's pickup location, which is what the column shows.";
@@ -737,7 +755,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function AdminProductDetail() {
-  const { product, presets, media, readiness, pack, shipping, tab, can, units, savedPackaging } =
+  const { product, presets, media, readiness, pack, shipping, tab, can, units, savedPackaging, selectable } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
@@ -852,6 +870,7 @@ export default function AdminProductDetail() {
           presets={presets}
           canEditCost={can.cost}
           units={units}
+          selectable={selectable}
           refused={
             actionData?.packageVariantId === null || actionData?.packageVariantId === undefined
               ? null
@@ -880,6 +899,7 @@ export default function AdminProductDetail() {
           presets={presets}
           canManage={can.manage}
           units={units}
+          selectable={selectable}
           refused={
             !actionData?.packageVariantId && actionData?.packageValues
               ? { problems: actionData.packageErrors ?? [], values: actionData.packageValues }

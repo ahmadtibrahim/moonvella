@@ -118,6 +118,7 @@ export default function ShippingTab({
   canManage,
   units,
   refused = null,
+  selectable,
 }: {
   product: {
     id: string;
@@ -135,6 +136,15 @@ export default function ShippingTab({
   units: UnitsView;
   /** A refused packaging-defaults save, and which row and column it named. */
   refused?: RefusedPackaging | null;
+  /**
+   * ONE PACKAGING EDITOR PER SELLABLE CONFIGURATION — see
+   * `productHasSelectableVariants` in the service. True when a seller chooses
+   * between this product's variants: the cartons belong to those variants and
+   * are edited on the Variants tab, so the product-level editor is not drawn
+   * here. The pickup-location half of this page is unaffected — a location is
+   * not a measurement, and the product's default still applies to every variant.
+   */
+  selectable: boolean;
 }) {
   const unmapped = variants.filter((variant) => variant.originSource === "missing");
   const inheritingCartons = variants.filter((variant) => variant.packageSource !== "variant");
@@ -352,6 +362,8 @@ export default function ShippingTab({
         canManage={canManage}
         units={units}
         refused={refused}
+        selectable={selectable}
+        productId={product.id}
         // This editor belongs to the family, so a new row is named for the
         // family: there is no one variant it could be named after. Only a row
         // that does not exist yet reads it — see `newCartonText`.
@@ -364,10 +376,9 @@ export default function ShippingTab({
       <div style={card}>
         <h2 style={sectionTitle}>What each variant is quoted from</h2>
         <p style={sectionNote}>
-          This product is sold as one configuration, so a variant with cartons of its own is quoted
-          from those and a variant without is quoted from the product defaults above. Nothing is
-          copied at save time, so changing a default changes the quote for every variant that
-          inherits it — and leaves the ones that do not alone.
+          {selectable
+            ? "Sellers choose between these variants, so each one is quoted from the cartons recorded beside it. Nothing is copied at save time: changing one variant's cartons changes that variant's quote and leaves the others alone."
+            : "This product is sold as one configuration, so a variant with cartons of its own is quoted from those and a variant without is quoted from the product defaults above. Nothing is copied at save time, so changing a default changes the quote for every variant that inherits it — and leaves the ones that do not alone."}
         </p>
         <ul style={{ margin: 0, paddingLeft: "1.1rem", fontSize: "0.78rem", lineHeight: 1.8, color: MUTED }}>
           {variants.map((variant) => (
@@ -377,7 +388,9 @@ export default function ShippingTab({
                 ? `its own packaging (${variant.packageCount} carton${variant.packageCount === 1 ? "" : "s"})`
                 : variant.packageSource === "product"
                   ? `inherits the product defaults (${variant.packageCount} carton${variant.packageCount === 1 ? "" : "s"})`
-                  : "no packaging at all — a quote cannot be produced"}
+                  : selectable
+                    ? "no cartons recorded for it yet — a quote cannot be produced"
+                    : "no packaging at all — a quote cannot be produced"}
             </li>
           ))}
         </ul>
@@ -432,6 +445,8 @@ function PackagingDefaults({
   units,
   refused,
   defaults,
+  selectable,
+  productId,
 }: {
   packages: ProductPackageRow[];
   presets: ShippingPreset[];
@@ -441,6 +456,10 @@ function PackagingDefaults({
   refused: RefusedPackaging | null;
   /** What a brand-new row starts out saying. See `newCartonText`. */
   defaults: { label: string; description: string };
+  /** Whether this product keeps its cartons on its variants instead. */
+  selectable: boolean;
+  /** For the link to the page that does own the cartons. */
+  productId: string;
 }) {
   const [rows, setRows] = useState<(EditorRowFields | null)[]>(() => {
     // A stored row and a refused submission are the same table drawn from two
@@ -489,6 +508,37 @@ function PackagingDefaults({
     setKeys((current) => current.filter((_, i) => i !== index));
     setRows((current) => current.filter((_, i) => i !== index));
   };
+
+  /*
+   * THE EDITOR BELONGS TO THE PRODUCT, SO IT IS ONLY DRAWN FOR A PRODUCT THAT
+   * HAS ONE ANSWER. When sellers choose between this product's variants the
+   * cartons belong to those variants — a queen pillow and a king pillow ship in
+   * different boxes, and one product-level box would have to be one of them or a
+   * wrong average. The editor is not hidden behind a disabled style: it is not
+   * drawn at all, because a disabled table of empty boxes reads as "fill this in
+   * and it will work" and it would not.
+   *
+   * The hooks above still run, in the same order, on every render — the branch
+   * is here rather than around them so that switching tabs or publishing a
+   * product cannot change the number of hooks this component calls.
+   */
+  if (selectable) {
+    return (
+      <div style={card}>
+        <h2 style={sectionTitle}>Packaging</h2>
+        <p style={{ ...sectionNote, marginBottom: 0 }}>
+          Sellers choose between this product&apos;s variants, so each variant ships in its own
+          carton and the cartons are recorded beside the variant that ships in them — a queen and a
+          king pillow do not go in the same box, and one box recorded here would be quoted for
+          both. Open{" "}
+          <Link to={`/admin/products/${productId}?tab=variants`} style={{ color: INK, fontWeight: 600 }}>
+            the Variants tab
+          </Link>{" "}
+          to measure them.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div style={card}>

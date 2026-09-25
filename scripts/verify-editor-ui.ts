@@ -162,6 +162,13 @@ async function main() {
             wholesalePrice: 1000,
             suggestedRetailPrice: 2000,
             isDefault: true,
+            // A choice for the seller to make, which is what puts this
+            // product's cartons on its variants. The variant editor this
+            // section is about is the one a product sold in choices gets;
+            // without the pair the page would (correctly) point at the
+            // Shipping tab instead, and the suite would be measuring its own
+            // fixture rather than the application.
+            variantOptions: { create: [{ name: "Size", value: "One size", sortOrder: 0 }] },
           },
         ],
       },
@@ -345,19 +352,76 @@ async function main() {
       descriptionTag.slice(0, 90)
     );
 
+    /**
+     * ONE PACKAGING EDITOR PER SELLABLE CONFIGURATION, AS THE PAGE DRAWS IT.
+     *
+     * This product's sellers choose a size, so its cartons belong to the
+     * variants and the Shipping tab must not offer a second, product-level
+     * answer to a question already answered above — a fallback nobody is
+     * looking at is the one that would be quoted. The check is on the rendered
+     * control, not on a prop: a card that is merely hidden by CSS would still
+     * be submitted by a browser.
+     */
     const shipping = await get(`/admin/products/${product.id}?tab=shipping`, cookie);
-    const productRowLabel = tagWithAttribute(shipping.html, 'name="pkg_label"');
-    const productRowDescription = tagWithAttribute(shipping.html, 'name="pkg_description"');
     check(
-      "The product-level editor names its row after the family, since it has no variant to name",
-      /value="Verify Editor UI"/.test(productRowLabel),
-      productRowLabel.slice(0, 90)
+      "A product sold in choices draws no product-level carton editor at all",
+      tagWithAttribute(shipping.html, 'name="pkg_label"') === "" &&
+        tagWithAttribute(shipping.html, 'name="pkg_description"') === "",
+      tagWithAttribute(shipping.html, 'name="pkg_label"').slice(0, 60)
     );
     check(
-      "And describes it the same way",
-      productRowDescription.includes(`value="${FAMILY_DESCRIPTION}"`),
-      productRowDescription.slice(0, 90)
+      "And the page says where the cartons are instead, rather than leaving a gap",
+      /Variants tab/.test(shipping.html),
+      "the notice names the tab that owns them"
     );
+
+    /**
+     * THE OTHER HALF OF THE RULE, on a product with nothing for the seller to
+     * choose. It is a second product because the two shapes are mutually
+     * exclusive: one page draws the editor and the other must not, and a single
+     * fixture cannot be both at once.
+     */
+    const simple = await prisma.product.create({
+      data: {
+        name: "Verify Editor UI Simple",
+        productCode: `${CODE}-SIMPLE`,
+        category: "Bedding",
+        currency: "CAD",
+        description: FAMILY_DESCRIPTION,
+        variants: {
+          create: [
+            { name: "One size", sku: `${CODE}-SIMPLE-1`, wholesalePrice: 1000, suggestedRetailPrice: 2000, isDefault: true },
+          ],
+        },
+      },
+      include: { variants: true },
+    });
+    try {
+      const simpleShipping = await get(`/admin/products/${simple.id}?tab=shipping`, cookie);
+      const simpleLabel = tagWithAttribute(simpleShipping.html, 'name="pkg_label"');
+      check(
+        "A product with no choice for the seller keeps its one carton editor on the Shipping tab",
+        simpleLabel.startsWith("<input") && /value="Verify Editor UI Simple"/.test(simpleLabel),
+        simpleLabel.slice(0, 90)
+      );
+      check(
+        "And it is described the same way a new row anywhere is",
+        tagWithAttribute(simpleShipping.html, 'name="pkg_description"').includes(
+          `value="${FAMILY_DESCRIPTION}"`
+        ),
+        tagWithAttribute(simpleShipping.html, 'name="pkg_description"').slice(0, 90)
+      );
+      const simpleVariants = await get(`/admin/products/${simple.id}?tab=variants`, cookie);
+      check(
+        "And the Variants tab draws no per-variant editor for it, but names the tab that has one",
+        tagWithAttribute(simpleVariants.html, 'name="pkg_label"') === "" &&
+          /Shipping tab/.test(simpleVariants.html),
+        tagWithAttribute(simpleVariants.html, 'name="pkg_label"').slice(0, 60)
+      );
+    } finally {
+      await prisma.productVariant.deleteMany({ where: { productId: simple.id } });
+      await prisma.product.deleteMany({ where: { id: simple.id } });
+    }
 
     await post(`/admin/products/${product.id}`, cookie, {
       intent: "save_packaging",

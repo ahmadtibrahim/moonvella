@@ -6,7 +6,10 @@ import {
   buildQuotePackagesForOrder,
   getVariantPackages,
   saveVariantPackages,
+  productHasSelectableVariants,
   resolvePackagesForLines,
+  resolvePackagesForVariant,
+  saveProductPackages,
   parcelRowsToQuotePackages,
   PackageValidationError,
   PresetValidationError,
@@ -296,6 +299,9 @@ async function main() {
   });
   if (!parent) throw new Error("the packaging fixture variant is missing");
   const madeVariants: string[] = [];
+  // Simple products this section builds for the other half of the rule — a
+  // product with no choices for the seller keeps its carton on the product.
+  const madeProducts: string[] = [];
 
   const makeVariant = async (suffix: string) => {
     const row = await prisma.productVariant.create({
@@ -617,10 +623,217 @@ async function main() {
         unreadableQuote.missing.some((reason) => reason.includes("row-metric-mm")),
       unreadableQuote.missing.join("; "),
     );
+    /* -------------------------------------------------------------------- */
+    /* I. One packaging editor per sellable configuration                     */
+    /* -------------------------------------------------------------------- */
+    /**
+     * THE INVARIANTS FIRST, BEFORE THIS SECTION WRITES ANYTHING.
+     *
+     * Migration 20260925010000 leaves every product with rows in exactly one of
+     * the two tables: the variants' for a product sold in choices, the product's
+     * for one sold as a single configuration. Those two statements are the whole
+     * postcondition of that migration, and they are asserted against the
+     * MIGRATED DATABASE rather than against a fixture — so they hold for the
+     * real catalogue, not merely for a shape this suite built.
+     *
+     * They run before the checks below because one of them deliberately writes a
+     * variant row onto a simple product by hand to prove the resolver still reads
+     * it. That row is a leftover of the kind the migration removes, and it would
+     * fail the second invariant while it exists.
+     */
+    const selectableWithProductRows = await prisma.$queryRaw<{ n: bigint }[]>`
+      SELECT COUNT(*)::bigint AS n
+        FROM "ProductPackage" pp
+       WHERE EXISTS (
+         SELECT 1
+           FROM "ProductVariant" v
+           JOIN "VariantOption" o ON o."variantId" = v."id"
+          WHERE v."productId" = pp."productId"
+            AND v."isActive" = true
+            AND BTRIM(o."name") <> ''
+            AND BTRIM(o."value") <> ''
+       )`;
+    check(
+      "no product sold in choices keeps a product-level carton (the fallback the migration removed)",
+      Number(selectableWithProductRows[0]?.n ?? -1) === 0,
+      `${selectableWithProductRows[0]?.n} row(s)`,
+    );
+
+    const simpleWithVariantRows = await prisma.$queryRaw<{ n: bigint }[]>`
+      SELECT COUNT(*)::bigint AS n
+        FROM "VariantPackage" vp
+        JOIN "ProductVariant" v ON v."id" = vp."variantId"
+       WHERE NOT EXISTS (
+         SELECT 1
+           FROM "ProductVariant" v2
+           JOIN "VariantOption" o ON o."variantId" = v2."id"
+          WHERE v2."productId" = v."productId"
+            AND v2."isActive" = true
+            AND BTRIM(o."name") <> ''
+            AND BTRIM(o."value") <> ''
+       )`;
+    check(
+      "and no simple product keeps a variant-level carton that would shadow the one its page edits",
+      Number(simpleWithVariantRows[0]?.n ?? -1) === 0,
+      `${simpleWithVariantRows[0]?.n} row(s)`,
+    );
+
+    check(
+      "the fixture product counts as sold in choices, which is what the checks below depend on",
+      (await productHasSelectableVariants(parent.productId)) === true,
+    );
+
+    /* ---- a selectable product: the product editor is closed ---- */
+    // A variant of its OWN, because `B` has carried cartons since section G —
+    // and a variant with cartons is not the case this check is about. What has
+    // to be answered is the variant that has none.
+    const bare2 = await makeVariant("NO-ROWS");
+    await prisma.productPackage.create({
+      data: { productId: parent.productId, label: "Shadow family box", length: 50, width: 40, height: 30, grossWeight: 5 },
+    });
+    const shadowed = await resolvePackagesForVariant(bare2);
+    check(
+      "a variant with no cartons of its own reads none, even with a product-level carton sitting there",
+      shadowed.source === "none" && shadowed.packages.length === 0 && shadowed.productDefault !== null,
+      `source=${shadowed.source}, productDefault=${shadowed.productDefault === null ? "null" : "present"}`,
+    );
+
+    let refusedProductSave: PackageValidationError | null = null;
+    try {
+      await saveProductPackages(parent.productId, [
+        {
+          label: "Should not land",
+          length: "10",
+          width: "10",
+          height: "10",
+          dimensionUnit: "cm",
+          grossWeight: "1",
+          weightUnit: "kg",
+        },
+      ]);
+    } catch (error) {
+      if (error instanceof PackageValidationError) refusedProductSave = error;
+      else throw error;
+    }
+    const productRowsAfterRefusal = await prisma.productPackage.findMany({
+      where: { productId: parent.productId },
+    });
+    check(
+      "and a product-level save is refused, leaving the rows exactly as they were",
+      refusedProductSave !== null &&
+        productRowsAfterRefusal.length === 1 &&
+        productRowsAfterRefusal[0].label === "Shadow family box" &&
+        refusedProductSave.details.some((detail) => detail.message.includes("Variants tab")),
+      `refused=${refusedProductSave !== null}, ${productRowsAfterRefusal.length} row(s) left`,
+    );
+    await prisma.productPackage.deleteMany({ where: { productId: parent.productId } });
+
+    /* ---- a simple product: the variant editor is closed ---- */
+    const simple = await prisma.product.create({
+      data: {
+        name: `Verify Packaging Simple ${stamp}`,
+        productCode: `VERIFY-PKG-SIMPLE-${stamp}`,
+        category: "Verification",
+      },
+    });
+    madeProducts.push(simple.id);
+    const simpleVariant = await prisma.productVariant.create({
+      data: {
+        productId: simple.id,
+        sku: `VERIFY-PKG-SIMPLE-${stamp}-V`,
+        name: "Only",
+        wholesalePrice: 1299,
+        suggestedRetailPrice: 4900,
+        inventory: 10,
+        isDefault: true,
+      },
+    });
+    await saveProductPackages(simple.id, [
+      {
+        label: "The one carton",
+        length: "40",
+        width: "30",
+        height: "20",
+        dimensionUnit: "cm",
+        grossWeight: "2.5",
+        weightUnit: "kg",
+      },
+    ]);
+    const simpleResolved = await resolvePackagesForVariant(simpleVariant.id);
+    check(
+      "a product with no choice for the seller to make is quoted from its own carton, and the source says so",
+      simpleResolved.source === "product" &&
+        simpleResolved.packages.length === 1 &&
+        simpleResolved.packages[0].length === 40,
+      `source=${simpleResolved.source}`,
+    );
+
+    let refusedVariantSave: PackageValidationError | null = null;
+    try {
+      await saveVariantPackages(simpleVariant.id, [
+        {
+          label: "Should not land",
+          length: "10",
+          width: "10",
+          height: "10",
+          dimensionUnit: "cm",
+          grossWeight: "1",
+          weightUnit: "kg",
+        },
+      ]);
+    } catch (error) {
+      if (error instanceof PackageValidationError) refusedVariantSave = error;
+      else throw error;
+    }
+    check(
+      "a variant-level save is refused for it, and the message names the page that owns the carton",
+      refusedVariantSave !== null &&
+        (await prisma.variantPackage.count({ where: { variantId: simpleVariant.id } })) === 0 &&
+        refusedVariantSave.details.some((detail) => detail.message.includes("Shipping tab")),
+      `refused=${refusedVariantSave !== null}`,
+    );
+
+    /*
+     * A LEFTOVER VARIANT ROW IS STILL READ — and that is deliberate, not a hole.
+     *
+     * The migration moves the shapes it can collapse and refuses the ones it
+     * cannot, so a row can only be here because the product was left alone on
+     * purpose. If the resolver stopped reading it, a quote would silently change
+     * for that product. Written by hand because the write path refuses it, which
+     * is the other half of the same rule.
+     */
+    await prisma.variantPackage.create({
+      data: {
+        variantId: simpleVariant.id,
+        label: "Surviving variant row",
+        length: 12,
+        width: 12,
+        height: 12,
+        dimensionUnit: "cm",
+        grossWeight: 1,
+        weightUnit: "kg",
+      },
+    });
+    const survivor = await resolvePackagesForVariant(simpleVariant.id);
+    check(
+      "a variant row that survived the migration still decides the quote, so nothing that ships today is requoted",
+      survivor.source === "variant" &&
+        survivor.packages.length === 1 &&
+        survivor.packages[0].length === 12 &&
+        survivor.productDefault?.length === 1,
+      `source=${survivor.source}, ${survivor.packages[0]?.length}cm`,
+    );
+    await prisma.variantPackage.deleteMany({ where: { variantId: simpleVariant.id } });
   } finally {
     for (const id of madeVariants) {
       await prisma.variantPackage.deleteMany({ where: { variantId: id } });
       await prisma.productVariant.deleteMany({ where: { id } });
+    }
+    for (const id of madeProducts) {
+      await prisma.productPackage.deleteMany({ where: { productId: id } });
+      await prisma.variantPackage.deleteMany({ where: { variant: { productId: id } } });
+      await prisma.productVariant.deleteMany({ where: { productId: id } });
+      await prisma.product.deleteMany({ where: { id } });
     }
   }
 

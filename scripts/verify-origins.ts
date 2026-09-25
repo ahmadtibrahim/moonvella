@@ -242,7 +242,17 @@ async function createLocation(overrides: Partial<Prisma.PickupLocationUncheckedC
   return location;
 }
 
-async function createProductWithVariants(names: string[]) {
+/**
+ * A product and its variants, with or without a choice for the seller to make.
+ *
+ * `selectable` is the difference between the two packaging shapes, and the
+ * option row it writes is the whole of that difference: an ACTIVE variant
+ * carrying a non-blank option pair is what `productHasSelectableVariants`
+ * reads, and what decides whether the cartons belong to the variants or to the
+ * product. Defaults to false because most of this suite's fixtures are about
+ * origins, where nothing packaging-shaped is being asserted.
+ */
+async function createProductWithVariants(names: string[], selectable = false) {
   const product = await prisma.product.create({
     data: {
       name: `Verify Origin ${suffix}`,
@@ -264,6 +274,9 @@ async function createProductWithVariants(names: string[]) {
         inventory: 10,
         isDefault: index === 0,
         sortOrder: index,
+        variantOptions: selectable
+          ? { create: [{ name: "Size", value: name, sortOrder: 0 }] }
+          : undefined,
       },
     });
     created.variantIds.push(variant.id);
@@ -571,7 +584,18 @@ async function packagingChecks() {
     JSON.stringify(validatePackageRow({ length: 10, width: -1, height: "", grossWeight: -2 }, 0))
   );
 
-  const { product, variants } = await createProductWithVariants(["Inherits", "Overrides"]);
+  /*
+   * WHICH PRODUCT THESE RUN ON IS NOW PART OF THE CHECK.
+   *
+   * One packaging editor per sellable configuration (see
+   * `productHasSelectableVariants`) means the two shapes answer differently, so
+   * pinning only one of them would pin half the rule. The pair below carries
+   * options, so its cartons live on the variants; the pair at the end carries
+   * none, so its cartons live on the product and a variant-level write is
+   * refused. Before this change both were the same product shape and the
+   * resolver's fallback was the whole story.
+   */
+  const { product, variants } = await createProductWithVariants(["Inherits", "Overrides"], true);
 
   const noneYet = await resolvePackagesForVariant(variants[0].id);
   check(
@@ -580,9 +604,52 @@ async function packagingChecks() {
     `source=${noneYet.source}`
   );
 
-  await saveProductPackages(product.id, [
+  /*
+   * A PRODUCT SOLD IN CHOICES IS NOT SAVED FROM THE PRODUCT ANY MORE.
+   *
+   * This used to write a product default and assert that a variant without rows
+   * inherited it. That fallback is exactly what the one-editor rule removes: for
+   * a product whose sellers pick between variants, a product-level row is a
+   * second answer that only some variants read, and it is invisible on the page
+   * that edits the cartons. So the write is refused, and the refusal is what is
+   * asserted — the message has to name where the cartons actually go, because
+   * "not permitted" on its own leaves the operator nowhere to go.
+   */
+  let productWriteRefused: PackageValidationError | null = null;
+  try {
+    await saveProductPackages(product.id, [
+      {
+        label: "Product default carton",
+        length: "24",
+        width: "16",
+        height: "6",
+        dimensionUnit: "in",
+        grossWeight: "2",
+        weightUnit: "lb",
+        unitsPerPackage: "1",
+        packagesPerUnit: "1",
+        shipsSeparately: "false",
+        consolidatable: "true",
+        declaredValue: "150.00",
+      },
+    ]);
+  } catch (error) {
+    if (error instanceof PackageValidationError) productWriteRefused = error;
+    else throw error;
+  }
+  const afterRefusedProductWrite = await resolvePackagesForVariant(variants[0].id);
+  check(
+    "20 a product-level carton is refused for a product sold in choices, nothing is written, and the message names the Variants tab",
+    productWriteRefused !== null &&
+      afterRefusedProductWrite.source === "none" &&
+      afterRefusedProductWrite.productDefault === null &&
+      productWriteRefused.details.some((problem) => problem.message.includes("Variants tab")),
+    `refused=${productWriteRefused !== null}, source=${afterRefusedProductWrite.source}`
+  );
+
+  await saveVariantPackages(variants[0].id, [
     {
-      label: "Product default carton",
+      label: "Inherits carton",
       length: "24",
       width: "16",
       height: "6",
@@ -596,24 +663,20 @@ async function packagingChecks() {
       declaredValue: "150.00",
     },
   ]);
-
-  const inherited = await resolvePackagesForVariant(variants[0].id);
+  const chosen = await resolvePackagesForVariant(variants[0].id);
   check(
-    "20 a variant with no rows of its own inherits the product's packaging, and the source says so",
-    inherited.source === "product" &&
-      inherited.packages.length === 1 &&
-      inherited.packages[0].length === 24 &&
-      inherited.packages[0].dimensionUnit === "in",
-    `source=${inherited.source}`
-  );
-  check(
-    "21 the product default is returned alongside, so the interface can show what would be inherited",
-    inherited.productDefault !== null && inherited.productDefault?.length === 1
+    "21 a variant of a product sold in choices reads its own cartons, and there is no product default behind them",
+    chosen.source === "variant" &&
+      chosen.packages.length === 1 &&
+      chosen.packages[0].length === 24 &&
+      chosen.packages[0].dimensionUnit === "in" &&
+      chosen.productDefault === null,
+    `source=${chosen.source}, productDefault=${chosen.productDefault === null ? "null" : "present"}`
   );
   check(
     "22 a declared value is stored in minor units, not as a float",
-    inherited.packages[0].declaredValue === 15000,
-    String(inherited.packages[0].declaredValue)
+    chosen.packages[0].declaredValue === 15000,
+    String(chosen.packages[0].declaredValue)
   );
 
   await saveVariantPackages(variants[1].id, [
@@ -633,11 +696,11 @@ async function packagingChecks() {
   ]);
   const overridden = await resolvePackagesForVariant(variants[1].id);
   check(
-    "23 a variant with its own rows is not inherited over, and the product default is still shown for comparison",
+    "23 each variant reads its own cartons and nobody else's — the two do not see one another",
     overridden.source === "variant" &&
       overridden.packages[0].length === 12 &&
-      overridden.productDefault?.[0].length === 24,
-    `source=${overridden.source}`
+      chosen.packages[0].length === 24,
+    `source=${overridden.source}, ${overridden.packages[0].length} vs ${chosen.packages[0].length}`
   );
   check(
     "24 ships-separately and consolidatable are carried through as booleans",
@@ -666,8 +729,12 @@ async function packagingChecks() {
   const afterRefusal = await resolvePackagesForVariant(variants[0].id);
   check(
     "25 an incomplete row is refused as a set, and nothing is written — not even the good row beside it",
-    threw && problems.length === 1 && afterRefusal.source === "product",
-    `threw=${threw} problems=${JSON.stringify(problems)} sourceAfter=${afterRefusal.source}`
+    threw &&
+      problems.length === 1 &&
+      afterRefusal.source === "variant" &&
+      afterRefusal.packages.length === 1 &&
+      afterRefusal.packages[0].length === 24,
+    `threw=${threw} problems=${JSON.stringify(problems)} sourceAfter=${afterRefusal.source} rows=${afterRefusal.packages.length}`
   );
 
   const quote = await buildQuotePackagesForOrder({
@@ -675,8 +742,8 @@ async function packagingChecks() {
     packages: [],
   });
   check(
-    "26 a quote built from inherited packaging converts once, rounds once, and reports the inherited source",
-    quote.source === "product" &&
+    "26 a quote built from a variant's carton converts once, rounds once, and reports where it came from",
+    quote.source === "variant" &&
       quote.packages.length === 1 &&
       quote.packages[0].length === 60.96 &&
       quote.packages[0].weight === 0.907 &&
@@ -695,6 +762,68 @@ async function packagingChecks() {
     "27 two packages stay two packages: dimensions are never added together",
     twoPackages.packages.length === 2 && twoPackages.missing.length === 0,
     JSON.stringify(twoPackages.packages.map((entry) => entry.length))
+  );
+
+  /*
+   * THE OTHER HALF OF THE RULE. A product whose variants carry no options is
+   * sold as one thing however many rows sit underneath it, so its carton lives
+   * on the product and the variants read it. The mirror of check 20 is that a
+   * variant-level write is refused here, for the same reason and with the same
+   * kind of message — otherwise the two editors exist again, one of them on a
+   * page that no longer draws it.
+   */
+  const simple = await createProductWithVariants(["Only"], false);
+
+  await saveProductPackages(simple.product.id, [
+    {
+      label: "The one carton",
+      length: "40",
+      width: "30",
+      height: "20",
+      dimensionUnit: "cm",
+      grossWeight: "2.5",
+      weightUnit: "kg",
+      unitsPerPackage: "1",
+      packagesPerUnit: "1",
+      shipsSeparately: "false",
+      consolidatable: "true",
+    },
+  ]);
+  const simpleResolved = await resolvePackagesForVariant(simple.variants[0].id);
+  check(
+    "27a a product with no selectable configuration keeps its carton on the product, and its variant reads it",
+    simpleResolved.source === "product" &&
+      simpleResolved.packages.length === 1 &&
+      simpleResolved.packages[0].length === 40 &&
+      simpleResolved.productDefault?.length === 1,
+    `source=${simpleResolved.source} rows=${simpleResolved.packages.length}`
+  );
+
+  let simpleRefused: PackageValidationError | null = null;
+  try {
+    await saveVariantPackages(simple.variants[0].id, [
+      {
+        label: "Variant carton",
+        length: "10",
+        width: "10",
+        height: "10",
+        dimensionUnit: "cm",
+        grossWeight: "1",
+        weightUnit: "kg",
+      },
+    ]);
+  } catch (error) {
+    if (error instanceof PackageValidationError) simpleRefused = error;
+    else throw error;
+  }
+  const stillProduct = await resolvePackagesForVariant(simple.variants[0].id);
+  check(
+    "27b a variant-level carton is refused for a product with no selectable configuration, and the message names the Shipping tab",
+    simpleRefused !== null &&
+      stillProduct.source === "product" &&
+      stillProduct.packages[0].length === 40 &&
+      simpleRefused.details.some((problem) => problem.message.includes("Shipping tab")),
+    `refused=${simpleRefused !== null}, source=${stillProduct.source}`
   );
 }
 

@@ -13,7 +13,7 @@ import { PrismaClient } from "@prisma/client";
 import { approveApplication } from "../app/services/application.server";
 import { createProduct, addVariant, updateVariant } from "../app/services/products.server";
 import { permissionsFor } from "../app/services/permissions";
-import { saveVariantPackages, validateVariantPackaging } from "../app/services/packaging.server";
+import { saveProductPackages, validateVariantPackaging } from "../app/services/packaging.server";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import {
   getFulfillmentRequest,
@@ -262,7 +262,7 @@ async function main() {
     },
     actor
   );
-  await saveVariantPackages(variant.id, [
+  await saveProductPackages(product.id, [
     {
       label: "Carton",
       packageType: "carton",
@@ -406,7 +406,7 @@ async function main() {
     },
     actor
   );
-  await saveVariantPackages(variant.id, [
+  await saveProductPackages(product.id, [
     {
       label: "Bigger carton",
       packageType: "carton",
@@ -458,7 +458,7 @@ async function main() {
     },
     actor
   );
-  await saveVariantPackages(variant.id, [
+  await saveProductPackages(product.id, [
     {
       label: "Carton",
       packageType: "carton",

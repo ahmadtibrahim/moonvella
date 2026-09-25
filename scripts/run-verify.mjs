@@ -182,6 +182,12 @@ async function seedPackagingFixture() {
       category: "Verification",
     },
   });
+  // A variant with an option pair, so the product counts as sold in selectable
+  // configurations and its cartons belong on the variant — which is the shape
+  // every check in verify-packaging is about. One packaging editor per sellable
+  // configuration: a product with no options keeps its carton on the PRODUCT,
+  // and the suite's variant-level writes would be refused (correctly, and the
+  // fixture would be the thing at fault rather than the application).
   const variant = await prisma.productVariant.create({
     data: {
       productId: product.id,
@@ -191,6 +197,7 @@ async function seedPackagingFixture() {
       suggestedRetailPrice: 4900,
       inventory: 10,
       isDefault: true,
+      variantOptions: { create: [{ name: "Size", value: "Standard", sortOrder: 0 }] },
     },
   });
   await prisma.variantPackage.create({
