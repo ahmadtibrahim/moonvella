@@ -613,6 +613,42 @@ export function productCodeFor(template: { id: number; default_code: string | fa
 }
 
 /**
+ * The columns a re-import may write over a product that is already here.
+ *
+ * WHAT ODOO OWNS, AND WHAT IT DOES NOT.
+ *
+ * Name, category and currency are Odoo's: they are the catalogue's own identity
+ * for the template, and MoonVella has nowhere better to keep them. Description is
+ * NOT one of those, whatever it looks like — the Details tab edits it here, and
+ * the sync runs every six hours over every mapped product. Writing Odoo's copy
+ * over it unconditionally means a description typed in MoonVella is gone by the
+ * next sync, with no error and nothing on screen to say why: the owner types it
+ * again, saves again, sees it saved, and it disappears again the same way. So a
+ * description already written here is KEPT. Odoo's text is written only where
+ * there is none of ours to lose — the first import, and any product whose
+ * description is still blank here.
+ *
+ * PUBLICATION IS NOT IN THIS OBJECT EITHER. `status` and `isPublished` are the
+ * publication gate, and only an operator moves them. An update that carried
+ * `status: "DRAFT", isPublished: false` would unpublish a published product every
+ * six hours — silently, since the sync is not something anybody is watching. The
+ * gate is opened when a product is created (a draft, unpublished — see the create
+ * path below) and by the restore path when the sync itself was what archived it;
+ * never by a routine re-import.
+ */
+export function updateFieldsFor(
+  template: Pick<PreviewTemplate, "odooName" | "description" | "odooCategory" | "currency">,
+  held: { description: string | null }
+) {
+  return {
+    name: template.odooName,
+    description: held.description?.trim() ? held.description : template.description,
+    category: template.odooCategory,
+    currency: template.currency,
+  };
+}
+
+/**
  * Read everything the import would use, and say what it cannot do.
  *
  * Read-only, and safe to run at any time: it resolves references, reads the
@@ -1223,25 +1259,34 @@ export async function importOdooProducts(options: {
           shopDomain: database,
           externalProductId: String(template.odooTemplateId),
         },
-        select: { productId: true, importStatus: true },
+        select: {
+          productId: true,
+          importStatus: true,
+          // Read for `updateFieldsFor`: what is already written here is what the
+          // update must not overwrite.
+          product: { select: { description: true } },
+        },
       });
 
       /*
-       * Only Odoo-owned columns are written on an update. Media, documents,
-       * features, materials, care instructions and shipping detail are not in
-       * this object, so a re-import cannot blank work that was done here after
-       * the first import — which is exactly what "preserve MoonVella-added
-       * media and documents" requires, and it is achieved by omission rather
-       * than by a merge.
+       * THE CREATE PATH, and only the create path. A product arriving for the
+       * first time is a draft, and not published: the publication gate is the
+       * only thing that moves a product in front of a seller, and an import must
+       * not be able to do it by accident. Odoo's description is taken as it
+       * stands, because there is nothing written here yet to lose.
+       *
+       * A product that is ALREADY here goes through `updateFieldsFor` instead —
+       * see the rule above it for which columns survive a re-import and which do
+       * not. Nothing outside these objects is written either way: media,
+       * documents, features, materials, care instructions and shipping detail
+       * are not named here at all, so "preserve MoonVella-added media and
+       * documents" holds by omission rather than by a merge.
        */
       const productFields = {
         name: template.odooName,
         description: template.description,
         category: template.odooCategory,
         currency: template.currency,
-        // A draft, and not published. The publication gate is the only thing
-        // that moves a product in front of a seller, and an import must not be
-        // able to do it by accident.
         status: "DRAFT" as const,
         isPublished: false,
       };
@@ -1260,12 +1305,25 @@ export async function importOdooProducts(options: {
        * decision somebody made here on purpose, and would do it every six hours.
        */
       const restoring = existing?.importStatus === "WITHDRAWN";
+      const held = { description: existing?.product.description ?? null };
       const product = existing
         ? await tx.product.update({
             where: { id: existing.productId },
             data: restoring
-              ? { ...productFields, isArchived: false, isActive: true }
-              : productFields,
+              ? {
+                  ...updateFieldsFor(template, held),
+                  /*
+                   * Coming back from the sync's own archive is the one case where
+                   * the sync may also reopen the gate — with the same four columns
+                   * `setArchived(false)` writes, and only for a product whose
+                   * mapping says the sync was what closed it.
+                   */
+                  status: "DRAFT" as const,
+                  isPublished: false,
+                  isArchived: false,
+                  isActive: true,
+                }
+              : updateFieldsFor(template, held),
           })
         : await tx.product.create({
             data: { ...productFields, productCode: template.productCode },

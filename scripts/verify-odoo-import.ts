@@ -15,7 +15,8 @@
  * mapped product tag and not a guess, that prices come from each variant's
  * effective sales price and from nowhere else, that quantities are read at sync
  * time and never invented, that the sync writes drafts, that a re-sync cannot
- * blank MoonVella-added media, and that nothing in this module writes to Odoo.
+ * blank MoonVella-added media or a description typed on the Details tab, and that
+ * nothing in this module writes to Odoo.
  *
  * The price rules themselves are not checked by reading code — they are checked
  * by running them, exhaustively, in `verify-pricing.ts`. What is left for this
@@ -44,6 +45,7 @@ import {
   previewOdooImport,
   productCodeFor,
   summariseQuants,
+  updateFieldsFor,
 } from "~/services/odooImport.server";
 import { MOONVELLA_PRODUCT_TAG_NAME, odooConfigured } from "~/services/odoo.server";
 import { PermanentJobError } from "~/services/jobs.server";
@@ -640,27 +642,53 @@ async function main() {
   const productFields = objectLiteral(source, "productFields");
   check(
     28,
-    "The fields an import writes are Odoo's own, and the list can be read in one place",
+    "The fields a first import writes are Odoo's own, and the list can be read in one place",
     productFields.length > 0 && /name: template\.odooName/.test(productFields),
     `${productFields.split("\n").length} lines`,
   );
   check(
     29,
-    "It writes none of MoonVella's own content, so a re-import cannot blank media, documents or features",
+    "It writes none of MoonVella's own content: no media, documents or features are in a create either",
     !/media|document|image|feature|material|care|shipping/i.test(productFields),
-    "no MoonVella-owned field in the update",
+    "no MoonVella-owned field in the create",
   );
+  /*
+   * THE UPDATE IS THE RULE, AND THE RULE IS WHAT GETS RUN BELOW.
+   *
+   * `productFields` above is the create path now, and reading it is no longer
+   * enough to say what a re-import writes: the update goes through
+   * `updateFieldsFor`, and the two are deliberately different objects. The
+   * directive is that a re-import must not blank work done here, and the field
+   * the owner watches is the description — typed on the Details tab, saved,
+   * visible after a refresh, and gone by the next sync, because the old update
+   * wrote Odoo's copy of it unconditionally. The same write also carried
+   * `status: "DRAFT"` and `isPublished: false`, so a published product was
+   * silently unpublished every six hours.
+   *
+   * The check below holds the halves apart by reading the branch: the ordinary
+   * update is *exactly* the rule's return value, and only the withdrawal's undo
+   * names publication or archive columns. The rule is then called, with the
+   * owner's own case as the fixture, because a regex can only say what the code
+   * looks like.
+   */
   check(
     30,
-    "The update passes that same list, plus the archive columns only when this sync is the one that hid the product",
-    /data: restoring\s*\?\s*\{\s*\.\.\.productFields,\s*isArchived: false,\s*isActive: true\s*\}\s*:\s*productFields,/.test(
-      source,
-    ) &&
-      /const restoring = existing\?\.importStatus === "WITHDRAWN"/.test(source) &&
-      // The ordinary update writes Odoo's fields and nothing about archiving, so
-      // an operator's own archived product is not silently restored.
-      !/isArchived|isActive/.test(productFields),
-    "product.update data = productFields, or productFields + the withdrawal's own undo",
+    "The update writes Odoo's own columns through one rule, and adds the archive columns only when this sync is the one that hid the product",
+    /const restoring = existing\?\.importStatus === "WITHDRAWN"/.test(source) &&
+      // The ordinary branch's data IS updateFieldsFor(template, held). Nothing can
+      // be added to it without breaking this line, which is the point: the
+      // publication columns it used to carry cannot come back by accident.
+      /:\s*updateFieldsFor\(template, held\),\s*\}\)/.test(source) &&
+      // The undone withdrawal, and only that, reopens the gate — the same four
+      // columns setArchived(false) writes.
+      /\? \{[\s\S]{0,900}?status: "DRAFT" as const,[\s\S]{0,300}?isPublished: false,[\s\S]{0,300}?isArchived: false,[\s\S]{0,300}?isActive: true,/.test(
+        source,
+      ) &&
+      /const held = \{ description: existing\?\.product\.description \?\? null \}/.test(source) &&
+      // The old shape, kept out by name: an update that spreads productFields is
+      // an update that rewrites the description and the publication state.
+      !/data: restoring\s*\?\s*\{\s*\.\.\.productFields/.test(source),
+    "product.update data = updateFieldsFor(template, held), or that plus the withdrawal's own undo",
   );
   check(
     30.1,
@@ -668,7 +696,36 @@ async function main() {
     /importStatus: "WITHDRAWN"/.test(readFileSync(WITHDRAWAL_PATH, "utf8")),
     "odooSync.server.ts marks a withdrawal it made",
   );
-
+  const odooWording = {
+    odooName: "TEST PILLOW",
+    description: "Wording written in Odoo",
+    odooCategory: "Home",
+    currency: "CAD",
+  };
+  const typedHere = updateFieldsFor(odooWording, { description: "Typed here, on the Details tab" });
+  const blankHere = updateFieldsFor(odooWording, { description: null });
+  const whitespaceHere = updateFieldsFor({ ...odooWording, description: null }, { description: "   " });
+  check(
+    30.2,
+    "A description typed in MoonVella survives a re-import that carries Odoo's own text; Odoo's is taken only where there is nothing of ours to lose",
+    typedHere.description === "Typed here, on the Details tab" &&
+      blankHere.description === "Wording written in Odoo" &&
+      whitespaceHere.description === null &&
+      typedHere.name === "TEST PILLOW" &&
+      typedHere.category === "Home" &&
+      typedHere.currency === "CAD",
+    `kept=[${typedHere.description}] blank=[${blankHere.description}] whitespace=[${whitespaceHere.description}]`,
+  );
+  check(
+    30.3,
+    "And no update carries publication or archive state, so no sync can publish, unpublish or restore a product by itself",
+    Object.keys(typedHere).join(",") === "name,description,category,currency" &&
+      !("status" in typedHere) &&
+      !("isPublished" in typedHere) &&
+      !("isArchived" in typedHere) &&
+      !("isActive" in typedHere),
+    `an update writes: ${Object.keys(typedHere).join(", ")}`,
+  );
   /* -------------------------------------------------------------------- */
   /* This module never writes to Odoo                                      */
   /* -------------------------------------------------------------------- */
