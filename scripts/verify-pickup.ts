@@ -54,6 +54,8 @@ import {
   type LocationSchedule,
 } from "~/services/holidays";
 import { instantOfLocalTime } from "~/services/shippingLogic";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 let failures = 0;
 let total = 0;
@@ -61,6 +63,23 @@ function check(name: string, pass: boolean, detail = "") {
   total++;
   if (!pass) failures++;
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+}
+
+/** A route's source, for the section that asserts on the forms themselves. */
+function readSource(relative: string): string {
+  return readFileSync(join(process.cwd(), relative), "utf8");
+}
+
+/**
+ * Source with comments removed.
+ *
+ * The assertions in section G are about what the forms do. These files carry
+ * long explanations — the house style here — and an explanation that happens to
+ * quote the markup being searched for would make a check pass with the control
+ * absent.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
 function same(actual: unknown, expected: unknown): boolean {
@@ -478,6 +497,60 @@ function main() {
     "An empty working-days string parses to no days rather than to a default week",
     parseWorkingDays("").length === 0 && parseWorkingDays(null).length === 0,
     "'' and null both parse to []",
+  );
+
+  /* ------------------------------------------------------------------------ */
+  console.log("\nG. The two forms these hours are entered on");
+
+  /*
+   * READ FROM THE ROUTE SOURCES, NOT DRIVEN. The dock's own form is driven over
+   * HTTP by `verify-editor-ui`, which signs in and reads the markup a browser
+   * receives — that is the strong check and it lives there. What is asserted
+   * here is the pair of claims a browser test cannot make: that BOTH forms use
+   * the same clock control, and that neither of them fills in hours nobody
+   * recorded. A route that grew a plausible default again would still pass a
+   * test that typed into it.
+   */
+  const originsSource = stripComments(readSource("app/routes/admin.origins.tsx"));
+  const shipmentSource = stripComments(readSource("app/routes/admin.shipping_.$shipmentId.tsx"));
+
+  check(
+    "The dock's hours are the browser's own time control, on the same field helper as every other clock",
+    /const field = \(\s*name: keyof OriginLocation,[\s\S]{0,200}type: "text" \| "time" = "text"/.test(
+      originsSource,
+    ) &&
+      /"pickupOpenTime",\s*"Opens at",[\s\S]{0,200}"time"/.test(originsSource) &&
+      /"pickupCloseTime",\s*"Closes at",[\s\S]{0,200}"time"/.test(originsSource) &&
+      /name="sameDayDeadline"\s*\n?\s*type="time"/.test(originsSource),
+    "type=time through one helper",
+  );
+  check(
+    "And the pair is read as a window on the way in, so a contradiction cannot be saved",
+    /readPickupWindow\(text\("pickupOpenTime"\), text\("pickupCloseTime"\)\)/.test(originsSource) &&
+      /pickupOpenTime: window\.open/.test(originsSource),
+    "readPickupWindow",
+  );
+  check(
+    "The shipment's collection window is two time controls, and no longer a sentence with a made-up example",
+    /name="pickupWindowOpen"/.test(shipmentSource) &&
+      /name="pickupWindowClose"/.test(shipmentSource) &&
+      (shipmentSource.match(/type="time"/g) ?? []).length >= 2 &&
+      !/placeholder=\{[^}]*09:00-17:00/.test(shipmentSource),
+    `${(shipmentSource.match(/type="time"/g) ?? []).length} time controls`,
+  );
+  check(
+    "A shipment's window starts from the dock's own recorded hours, and from nothing when it has none",
+    /pickupPlan\.suggestedWindow \?\? ""/.test(shipmentSource) &&
+      /defaultValue=\{standingWindow\.open\}/.test(shipmentSource) &&
+      /readCarrierWindow\(\s*form\.get\("pickupWindowOpen"\),\s*form\.get\("pickupWindowClose"\)\s*\)/.test(
+        shipmentSource,
+      ),
+    "prefilled from the dock, blank otherwise",
+  );
+  check(
+    "The dock's window is never defaulted in the form either — the boxes are empty until somebody fills them",
+    !/defaultValue=\{[^}]*"0[89]:\d\d"/.test(originsSource),
+    "no invented hours in the origin form",
   );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);

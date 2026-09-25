@@ -175,7 +175,7 @@ export function missingOriginFields(location: OriginLocation): string[] {
 }
 
 /** "HH:MM" strings compare correctly as strings once zero-padded. */
-function windowIsOrdered(open: string, close: string): boolean {
+export function windowIsOrdered(open: string, close: string): boolean {
   return normalizeClock(open) < normalizeClock(close);
 }
 
@@ -183,4 +183,99 @@ export function normalizeClock(value: string): string {
   const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
   if (!match) return value.trim();
   return `${match[1].padStart(2, "0")}:${match[2]}`;
+}
+
+/**
+ * The shape every clock on these forms has to arrive in.
+ *
+ * 24-hour, zero-padded, and nothing else. The pickers produce this and a hand
+ * made request does not have to: a value like "10am" reaching the proposal would
+ * fail its own regex there and be read as no cutoff at all, which is a deadline
+ * that silently disappears.
+ */
+export const CLOCK_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/**
+ * A refusal an operator can act on, as opposed to a stack trace.
+ *
+ * Its own class so a caller can tell "the window you typed is not usable" apart
+ * from a database error, and print the first while reporting the second.
+ */
+export class PickupWindowError extends Error {}
+
+function readClockPart(value: unknown, label: string): string | null {
+  const text = String(value ?? "").trim();
+  if (text === "") return null;
+  if (!CLOCK_PATTERN.test(text)) {
+    throw new PickupWindowError(`${label} must be a time of day like 08:30 (24-hour), or left blank.`);
+  }
+  return text;
+}
+
+/**
+ * The dock's standing hours, as the form posts them.
+ *
+ * BOTH ENDS ARE READ TOGETHER BECAUSE THE RULE IS ABOUT THE PAIR. A window that
+ * closes before it opens is not a window, and the failure it causes is invisible
+ * at the form and expensive later: the proposal would offer a day and the carrier
+ * would arrive to a locked gate. The booking gate already refuses such a dock
+ * (`missingOriginFields` reports "closing time is not after opening time"), which
+ * is exactly why the form must not store one — an operator who can save it has
+ * been told the value is fine.
+ *
+ * A HALF WINDOW IS ALLOWED HERE and refused by the gate. A dock being written
+ * down for the first time has one of the two times before it has the other, and
+ * refusing to save that would lose the rest of the form with it; the incomplete
+ * row is then unusable for collection, which is the honest state.
+ *
+ * AN OVERNIGHT WINDOW IS NOT EXPRESSIBLE, and is refused rather than stored and
+ * ignored: "22:00 to 06:00" would compare as closing before it opens. The message
+ * says so, because an operator whose dock really does work nights needs to know
+ * that this field cannot record it rather than watch the value come back wrong.
+ */
+export function readPickupWindow(
+  openValue: unknown,
+  closeValue: unknown,
+  labels: { open: string; close: string } = { open: "Opens at", close: "Closes at" }
+): { open: string | null; close: string | null } {
+  const open = readClockPart(openValue, labels.open);
+  const close = readClockPart(closeValue, labels.close);
+  if (open && close && !windowIsOrdered(open, close)) {
+    throw new PickupWindowError(
+      `${labels.close} (${close}) is not after ${labels.open.toLowerCase()} (${open}). A ` +
+        `collection window has to end later on the same day than it starts; a window running ` +
+        `past midnight cannot be recorded here. Correct one of the two times, or clear both ` +
+        `until the dock's hours are known.`
+    );
+  }
+  return { open, close };
+}
+
+/**
+ * The window a carrier is asked to collect within, for one shipment.
+ *
+ * BOTH ENDS OR NEITHER, unlike the dock's own hours. This one is not a record of
+ * how a warehouse runs — it is what the carrier is told, and half of it is not an
+ * instruction anybody can follow. Blank means "use the dock's recorded hours",
+ * which the scheduling service derives from the origin snapshot and refuses
+ * outright when the dock has none recorded: a window nobody stated is never
+ * invented here.
+ */
+export function readCarrierWindow(openValue: unknown, closeValue: unknown): string | null {
+  const open = readClockPart(openValue, "The collection window's start");
+  const close = readClockPart(closeValue, "The collection window's end");
+  if (!open && !close) return null;
+  if (!open || !close) {
+    throw new PickupWindowError(
+      "A collection window needs both a start and an end. Fill in both times, or leave both " +
+        "blank to use the times recorded on the pickup location."
+    );
+  }
+  if (!windowIsOrdered(open, close)) {
+    throw new PickupWindowError(
+      `The collection window ends (${close}) before it starts (${open}). Give a window that ` +
+        `ends later on the same day.`
+    );
+  }
+  return `${open}-${close}`;
 }

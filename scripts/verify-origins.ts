@@ -67,6 +67,15 @@ import {
   saveImageSelection,
 } from "../app/services/importMediaSelection.server";
 import { saveCredentials } from "../app/services/credentials.server";
+// The pickup window rule. It lives in the client-safe module because both forms
+// enforce it and the browser renders the same fields the server validates, so
+// the suite reads it from the same place the pages do.
+import {
+  CLOCK_PATTERN,
+  PickupWindowError,
+  readCarrierWindow,
+  readPickupWindow,
+} from "../app/utils/originFields";
 
 let failures = 0;
 let total = 0;
@@ -455,6 +464,136 @@ async function originChecks() {
       pickupOpenTime: "16:00",
       pickupCloseTime: "09:00",
     }).some((entry) => entry.includes("pickup window"))
+  );
+
+  /*
+   * THE SAME RULE, AT THE FORM.
+   *
+   * Check 6 proves the booking gate refuses a dock whose window closes before it
+   * opens. That was the whole defence, and it is not enough: an operator could
+   * still SAVE the contradiction, and a value the form accepted is a value the
+   * operator believes is correct — the refusal would then arrive as a booking
+   * that will not go through, with the dock's own page showing hours that look
+   * fine. The pair is read together on the way in.
+   */
+  const kept = readPickupWindow("08:30", "17:00");
+  check(
+    "6a the dock's window is stored as the two times it was given",
+    kept.open === "08:30" && kept.close === "17:00",
+    JSON.stringify(kept)
+  );
+
+  let windowRefusal: PickupWindowError | null = null;
+  try {
+    readPickupWindow("17:00", "08:30");
+  } catch (error) {
+    if (error instanceof PickupWindowError) windowRefusal = error;
+  }
+  check(
+    "6b a window that closes before it opens is refused on save, naming both times",
+    windowRefusal !== null &&
+      windowRefusal.message.includes("17:00") &&
+      windowRefusal.message.includes("08:30"),
+    windowRefusal?.message ?? "no refusal"
+  );
+
+  let sameTimeRefusal: PickupWindowError | null = null;
+  try {
+    readPickupWindow("09:00", "09:00");
+  } catch (error) {
+    if (error instanceof PickupWindowError) sameTimeRefusal = error;
+  }
+  check(
+    "6c a window with no length at all is refused too — zero is not 'open'",
+    sameTimeRefusal !== null,
+    sameTimeRefusal ? "refused" : "accepted"
+  );
+
+  let shapeRefusal: PickupWindowError | null = null;
+  try {
+    readPickupWindow("10am", "17:00");
+  } catch (error) {
+    if (error instanceof PickupWindowError) shapeRefusal = error;
+  }
+  check(
+    "6d a time that is not HH:MM is refused rather than stored and ignored",
+    shapeRefusal !== null && !CLOCK_PATTERN.test("10am"),
+    shapeRefusal?.message ?? "no refusal"
+  );
+
+  const halfWindow = readPickupWindow("08:30", "");
+  check(
+    "6e half a window saves — an unfinished dock is a dock someone is still writing down",
+    halfWindow.open === "08:30" && halfWindow.close === null,
+    JSON.stringify(halfWindow)
+  );
+
+  const noWindow = readPickupWindow("", "  ");
+  check(
+    "6f no hours at all is an empty answer, not a default one — nothing is invented",
+    noWindow.open === null && noWindow.close === null,
+    JSON.stringify(noWindow)
+  );
+
+  /*
+   * THE SHIPMENT'S WINDOW IS A DIFFERENT FACT from the dock's standing hours:
+   * it is what the carrier is told for one collection, so half of it is not an
+   * instruction anybody can follow — both ends or neither.
+   */
+  const asked = readCarrierWindow("09:00", "12:00");
+  check(
+    "6g a carrier window is composed from the two times the form posts",
+    asked === "09:00-12:00",
+    String(asked)
+  );
+
+  let halfRefusal: PickupWindowError | null = null;
+  try {
+    readCarrierWindow("09:00", "");
+  } catch (error) {
+    if (error instanceof PickupWindowError) halfRefusal = error;
+  }
+  check(
+    "6h half a carrier window is refused, and the message says how to get the dock's own hours",
+    halfRefusal !== null && /leave both\s+blank|both/i.test(halfRefusal.message),
+    halfRefusal?.message ?? "no refusal"
+  );
+
+  check(
+    "6i a blank carrier window is null, which the service reads as 'use the dock's hours'",
+    readCarrierWindow("", "") === null
+  );
+
+  /*
+   * An exception that changes one day's hours is a window too. It is read with
+   * the same rule and different labels, so a date cannot be given an exception
+   * that opens after it closes — which would replace the dock's real hours for
+   * that day with a window ending before it begins, and be offered as available.
+   */
+  let specialRefusal: PickupWindowError | null = null;
+  try {
+    readPickupWindow("18:00", "09:00", {
+      open: "Special opening time",
+      close: "Special closing time",
+    });
+  } catch (error) {
+    if (error instanceof PickupWindowError) specialRefusal = error;
+  }
+  check(
+    "6j a special-hours exception is held to the same rule, and the refusal names its own fields",
+    specialRefusal !== null &&
+      specialRefusal.message.includes("Special closing time") &&
+      specialRefusal.message.includes("special opening time"),
+    specialRefusal?.message ?? "no refusal"
+  );
+  const openLate = readPickupWindow("18:00", "", {
+    open: "Special opening time",
+    close: "Special closing time",
+  });
+  check(
+    "6k and an exception that only opens late is kept — one end is not a contradiction",
+    openLate.open === "18:00" && openLate.close === null,
+    JSON.stringify(openLate)
   );
 
   const grouping = await groupOrderLinesByOrigin([

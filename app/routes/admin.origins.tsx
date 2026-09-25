@@ -12,6 +12,7 @@ import {
   REQUIRED_ORIGIN_FIELDS,
   SUGGESTION_TARGET_INPUTS,
   missingOriginFields,
+  readPickupWindow,
   type OriginLocation,
 } from "~/utils/originFields";
 import { useEffect, useRef, useState } from "react";
@@ -339,6 +340,13 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
     switch (intent) {
       case "save_location": {
         const id = text("id");
+        /*
+         * The two clock fields are read as a pair, because the rule is about the
+         * pair: a window that closes before it opens is refused here with a
+         * sentence naming both times, rather than stored and left for the booking
+         * gate to reject silently weeks later. See `readPickupWindow`.
+         */
+        const window = readPickupWindow(text("pickupOpenTime"), text("pickupCloseTime"));
         const data = {
           code: text("code").toUpperCase(),
           name: text("name"),
@@ -357,8 +365,8 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
           postalCode: orNull("postalCode"),
           country: text("country").toUpperCase() || null,
           timeZone: orNull("timeZone"),
-          pickupOpenTime: orNull("pickupOpenTime"),
-          pickupCloseTime: orNull("pickupCloseTime"),
+          pickupOpenTime: window.open,
+          pickupCloseTime: window.close,
           // Checkbox days arrive as repeated `workingDays` values, one per ticked
           // box; the service stores them as one comma-joined string. An empty
           // result is KEPT rather than defaulted — "this dock works no days" is
@@ -517,8 +525,20 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
         const date = text("date");
         const kind = text("kind").toUpperCase();
         const name = orNull("name");
-        const openTime = readClock("openTime");
-        const closeTime = readClock("closeTime");
+        /*
+         * Special hours are a window like any other, and are read as one: a date
+         * whose exception opens after it closes would replace the dock's real
+         * hours for that day with a window that ends before it begins, and the
+         * proposal would offer it. The pair is validated with the same rule the
+         * dock's own hours go through, so the two cannot disagree about what a
+         * window is — only the field names in the message differ.
+         */
+        const special = readPickupWindow(text("openTime"), text("closeTime"), {
+          open: "Special opening time",
+          close: "Special closing time",
+        });
+        const openTime = special.open;
+        const closeTime = special.close;
 
         if (!locationId) throw new Error("Choose the pickup location this date applies to.");
         const location = await prisma.pickupLocation.findUnique({ where: { id: locationId }, select: { id: true, name: true } });
@@ -1062,10 +1082,23 @@ function LocationForm({
     return () => aid.destroy();
   }, [browserKey]);
 
-  const field = (name: keyof OriginLocation, text: string, hint?: string) => (
+  /**
+   * One field of the form.
+   *
+   * `type` exists for the clocks. Every time on this page is entered with the
+   * browser's own time control — the same one the same-day deadline uses — and
+   * the server checks the shape again regardless, because a picker is a
+   * convenience and a posted value is the fact.
+   */
+  const field = (
+    name: keyof OriginLocation,
+    label: string,
+    hint?: string,
+    type: "text" | "time" = "text"
+  ) => (
     <Field
       id={`loc-${String(name)}`}
-      label={`${text}${
+      label={`${label}${
         required.has(String(name)) ? " *" : optional.has(String(name)) ? " (optional)" : ""
       }`}
       hint={hint}
@@ -1073,6 +1106,7 @@ function LocationForm({
       <input
         id={`loc-${String(name)}`}
         name={String(name)}
+        type={type}
         style={input}
         defaultValue={value(name)}
         disabled={!canManage}
@@ -1234,8 +1268,26 @@ function LocationForm({
                 : ""}
             </div>
           </Field>
-          {field("pickupOpenTime", "Opens at", "A time in the zone above.")}
-          {field("pickupCloseTime", "Closes at", "A time in the zone above.")}
+          {/*
+            THE DOCK'S OWN HOURS, IN THE DOCK'S OWN ZONE, and read as one window:
+            a closing time earlier than the opening time is refused on save with
+            a sentence naming both. They are the hours a collection may be
+            scheduled within and the window a carrier is told, so they are never
+            filled in for the operator — a dock whose hours nobody has recorded
+            has an empty field rather than a plausible one.
+          */}
+          {field(
+            "pickupOpenTime",
+            "Opens at",
+            "A time in the zone above. Used to propose pickup dates and as the window a carrier is given.",
+            "time"
+          )}
+          {field(
+            "pickupCloseTime",
+            "Closes at",
+            "Must be later than Opens at, on the same day.",
+            "time"
+          )}
           <Field
             id="loc-leadTimeDays"
             label="Notice needed (days)"

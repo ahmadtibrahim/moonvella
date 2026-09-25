@@ -33,6 +33,10 @@ import {
 } from "~/services/addressValidation.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
+// The window form's rule, from the client-safe module: both ends or neither,
+// shaped and in order. Shared with the pickup-location form so the two agree on
+// what a window is.
+import { readCarrierWindow } from "~/utils/originFields";
 // Display-only helpers, imported from the isomorphic module: this route renders
 // them, so pulling them from shipping.server would drag server code into the
 // client bundle and fail the build.
@@ -566,7 +570,14 @@ export async function action({ request, params }: ActionFunctionArgs) {
         shipmentId,
         {
           pickupDate: String(form.get("pickupDate") || ""),
-          pickupTimeWindow: String(form.get("pickupTimeWindow") || ""),
+          // The two times are read as one window: both, or neither. Neither is
+          // not "no window" — it is "use the dock's own recorded hours", which
+          // the service derives and refuses to invent when there are none. See
+          // `readCarrierWindow`.
+          pickupTimeWindow: readCarrierWindow(
+            form.get("pickupWindowOpen"),
+            form.get("pickupWindowClose")
+          ) ?? "",
           notes: String(form.get("notes") || "") || undefined,
           // The tick-box that steps over the dock's own calendar. Read as
           // present-or-absent rather than as a value, because an unticked
@@ -811,6 +822,15 @@ export default function AdminShipmentDetail() {
   const fastest = pickFastestQuote(quotes);
   const returnCheapest = pickCheapestQuote(returnQuotes);
   const canBook = !shipment.providerShipmentId && paid && packages.length > 0;
+  /*
+   * The dock's own hours, as the two fields start out. `suggestedWindow` is
+   * "HH:MM-HH:MM" and is null unless BOTH ends are recorded — half a window is
+   * not one, and a field prefilled with half a fact is a field that gets
+   * submitted as if it were whole. Nothing is filled in when the dock has no
+   * hours: an empty box says the hours are unknown, which is the truth.
+   */
+  const [standingOpen, standingClose] = (pickupPlan.suggestedWindow ?? "").split("-");
+  const standingWindow = { open: standingOpen || "", close: standingClose || "" };
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -1262,12 +1282,34 @@ export default function AdminShipmentDetail() {
             the audit entry.
           */}
           <label style={label}>Pickup date<br /><input type="date" name="pickupDate" style={input} required /></label>
+          {/*
+            TWO TIMES, NOT A SENTENCE.
+
+            The window is what the carrier is told, and it used to be one free
+            text box whose placeholder advertised 09:00-17:00 — a window nobody
+            had recorded, offered in the place where a fact belongs. These are the
+            same time controls the rest of the system uses, and they start from
+            the dock's OWN recorded hours when it has both of them, so the
+            operator confirms a window rather than inventing one. Left blank,
+            the service derives the window from the origin snapshot and refuses
+            outright when the dock has no hours on record.
+          */}
           <label style={label}>
-            Time window<br />
+            Opens at<br />
             <input
-              name="pickupTimeWindow"
+              type="time"
+              name="pickupWindowOpen"
               style={input}
-              placeholder={pickupPlan.suggestedWindow ?? "09:00-17:00"}
+              defaultValue={standingWindow.open}
+            />
+          </label>
+          <label style={label}>
+            Closes at<br />
+            <input
+              type="time"
+              name="pickupWindowClose"
+              style={input}
+              defaultValue={standingWindow.close}
             />
           </label>
           <label style={label}>Notes<br /><input name="notes" style={input} /></label>

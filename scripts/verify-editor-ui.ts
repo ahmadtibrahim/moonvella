@@ -34,6 +34,9 @@ const BASE = process.env.APP_BASE || "http://localhost:62259";
 const EMAIL = process.env.OWNER_EMAIL || "";
 const PASSWORD = process.env.OWNER_PASSWORD || "";
 const CODE = `VERIFY-UI-${Date.now()}`;
+// The pickup-location fixture's code, declared out here so the cleanup in the
+// `finally` can find it even when a check above it threw.
+const DOCK_CODE = `VERIFY-UI-DOCK-${Date.now().toString(36).toUpperCase()}`;
 
 let failures = 0;
 let total = 0;
@@ -860,13 +863,125 @@ async function main() {
       `HTTP ${parkAttempt.status}, status ${afterPark?.status}`
     );
 
+    /* ------------------------------------------------------------------ */
+    /* The pickup location's hours, through the form a person uses          */
+    /* ------------------------------------------------------------------ */
+
+    /*
+     * A DOCK WITH NO HOURS IS CREATED FIRST, and it is the case that matters
+     * most: the directive is that warehouse hours are never invented, and the
+     * way that fails is a form that prefills a plausible window. The check is on
+     * the markup a browser receives — an input carrying a value the dock does
+     * not have would be a made-up opening time in the control that a carrier's
+     * window is read from.
+     */
+    await post("/admin/origins", cookie, {
+      intent: "save_location",
+      code: DOCK_CODE,
+      name: "Verify UI dock",
+      timeZone: "America/Toronto",
+    });
+    const dock = await prisma.pickupLocation.findFirst({ where: { code: DOCK_CODE } });
+    check(
+      "A pickup location saves from the form, with no hours recorded",
+      dock !== null && dock.pickupOpenTime === null && dock.pickupCloseTime === null,
+      `open=${dock?.pickupOpenTime ?? "-"} close=${dock?.pickupCloseTime ?? "-"}`
+    );
+
+    const dockPage = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    const openTag = tagById(dockPage.html, "loc-pickupOpenTime");
+    const closeTag = tagById(dockPage.html, "loc-pickupCloseTime");
+    const deadlineTag = tagById(dockPage.html, "loc-sameDayDeadline");
+    check(
+      "Opens at and Closes at are the same time control the same-day deadline uses",
+      openTag.includes('type="time"') &&
+        closeTag.includes('type="time"') &&
+        deadlineTag.includes('type="time"'),
+      `${openTag.slice(0, 50)} | ${closeTag.slice(0, 50)} | ${deadlineTag.slice(0, 50)}`
+    );
+    check(
+      "And neither of them is prefilled — a dock with no hours recorded shows empty boxes",
+      !/value="[^"]+"/.test(openTag) && !/value="[^"]+"/.test(closeTag),
+      `${openTag} | ${closeTag}`
+    );
+
+    const zoneTag = tagById(dockPage.html, "loc-timeZone");
+    // The datalist's own tag carries no values — its options are children — so
+    // the list is asserted from the page, and the input is asserted separately.
+    const zoneListTag = tagWithAttribute(dockPage.html, 'id="loc-timeZone-list"');
+    check(
+      "The time zone is chosen from the searchable list, and Toronto is what it starts on",
+      zoneTag.includes('list="loc-timeZone-list"') &&
+        zoneTag.includes('value="America/Toronto"') &&
+        zoneListTag.startsWith("<datalist") &&
+        dockPage.html.includes('<option value="America/Toronto">') &&
+        dockPage.html.includes("Eastern Time"),
+      zoneTag.slice(0, 80)
+    );
+    check(
+      "The working days are boxes to tick, and a new dock starts on a working week",
+      countNamed(dockPage.html, "workingDays") === 7,
+      `${countNamed(dockPage.html, "workingDays")} day boxes`
+    );
+
+    const inverted = await post("/admin/origins", cookie, {
+      intent: "save_location",
+      id: dock?.id ?? "",
+      code: DOCK_CODE,
+      name: "Verify UI dock",
+      timeZone: "America/Toronto",
+      pickupOpenTime: "17:00",
+      pickupCloseTime: "08:00",
+    });
+    const invertedHtml = await inverted.text();
+    const afterInverted = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "A window that closes before it opens is refused by the form, and nothing is written",
+      invertedHtml.includes("is not after Opens at") &&
+        afterInverted?.pickupOpenTime === null &&
+        afterInverted?.pickupCloseTime === null,
+      `HTTP ${inverted.status}, open=${afterInverted?.pickupOpenTime ?? "-"}`
+    );
+
+    const savedDock = await post("/admin/origins", cookie, {
+      intent: "save_location",
+      id: dock?.id ?? "",
+      code: DOCK_CODE,
+      name: "Verify UI dock",
+      timeZone: "America/Toronto",
+      pickupOpenTime: "08:30",
+      pickupCloseTime: "16:45",
+    });
+    const afterStored = await prisma.pickupLocation.findUnique({ where: { id: dock?.id ?? "" } });
+    check(
+      "A window that makes sense is saved, and the saved window is shown back",
+      savedDock.status === 200 &&
+        afterStored?.pickupOpenTime === "08:30" &&
+        afterStored?.pickupCloseTime === "16:45",
+      `HTTP ${savedDock.status}, ${afterStored?.pickupOpenTime}–${afterStored?.pickupCloseTime}`
+    );
+    const reread = await get(`/admin/origins?location=${dock?.id ?? ""}`, cookie);
+    check(
+      "And it comes back in the two time controls, not in a sentence",
+      tagById(reread.html, "loc-pickupOpenTime").includes('value="08:30"') &&
+        tagById(reread.html, "loc-pickupCloseTime").includes('value="16:45"'),
+      `${tagById(reread.html, "loc-pickupOpenTime").slice(0, 60)}`
+    );
+
+    await prisma.locationHoliday.deleteMany({ where: { locationId: dock?.id ?? "" } });
+    await prisma.pickupLocation.deleteMany({ where: { code: DOCK_CODE } });
+
     await prisma.mediaAssetAssignment.deleteMany({ where: { assetId: image.id } });
     await prisma.mediaAsset.deleteMany({ where: { id: image.id } });
     await prisma.adminSession.deleteMany({ where: { userId: catalog.id } });
     await prisma.adminUser.deleteMany({ where: { id: catalog.id } });
   } finally {
     // Audit rows are append-only at the database level and are deliberately
-    // left behind; everything else this suite made goes.
+    // left behind; everything else this suite made goes. The dock is deleted
+    // here as well as at the end of the checks, so a failure part-way through
+    // does not leave a pickup location behind for the next run to trip over.
+    await prisma.locationHoliday.deleteMany({ where: { location: { code: DOCK_CODE } } });
+    await prisma.pickupLocation.deleteMany({ where: { code: DOCK_CODE } });
     await prisma.variantPackage.deleteMany({ where: { variantId: variant.id } });
     await prisma.productVariant.deleteMany({ where: { productId: product.id } });
     await prisma.product.deleteMany({ where: { id: product.id } });
