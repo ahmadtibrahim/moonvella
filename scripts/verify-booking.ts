@@ -43,6 +43,7 @@ import {
   addressMateriallyDiffers,
   addressStatus,
   bookingAddressGate,
+  applySuggestedAddress,
   loadSubjectAddress,
   outcomeFromResponse,
   recordAddressOverride,
@@ -1325,15 +1326,20 @@ async function addressGateChecks() {
   {
     const { order, quote, origin } = await createBookableOrder(seller.id, "agate-edited");
     if (!origin) throw new Error("fixture expected an origin");
-    // An accepted verdict whose hash was computed for a DIFFERENT address — the
-    // state a dock lands in when someone edits the address and the old
-    // acceptance is still on file.
+    // An accepted verdict for a DIFFERENT address than the one on the dock now —
+    // the state a dock lands in when someone edits the address and the old
+    // acceptance is still on file. It is built by recording the address the
+    // verdict was computed for, which is what the gate compares: the row is
+    // evidence about an address, and evidence about a different address is not
+    // evidence about this one.
     await prisma.addressValidation.deleteMany({ where: { subjectId: origin.location.id } });
+    const current = await loadSubjectAddress("PICKUP", origin.location.id);
+    if (!current) throw new Error("fixture expected a dock address");
     await recordVerdict(prisma, {
       subjectType: "PICKUP",
       subjectId: origin.location.id,
       verdict: "ACCEPTED",
-      inputHash: "hash-for-an-address-that-is-no-longer-there",
+      originalAddress: { ...current, street1: "1 Somewhere Else Ave" },
     });
 
     const gate = await addressGate("PICKUP", origin.location.id);
@@ -1539,10 +1545,14 @@ async function addressGateChecks() {
      * The case the owner asked to preserve: an address with a unit in its own
      * field, and a postal code Google would change.
      *
-     * Two things are asserted. That a disagreement is FLAGGED — the difference
-     * is stored, shown, and blocks a booking. And that nothing is APPLIED: the
-     * unit stays in street2, the postal code stays as the customer entered it,
-     * and no screen or service writes Google's suggestion over either.
+     * Three things are asserted. That a disagreement is FLAGGED — the
+     * difference is stored, shown, and blocks a booking. That nothing is
+     * APPLIED BY ITSELF: until somebody acts, the unit stays in street2, the
+     * postal code stays as the customer entered it, and no code path copies
+     * Google's answer over either. And that the one path which does apply it
+     * applies only the field that actually differs, only when asked, and leaves
+     * the record checked rather than assumed — which is what the owner's
+     * "Apply Google suggestion and save" button does, exercised below.
      */
     const seller7a = await createSeller("agate-7a");
     const { order, origin } = await createBookableOrder(seller7a.id, "agate-7a");
@@ -1552,6 +1562,13 @@ async function addressGateChecks() {
       data: {
         shippingAddress: JSON.stringify({
           name: "Verify Customer",
+          // A phone number and a company name are fields the customer typed
+          // and this app never reads. They are in the fixture because the
+          // apply path edits this blob in place, and the one way to be sure it
+          // does not rebuild the object from the five fields it understands is
+          // to put something in it that would not survive a rebuild.
+          phone: "+1 555 0199",
+          company: "Verify Co",
           address1: "500 Queen St W",
           address2: "Unit 7A",
           city: "Toronto",
@@ -1640,6 +1657,102 @@ async function addressGateChecks() {
     );
     check("...and the gate is shut on it", status.allowed === false, status.label);
 
+    /*
+     * ── Applying the suggestion ────────────────────────────────────────────
+     *
+     * The operator's other option, and the only one that rewrites the address.
+     * The call carries no address at all: the values come from the stored
+     * verdict, read inside the service, so there is nothing here for a form to
+     * forge. This is the delivery end, whose address is not five columns but
+     * the JSON blob the order arrived with — which is why the blob carries a
+     * phone number and a company name that no part of this application reads.
+     */
+    // An owner for this block alone: the block above created its own and
+    // removed it with its fixtures, and the apply action checks the stored role
+    // rather than anything the caller claims.
+    const applyOwner = await prisma.adminUser.create({
+      data: {
+        email: `verify-apply-owner-${suffix.toLowerCase()}@example.test`,
+        name: "Verify Apply Owner",
+        role: "OWNER",
+        isActive: true,
+      },
+    });
+
+    const appliedResult = await applySuggestedAddress({
+      subjectType: "DELIVERY",
+      subjectId: order.id,
+      actorId: applyOwner.id,
+    });
+    const appliedStored = JSON.parse(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress ?? "{}"
+    );
+    check(
+      "applying the suggestion writes the postal code into the order's own address blob",
+      appliedResult.ok === true &&
+        appliedResult.applied.length === 1 &&
+        appliedResult.applied[0].component === "postalCode" &&
+        appliedStored.zip === "M5V 3A8",
+      appliedResult.ok ? JSON.stringify(appliedResult.applied) : appliedResult.error
+    );
+    check(
+      "...and every other key in the blob survives, including the ones this app never reads",
+      appliedStored.name === "Verify Customer" &&
+        appliedStored.phone === "+1 555 0199" &&
+        appliedStored.company === "Verify Co" &&
+        appliedStored.address1 === "500 Queen St W" &&
+        appliedStored.address2 === "Unit 7A" &&
+        appliedStored.city === "Toronto" &&
+        appliedStored.province === "ON" &&
+        appliedStored.country === "CA",
+      JSON.stringify(appliedStored)
+    );
+    const appliedReread = await loadSubjectAddress("DELIVERY", order.id);
+    check(
+      "...and the unit is still its own field, untouched by an answer that did not ask to change it",
+      appliedReread?.street2 === "Unit 7A" && appliedReread?.postalCode === "M5V 3A8",
+      `${appliedReread?.street2} / ${appliedReread?.postalCode}`
+    );
+
+    /*
+     * The corrected address is checked again, and it does not inherit the
+     * standing of the address it replaced. There is no Google key configured in
+     * this suite, so what comes back is UNAVAILABLE — and the point is that it
+     * is UNAVAILABLE rather than the previous verdict carried forward, because
+     * an address that was corrected is still an address nobody has checked.
+     */
+    const appliedGate = await addressGate("DELIVERY", order.id);
+    check(
+      "...and the address is re-checked rather than left standing on the verdict of the address it replaced",
+      appliedGate.allowed === false &&
+        appliedGate.verdict === "UNAVAILABLE" &&
+        appliedGate.googleValidated === false,
+      `${appliedGate.verdict}: ${appliedGate.blockers.join(" ")}`
+    );
+    const bookedAfterApply = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
+    check(
+      "...so a corrected address is not a way past the gate",
+      bookedAfterApply.allowed === false &&
+        bookedAfterApply.blockers.some((line) => line.includes("Delivery address")),
+      bookedAfterApply.blockers.join(" | ")
+    );
+
+    const secondAttempt = await applySuggestedAddress({
+      subjectType: "DELIVERY",
+      subjectId: order.id,
+      actorId: applyOwner.id,
+    });
+    const afterSecond = JSON.parse(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress ?? "{}"
+    );
+    check(
+      "a second press applies nothing: there is no suggestion left to apply, and the address is untouched",
+      secondAttempt.ok === false &&
+        afterSecond.zip === "M5V 3A8" &&
+        afterSecond.phone === "+1 555 0199",
+      secondAttempt.ok ? JSON.stringify(secondAttempt.applied) : secondAttempt.error
+    );
+
     const shipment = await prisma.shipment.findFirstOrThrow({ where: { orderId: order.id } });
     const quote = await prisma.shippingQuote.findFirstOrThrow({ where: { orderId: order.id } });
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-7A") });
@@ -1654,14 +1767,18 @@ async function addressGateChecks() {
     check("...and nothing is bought", apiCalls().length === 0, `calls=${apiCalls().length}`);
 
     // The source of the last write is checked too: no code path copies a
-    // suggestion onto a stored address. If one ever does, this pin fails and
-    // points at the line.
+    // suggestion onto a stored address without somebody pressing the button
+    // that says so. If one ever does, this pin fails and points at the line.
     const writes = sourceLinesMatching(/shippingAddress:\s*(JSON\.stringify\()?\s*(outcome|suggested)/);
     check(
-      "no code writes a validation suggestion over a stored address",
+      "no code copies a validation suggestion onto a stored address on its own",
       writes.length === 0,
       writes.join(" | ").slice(0, 160)
     );
+
+    // The audit rows the apply wrote stay, as every override's do: the log is
+    // append-only and keeps the actor's name on the row. Only the account goes.
+    await prisma.adminUser.deleteMany({ where: { id: applyOwner.id } });
   }
 
   /* --- the scopes this suite's orders are NOT bought with ---------------- */

@@ -1,23 +1,37 @@
 import { Form } from "react-router";
 
 /*
- * One address, its verdict, and the two things a person can do about it.
+ * One address, its verdict, and what a person can do about it.
  *
  * Shared between the booking screens rather than copied into each, because the
  * copy is where this kind of panel goes wrong: one screen learns to show the
  * reason the booking was refused and the other keeps saying "not validated"
  * with no way forward, and nobody notices until an operator is stuck.
  *
- * WHAT IT DELIBERATELY DOES NOT DO: it never writes Google's suggestion into
- * the address. Google's opinion of a postal code is shown beside the entered
- * one and left there — an address that changes because a third party thought it
- * should is an address nobody chose, and a stack of them is how a warehouse's
- * own recorded location drifts. The differences are evidence for a human, not
- * an edit.
+ * GOOGLE'S SUGGESTION IS STILL NOT WRITTEN BY ACCIDENT. Nothing on this panel
+ * changes the address by itself: the differences are listed, the address that
+ * would be written is shown field by field beside the one that is stored, and
+ * the write happens only when somebody presses a button that says what it does.
+ * The earlier version of this panel refused to write the suggestion at all, on
+ * the grounds that an address which changes because a third party thought it
+ * should is an address nobody chose — and that reasoning still holds. What
+ * changed is that leaving the operator to retype Google's answer by hand was
+ * not a safeguard, it was a transcription step: the correction got typed in
+ * with a typo, or not at all, and the address that ended up on the label was
+ * neither the one recorded nor the one Google proposed. The apply action is the
+ * same decision made once, on the record, with the before and after kept.
  *
- * The override form is drawn only for an owner, but that is cosmetic: the rule
- * is enforced in `recordAddressOverride` against the stored account, so a form
- * posted by anyone else is refused regardless of what this page rendered.
+ * A SUGGESTION THAT IS NOT CURRENT IS NOT SHOWN. `suggestionCurrent` is the
+ * server saying the stored suggestion describes the address as it stands now.
+ * When it is false the suggestion belongs to an earlier version of the record
+ * and applying it would write stale values over a newer address, so the table
+ * is withheld rather than shown with a warning — a warning beside a plausible
+ * looking table is a table somebody will act on.
+ *
+ * The override and apply forms are drawn only for an owner, but that is
+ * cosmetic: both rules are enforced in the service against the stored account,
+ * so a form posted by anyone else is refused regardless of what this page
+ * rendered.
  */
 
 export interface GateDifference {
@@ -45,6 +59,13 @@ export interface GateStatus {
   blockers: string[];
   differences: GateDifference[];
   suggested?: GateAddress | null;
+  /**
+   * Whether the stored suggestion describes the address as it stands now.
+   * Optional so a caller that predates the field still renders — absent is
+   * treated as "not current", which hides the suggestion rather than offering
+   * one that may be stale.
+   */
+  suggestionCurrent?: boolean;
   overrideReason?: string | null;
   overriddenBy?: string | null;
   original?: GateAddress | null;
@@ -197,11 +218,52 @@ export function AddressGateCard({
             </tbody>
           </table>
           <p style={helpText}>
-            Nothing is changed automatically — the address on the label stays the address you
-            recorded. Review the difference and correct the fields yourself, or have an owner
-            accept the address as it stands.
+            Nothing here changes on its own. The address on the label stays the address that was
+            recorded until somebody applies the suggestion, corrects the fields, or an owner
+            accepts the address as it stands.
           </p>
         </details>
+      ) : null}
+
+      {/*
+        The write itself, and the only place on this panel that changes anything.
+        The list is the before-and-after rather than a count of changes: an
+        operator agreeing to "3 changes" is agreeing to something they have not
+        read, and the postal code is the one that quietly puts a parcel in the
+        wrong city, so it is called out.
+      */}
+      {canManage && isOwner && status.suggestionCurrent && status.suggested && status.differences.length > 0 ? (
+        <Form method="post" style={{ marginTop: "0.7rem", borderTop: `1px solid ${LINE}`, paddingTop: "0.7rem" }}>
+          <input type="hidden" name="subjectType" value={subjectType} />
+          <input type="hidden" name="subjectId" value={subjectId} />
+          <p style={{ fontSize: "0.72rem", color: INK, margin: 0, fontWeight: 600 }}>
+            Applying writes these values to the stored address:
+          </p>
+          <ul style={{ margin: "0.35rem 0 0", paddingLeft: "1.1rem", fontSize: "0.74rem", color: INK }}>
+            {status.differences.map((difference, index) => (
+              <li
+                key={`apply-${difference.component}-${index}`}
+                style={difference.component === "postalCode" ? { fontWeight: 700 } : undefined}
+              >
+                {difference.component}: {difference.entered ?? "—"} →{" "}
+                <strong>{difference.suggested ?? "—"}</strong>
+              </li>
+            ))}
+          </ul>
+          <p style={helpText}>
+            Fields Google did not ask to change are left exactly as entered, including the unit.
+            The address is saved and then checked with Google: if that check cannot be made, the
+            correction stays saved and the booking stays blocked.
+          </p>
+          <button
+            type="submit"
+            name="intent"
+            value="apply_suggestion"
+            style={{ ...button(INK), marginTop: "0.4rem" }}
+          >
+            Apply Google suggestion and save
+          </button>
+        </Form>
       ) : null}
 
       {children}

@@ -28,6 +28,7 @@ import {
  * address is assigning values and nothing else.
  */
 import { createAddressEntryAid } from "../utils/placesEntryAid";
+import { countryOptions, countryValue } from "../utils/countries";
 
 const PRODUCT_CATEGORIES = [
   "Bedding & Bath",
@@ -1062,14 +1063,37 @@ export default function ApplicationPage() {
                       {field.label}
                       {!field.required && " (optional)"}
                     </span>
-                    <input
-                      type="text"
-                      className="mv-settings-input"
-                      value={addressValues[field.key] ?? ""}
-                      onChange={(e) => handleAddressChange(field.key, e.target.value)}
-                      aria-invalid={!!fieldErrors[field.key]}
-                      ref={field.key === "addressLine1" ? street1Ref : undefined}
-                    />
+                    {/*
+                      The country is chosen, not typed: the value stored and
+                      sent is the two-letter code, and the name is what the
+                      merchant reads. A record that already holds a spelling
+                      this list does not carry keeps that spelling as its own
+                      option, so opening this form cannot quietly change which
+                      country a merchant is in.
+                    */}
+                    {field.options ? (
+                      <select
+                        className="mv-settings-input"
+                        value={countryValue(addressValues[field.key])}
+                        onChange={(e) => handleAddressChange(field.key, e.target.value)}
+                        aria-invalid={!!fieldErrors[field.key]}
+                      >
+                        {countryOptions(addressValues[field.key]).map((option) => (
+                          <option key={option.code} value={option.code}>
+                            {option.name}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        className="mv-settings-input"
+                        value={addressValues[field.key] ?? ""}
+                        onChange={(e) => handleAddressChange(field.key, e.target.value)}
+                        aria-invalid={!!fieldErrors[field.key]}
+                        ref={field.key === "addressLine1" ? street1Ref : undefined}
+                      />
+                    )}
                     {field.key === "addressLine1" && placesBrowserKey && (
                       <>
                         <div

@@ -60,6 +60,18 @@ export async function recordVerdict(
     unavailableReason?: string;
     /** Override the hash deliberately — for the "address edited since check" case. */
     inputHash?: string;
+    /**
+     * The address the verdict was computed for, when that is not the address on
+     * the record now.
+     *
+     * This is how a stale verdict is built faithfully. The gate reads the
+     * address stored on the row and compares it with the record's current one,
+     * so modelling "edited since it was checked" by writing a hash that does not
+     * match would be modelling it with a field nothing reads: the row would look
+     * like a verdict for the address that is there now, which is what it would
+     * then be treated as.
+     */
+    originalAddress?: StructuredAddress;
     /** A past date makes an otherwise acceptable verdict expire. */
     expiresAt?: Date | null;
     suggestedAddress?: StructuredAddress | null;
@@ -67,13 +79,17 @@ export async function recordVerdict(
   }
 ): Promise<{ id: string; inputHash: string }> {
   const { address, inputHash } = await hashedAddress(input.subjectType, input.subjectId);
+  const original = input.originalAddress ?? address;
   const row = await client.addressValidation.create({
     data: {
       subjectType: input.subjectType,
       subjectId: input.subjectId,
-      inputHash: input.inputHash ?? inputHash,
+      // Hashed from the address actually stored, unless a caller overrides it:
+      // a row whose hash and address disagree is not a state the service can
+      // produce, and only a caller testing the cache is entitled to one.
+      inputHash: input.inputHash ?? addressInputHash(original),
       verdict: input.verdict,
-      originalAddress: address as unknown as Prisma.InputJsonValue,
+      originalAddress: original as unknown as Prisma.InputJsonValue,
       suggestedAddress: (input.suggestedAddress ?? undefined) as Prisma.InputJsonValue | undefined,
       differences: (input.differences ?? undefined) as Prisma.InputJsonValue | undefined,
       unavailableReason: input.unavailableReason ?? null,

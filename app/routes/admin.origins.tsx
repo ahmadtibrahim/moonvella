@@ -18,12 +18,18 @@ import { useEffect, useRef, useState } from "react";
 import {
   AddressOverrideNotPermitted,
   addressStatus,
+  applySuggestedAddress,
   browserKeyForPlaces,
   recordAddressOverride,
   recordValidation,
   validateAddress,
   type StructuredAddress,
 } from "~/services/addressValidation.server";
+// Names for the country list, codes for the value that is stored. The map is
+// imported rather than duplicated so the dropdown on this form, the dropdown on
+// the merchant application and the comparison rules the validator uses all read
+// the same table of countries.
+import { countryOptions, countryValue } from "~/utils/countries";
 // The address entry aid. Every decision it makes lives in this typed module —
 // Google's components are read, the country is pinned, street2 cannot be
 // reached from a suggestion — and this page only assigns what comes back.
@@ -441,6 +447,33 @@ export async function action({ request }: ActionFunctionArgs): Promise<OriginsAc
           message: `${location.name}: ${
             outcome.reason ?? "the address needs review before it can be booked against."
           }`,
+          editing: id,
+        };
+      }
+
+      case "apply_suggestion": {
+        const id = text("id");
+        /*
+         * The values written here come from the stored verdict, read inside the
+         * service — never from this form. A suggestion the browser could supply
+         * would be a suggestion Google never gave, and the whole point of the
+         * comparison panel is that a person is agreeing to what Google said.
+         * The role rule lives there too, against the stored account.
+         */
+        const result = await applySuggestedAddress({
+          subjectType: "PICKUP",
+          subjectId: id,
+          actorId: user.id,
+        });
+        if (!result.ok) return { ok: false, error: result.error, editing: id };
+
+        const named = await prisma.pickupLocation.findUnique({
+          where: { id },
+          select: { name: true },
+        });
+        return {
+          ok: true,
+          message: `${named?.name ?? "The location"}: ${result.message}`,
           editing: id,
         };
       }
@@ -1006,7 +1039,20 @@ function LocationForm({
           const next = picked.fields[field as keyof typeof SUGGESTION_TARGET_INPUTS];
           if (!next) continue;
           const element = form.elements.namedItem(String(target));
-          if (element instanceof HTMLInputElement) element.value = next;
+          // A control this does not recognise is skipped rather than forced,
+          // which is why the type is checked at all.
+          if (!(element instanceof HTMLInputElement || element instanceof HTMLSelectElement)) {
+            continue;
+          }
+          // The country is a select over two-letter codes, and the aid carries
+          // whichever spelling Google answered with — normally the code, but
+          // "Canada" when the record has no short form. Assigning a value no
+          // option holds leaves a select with nothing selected, so the field
+          // would post empty: the pick would blank a country the dock is in.
+          // Folding through the same list the options come from lands the long
+          // form on the code that spells it, and leaves a country the list does
+          // not carry as it is — the same rule the form's own default follows.
+          element.value = target === "country" ? countryValue(next) : next;
         }
         // Reported, never written: Street 2 is the unit, and the unit is the
         // dock's own line.
@@ -1126,7 +1172,34 @@ function LocationForm({
           {field("city", "City")}
           {field("province", "Province / state")}
           {field("postalCode", "Postal code")}
-          {field("country", "Country code", "Two letters, e.g. CA.")}
+          {/* A LIST, NOT A TEXT BOX, AND THE NAME ON IT IS NOT WHAT IS STORED.
+              A code is what Google, Shopify, the carrier and the Odoo address
+              record all want, and it is exactly what a person should not have
+              to remember: the old box took "Ca" but not "Can" or "Canada", and
+              an address whose country cannot be read is one nothing downstream
+              will route. The options show the name and carry the code, and a
+              record holding a value that is not in the list keeps that value as
+              an extra option — so opening this form cannot rewrite a country
+              nobody chose. */}
+          <Field
+            id="loc-country"
+            label={`Country${required.has("country") ? " *" : ""}`}
+            hint="Shown by name; stored and sent as the two-letter code."
+          >
+            <select
+              id="loc-country"
+              name="country"
+              style={input}
+              defaultValue={countryValue(value("country"))}
+              disabled={!canManage}
+            >
+              {countryOptions(value("country")).map((country) => (
+                <option key={country.code} value={country.code}>
+                  {country.name}
+                </option>
+              ))}
+            </select>
+          </Field>
           {/* A LIST, NOT A TEXT BOX. An IANA name typed by hand is one typo away
               from a dock whose calendar is a different country's, and nothing on
               this page would look wrong — the window would simply be read in a

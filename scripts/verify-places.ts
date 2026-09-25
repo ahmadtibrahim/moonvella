@@ -591,6 +591,19 @@ function pageSection() {
   );
 
   check(
+    "31.1 a long-form country from a suggestion lands on the matching option instead of emptying the select",
+    // The country control is a list of two-letter codes; the aid can carry
+    // "Canada" when Google's record has no short form. A select assigned a value
+    // no option holds ends up with nothing selected, so the field would post
+    // empty — the pick would blank the country the dock is in. Both pages
+    // therefore fold the value through the same list the options come from.
+    /target === "country" \? countryValue\(next\) : next/.test(origins) &&
+      /value=\{countryValue\(addressValues\[field\.key\]\)\}/.test(application) &&
+      /countryOptions\(addressValues\[field\.key\]\)/.test(application),
+    "folded through the option list on both pages"
+  );
+
+  check(
     "32 both pages destroy the aid, so no listener outlives the form it was attached to",
     /return \(\) => aid\.destroy\(\);/.test(application) &&
       /return \(\) => aid\.destroy\(\);/.test(origins),

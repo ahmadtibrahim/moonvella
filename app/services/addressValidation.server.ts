@@ -39,6 +39,7 @@
 
 import { createHash } from "node:crypto";
 import { prisma } from "~/db.server";
+import { COUNTRIES } from "~/utils/countries";
 import { getCredential } from "./credentials.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 
@@ -108,24 +109,257 @@ export interface ValidationOutcome {
 }
 
 /**
- * Normalise before hashing, so " 12 Main St " and "12  main st" are the same
+ * Normalise before comparing, so " 12 Main St " and "12  main st" are the same
  * address and do not each cost a call. Case and internal whitespace are
  * flattened; the STRUCTURE is not — merging street2 into street1 here would
- * make two different doors hash identically.
+ * make two different doors compare equal.
  */
 export function normalizeAddressPart(value: string | null | undefined): string {
-  return (value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return foldDiacritics((value ?? "").trim().replace(/\s+/g, " ")).toLowerCase();
+}
+
+/**
+ * Accents folded away, so "Montréal" and "Montreal" are one place.
+ *
+ * NFD splits a letter from its accent and the combining marks are then dropped,
+ * which is what makes the *comparison* accent-blind. The stored value is never
+ * touched: an address keeps the accents somebody typed, and only the question
+ * "are these the same address" is answered without them.
+ */
+function foldDiacritics(value: string): string {
+  return value.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+}
+
+/**
+ * The two spellings of a country are one country. Country text arrives from
+ * three directions and none of them agrees with the others: the depot form has
+ * always asked for a code, a Shopify order carries `countryCode`, and Google's
+ * validation response answers with a display name. Comparing them as text makes
+ * "CA" versus "Canada" look like a correction the operator has to accept, which
+ * is exactly the formatting-only difference the directive forbids forcing an
+ * override for.
+ */
+const COUNTRY_CODES = new Map<string, string>();
+for (const country of COUNTRIES) {
+  COUNTRY_CODES.set(normalizeAddressPart(country.name), country.code);
+}
+
+/** Spellings that name a country without being its name or its code. */
+const COUNTRY_ALIASES: Record<string, string> = {
+  america: "US",
+  "united states of america": "US",
+  "u.s.": "US",
+  "u.s.a.": "US",
+  us: "US",
+  usa: "US",
+  britain: "GB",
+  "great britain": "GB",
+  "u.k.": "GB",
+  uk: "GB",
+  "united kingdom of great britain and northern ireland": "GB",
+};
+
+/**
+ * The two-letter code for any spelling of a country, or "" when the text names
+ * no country this app knows.
+ */
+export function countryCodeFor(value: string | null | undefined): string {
+  const part = normalizeAddressPart(value);
+  if (!part) return "";
+  const upper = part.toUpperCase();
+  if (part.length === 2 && COUNTRIES.some((country) => country.code === upper)) return upper;
+  return COUNTRY_CODES.get(part) ?? COUNTRY_ALIASES[part] ?? "";
+}
+
+/**
+ * The country as this app stores and sends it: the code when the text names a
+ * country we know, otherwise the text unchanged rather than mangled into a
+ * pseudo-code.
+ *
+ * This is what makes Google's `country` component land in the record as "CA"
+ * instead of "Canada", and it is also why `callGoogle` can put the value
+ * straight into `regionCode` — a field that wants an ISO code and would be sent
+ * "CANADA" by a naive `toUpperCase()`.
+ */
+export function canonicalCountry(value: string | null | undefined): string {
+  return countryCodeFor(value) || (value ?? "").trim();
+}
+
+/**
+ * Province and state names beside their codes, for the same reason countries
+ * have them: Google answers with "Ontario" where the depot form stored "ON".
+ *
+ * The list covers the two countries this deployment ships between rather than
+ * the world. An unrecognised name is compared as text, which is the behaviour
+ * that existed before any of this — so an address in a country not listed here
+ * is no worse off, it simply gets no folding.
+ */
+const REGION_NAMES: Record<string, string[]> = {
+  // Canada
+  AB: ["alberta"],
+  BC: ["british columbia"],
+  MB: ["manitoba"],
+  NB: ["new brunswick"],
+  NL: ["newfoundland and labrador", "newfoundland"],
+  NS: ["nova scotia"],
+  NT: ["northwest territories"],
+  NU: ["nunavut"],
+  ON: ["ontario"],
+  PE: ["prince edward island"],
+  QC: ["quebec"],
+  SK: ["saskatchewan"],
+  YT: ["yukon"],
+  // United States
+  AK: ["alaska"],
+  AL: ["alabama"],
+  AR: ["arkansas"],
+  AZ: ["arizona"],
+  CA: ["california"],
+  CO: ["colorado"],
+  CT: ["connecticut"],
+  DC: ["district of columbia", "washington dc"],
+  DE: ["delaware"],
+  FL: ["florida"],
+  GA: ["georgia"],
+  HI: ["hawaii"],
+  IA: ["iowa"],
+  ID: ["idaho"],
+  IL: ["illinois"],
+  IN: ["indiana"],
+  KS: ["kansas"],
+  KY: ["kentucky"],
+  LA: ["louisiana"],
+  MA: ["massachusetts"],
+  MD: ["maryland"],
+  ME: ["maine"],
+  MI: ["michigan"],
+  MN: ["minnesota"],
+  MO: ["missouri"],
+  MS: ["mississippi"],
+  MT: ["montana"],
+  NC: ["north carolina"],
+  ND: ["north dakota"],
+  NE: ["nebraska"],
+  NH: ["new hampshire"],
+  NJ: ["new jersey"],
+  NM: ["new mexico"],
+  NV: ["nevada"],
+  NY: ["new york"],
+  OH: ["ohio"],
+  OK: ["oklahoma"],
+  OR: ["oregon"],
+  PA: ["pennsylvania"],
+  RI: ["rhode island"],
+  SC: ["south carolina"],
+  SD: ["south dakota"],
+  TN: ["tennessee"],
+  TX: ["texas"],
+  UT: ["utah"],
+  VA: ["virginia"],
+  VT: ["vermont"],
+  WA: ["washington"],
+  WI: ["wisconsin"],
+  WV: ["west virginia"],
+  WY: ["wyoming"],
+};
+
+const REGION_CODES = new Map<string, string>();
+for (const [code, names] of Object.entries(REGION_NAMES)) {
+  for (const name of names) REGION_CODES.set(normalizeAddressPart(name), code);
+}
+
+/** The code a province or state name stands for, or "" when it is not listed. */
+export function regionCodeFor(value: string | null | undefined): string {
+  const part = normalizeAddressPart(value);
+  if (!part) return "";
+  const upper = part.toUpperCase();
+  if (part.length === 2 && REGION_NAMES[upper]) return upper;
+  return REGION_CODES.get(part) ?? "";
+}
+
+/**
+ * A unit written five ways is one unit: "Unit 7A", "#7A", "Apt. 7A" and "7A" all
+ * describe the same door, and which spelling a person or a feed chooses says
+ * nothing about the address. The prefix is stripped repeatedly, because they
+ * stack — "# Unit 7A" is not unusual in a hand-typed field.
+ *
+ * Only the unit field is compared this way. Applying it to street1 would make
+ * "12 Main St Unit 7A" equal to "12 Main St", and those are deliberately
+ * different: Google puts the unit in the subpremise component, the app keeps it
+ * in its own column, and collapsing the two here would erase a real difference
+ * instead of a cosmetic one.
+ */
+const UNIT_PREFIX = /^(?:unit|apt|apartment|suite|ste|flat|bldg|building|no|number|#)\s*[.:#-]?\s*/;
+
+export function normalizeUnitPart(value: string | null | undefined): string {
+  let part = normalizeAddressPart(value);
+  for (let pass = 0; pass < 4; pass += 1) {
+    const stripped = part.replace(UNIT_PREFIX, "").trim();
+    // An empty result means the whole field was the prefix ("Unit"), which
+    // carries no door number and is left as typed rather than folded to nothing.
+    if (!stripped || stripped === part) break;
+    part = stripped;
+  }
+  return part;
+}
+
+/** Punctuation and spacing in a postal code are presentation, not location. */
+export function normalizePostalCode(value: string | null | undefined): string {
+  return normalizeAddressPart(value).replace(/[^a-z0-9]/g, "");
+}
+
+/** Every field a verdict is about, in the order it is read and hashed. */
+const ADDRESS_FIELDS: (keyof StructuredAddress)[] = [
+  "street1",
+  "street2",
+  "city",
+  "province",
+  "postalCode",
+  "country",
+];
+
+/**
+ * The form of one field that is compared. Storage is never normalised — a
+ * record keeps the text somebody entered, accents, prefixes and all — and this
+ * is the only place the comparison rules live, so the hash, the cached lookup
+ * and the difference list can never disagree about what counts as a change.
+ */
+export function comparisonForm(field: keyof StructuredAddress, value: string | null | undefined): string {
+  switch (field) {
+    case "country":
+      return countryCodeFor(value) || normalizeAddressPart(value);
+    case "province":
+      return regionCodeFor(value) || normalizeAddressPart(value);
+    case "postalCode":
+      return normalizePostalCode(value);
+    case "street2":
+      return normalizeUnitPart(value);
+    default:
+      return normalizeAddressPart(value);
+  }
+}
+
+/**
+ * Whether two addresses are the same address, under the rules above.
+ *
+ * A null on either side is never equivalent: an address that could not be read
+ * cannot be compared, and answering "same" there would let a verdict about an
+ * address nobody can parse stand in for one that was never read at all.
+ */
+export function addressesEquivalent(
+  a: StructuredAddress | null | undefined,
+  b: StructuredAddress | null | undefined
+): boolean {
+  if (!a || !b) return false;
+  return ADDRESS_FIELDS.every(
+    (field) => comparisonForm(field, a[field] as string | null) === comparisonForm(field, b[field] as string | null)
+  );
 }
 
 export function addressInputHash(address: StructuredAddress): string {
-  const material = [
-    normalizeAddressPart(address.street1),
-    normalizeAddressPart(address.street2),
-    normalizeAddressPart(address.city),
-    normalizeAddressPart(address.province),
-    normalizeAddressPart(address.postalCode),
-    normalizeAddressPart(address.country).toUpperCase(),
-  ].join("\u0000");
+  const material = ADDRESS_FIELDS.map((field) =>
+    comparisonForm(field, address[field] as string | null)
+  ).join("\u0000");
   return createHash("sha256").update(material).digest("hex");
 }
 
@@ -164,6 +398,57 @@ export function structuredFromStoredAddress(raw: string | null | undefined): Str
 export function structuredFromShopifyAddress(value: unknown): StructuredAddress | null {
   if (!value || typeof value !== "object") return null;
   return structuredFromStoredAddress(JSON.stringify(value));
+}
+
+/**
+ * The key each structured field is written back to, in the order the stored JSON
+ * may spell it. Shopify's names come first where they exist, because that is the
+ * shape this column actually holds.
+ */
+const STORED_ADDRESS_KEYS: Record<keyof StructuredAddress, string[]> = {
+  street1: ["address1", "address"],
+  street2: ["address2"],
+  city: ["city"],
+  province: ["province", "provinceCode"],
+  postalCode: ["zip", "postalCode"],
+  country: ["country", "countryCode"],
+};
+
+/**
+ * Write fields back into a stored shipping-address blob, leaving everything
+ * else in it alone.
+ *
+ * A delivery address is not a row of five columns; it is the JSON a Shopify
+ * order arrived with, and it carries a recipient name, a phone number, a
+ * company and whatever else Shopify adds next. Rebuilding it from the five
+ * fields this module understands would silently delete all of that, so the
+ * object is edited in place instead.
+ *
+ * A field is written to every key it is already stored under, so a blob
+ * carrying both `postalCode` and `zip` cannot keep a stale twin that the reader
+ * then prefers. Returns null for a blob that cannot be read, which the caller
+ * treats as a refusal rather than as an empty address.
+ */
+export function applyToStoredAddress(
+  raw: string | null | undefined,
+  patch: Partial<StructuredAddress>
+): string | null {
+  if (!raw) return null;
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+
+  for (const [field, value] of Object.entries(patch)) {
+    const keys = STORED_ADDRESS_KEYS[field as keyof StructuredAddress];
+    if (!keys || value === undefined) continue;
+    const present = keys.filter((candidate) => candidate in parsed);
+    for (const key of present.length > 0 ? present : [keys[0]]) parsed[key] = value;
+  }
+  return JSON.stringify(parsed);
 }
 
 /**
@@ -303,7 +588,10 @@ export function suggestedFromComponents(
     }
     const field = COMPONENT_TO_FIELD[type];
     if (field && field !== "street1") {
-      result[field] = text;
+      // The country is stored as its two-letter code wherever this app writes
+      // one, so Google's display name is converted here rather than being
+      // copied into a record that every other path expects to hold a code.
+      result[field] = field === "country" ? canonicalCountry(text) : text;
     }
   }
 
@@ -324,7 +612,10 @@ function collectDifferences(
   for (const field of fields) {
     const before = (entered[field] ?? "") as string;
     const after = (suggested[field] ?? "") as string;
-    if (normalizeAddressPart(before) === normalizeAddressPart(after)) continue;
+    // Compared in the per-field form, so a disagreement about spelling — a
+    // country written as a name on one side and a code on the other, a unit
+    // written with a prefix on one side only — is not a difference at all.
+    if (comparisonForm(field, before) === comparisonForm(field, after)) continue;
     // The confirmation level for the component Google changed, so the reader
     // can tell "corrected with confidence" from "guessed".
     const componentType = field === "street2" ? "subpremise" : undefined;
@@ -596,7 +887,11 @@ async function callGoogle(address: StructuredAddress): Promise<ValidationOutcome
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         address: {
-          regionCode: address.country.trim().toUpperCase(),
+          // An ISO code, not the text somebody typed. A record holding "Canada"
+          // would otherwise be sent as "CANADA", which Google cannot route as a
+          // region — and the failure looks like a bad address rather than a bad
+          // field.
+          regionCode: canonicalCountry(address.country),
           addressLines: [address.street1.trim(), address.street2?.trim()].filter(Boolean),
           locality: address.city.trim(),
           administrativeArea: address.province.trim(),
@@ -760,6 +1055,20 @@ export async function recordAddressOverride(input: {
     orderBy: { checkedAt: "desc" },
   });
 
+  /*
+   * The suggestion and the difference list are carried onto the override row so
+   * the decision shows what was being accepted — but only when the row they came
+   * from describes the address being overridden now. An owner may override an
+   * address that was edited after it was last checked; copying across that edit
+   * would attach Google's answer about the old address to a decision about the
+   * new one, and the record would read as though the override were informed by a
+   * check of an address it never saw.
+   */
+  const previousDescribesAddress = addressesEquivalent(
+    previous?.originalAddress as unknown as StructuredAddress | null,
+    address
+  );
+
   const row = await prisma.addressValidation.create({
     data: {
       subjectType: input.subjectType,
@@ -767,10 +1076,14 @@ export async function recordAddressOverride(input: {
       inputHash: addressInputHash(address),
       verdict: "OVERRIDDEN",
       originalAddress: address as unknown as object,
-      suggestedAddress: (previous?.suggestedAddress ?? undefined) as object | undefined,
-      differences: (previous?.differences ?? undefined) as object | undefined,
-      granularity: previous?.granularity ?? null,
-      placeId: previous?.placeId ?? null,
+      suggestedAddress: (previousDescribesAddress
+        ? (previous?.suggestedAddress ?? undefined)
+        : undefined) as object | undefined,
+      differences: (previousDescribesAddress
+        ? (previous?.differences ?? undefined)
+        : undefined) as object | undefined,
+      granularity: previousDescribesAddress ? (previous?.granularity ?? null) : null,
+      placeId: previousDescribesAddress ? (previous?.placeId ?? null) : null,
       overriddenById: actor.id,
       overriddenByName: actor.name,
       overrideReason: reason,
@@ -808,11 +1121,214 @@ export async function recordAddressOverride(input: {
       subjectType: input.subjectType,
       subjectId: input.subjectId,
       reason,
-      overriddenVerdict: previous?.verdict ?? "UNVALIDATED",
+      overriddenVerdict: previousDescribesAddress ? (previous?.verdict ?? "UNVALIDATED") : "UNVALIDATED",
     },
   });
 
   return { ok: true, validationId: row.id };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Accepting Google's suggestion                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface AppliedChange {
+  component: string;
+  from: string | null;
+  to: string | null;
+}
+
+export type ApplySuggestionResult =
+  | {
+      ok: true;
+      /** The fields actually rewritten. Empty is impossible: a no-op is refused. */
+      applied: AppliedChange[];
+      /** The verdict for the address as it now stands, freshly checked. */
+      outcome: ValidationOutcome;
+      message: string;
+    }
+  | { ok: false; error: string; applied: [] };
+
+/**
+ * Write Google's suggestion into the stored address, then check the result.
+ *
+ * WHY THIS IS NOT JUST "SAVE THE FORM". The suggested address is read back from
+ * the stored verdict rather than taken from the request, so the browser cannot
+ * propose values Google never gave: the only address this can write is the one
+ * the latest check produced for this exact record. That is also why a suggestion
+ * that no longer describes the record's current address is refused outright
+ * instead of being tidied up — see `addressStatus`.
+ *
+ * ONLY FIELDS THAT ACTUALLY DIFFER ARE WRITTEN. A field whose two spellings
+ * compare equal ("ON" against "Ontario", "Unit 7A" against "#7A", the same
+ * postal code with a space moved) is left exactly as the person entered it: the
+ * point of the comparison rules is that a formatting difference is not a change,
+ * and quietly rewriting a field to Google's spelling of a value that was already
+ * correct is the churn the directive asks us not to do. The unit is therefore
+ * preserved whenever it matches, which is the behaviour the directive requires,
+ * and is not special-cased — it falls out of the same rule.
+ *
+ * The verdict is then re-checked and stored, because the address it described
+ * is gone. This is a deliberately billable call on a deliberate click; it is not
+ * a page render. If Google cannot be reached the address still changes — the
+ * operator asked for that, and refusing to save it would lose the correction —
+ * and the stored verdict comes back UNAVAILABLE, which the gate keeps shut. That
+ * outcome is recorded rather than swallowed, so the panel says the save happened
+ * and the check did not.
+ *
+ * A delivery address is edited inside the order's stored JSON, so a later
+ * webhook may supersede it with the address the customer's own order carries.
+ * That is correct — the order's address is the customer's to change — and it is
+ * why the gate re-reads the address from the order every time rather than
+ * trusting a copy.
+ */
+export async function applySuggestedAddress(input: {
+  subjectType: "PICKUP" | "DELIVERY";
+  subjectId: string;
+  actorId: string;
+}): Promise<ApplySuggestionResult> {
+  const actor = await prisma.adminUser.findUnique({
+    where: { id: input.actorId },
+    select: { id: true, name: true, role: true, isActive: true },
+  });
+  if (!actor || !actor.isActive) return { ok: false, error: "Unknown or inactive user.", applied: [] };
+
+  /*
+   * The same role rule as recording an override, and for a related reason: both
+   * write an address that a carrier will be handed, and both do it from a panel
+   * rather than from the ordinary edit form. Widening this is a one-line change
+   * here, and it should be widened here rather than checked at the button,
+   * because a role submitted by a form is a role the submitter chose.
+   */
+  if (actor.role !== "OWNER") {
+    return {
+      ok: false,
+      error: "Only an owner may apply a suggested address to a record.",
+      applied: [],
+    };
+  }
+
+  const current = await loadSubjectAddress(input.subjectType, input.subjectId);
+  if (!current) {
+    return { ok: false, error: "The address being corrected could not be found.", applied: [] };
+  }
+
+  const status = await addressStatus(input.subjectType, input.subjectId, current);
+  if (!status.suggestionCurrent) {
+    return {
+      ok: false,
+      error:
+        "The stored suggestion is for an earlier version of this address. Check the " +
+        "address again, then apply the new suggestion.",
+      applied: [],
+    };
+  }
+  const suggested = status.suggested;
+  if (!suggested) {
+    return {
+      ok: false,
+      error: "There is no suggestion stored for this address. Check it first.",
+      applied: [],
+    };
+  }
+
+  const applied: AppliedChange[] = [];
+  const patch: Partial<StructuredAddress> = {};
+  for (const field of ADDRESS_FIELDS) {
+    const before = (current[field] ?? null) as string | null;
+    const after = (suggested[field] ?? null) as string | null;
+    if (comparisonForm(field, before) === comparisonForm(field, after)) continue;
+    patch[field] = after ?? "";
+    applied.push({ component: field, from: before, to: after });
+  }
+
+  if (applied.length === 0) {
+    return {
+      ok: false,
+      error:
+        "Google's suggestion differs from the stored address only in formatting, so there " +
+        "is nothing to apply. If the address is correct as entered, record an override; " +
+        "otherwise check it again.",
+      applied: [],
+    };
+  }
+
+  const next: StructuredAddress = { ...current, ...patch };
+  try {
+    if (input.subjectType === "PICKUP") {
+      await prisma.pickupLocation.update({
+        where: { id: input.subjectId },
+        data: {
+          street1: next.street1,
+          street2: next.street2 ?? null,
+          city: next.city,
+          province: next.province,
+          postalCode: next.postalCode,
+          country: next.country,
+        },
+      });
+    } else {
+      const order = await prisma.order.findUnique({
+        where: { id: input.subjectId },
+        select: { shippingAddress: true },
+      });
+      const rewritten = applyToStoredAddress(order?.shippingAddress, patch);
+      if (!rewritten) {
+        return {
+          ok: false,
+          error:
+            "This order's stored shipping address could not be read, so it cannot be " +
+            "corrected here.",
+          applied: [],
+        };
+      }
+      await prisma.order.update({
+        where: { id: input.subjectId },
+        data: { shippingAddress: rewritten },
+      });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      error: `The corrected address could not be saved: ${
+        error instanceof Error ? error.message : "unknown error"
+      }.`,
+      applied: [],
+    };
+  }
+
+  const outcome = await validateAddress(next, { refresh: true });
+  await recordValidation({ subjectType: input.subjectType, subjectId: input.subjectId, outcome });
+
+  await recordAudit({
+    actorType: "ADMIN_USER",
+    actorId: actor.id,
+    actorName: actor.name,
+    action: "address.suggestion_applied",
+    entityType: AUDIT_ENTITY.SETTINGS,
+    entityId: input.subjectId,
+    // Component names and the two values, which is the decision that was made.
+    // Same reduced shape as the difference list the panel showed.
+    afterData: {
+      subjectType: input.subjectType,
+      subjectId: input.subjectId,
+      applied,
+      verdict: outcome.verdict,
+    },
+  });
+
+  const what = applied.map((change) => change.component).join(", ");
+  return {
+    ok: true,
+    applied,
+    outcome,
+    message:
+      outcome.verdict === "ACCEPTED"
+        ? `Applied Google's suggestion (${what}) and Google accepts the address as it now stands.`
+        : `Applied Google's suggestion (${what}). The address is saved, but the check came back ${
+            verdictLabel(outcome.verdict).toLowerCase()
+          }.`,
+  };
 }
 
 /**
@@ -1076,10 +1592,24 @@ export async function addressGate(
     };
   }
 
-  // A material edit invalidates the verdict: it now describes a different
-  // address, and reusing it would let an unchecked address through on the
-  // strength of an old check.
-  if (row.inputHash !== addressInputHash(current)) {
+  /*
+   * A material edit invalidates the verdict: it now describes a different
+   * address, and reusing it would let an unchecked address through on the
+   * strength of an old check.
+   *
+   * THE ROW'S OWN ADDRESS IS COMPARED, NOT ITS HASH, and the difference matters.
+   * A hash is only comparable against a hash produced by the same version of the
+   * normaliser. The normaliser deliberately changes — country names fold to
+   * codes, units fold to their number — so an address nobody touched can hash
+   * differently to the way it hashed when its verdict was written, and a hash
+   * comparison would then announce that the address had changed and demand a
+   * re-check. The row stores the address it was computed for, so comparing that
+   * address to the current one under the same rules answers the question the
+   * hash was standing in for — and answers it for rows written by any earlier
+   * version. The hash keeps its real job: the cache lookup that stops an
+   * unchanged address costing a second call.
+   */
+  if (!addressesEquivalent(row.originalAddress as unknown as StructuredAddress | null, current)) {
     return {
       allowed: false,
       verdict: "UNVALIDATED",
@@ -1179,17 +1709,37 @@ export async function addressStatus(
   subjectId: string,
   currentAddress?: StructuredAddress | null
 ) {
-  const gate = await addressGate(subjectType, subjectId, { currentAddress });
+  const current = currentAddress ?? (await loadSubjectAddress(subjectType, subjectId));
+  const gate = await addressGate(subjectType, subjectId, { currentAddress: current });
   const latest = await prisma.addressValidation.findFirst({
     where: { subjectType, subjectId },
     orderBy: { checkedAt: "desc" },
   });
+
+  /*
+   * A SUGGESTION BELONGS TO THE ADDRESS IT WAS COMPUTED FOR. Once the record is
+   * edited, the newest row describes the address as it was before the edit, and
+   * its suggestion is Google's answer about that older address. Showing it
+   * beside the new one invites somebody to accept a correction to something
+   * they are no longer looking at, and applying it would write those old values
+   * over the new address. So a suggestion that no longer matches is withheld
+   * entirely rather than shown with a caveat, and `suggestionCurrent` records
+   * which of the two happened.
+   */
+  const latestAddress = (latest?.originalAddress as unknown as StructuredAddress | null) ?? null;
+  const describesCurrent = addressesEquivalent(latestAddress, current);
+
   return {
     ...gate,
-    suggested: (latest?.suggestedAddress as unknown as StructuredAddress | null) ?? null,
-    differences: (latest?.differences as unknown as AddressDifference[] | null) ?? [],
+    suggested: describesCurrent
+      ? ((latest?.suggestedAddress as unknown as StructuredAddress | null) ?? null)
+      : null,
+    differences: describesCurrent
+      ? ((latest?.differences as unknown as AddressDifference[] | null) ?? [])
+      : [],
+    suggestionCurrent: describesCurrent,
     overrideReason: latest?.overrideReason ?? null,
     overriddenBy: latest?.overriddenByName ?? null,
-    original: (latest?.originalAddress as unknown as StructuredAddress | null) ?? currentAddress ?? null,
+    original: describesCurrent ? latestAddress : (current ?? null),
   };
 }

@@ -19,6 +19,7 @@
  * session.
  */
 
+import { COUNTRIES } from "~/utils/countries";
 import type { ShopProfile } from "~/services/shopProfile.server";
 
 export interface StoredField {
@@ -35,6 +36,16 @@ export interface StoredField {
   identity?: boolean;
   /** The merchant has to supply it before the application can be submitted. */
   required?: boolean;
+  /**
+   * Set when the fact has to be chosen from a list rather than typed. The page
+   * renders a `<select>` of these instead of a text box.
+   *
+   * Only the country uses it, and the reason is that a country has two
+   * spellings — the name a person knows and the two-letter code every system
+   * downstream wants — and asking a merchant to produce the code is asking them
+   * to guess. The options carry the code and show the name.
+   */
+  options?: readonly { code: string; name: string }[];
 }
 
 /**
@@ -74,7 +85,13 @@ export const ADDRESS_FIELDS: StoredField[] = [
   { key: "addressCity", column: "addressCity", label: "City", required: true },
   { key: "addressProvinceCode", column: "addressProvinceCode", label: "Province / State", required: true },
   { key: "addressPostalCode", column: "addressPostalCode", label: "Postal / ZIP code", required: true },
-  { key: "addressCountryCode", column: "addressCountryCode", label: "Country code", required: true },
+  {
+    key: "addressCountryCode",
+    column: "addressCountryCode",
+    label: "Country",
+    required: true,
+    options: COUNTRIES,
+  },
 ];
 
 /** Everything the page reads from a stored column. */

@@ -30,6 +30,7 @@ import { groupOrderLinesByOrigin } from "~/services/origins.server";
 import {
   addressStatus,
   loadSubjectAddress,
+  applySuggestedAddress,
   recordAddressOverride,
   recordValidation,
   validateAddress,
@@ -207,6 +208,26 @@ export async function action({ request, params }: ActionFunctionArgs) {
           outcome.reason ?? "the address needs review before it can be booked against."
         }`,
       };
+    } else if (intent === "apply_suggestion") {
+      /*
+       * Google's own values, read back from the stored verdict inside the
+       * service rather than posted by this form — a suggestion the browser
+       * could supply is a suggestion Google never gave. The role rule is there
+       * too, checked against the stored account.
+       *
+       * A successful apply redirects like the check above it: the address on
+       * the page has changed, so the page has to be re-read rather than
+       * annotated, and the panel then shows the new address under its new
+       * verdict.
+       */
+      const subject = addressSubject(form);
+      const result = await applySuggestedAddress({
+        subjectType: subject.type,
+        subjectId: subject.id,
+        actorId: user.id,
+      });
+      if (!result.ok) return { error: result.error };
+      return redirect(`/admin/orders/${orderId}`);
     } else if (intent === "override_address") {
       // The role check that matters is in the service, against the stored
       // account: a role posted by this form would be a role the submitter chose.

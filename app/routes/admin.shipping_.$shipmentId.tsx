@@ -26,6 +26,7 @@ import {
 import {
   addressStatus,
   loadSubjectAddress,
+  applySuggestedAddress,
   recordAddressOverride,
   recordValidation,
   validateAddress,
@@ -531,6 +532,24 @@ export async function action({ request, params }: ActionFunctionArgs) {
           outcome.reason ?? "the address needs review before it can be booked against."
         }`,
       };
+    } else if (intent === "apply_suggestion") {
+      /*
+       * The values written are read back from the stored verdict inside the
+       * service, never posted by this form, and the role rule is checked there
+       * against the stored account.
+       *
+       * Redirecting on success, as the check above does: the address this page
+       * prints has changed, so the page is re-read rather than annotated, and
+       * the panel comes back showing the new address under its new verdict.
+       */
+      const subject = addressSubject(form);
+      const result = await applySuggestedAddress({
+        subjectType: subject.type,
+        subjectId: subject.id,
+        actorId: user.id,
+      });
+      if (!result.ok) return { error: result.error };
+      return redirect(back);
     } else if (intent === "override_address") {
       // The role check that matters is inside the service, against the stored
       // account: a role posted by this form would be a role the submitter chose.

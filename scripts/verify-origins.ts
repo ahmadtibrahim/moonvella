@@ -47,7 +47,10 @@ import {
 import {
   addressGate,
   addressInputHash,
+  addressesEquivalent,
+  applySuggestedAddress,
   browserKeyForPlaces,
+  loadSubjectAddress,
   missingAddressFields,
   normalizeAddressPart,
   recordAddressOverride,
@@ -865,6 +868,31 @@ async function addressChecks() {
     GOOGLE_MAPS_SERVER_KEY: SERVER_KEY,
   });
 
+  /*
+   * The owner and the viewer are created before the stubbed block rather than
+   * after it, because the checks that apply Google's suggestion need both the
+   * credential and the stubbed transport — the credential is removed again as
+   * soon as that block ends, so anything that makes a real call has to live
+   * inside it. `finally` below still deletes them either way.
+   */
+  // --- owner override -----------------------------------------------------
+  const owner = await prisma.adminUser.create({
+    data: {
+      email: `verify-owner-${suffix.toLowerCase()}@example.test`,
+      name: "Verify Owner",
+      role: "OWNER",
+      isActive: true,
+    },
+  });
+  const viewer = await prisma.adminUser.create({
+    data: {
+      email: `verify-viewer-${suffix.toLowerCase()}@example.test`,
+      name: "Verify Viewer",
+      role: "VIEWER",
+      isActive: true,
+    },
+  });
+
   installGoogleStub();
   try {
     // --- outage ----------------------------------------------------------
@@ -940,8 +968,93 @@ async function addressChecks() {
     check(
       "36 a replaced component is CORRECTION_REQUIRED, with the change listed side by side",
       corrected.verdict === "CORRECTION_REQUIRED" &&
-        corrected.differences.some((entry) => entry.component === "province" && entry.entered === "ON"),
+        corrected.differences.some(
+          (entry) =>
+            entry.component === "postalCode" &&
+            entry.entered === "M5H 3N3" &&
+            entry.suggested === "M5H 2N2"
+        ),
       JSON.stringify(corrected.differences)
+    );
+    /*
+     * The same response, read for the difference it must NOT report. Google
+     * answered "Ontario" where the record says "ON", which is the same province
+     * spelled two ways, and a panel that lists it is asking an operator to
+     * approve a correction to something that was never wrong. The check above
+     * and this one come from one response on purpose: the correction that is
+     * real is still shown, and the spelling that is not real is not.
+     */
+    check(
+      "36a the province spelled out in full is not reported as a difference from its code",
+      corrected.differences.every((entry) => entry.component !== "province"),
+      JSON.stringify(corrected.differences)
+    );
+
+    // --- comparison rules -------------------------------------------------
+    /*
+     * These pin the rules themselves rather than a screen that uses them.
+     * Every one of them is a pair of spellings of one address: reporting any of
+     * them as a difference forces a person to accept a "correction" that
+     * changes nothing, and the postal-code pair at the end is the one that must
+     * still be reported.
+     */
+    const sameAddress = (a: Partial<StructuredAddress>, b: Partial<StructuredAddress>) =>
+      addressesEquivalent(
+        { street1: "12 Main St", city: "Toronto", province: "ON", postalCode: "M5H 3N3", country: "CA", ...a },
+        { street1: "12 Main St", city: "Toronto", province: "ON", postalCode: "M5H 3N3", country: "CA", ...b }
+      );
+
+    check(
+      "36b one country written as a code and as its name is one country",
+      sameAddress({ country: "CA" }, { country: "Canada" }) &&
+        sameAddress({ country: "ca" }, { country: "CANADA" }) &&
+        sameAddress({ country: "US" }, { country: "United States" }) &&
+        !sameAddress({ country: "CA" }, { country: "US" }),
+      `CA/Canada=${sameAddress({ country: "CA" }, { country: "Canada" })}`
+    );
+
+    check(
+      "36c a unit is the same door with or without its prefix",
+      sameAddress({ street2: "Unit 7A" }, { street2: "#7A" }) &&
+        sameAddress({ street2: "Unit 7A" }, { street2: "7A" }) &&
+        sameAddress({ street2: "Apt. 7A" }, { street2: "Suite 7A" }),
+      `Unit 7A/#7A=${sameAddress({ street2: "Unit 7A" }, { street2: "#7A" })}`
+    );
+
+    check(
+      "36d folding a prefix never hides a unit that is actually missing",
+      !sameAddress({ street2: null }, { street2: "7A" }) &&
+        !sameAddress({ street2: "7A" }, { street2: "7B" }),
+      `missing-vs-present=${sameAddress({ street2: null }, { street2: "7A" })}`
+    );
+
+    check(
+      "36e a unit typed into the street line is not the same address as one kept in its own field",
+      !sameAddress({ street1: "12 Main St Unit 7A", street2: null }, { street1: "12 Main St", street2: "7A" }),
+      "street2 is a different door from a street line that mentions a unit"
+    );
+
+    check(
+      "36f accents are folded for comparison only",
+      addressesEquivalent(
+        { street1: "1200 Rue Saint-Denis", city: "Montréal", province: "QC", postalCode: "H2X 3K6", country: "CA" },
+        { street1: "1200 Rue Saint-Denis", city: "Montreal", province: "Quebec", postalCode: "H2X3K6", country: "Canada" }
+      ),
+      "Montréal/Montreal, QC/Quebec, H2X 3K6/H2X3K6"
+    );
+
+    check(
+      "36g a postal code that is genuinely different is still a difference",
+      !sameAddress({ postalCode: "M5H 3N3" }, { postalCode: "M5H 3N4" }) &&
+        sameAddress({ postalCode: "M5H 3N3" }, { postalCode: "m5h3n3" }),
+      `M5H 3N3 vs M5H 3N4=${sameAddress({ postalCode: "M5H 3N3" }, { postalCode: "M5H 3N4" })}`
+    );
+
+    check(
+      "36h an unreadable address is never equivalent to a readable one",
+      !addressesEquivalent(null, { street1: "12 Main St", city: "Toronto", province: "ON", postalCode: "M5H 3N3", country: "CA" }) &&
+        !addressesEquivalent({ street1: "12 Main St", city: "Toronto", province: "ON", postalCode: "M5H 3N3", country: "CA" }, null),
+      "null on either side is not a match"
     );
 
     // --- confirmation required: a missing unit ---------------------------
@@ -1018,6 +1131,146 @@ async function addressChecks() {
       browserFacing === BROWSER_KEY && !String(browserFacing).includes(SERVER_KEY),
       `returned=${browserFacing === BROWSER_KEY ? "the browser key" : String(browserFacing).slice(0, 12)}`
     );
+    /* ---------------------------------------------------------------------- */
+    /* Applying Google's suggestion                                           */
+    /* ---------------------------------------------------------------------- */
+
+    const applyDock = await createLocation({ code: `VFA-${suffix}-APLY`, name: "Dock Applied", street2: "7A" });
+    const applyBefore = await loadSubjectAddress("PICKUP", applyDock.id);
+
+    /*
+     * One response that spells every field differently and changes one of them.
+     * The province comes back in full, the country by name, the unit with its
+     * prefix, the city in capitals — all the same address — and the postal code
+     * comes back different. The postal code is the only thing that may reach
+     * the record, and the spellings may not, which is exactly the difference
+     * between a correction and churn.
+     */
+    googleResponder = () =>
+      respond(
+        googleAccepted({
+          street1: applyBefore!.street1,
+          city: applyBefore!.city.toUpperCase(),
+          province: "Ontario",
+          postalCode: "M5H 2N3",
+          country: "Canada",
+          subpremise: "Unit 7A",
+        })
+      );
+
+    const checkedBi = await validateAddress(applyBefore!, { refresh: true });
+    await recordValidation({ subjectType: "PICKUP", subjectId: applyDock.id, outcome: checkedBi });
+    const applied = await applySuggestedAddress({
+      subjectType: "PICKUP",
+      subjectId: applyDock.id,
+      actorId: owner.id,
+    });
+    const applyAfter = await loadSubjectAddress("PICKUP", applyDock.id);
+    const applyGate = await addressGate("PICKUP", applyDock.id);
+
+    check(
+      "46a applying a suggestion writes the one field that differs and leaves the spelling of the rest alone",
+      applied.ok === true &&
+        applied.applied.length === 1 &&
+        applied.applied[0].component === "postalCode" &&
+        applyAfter?.postalCode === "M5H 2N3" &&
+        applyAfter?.province === "ON" &&
+        applyAfter?.country === "CA" &&
+        applyAfter?.street2 === "7A" &&
+        applyAfter?.city === applyBefore?.city &&
+        applyAfter?.street1 === applyBefore?.street1,
+      applied.ok ? JSON.stringify(applied.applied) : applied.error
+    );
+    check(
+      "46b the applied address is checked again, and the verdict stored is the one for the address now on the record",
+      applied.ok === true &&
+        applyGate.allowed === true &&
+        applyGate.googleValidated === true &&
+        applied.outcome.verdict === "ACCEPTED" &&
+        applyGate.checkedAt !== null &&
+        applyGate.checkedAt.getTime() >= applied.outcome.checkedAt.getTime() - 1000,
+      applied.ok ? `verdict=${applied.outcome.verdict} gate=${applyGate.verdict}` : "apply failed"
+    );
+    check(
+      "46c applying is recorded in the audit trail with the fields it changed",
+      await prisma.auditLog
+        .findFirst({ where: { action: "address.suggestion_applied", actorId: owner.id }, orderBy: { createdAt: "desc" } })
+        .then((row) => row !== null && JSON.stringify(row?.afterData ?? {}).includes("M5H 2N3")),
+      "audit row names the new postal code"
+    );
+
+    let applyRefusedForViewer = false;
+    try {
+      const refused = await applySuggestedAddress({
+        subjectType: "PICKUP",
+        subjectId: applyDock.id,
+        actorId: viewer.id,
+      });
+      applyRefusedForViewer = refused.ok === false && refused.error.includes("owner");
+    } catch (error) {
+      applyRefusedForViewer = error instanceof Error && error.name === "AddressOverrideNotPermitted";
+    }
+    check("46d a non-owner cannot apply a suggested address", applyRefusedForViewer);
+
+    /*
+     * A suggestion belongs to the address it was computed for. The record is
+     * edited after the check, so the stored suggestion now describes the
+     * previous address; applying it would write values Google produced for an
+     * address that is no longer on the record.
+     */
+    await prisma.pickupLocation.update({ where: { id: applyDock.id }, data: { street1: "99 Elsewhere Rd" } });
+    const staleAttempt = await applySuggestedAddress({
+      subjectType: "PICKUP",
+      subjectId: applyDock.id,
+      actorId: owner.id,
+    });
+    const afterStale = await loadSubjectAddress("PICKUP", applyDock.id);
+    check(
+      "46e a suggestion that no longer describes the stored address is refused rather than applied",
+      staleAttempt.ok === false &&
+        staleAttempt.error.includes("earlier version") &&
+        afterStale?.street1 === "99 Elsewhere Rd" &&
+        afterStale?.postalCode === "M5H 2N3",
+      staleAttempt.ok ? "applied a stale suggestion" : staleAttempt.error
+    );
+
+    /*
+     * The other half of the same rule: a suggestion that differs only in
+     * spelling is not something to apply. Refused with a message that names
+     * both ways forward rather than silently rewriting four fields to Google's
+     * spelling of values that were already correct.
+     */
+    const spellingDock = await createLocation({ code: `VFA-${suffix}-SPELL`, name: "Dock Spelling", street2: "Unit 8B" });
+    const spellingAddress = await loadSubjectAddress("PICKUP", spellingDock.id);
+    googleResponder = () =>
+      respond(
+        googleAccepted({
+          street1: spellingAddress!.street1,
+          city: spellingAddress!.city,
+          province: "Ontario",
+          postalCode: spellingAddress!.postalCode,
+          country: "Canada",
+          subpremise: "8B",
+        })
+      );
+    const spellingCheck = await validateAddress(spellingAddress!, { refresh: true });
+    await recordValidation({ subjectType: "PICKUP", subjectId: spellingDock.id, outcome: spellingCheck });
+    const spellingAttempt = await applySuggestedAddress({
+      subjectType: "PICKUP",
+      subjectId: spellingDock.id,
+      actorId: owner.id,
+    });
+    const spellingAfter = await loadSubjectAddress("PICKUP", spellingDock.id);
+    check(
+      "46f a suggestion that differs only in formatting is refused, and nothing on the record is rewritten",
+      spellingAttempt.ok === false &&
+        spellingAttempt.error.includes("only in formatting") &&
+        spellingAfter?.province === "ON" &&
+        spellingAfter?.country === "CA" &&
+        spellingAfter?.street2 === "Unit 8B",
+      spellingAttempt.ok ? JSON.stringify(spellingAttempt.applied) : spellingAttempt.error
+    );
+
   } finally {
     restoreFetch();
     await prisma.integrationCredential.deleteMany({ where: { key: "google" } });
@@ -1030,24 +1283,6 @@ async function addressChecks() {
       await prisma.integrationState.deleteMany({ where: { key: "google" } });
     }
   }
-
-  // --- owner override -----------------------------------------------------
-  const owner = await prisma.adminUser.create({
-    data: {
-      email: `verify-owner-${suffix.toLowerCase()}@example.test`,
-      name: "Verify Owner",
-      role: "OWNER",
-      isActive: true,
-    },
-  });
-  const viewer = await prisma.adminUser.create({
-    data: {
-      email: `verify-viewer-${suffix.toLowerCase()}@example.test`,
-      name: "Verify Viewer",
-      role: "VIEWER",
-      isActive: true,
-    },
-  });
 
   try {
     const dock2 = await createLocation({ code: `VFA-${suffix}-OVR`, name: "Dock Override" });
@@ -1103,6 +1338,7 @@ async function addressChecks() {
       audit !== null && JSON.stringify(audit?.afterData ?? {}).includes("Confirmed with the dock by phone"),
       audit ? `audit ${audit.id}` : "no audit row"
     );
+
   } finally {
     // The audit rows are NOT removed, and cannot be: the database carries a
     // trigger that refuses DELETE on AuditLog, which this suite discovered by
