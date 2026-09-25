@@ -584,13 +584,24 @@ async function main() {
     process.exit(runScript(script, scriptArgs, extraEnv));
   }
 
+  /*
+   * THE FIXTURE IS REMOVED BEFORE THE PROCESS ENDS, which is not what
+   * `process.exit` inside the `try` did: exiting is not a return, so the
+   * `finally` below it was unreachable and every seeded run left its product
+   * behind. A leftover is not merely untidy — it is a simple product holding a
+   * variant-level carton, which is exactly the shape `verify-packaging` asserts
+   * does not exist, so one crashed run made the next run's invariant checks
+   * fail against the harness's own litter.
+   */
   const fixture = await seedPackagingFixture();
+  let status = 1;
   try {
     scriptArgs.unshift(fixture.variantId);
-    process.exit(runScript(script, scriptArgs, extraEnv));
+    status = runScript(script, scriptArgs, extraEnv);
   } finally {
     await cleanupPackagingFixture(fixture);
   }
+  process.exit(status);
 }
 
 main().catch((error) => {
