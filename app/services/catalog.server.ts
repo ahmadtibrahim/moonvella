@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { assetUrl } from "./media.server";
 import type { SellerContext } from "./seller.server";
 
 export interface PublicCatalogProduct {
@@ -50,6 +51,7 @@ const CATALOG_IMAGE_CATEGORIES = ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"] a
 type MediaAssetWithAssignments = {
   id: string;
   storageKey: string;
+  sourceUrl: string | null;
   category: string;
   assignments: { variantId: string | null; sortOrder: number; isPrimary: boolean }[];
 };
@@ -63,6 +65,14 @@ type MediaAssetWithAssignments = {
  * lowest-ordered asset. The fallbacks matter because a product can legitimately
  * carry only shared media, which is the common case for a family whose variants
  * differ only in size.
+ *
+ * IT RETURNS A URL, NOT A KEY. It used to return `storageKey`, which is 32 hex
+ * characters and nothing else, and the catalog card rendered it directly as an
+ * `src`. Every product image in the seller's catalogue was therefore a broken
+ * image — the file was stored, approved and published, and the browser was
+ * asked for a file called `9f2c…e1` relative to the current page. `assetUrl` is
+ * the function that already knows what a row's address is, so this is now the
+ * same answer the admin screens get.
  */
 function pickPrimaryImage(
   assets: MediaAssetWithAssignments[],
@@ -83,7 +93,7 @@ function pickPrimaryImage(
     const own = withImage
       .filter((asset) => asset.assignments.some((a) => a.variantId === defaultVariantId))
       .sort((a, b) => byVariantOrder(a, defaultVariantId) - byVariantOrder(b, defaultVariantId));
-    if (own.length) return own[0].storageKey;
+    if (own.length) return assetUrl(own[0]);
   }
 
   const scoped = withImage
@@ -94,7 +104,7 @@ function pickPrimaryImage(
       if (aPrimary !== bPrimary) return aPrimary - bPrimary;
       return a.id.localeCompare(b.id);
     });
-  if (scoped.length) return scoped[0].storageKey;
+  if (scoped.length) return assetUrl(scoped[0]);
 
   const shared = withImage
     .filter((asset) => asset.assignments.some((a) => a.variantId === null))
@@ -104,9 +114,9 @@ function pickPrimaryImage(
       if (aPrimary !== bPrimary) return aPrimary - bPrimary;
       return byVariantOrder(a, null) - byVariantOrder(b, null);
     });
-  if (shared.length) return shared[0].storageKey;
+  if (shared.length) return assetUrl(shared[0]);
 
-  return withImage[0].storageKey;
+  return assetUrl(withImage[0]);
 }
 
 /**
@@ -141,6 +151,11 @@ export async function listCatalog(
         select: {
           id: true,
           storageKey: true,
+          // Read so the URL below can be built. A migrated asset has a key that
+          // names no object here and lives at its original address instead;
+          // `assetUrl` is the one place that decides which of the two a row is,
+          // and it needs both to decide.
+          sourceUrl: true,
           category: true,
           assignments: {
             select: { variantId: true, sortOrder: true, isPrimary: true },

@@ -527,6 +527,17 @@ const CHECKS = [
     file: "scripts/verify-media.ts",
     requires: [],
   },
+  // Sending a file into a seller's Shopify store. The store is a stub and the
+  // staged upload goes through an injectable fetch, so this reaches nothing —
+  // what it pins is the request we build (which mutation, which resource, which
+  // fields) and how we read the reply. Whether Shopify accepts it is a claim
+  // that needs a live storefront and is not made here.
+  {
+    name: "shopify-transfer",
+    kind: "ts",
+    file: "scripts/verify-shopify-transfer.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {

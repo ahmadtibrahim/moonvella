@@ -296,6 +296,18 @@ export default function CatalogPage() {
                   </a>
                 ) : null}
 
+                {/* Videos, documents and everything else the merchant has
+                    shared. Separate from the image picker because that one
+                    decides what an import sends, while this one sends a single
+                    file on demand — and a video cannot go through the import. */}
+                <a
+                  className="mv-import-btn"
+                  style={{ display: "block", textAlign: "center", marginBottom: "0.4rem" }}
+                  href={`/app/product-assets/${encodeURIComponent(product.id)}`}
+                >
+                  Files &amp; videos
+                </a>
+
                 {canImport ? (
                   <ImagePicker productId={product.id} disabled={fetcher.state !== "idle"} />
                 ) : null}

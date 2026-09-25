@@ -29,6 +29,7 @@
 import { prisma } from "~/db.server";
 import { redactSecrets } from "./credentials.server";
 import { listProductMedia, type MediaAssetView } from "./media.server";
+import { transferFilename } from "./shopifyTransfer.server";
 
 /** The categories an import may carry. Documents and marketing material are not images. */
 export const IMPORTABLE_IMAGE_CATEGORIES = ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"] as const;
@@ -252,8 +253,18 @@ export async function saveImageSelection(input: SaveSelectionInput): Promise<Sav
 
 export interface ResolvedImportImage {
   mediaAssetId: string;
-  /** Absolute URL the store will fetch. Only assets that have one are usable. */
-  url: string;
+  /**
+   * The address the store can fetch the image from, when it has one.
+   *
+   * Null means the bytes are in this deployment's own storage instead — which
+   * has no public origin — and `staged` says how to send them. It is null rather
+   * than a `/uploads/...` path on purpose: a relative path is not something
+   * Shopify can fetch, and handing one over would look like an address while
+   * behaving like a 404.
+   */
+  url: string | null;
+  /** Set when the file must be uploaded: the store cannot fetch our storage. */
+  staged: { storageKey: string; filename: string; mimeType: string } | null;
   alt: string | null;
   sortOrder: number;
   isMain: boolean;
@@ -286,6 +297,22 @@ export async function resolveImagesForImport(
   const view = await listSelectableImages(sellerId, productId);
   const selected = view.images.filter((image) => image.selected);
 
+  // The storage keys are read here, on the server, and they are the one thing a
+  // view deliberately withholds — it reports a URL instead, so that a key never
+  // travels to a browser. The import is the caller that needs the bytes, so this
+  // is where they are looked up.
+  const rows = await prisma.mediaAsset.findMany({
+    where: { id: { in: selected.map((image) => image.mediaAssetId) } },
+    select: {
+      id: true,
+      storageKey: true,
+      mimeType: true,
+      originalFilename: true,
+      title: true,
+    },
+  });
+  const rowById = new Map(rows.map((row) => [row.id, row]));
+
   const images: ResolvedImportImage[] = [];
   const unusable: ResolvedImportImages["unusable"] = [];
 
@@ -294,6 +321,7 @@ export async function resolveImagesForImport(
       images.push({
         mediaAssetId: image.mediaAssetId,
         url: image.url,
+        staged: null,
         alt: image.altText,
         sortOrder: image.sortOrder,
         isMain: image.isMain,
@@ -302,24 +330,49 @@ export async function resolveImagesForImport(
       });
       continue;
     }
-    if (!/^https?:\/\//i.test(image.url)) {
-      // A stored asset with no public origin cannot be fetched by the store.
-      // Inventing a URL would send a broken link, so it is reported instead.
-      unusable.push({
+    if (/^https?:\/\//i.test(image.url)) {
+      images.push({
         mediaAssetId: image.mediaAssetId,
-        title: image.title,
-        reason: "This image has no public address, so the store cannot fetch it.",
+        url: image.url,
+        staged: null,
+        alt: image.altText,
+        sortOrder: image.sortOrder,
+        isMain: image.isMain,
+        variantIds: image.variantIds,
+        alreadyUploadedAs: null,
       });
       continue;
     }
-    images.push({
+
+    // No address the store can fetch. That used to end the story for every
+    // image uploaded through the new pipeline: it was reported as unusable and
+    // skipped, so a merchant could approve a photograph, tick it for import, and
+    // watch it never arrive. The bytes are in our storage, and a staged upload
+    // is how they get out — the store will accept them even though it cannot
+    // reach us, because the upload comes from here.
+    const row = rowById.get(image.mediaAssetId);
+    if (row?.storageKey) {
+      images.push({
+        mediaAssetId: image.mediaAssetId,
+        url: null,
+        staged: {
+          storageKey: row.storageKey,
+          filename: transferFilename(row),
+          mimeType: row.mimeType,
+        },
+        alt: image.altText,
+        sortOrder: image.sortOrder,
+        isMain: image.isMain,
+        variantIds: image.variantIds,
+        alreadyUploadedAs: null,
+      });
+      continue;
+    }
+
+    unusable.push({
       mediaAssetId: image.mediaAssetId,
-      url: image.url,
-      alt: image.altText,
-      sortOrder: image.sortOrder,
-      isMain: image.isMain,
-      variantIds: image.variantIds,
-      alreadyUploadedAs: null,
+      title: image.title,
+      reason: "This image's file is no longer in MoonVella's storage, so there is nothing to send.",
     });
   }
 
