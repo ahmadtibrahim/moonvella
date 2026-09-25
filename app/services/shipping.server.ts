@@ -50,6 +50,7 @@ import {
   type LocationSchedule,
 } from "./holidays";
 import { resolveFulfillmentOrders } from "./shopifyFulfillment.server";
+import { assertBookingAddressesBookable, assertDeliveryAddressBookable } from "./addressValidation.server";
 
 /**
  * The states from which a booking may be attempted.
@@ -839,6 +840,18 @@ export async function bookShipmentForOrder(
     throw new Error(origin.reason ?? "Pickup location required before booking.");
   }
 
+  /*
+   * The addresses, before the money. Both ends of the label are checked here —
+   * this is the enforcement the booking flow was missing: `addressGate` existed
+   * and was rendered on the origins page, but nothing that books ever consulted
+   * it, so an address Google had refused (or had never managed to check at all)
+   * still produced a label and a charge. It runs before the quote lookup for a
+   * blunt reason: a refusal that says "this address has never been checked"
+   * tells the operator what to do, and a refusal that says "re-quote" sends them
+   * to re-quote an address that will refuse again.
+   */
+  await assertBookingAddressesBookable({ originLocationId: origin.location.id, orderId });
+
   const quote = opts.quoteId
     ? await prisma.shippingQuote.findUnique({ where: { id: opts.quoteId } })
     : await prisma.shippingQuote.findFirst({
@@ -936,6 +949,12 @@ export async function bookPreparedShipment(shipmentId: string, quoteId: string |
   if (!origin.ready || !origin.location) {
     throw new Error(origin.reason ?? "Pickup location required before booking.");
   }
+
+  // The same address precondition as bookShipmentForOrder, on the same two
+  // ends. Booking a prepared parcel is still booking, and it still prints a
+  // destination the customer typed.
+  await assertBookingAddressesBookable({ originLocationId: origin.location.id, orderId: order.id });
+
   const quote = quoteId
     ? await prisma.shippingQuote.findUnique({ where: { id: quoteId } })
     : await prisma.shippingQuote.findFirst({
@@ -2218,6 +2237,15 @@ export async function bookReturnForOrder(
   if (!quote || quote.orderId !== orderId || quote.provider !== "eshipper-return") {
     throw new Error("Return quote not found. Request return rates first.");
   }
+
+  // The return label's destination is the customer's address, which is the
+  // order's shipping address — the same address, under the same subject, as the
+  // outbound delivery. It is gated for the same reason the outbound one is: a
+  // label is a label, and a return to an address nobody checked is the same
+  // risk pointing the other way. Only this end: the ship-from is the configured
+  // return address, which has no record to validate (see
+  // assertDeliveryAddressBookable).
+  await assertDeliveryAddressBookable(orderId, "Return booking");
 
   const built = await buildQuotePackagesForOrder({
     items: order.items.map((i) => ({ sku: i.sku, quantity: i.quantity, variantId: i.variantId })),

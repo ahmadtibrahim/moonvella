@@ -815,7 +815,16 @@ export async function recordAddressOverride(input: {
   return { ok: true, validationId: row.id };
 }
 
-async function loadSubjectAddress(
+/**
+ * The address a verdict is about, exactly as the gate reads it.
+ *
+ * Exported because a screen offering "check this now" has to check the same
+ * address the booking will be judged on. A route that assembled its own copy
+ * from the same row would be a second definition of the address, and the day
+ * the two disagree the panel says ACCEPTED while the gate says the hash does
+ * not match — the worst possible version of this feature.
+ */
+export async function loadSubjectAddress(
   subjectType: "PICKUP" | "DELIVERY",
   subjectId: string
 ): Promise<StructuredAddress | null> {
@@ -834,7 +843,145 @@ async function loadSubjectAddress(
       country: location.country ?? "",
     };
   }
-  return null;
+
+  /*
+   * DELIVERY is keyed on the ORDER, not on a stored address record: the
+   * destination exists only as the billing/shipping blob the order arrived
+   * with, and there is nothing to point at but the order itself. An order with
+   * no shipping address is returned as null rather than as an empty address, so
+   * the gate refuses it with "could not be found" instead of asking Google to
+   * validate a blank.
+   */
+  const order = await prisma.order.findUnique({
+    where: { id: subjectId },
+    select: { shippingAddress: true },
+  });
+  if (!order) return null;
+  return structuredFromStoredAddress(order.shippingAddress);
+}
+
+/* -------------------------------------------------------------------------- */
+/* The booking gate                                                           */
+/* -------------------------------------------------------------------------- */
+
+export class BookingAddressRefused extends Error {
+  readonly blockers: string[];
+  constructor(message: string, blockers: string[]) {
+    super(message);
+    this.name = "BookingAddressRefused";
+    this.blockers = blockers;
+  }
+}
+
+export interface BookingAddressCheck {
+  allowed: boolean;
+  /** Every reason the booking must not proceed, one line per end. Empty when open. */
+  blockers: string[];
+  pickup: AddressGate | null;
+  delivery: AddressGate;
+}
+
+/**
+ * Both ends of a booking, gated together.
+ *
+ * A LABEL CARRIES TWO ADDRESSES AND BOTH OF THEM PRINT. Gating only the dock
+ * would leave the destination — the address the goods actually travel to, and
+ * the one a customer typed into a checkout form — unchecked; gating only the
+ * destination would leave the dock, which is the address that decides the
+ * price, unchecked. So both are asked, and the booking is refused if either is
+ * not accepted.
+ *
+ * WHAT "ACCEPTED" MEANS HERE. `addressGate` is the only judge: a current
+ * ACCEPTED verdict for the address as it stands now, or a recorded owner
+ * override of that same address. UNAVAILABLE is NOT a pass — it is the verdict
+ * that says nobody checked, and treating an outage as consent is the one
+ * reading the module's rules forbid. An address that was accepted and then
+ * edited is not accepted either: the hash no longer matches, so the old verdict
+ * describes a different address.
+ *
+ * The pickup end is null when no dock was resolved. That is not this function's
+ * refusal to make — booking already refuses an order whose lines map to no dock,
+ * and it says so first — but the null is reported rather than folded into a
+ * pass, so a caller that somehow reaches here without one is refused too.
+ */
+export async function bookingAddressGate(input: {
+  originLocationId: string | null | undefined;
+  orderId: string;
+}): Promise<BookingAddressCheck> {
+  const [pickup, delivery] = await Promise.all([
+    input.originLocationId ? addressGate("PICKUP", input.originLocationId) : Promise.resolve(null),
+    addressGate("DELIVERY", input.orderId),
+  ]);
+
+  const blockers: string[] = [];
+  if (!pickup) {
+    blockers.push(
+      "The pickup address could not be resolved, so it cannot be checked. Map the ordered items to a pickup location first."
+    );
+  } else if (!pickup.allowed) {
+    blockers.push(`Pickup address — ${pickup.label}: ${pickup.blockers.join(" ")}`);
+  }
+  if (!delivery.allowed) {
+    blockers.push(`Delivery address — ${delivery.label}: ${delivery.blockers.join(" ")}`);
+  }
+
+  return { allowed: blockers.length === 0, blockers, pickup, delivery };
+}
+
+/**
+ * The same check, as the refusal a booking throws.
+ *
+ * The wording is load-bearing. It names which end failed, repeats the gate's own
+ * reason rather than a generic one, and states the way out — check the address,
+ * or have an owner record an override — because the alternative is an operator
+ * who reads "refused" and looks for a way to make the screen stop refusing.
+ * It does NOT name the address itself: the refusal travels into logs and audit
+ * rows, and the screen it is rendered on already shows the address.
+ */
+export async function assertBookingAddressesBookable(input: {
+  originLocationId: string | null | undefined;
+  orderId: string;
+}): Promise<BookingAddressCheck> {
+  const gate = await bookingAddressGate(input);
+  if (gate.allowed) return gate;
+
+  throw new BookingAddressRefused(
+    `Booking refused: ${gate.blockers.join(" ")} ` +
+      `A booking needs an address Google accepts, or an owner override recorded with a reason. ` +
+      `An address the validator could not check does not pass.`,
+    gate.blockers
+  );
+}
+
+/**
+ * The destination end alone, for bookings that do not travel from a dock.
+ *
+ * A return label points from the configured return address BACK to the customer,
+ * so its destination is the order's shipping address — the same address, under
+ * the same subject, as the outbound delivery. It is checked for the same reason.
+ *
+ * The other end is deliberately NOT checked, and this is the honest limit of
+ * this function rather than an oversight. A return's ship-from is
+ * `configuredReturnAddress()` in shipping.server.ts: environment placeholders
+ * that are not a PickupLocation and therefore have no record a verdict could
+ * belong to. Gating it would refuse every return with no way to clear the
+ * refusal. That address is already flagged in the code as Phase D work — the
+ * day it becomes a real configured record, it becomes gateable, and this
+ * function should grow the pickup half.
+ */
+export async function assertDeliveryAddressBookable(
+  orderId: string,
+  context = "Booking"
+): Promise<AddressGate> {
+  const delivery = await addressGate("DELIVERY", orderId);
+  if (delivery.allowed) return delivery;
+
+  throw new BookingAddressRefused(
+    `${context} refused: Delivery address — ${delivery.label}: ${delivery.blockers.join(" ")} ` +
+      `A booking needs an address Google accepts, or an owner override recorded with a reason. ` +
+      `An address the validator could not check does not pass.`,
+    [`Delivery address — ${delivery.label}: ${delivery.blockers.join(" ")}`]
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -947,6 +1094,31 @@ export async function addressGate(
     };
   }
 
+  /*
+   * UNAVAILABLE is asked about BEFORE the expiry test, and the order matters.
+   *
+   * An unavailable verdict is stored with `expiresAt = checkedAt`, so it is
+   * always already expired — which means the expiry branch would answer for it,
+   * and the operator would be told "the last check of this address has expired,
+   * check it again". That is true and useless: it reads as housekeeping, and it
+   * hides the fact that the validator never answered, which is the thing worth
+   * knowing. The check is what failed; the row says so; so the gate says so.
+   */
+  if (row.verdict === "UNAVAILABLE") {
+    return {
+      allowed: false,
+      verdict: "UNAVAILABLE",
+      blockers: [
+        row.unavailableReason ??
+          "The address could not be checked. Booking stays blocked until it is.",
+      ],
+      label: verdictLabel("UNAVAILABLE"),
+      googleValidated: false,
+      checkedAt: row.checkedAt,
+      canOverride: true,
+    };
+  }
+
   const expired = row.expiresAt !== null && row.expiresAt <= new Date();
   if (expired) {
     return {
@@ -985,13 +1157,14 @@ export async function addressGate(
     };
   }
 
+  // What is left is a verdict that asks for a person: Google could not confirm
+  // the address, or it wants a component corrected. UNAVAILABLE cannot reach
+  // here — it is answered above, before the expiry test.
   return {
     allowed: false,
     verdict: row.verdict,
     blockers: [
-      row.verdict === "UNAVAILABLE"
-        ? row.unavailableReason ?? "The address could not be checked."
-        : `This address needs attention before it can be booked against (${verdictLabel(row.verdict)}).`,
+      `This address needs attention before it can be booked against (${verdictLabel(row.verdict)}).`,
     ],
     label: verdictLabel(row.verdict),
     googleValidated: false,

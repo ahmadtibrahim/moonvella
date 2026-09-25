@@ -14,6 +14,7 @@ import {
 import { applyStripeEvent } from "../app/services/payments.server";
 import { forbidProviderCalls } from "./provider-guard";
 import { installEshipperStub } from "./eshipper-stub";
+import { acceptAddress } from "./verify-address-fixtures";
 
 const prisma = new PrismaClient();
 const SHOP = "wholesale-test.myshopify.com";
@@ -41,6 +42,9 @@ async function cleanup() {
     await prisma.orderPackage.deleteMany({ where: { orderId: { in: ids } } });
     await prisma.orderItem.deleteMany({ where: { orderId: { in: ids } } });
     await prisma.fulfillmentRequest.deleteMany({ where: { orderId: { in: ids } } });
+    // The verdicts this suite seeded for those orders, so a re-run does not
+    // inherit a decision it did not make.
+    await prisma.addressValidation.deleteMany({ where: { subjectId: { in: ids } } });
     await prisma.order.deleteMany({ where: { sellerId: seller.id } });
     await prisma.sellerPaymentMethod.deleteMany({ where: { sellerId: seller.id } });
     await prisma.sellerBillingSettings.deleteMany({ where: { sellerId: seller.id } });
@@ -55,6 +59,7 @@ async function cleanup() {
     dock.productIds = [];
   }
   if (dock.locationIds.length) {
+    await prisma.addressValidation.deleteMany({ where: { subjectId: { in: dock.locationIds } } });
     await prisma.pickupLocation.deleteMany({ where: { id: { in: dock.locationIds } } });
     dock.locationIds = [];
   }
@@ -107,6 +112,15 @@ async function ensureDock() {
     },
   });
   dock.locationIds.push(location.id);
+
+  /*
+   * The dock has to be an address booking will accept, or every check below
+   * would stop exercising billing and start exercising the address gate. The
+   * verdict is seeded through the gate's own hash so it matches by construction
+   * — see scripts/verify-address-fixtures.ts. This suite is about money and
+   * shipments; the gate has its own suite.
+   */
+  await acceptAddress(prisma, "PICKUP", location.id);
 
   const product = await prisma.product.create({
     data: {
@@ -183,6 +197,10 @@ async function makeOrder(sellerId: string, total = 2598) {
       fulfillmentRequest: { create: {} },
     },
   });
+
+  // The delivery end, ditto. Accepted as it stands: this suite is not testing
+  // what happens when it is not.
+  await acceptAddress(prisma, "DELIVERY", order.id);
   return order;
 }
 

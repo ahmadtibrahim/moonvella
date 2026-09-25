@@ -27,9 +27,18 @@ import {
 } from "~/services/fulfillmentRequest.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { groupOrderLinesByOrigin } from "~/services/origins.server";
+import {
+  addressStatus,
+  loadSubjectAddress,
+  recordAddressOverride,
+  recordValidation,
+  validateAddress,
+} from "~/services/addressValidation.server";
+import { AddressGateCard } from "~/components/AddressGateCard";
+import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
-  await requirePermission(request, "orders.view");
+  const user = await requirePermission(request, "orders.view");
   const order = await prisma.order.findUnique({
     where: { id: String(params.id) },
     include: {
@@ -89,24 +98,47 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     }))
   );
 
+  /*
+   * The addresses this order's labels will carry, with their verdicts. Read
+   * here rather than in the component for the same reason the gate is: the page
+   * must not draw a Book button it already knows will be refused, and the
+   * delivery end belongs to the order while each pickup end belongs to a dock —
+   * an order shipping from two docks has two of them and both have to be
+   * accepted.
+   */
+  const collectionGroups = await Promise.all(
+    grouping.groups.map(async (group) => ({
+      key: group.key,
+      ready: group.ready,
+      reason: group.reason,
+      code: group.location?.code ?? null,
+      name: group.location?.name ?? null,
+      lines: group.lines.length,
+      quantity: group.lines.reduce((sum, line) => sum + line.quantity, 0),
+      skus: [...new Set(group.lines.map((line) => line.sku))],
+      locationId: group.location?.id ?? null,
+      addressGate: group.location ? await addressStatus("PICKUP", group.location.id) : null,
+    }))
+  );
+
   return {
     order,
     collection: {
       split: grouping.split,
       blockers: grouping.blockers,
-      groups: grouping.groups.map((group) => ({
-        key: group.key,
-        ready: group.ready,
-        reason: group.reason,
-        code: group.location?.code ?? null,
-        name: group.location?.name ?? null,
-        lines: group.lines.length,
-        quantity: group.lines.reduce((sum, line) => sum + line.quantity, 0),
-        skus: [...new Set(group.lines.map((line) => line.sku))],
-      })),
+      groups: collectionGroups,
+      deliveryGate: await addressStatus("DELIVERY", order.id),
     },
     mode: await stripeMode(),
     shopifyFulfillment,
+    /*
+     * Only the override control is gated on this, and the gate is drawn from it
+     * for the same reason the shipment page draws it: an owner who is not told
+     * they are the only one who can clear a refusal phones someone. The rule
+     * itself is enforced in the service against the stored role, so a forged
+     * form is refused whatever this flag says.
+     */
+    isOwner: user.role === "OWNER",
     eshipper: { mode: await eshipperMode(), account: await maskedEshipperAccount() },
     billing: {
       mode: billing.mode,
@@ -160,6 +192,32 @@ export async function action({ request, params }: ActionFunctionArgs) {
     } else if (intent === "manual_pay") {
       const result = await chargeWholesaleOrder(orderId, { trigger: "MANUAL", actor });
       if (!result.ok) return { error: result.error || "Manual payment failed." };
+    } else if (intent === "check_address") {
+      // The same two intents the shipment page carries, on the screen where an
+      // order is booked whole. A refusal names an address, so the address has to
+      // be fixable where the refusal is read.
+      const subject = addressSubject(form);
+      const address = await loadSubjectAddress(subject.type, subject.id);
+      if (!address) throw new Error("That address could not be found.");
+      const outcome = await validateAddress(address, { refresh: true });
+      await recordValidation({ subjectType: subject.type, subjectId: subject.id, outcome });
+      if (outcome.verdict === "ACCEPTED") return redirect(`/admin/orders/${orderId}`);
+      return {
+        error: `${addressSubjectLabel(subject.type)}: ${
+          outcome.reason ?? "the address needs review before it can be booked against."
+        }`,
+      };
+    } else if (intent === "override_address") {
+      // The role check that matters is in the service, against the stored
+      // account: a role posted by this form would be a role the submitter chose.
+      const subject = addressSubject(form);
+      const result = await recordAddressOverride({
+        subjectType: subject.type,
+        subjectId: subject.id,
+        actorId: user.id,
+        reason: String(form.get("reason") || ""),
+      });
+      if (!result.ok) return { error: result.error };
     } else if (intent === "book_shipment") {
       await bookShipmentForOrder(orderId, { quoteId: String(form.get("quoteId") || "") || undefined }, actor);
     } else if (intent === "void_shipment") {
@@ -233,7 +291,7 @@ function money(cents: number, currency = "CAD") {
 }
 
 export default function AdminOrderDetail() {
-  const { order, collection, mode, eshipper, billing, shopifyFulfillment } = useLoaderData<typeof loader>();
+  const { order, collection, mode, eshipper, billing, shopifyFulfillment, isOwner } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
   const selectedQuote = order.shippingQuotes.find((q) => q.selected) ?? null;
@@ -421,6 +479,46 @@ export default function AdminOrderDetail() {
             origin mapping is complete. No global address is substituted.
           </p>
         ) : null}
+      </div>
+
+      <div style={card}>
+        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Addresses on this label</h2>
+        {/*
+          * Every dock this order ships from, then the destination. Both ends,
+          * because the booking refuses on either: a page that showed only the
+          * customer's address would leave an operator reading "Pickup address —
+          * Validation unavailable" with nothing on the screen to press.
+          */}
+        <p style={{ fontSize: "0.72rem", color: "#64748b", margin: "0 0 0.2rem" }}>
+          Booking needs every address below accepted. A check that could not be performed is not an
+          acceptance: it blocks the booking the same way a rejected address does.
+        </p>
+        {collection.groups.map((group) =>
+          group.addressGate && group.locationId ? (
+            <AddressGateCard
+              key={group.key}
+              title={`Pickup address — ${group.code ?? group.name ?? "dock"}`}
+              subjectType="PICKUP"
+              subjectId={group.locationId}
+              status={group.addressGate}
+              isOwner={isOwner}
+              editHref="/admin/origins"
+              editLabel="Edit this location's address"
+            />
+          ) : (
+            <p key={group.key} style={{ fontSize: "0.78rem", color: "#b45309", marginTop: "0.8rem" }}>
+              A pickup address could not be resolved for this order&apos;s lines, so there is nothing to
+              check and booking is blocked until the origin mapping is complete.
+            </p>
+          )
+        )}
+        <AddressGateCard
+          title="Delivery address"
+          subjectType="DELIVERY"
+          subjectId={order.id}
+          status={collection.deliveryGate}
+          isOwner={isOwner}
+        />
       </div>
 
       <div style={card}>

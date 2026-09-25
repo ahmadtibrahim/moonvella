@@ -25,6 +25,8 @@
  * abort — the only thing the adapter distinguishes.
  */
 
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import {
   QUOTE_INVALIDATION,
@@ -36,7 +38,17 @@ import {
   schedulePickupForShipment,
 } from "../app/services/shipping.server";
 import { addOrderPackage, advanceShipment, removeOrderPackage } from "../app/services/fulfillment.server";
-import { addressMateriallyDiffers } from "../app/services/addressValidation.server";
+import {
+  addressGate,
+  addressMateriallyDiffers,
+  addressStatus,
+  bookingAddressGate,
+  loadSubjectAddress,
+  outcomeFromResponse,
+  recordAddressOverride,
+  recordValidation,
+} from "../app/services/addressValidation.server";
+import { acceptBookingAddresses, recordVerdict } from "./verify-address-fixtures";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import { packingListFor, parseAddressLines, renderPackingList } from "../app/services/packingList.server";
 import { eshipperMode } from "../app/services/eshipper.server";
@@ -327,6 +339,21 @@ async function createBookableOrder(
     },
   });
 
+  /*
+   * ACCEPTED VERDICTS, BOTH ENDS — the precondition booking now has.
+   *
+   * Added when the address gate was wired in. Without it every check below
+   * would be refused for an address nobody checked, and the suite would report
+   * a wall of failures that say nothing about the behaviour it exists to
+   * examine. The verdicts are seeded through the same hash the gate computes,
+   * so they are accepted for the right reason rather than by a shortcut the
+   * product does not have.
+   */
+  await acceptBookingAddresses(prisma, {
+    originLocationId: origin?.location.id ?? null,
+    orderId: order.id,
+  });
+
   return { order, quote, shipment, origin };
 }
 
@@ -357,6 +384,13 @@ async function cleanup() {
     // last and only after the orders that point at it.
     if (created.productIds.length) {
       await prisma.product.deleteMany({ where: { id: { in: created.productIds } } });
+    }
+    // Verdicts are keyed by a subject id rather than by a relation — a verdict
+    // can belong to a dock or to an order — so nothing above reaches them and
+    // they are removed by the ids this run created.
+    const subjects = [...created.orderIds, ...created.locationIds];
+    if (subjects.length) {
+      await prisma.addressValidation.deleteMany({ where: { subjectId: { in: subjects } } });
     }
     if (created.locationIds.length) {
       await prisma.pickupLocation.deleteMany({ where: { id: { in: created.locationIds } } });
@@ -1171,12 +1205,557 @@ async function originGateChecks() {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* The booking address gate                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Booking must refuse an address that is not accepted, and an unavailable
+ * validator is not an acceptance.
+ *
+ * THE DEFECT THIS EXISTS FOR. `addressGate` was written long before this suite
+ * and rendered on the Pickup locations page, but nothing that books ever called
+ * it: an operator could check a dock, watch Google refuse it, and then book
+ * from it anyway, because the check was advice. The checks below are the
+ * requirement stated as behaviour — a refusal, with a reason, before any money
+ * or any carrier call — on the code path the routes call.
+ *
+ * Every provider call is stubbed and every address here is a fixture. Nothing
+ * was checked against Google, no label was bought, and no real address is
+ * recorded in this suite: the verdicts are the ones the service itself would
+ * have stored, replayed through `recordValidation` so the storage path is the
+ * real one.
+ */
+async function addressGateChecks() {
+  console.log("\n-- the booking address gate --");
+  /*
+   * The stub is installed for the whole group, including the checks that expect
+   * a refusal. Most of them assert the carrier was never called, which needs a
+   * stubbed transport to be meaningful — but one check at the end books
+   * successfully, and without the stub that one reaches the REAL test API with a
+   * fixture quote id. It did, once: the provider answered 400 and bought nothing,
+   * and the check failed for a reason that had nothing to do with overrides.
+   */
+  installStub();
+  const seller = await createSeller("agate");
+
+  /* --- nothing has ever been checked ------------------------------------- */
+  {
+    const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "agate-never");
+    if (!origin) throw new Error("fixture expected an origin");
+    // The fixture seeds accepted verdicts so the OTHER checks exercise booking.
+    // This one is about the unvalidated case, so it removes them.
+    await prisma.addressValidation.deleteMany({
+      where: { subjectId: { in: [order.id, origin.location.id] } },
+    });
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-NEVER") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    const after = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check(
+      "booking refuses an address that has never been checked",
+      /never been checked/i.test(message),
+      message.slice(0, 180)
+    );
+    check(
+      "...and says which address it means",
+      /pickup address/i.test(message) && /delivery address/i.test(message),
+      message.slice(0, 180)
+    );
+    check("...and the refusal offers a way out", /override|accept/i.test(message), message.slice(0, 200));
+    check("...and the carrier is never called", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check("...and the shipment is left exactly where it was", after.status === "PENDING", after.status);
+    check("...and nothing is recorded as purchased", after.providerShipmentId === null);
+    check("...and no label time is stamped", after.labelCreatedAt === null);
+  }
+
+  /* --- the validator could not be reached -------------------------------- */
+  {
+    const { shipment, quote, origin } = await createBookableOrder(seller.id, "agate-unavail");
+    if (!origin) throw new Error("fixture expected an origin");
+
+    /*
+     * Stored through the product's own path: the outcome Google's silence
+     * produces, handed to the same `recordValidation` a real check would call.
+     * The pickup end is set unavailable and the delivery end left accepted, so a
+     * pass or a refusal here is attributable to the pickup end alone.
+     */
+    const address = await loadSubjectAddress("PICKUP", origin.location.id);
+    if (!address) throw new Error("fixture expected a pickup address");
+    const outcome = outcomeFromResponse(address, {});
+    check("an unanswered check is an UNAVAILABLE verdict", outcome.verdict === "UNAVAILABLE", outcome.verdict);
+    await recordValidation({ subjectType: "PICKUP", subjectId: origin.location.id, outcome });
+
+    const gate = await addressGate("PICKUP", origin.location.id);
+    check("the validator being unreachable does not pass the gate", gate.allowed === false, gate.label);
+    check(
+      "...and the gate repeats what went wrong, not that a timer ran out",
+      /could not be checked|no verdict|unavailable/i.test(gate.blockers.join(" ")),
+      gate.blockers.join(" ").slice(0, 160)
+    );
+    check("...and an override is offered as the way through", gate.canOverride === true);
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-UNAVAIL") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "an unavailable validator does not silently permit booking",
+      /pickup address/i.test(message) && /unavailable/i.test(message),
+      message.slice(0, 200)
+    );
+    check("...and the carrier is never called for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check(
+      "...and the shipment is untouched",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "PENDING"
+    );
+  }
+
+  /* --- the address was edited after it was checked ----------------------- */
+  {
+    const { order, quote, origin } = await createBookableOrder(seller.id, "agate-edited");
+    if (!origin) throw new Error("fixture expected an origin");
+    // An accepted verdict whose hash was computed for a DIFFERENT address — the
+    // state a dock lands in when someone edits the address and the old
+    // acceptance is still on file.
+    await prisma.addressValidation.deleteMany({ where: { subjectId: origin.location.id } });
+    await recordVerdict(prisma, {
+      subjectType: "PICKUP",
+      subjectId: origin.location.id,
+      verdict: "ACCEPTED",
+      inputHash: "hash-for-an-address-that-is-no-longer-there",
+    });
+
+    const gate = await addressGate("PICKUP", origin.location.id);
+    check("an address edited since its check is not accepted", gate.allowed === false, gate.label);
+    check(
+      "...and the reason is that it changed, not that it was never checked",
+      /changed since it was last checked/i.test(gate.blockers.join(" ")),
+      gate.blockers.join(" ").slice(0, 160)
+    );
+    check("...and the gate will not vouch for it", gate.googleValidated === false);
+
+    // And the booking path agrees with the gate, rather than having its own idea.
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-EDITED") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(
+        (await prisma.shipment.findFirstOrThrow({ where: { orderId: order.id } })).id,
+        quote.id,
+        ACTOR
+      );
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("...and booking is refused", /changed since it was last checked/i.test(message), message.slice(0, 180));
+    check("...with no carrier call", apiCalls().length === 0, `calls=${apiCalls().length}`);
+  }
+
+  /* --- the two verdicts that ask for a person ---------------------------- */
+  for (const verdict of ["CONFIRMATION_REQUIRED", "CORRECTION_REQUIRED"] as const) {
+    const { shipment, quote, origin } = await createBookableOrder(seller.id, `agate-${verdict.toLowerCase()}`);
+    if (!origin) throw new Error("fixture expected an origin");
+    await prisma.addressValidation.deleteMany({ where: { subjectId: origin.location.id } });
+    await recordVerdict(prisma, { subjectType: "PICKUP", subjectId: origin.location.id, verdict });
+
+    const gate = await addressGate("PICKUP", origin.location.id);
+    check(`${verdict} does not pass the gate`, gate.allowed === false, gate.label);
+    check(`...and ${verdict} is distinguishable from never having checked`, gate.verdict === verdict, gate.verdict);
+
+    responder = () => ({ status: 200, body: BOOKED_BODY(`ADDR-${verdict}`) });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(`booking is refused while the pickup address is ${verdict}`, message.length > 0, message.slice(0, 140));
+    check(`...and the carrier is not called for ${verdict}`, apiCalls().length === 0);
+  }
+
+  /* --- the destination is gated too, not just the dock ------------------- */
+  {
+    const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "agate-delivery");
+    if (!origin) throw new Error("fixture expected an origin");
+    await prisma.addressValidation.deleteMany({ where: { subjectId: order.id } });
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-DELIVERY") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "a dock that is accepted does not carry an unchecked destination",
+      /delivery address/i.test(message) && /never been checked/i.test(message),
+      message.slice(0, 200)
+    );
+    check("...and no label is bought for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    const gate = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
+    check(
+      "...and the gate is shut on one end only",
+      gate.allowed === false && gate.pickup?.allowed === true && gate.delivery.allowed === false,
+      `pickup=${gate.pickup?.allowed} delivery=${gate.delivery.allowed}`
+    );
+  }
+
+  /* --- an owner's override, on the record -------------------------------- */
+  {
+    const { shipment, quote, origin } = await createBookableOrder(seller.id, "agate-override");
+    if (!origin) throw new Error("fixture expected an origin");
+    await prisma.addressValidation.deleteMany({ where: { subjectId: origin.location.id } });
+
+    // Who may override is decided against the STORED account, so the check is
+    // made with a real one: an operations user, who can book and can check an
+    // address but is not an owner.
+    const staff = await prisma.adminUser.create({
+      data: {
+        email: `verify-addr-ops-${suffix.toLowerCase()}@example.test`,
+        name: "Verify Operations",
+        role: "OPERATIONS",
+        isActive: true,
+      },
+    });
+
+    let refused = "";
+    try {
+      await recordAddressOverride({
+        subjectType: "PICKUP",
+        subjectId: origin.location.id,
+        actorId: staff.id,
+        reason: "This address is correct, I have been there many times.",
+      });
+    } catch (error) {
+      refused = error instanceof Error ? error.message : String(error);
+    }
+    check("a non-owner cannot override an address", /only an owner/i.test(refused), refused.slice(0, 120));
+
+    const short = await recordAddressOverride({
+      subjectType: "PICKUP",
+      subjectId: origin.location.id,
+      actorId: staff.id,
+      reason: "fine",
+    });
+    check(
+      "an override with no real reason is refused",
+      short.ok === false && /10 characters/i.test(short.error),
+      short.ok ? "(accepted)" : short.error
+    );
+
+    const owner = await prisma.adminUser.create({
+      data: {
+        email: `verify-addr-owner-${suffix.toLowerCase()}@example.test`,
+        name: "Verify Owner",
+        role: "OWNER",
+        isActive: true,
+      },
+    });
+    const overridden = await recordAddressOverride({
+      subjectType: "PICKUP",
+      subjectId: origin.location.id,
+      actorId: owner.id,
+      reason: "Checked against the landlord's lease; the address is right and the postcode is the one the carrier uses.",
+    });
+    check("an owner can override with a reason", overridden.ok === true, overridden.ok ? "" : overridden.error);
+
+    const gate = await addressGate("PICKUP", origin.location.id);
+    check("an overridden address is allowed through", gate.allowed === true, gate.label);
+    check(
+      "...and is NEVER described as validated by Google",
+      gate.googleValidated === false && /owner/i.test(gate.label),
+      gate.label
+    );
+
+    // And the money moves only once the gate is open — the same booking that was
+    // refused a moment ago now goes through, with the override carrying it.
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-OVERRIDE") });
+    providerCalls = [];
+    let message = "";
+    let booked = false;
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("the booking proceeds on an owner's override", booked, message.slice(0, 180));
+    check("...and the carrier IS called once it is open", apiCalls().length > 0, `calls=${apiCalls().length}`);
+
+    // The entry is keyed on the validation row it created (`entityId`), and the
+    // address it is about is in `afterData` — stored as a JSON string, so it is
+    // parsed here rather than queried by path. Asserting on the subject is the
+    // stronger statement: it proves the record says WHICH address was
+    // overridden, not merely that some override happened.
+    const overrideEntries = await prisma.auditLog.findMany({
+      where: { action: "address.override_recorded" },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+    const audit = overrideEntries.find((entry) => {
+      try {
+        return JSON.parse(entry.afterData ?? "{}").subjectId === origin.location.id;
+      } catch {
+        return false;
+      }
+    });
+    check("the override is audited", audit !== undefined, `${overrideEntries.length} override entr(ies) in the log`);
+    check(
+      "...with the owner's name on it",
+      audit?.actorId === owner.id,
+      audit?.actorName ?? audit?.actorId ?? "(none)"
+    );
+
+    /*
+     * The override's audit entries stay. They are append-only by design — a
+     * DELETE is refused by the database itself, and arranging a way around that
+     * would be arranging to weaken the guarantee this check just proved. What
+     * can go is the fixture accounts; the log keeps their names in `actorName`,
+     * which is the point of copying the name onto the row.
+     *
+     * So this group leaves audit rows behind, one per run. That is the intended
+     * behaviour of an append-only log, not a leak: it is why `actorId` carries
+     * no foreign key, and why the fixture accounts use a per-run address.
+     */
+    await prisma.adminUser.deleteMany({ where: { id: { in: [staff.id, owner.id] } } });
+  }
+
+  /* --- Unit 7A and a postal code Google disagrees with ------------------- */
+  {
+    /*
+     * The case the owner asked to preserve: an address with a unit in its own
+     * field, and a postal code Google would change.
+     *
+     * Two things are asserted. That a disagreement is FLAGGED — the difference
+     * is stored, shown, and blocks a booking. And that nothing is APPLIED: the
+     * unit stays in street2, the postal code stays as the customer entered it,
+     * and no screen or service writes Google's suggestion over either.
+     */
+    const seller7a = await createSeller("agate-7a");
+    const { order, origin } = await createBookableOrder(seller7a.id, "agate-7a");
+    if (!origin) throw new Error("fixture expected an origin");
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        shippingAddress: JSON.stringify({
+          name: "Verify Customer",
+          address1: "500 Queen St W",
+          address2: "Unit 7A",
+          city: "Toronto",
+          province: "ON",
+          zip: "M5V 2T6",
+          country: "CA",
+        }),
+      },
+    });
+    // The fixture's accepted verdict was computed for the earlier blob, so it is
+    // cleared the way an edit would invalidate it.
+    await prisma.addressValidation.deleteMany({ where: { subjectId: order.id } });
+
+    const entered = await loadSubjectAddress("DELIVERY", order.id);
+    if (!entered) throw new Error("fixture expected a delivery address");
+    check("the unit is read as its own field, not folded into the street", entered.street2 === "Unit 7A", String(entered.street2));
+
+    // Google's answer, in its own shape: the unit confirmed, the postal code
+    // replaced with a different one.
+    const outcome = outcomeFromResponse(entered, {
+      result: {
+        verdict: {
+          validationGranularity: "SUB_PREMISE",
+          addressComplete: true,
+          hasReplacedComponents: true,
+        },
+        address: {
+          formattedAddress: "500 Queen St W Unit 7A, Toronto, ON M5V 3A8, Canada",
+          addressComponents: [
+            { componentType: "street_number", componentName: { text: "500" } },
+            { componentType: "route", componentName: { text: "Queen St W" } },
+            { componentType: "subpremise", componentName: { text: "Unit 7A" } },
+            { componentType: "locality", componentName: { text: "Toronto" } },
+            {
+              componentType: "administrative_area_level_1",
+              componentName: { text: "ON" },
+            },
+            {
+              componentType: "postal_code",
+              componentName: { text: "M5V 3A8" },
+              confirmationLevel: "CONFIRMED",
+              replaced: true,
+            },
+            { componentType: "country", componentName: { text: "CA" } },
+          ],
+        },
+        geocode: { placeId: "verify-place-7a" },
+      },
+    });
+    check(
+      "a replaced postal code is CORRECTION_REQUIRED, not a pass",
+      outcome.verdict === "CORRECTION_REQUIRED",
+      outcome.verdict
+    );
+    check(
+      "...and the unit is not among the differences",
+      !outcome.differences.some((d) => d.component === "street2"),
+      outcome.differences.map((d) => d.component).join(",") || "(none)"
+    );
+    const postal = outcome.differences.find((d) => d.component === "postalCode");
+    check(
+      "...and the postal-code discrepancy is recorded for review",
+      postal?.entered === "M5V 2T6" && postal?.suggested === "M5V 3A8",
+      JSON.stringify(postal ?? {})
+    );
+
+    await recordValidation({ subjectType: "DELIVERY", subjectId: order.id, outcome });
+
+    // Nothing applied. The order still carries what the customer typed, and the
+    // module still reads it that way.
+    const stored = JSON.parse((await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress ?? "{}");
+    check("the postal code on the order is unchanged by Google's answer", stored.zip === "M5V 2T6", String(stored.zip));
+    check("the unit on the order is unchanged", stored.address2 === "Unit 7A", String(stored.address2));
+    const reread = await loadSubjectAddress("DELIVERY", order.id);
+    check(
+      "...and the gate still reads the entered address, not the suggestion",
+      reread?.postalCode === "M5V 2T6" && reread?.street2 === "Unit 7A",
+      `${reread?.street2} / ${reread?.postalCode}`
+    );
+
+    const status = await addressStatus("DELIVERY", order.id);
+    check(
+      "the discrepancy is visible to the person deciding",
+      status.differences.some((d) => d.component === "postalCode"),
+      status.differences.map((d) => d.component).join(",") || "(none)"
+    );
+    check("...and the gate is shut on it", status.allowed === false, status.label);
+
+    const shipment = await prisma.shipment.findFirstOrThrow({ where: { orderId: order.id } });
+    const quote = await prisma.shippingQuote.findFirstOrThrow({ where: { orderId: order.id } });
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-7A") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("booking is refused while the postal code is disputed", message.length > 0, message.slice(0, 160));
+    check("...and nothing is bought", apiCalls().length === 0, `calls=${apiCalls().length}`);
+
+    // The source of the last write is checked too: no code path copies a
+    // suggestion onto a stored address. If one ever does, this pin fails and
+    // points at the line.
+    const writes = sourceLinesMatching(/shippingAddress:\s*(JSON\.stringify\()?\s*(outcome|suggested)/);
+    check(
+      "no code writes a validation suggestion over a stored address",
+      writes.length === 0,
+      writes.join(" | ").slice(0, 160)
+    );
+  }
+
+  /* --- the scopes this suite's orders are NOT bought with ---------------- */
+  {
+    /*
+     * The owner's instruction was explicit: do not add write_orders or
+     * write_draft_orders to create a test order, and buy through the storefront
+     * as a customer instead. A scope is a capability the whole app carries
+     * afterwards, so the pin is a check rather than a promise.
+     */
+    const writesOrderScope = (text: string) => {
+      const found = text.match(/\bwrite_(draft_)?orders\b/g) ?? [];
+      return found.length > 0;
+    };
+
+    // The declaration of record, when the repository is in view. The harness
+    // mounts app/ and prisma/ but not the repository root, so this one is
+    // checked where it exists and skipped where it does not — skipping loudly,
+    // because a check that passes because it read nothing is the kind of pass
+    // this file exists to avoid.
+    const tomlPath = join(process.cwd(), "shopify.app.toml");
+    if (existsSync(tomlPath)) {
+      const declared = readFileSync(tomlPath, "utf8")
+        .split("\n")
+        .filter((line) => /^\s*scopes\s*=/.test(line))
+        .join("\n");
+      check(
+        "shopify.app.toml asks for no order-writing scope",
+        declared.length > 0 && !writesOrderScope(declared),
+        declared.length === 0 ? "(no scopes line found — check is vacuous)" : writesOrderScope(declared) ? "write_orders present" : "clean"
+      );
+    } else {
+      console.log("SKIP  shopify.app.toml is not mounted here; the runtime scope list below is checked instead");
+    }
+
+    // What the running app actually asks Shopify for. In the harness this is the
+    // deployment's own value, read from the environment the suites already run
+    // with — so it says something about the deployed app, not just the tree.
+    const envScopes = process.env.SCOPES ?? "";
+    check(
+      "the configured scope list carries no order-writing scope",
+      envScopes.length > 0 && !writesOrderScope(envScopes),
+      envScopes.length === 0 ? "(SCOPES is unset — check is vacuous)" : writesOrderScope(envScopes) ? "write_orders present" : `clean, ${envScopes.split(",").length} scopes`
+    );
+
+    // And the one place a scope list is assembled in code.
+    const shopifyConfig = readFileSync(join(process.cwd(), "app", "shopify.server.js"), "utf8");
+    const scopeLines = shopifyConfig
+      .split("\n")
+      .filter((line) => /scopes/i.test(line))
+      .join("\n");
+    check(
+      "app/shopify.server.js passes the scope list through untouched",
+      !writesOrderScope(scopeLines),
+      scopeLines.trim().slice(0, 160)
+    );
+  }
+
+  restoreFetch();
+}
+
+/**
+ * Source lines under app/ matching a pattern — for pins about what must NOT be
+ * there. A behavioural check can only speak for the paths it exercises; a pin
+ * speaks for the whole file tree, which is what "no code does this" needs.
+ */
+function sourceLinesMatching(pattern: RegExp): string[] {
+  const hits: string[] = [];
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir)) {
+      const path = `${dir}/${entry}`;
+      if (statSync(path).isDirectory()) {
+        walk(path);
+        continue;
+      }
+      if (!/\.(ts|tsx|js|jsx)$/.test(entry)) continue;
+      readFileSync(path, "utf8")
+        .split("\n")
+        .forEach((line, index) => {
+          if (pattern.test(line)) hits.push(`${path}:${index + 1}`);
+        });
+    }
+  };
+  walk(join(process.cwd(), "app"));
+  return hits;
+}
+
 async function main() {
   await quoteInvalidationChecks();
   await quoteWithdrawalWiringChecks();
   await addressChangeChecks();
   await bookingOutcomeChecks();
   await originGateChecks();
+  await addressGateChecks();
   await pickupChecks();
   await packingListChecks();
 

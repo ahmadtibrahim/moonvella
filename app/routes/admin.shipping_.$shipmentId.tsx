@@ -21,7 +21,17 @@ import {
   pickupPlanForShipment,
   getBillingReconciliation,
   reconcileCarrierInvoice,
+  resolveShipmentOrigin,
 } from "~/services/shipping.server";
+import {
+  addressStatus,
+  loadSubjectAddress,
+  recordAddressOverride,
+  recordValidation,
+  validateAddress,
+} from "~/services/addressValidation.server";
+import { AddressGateCard } from "~/components/AddressGateCard";
+import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
 // Display-only helpers, imported from the isomorphic module: this route renders
 // them, so pulling them from shipping.server would drag server code into the
 // client bundle and fail the build.
@@ -241,6 +251,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     pickupPlanForShipment(shipmentId),
   ]);
 
+  /*
+   * Which dock this booking will actually use — resolved the same way
+   * `bookPreparedShipment` resolves it, deliberately, rather than read from
+   * `shipment.originLocationId`. The column can be empty on a parcel whose dock
+   * is implied by its lines, and the gate has to be asked about the dock the
+   * booking will name. Asking about a different one would either block a
+   * booking that is fine or bless one that is not.
+   */
+  const resolvedDock = await resolveShipmentOrigin(shipment, order.items);
+
   const selectedQuote = quotes.find((q) => q.selected) ?? null;
 
   /*
@@ -332,6 +352,25 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     },
     shopifyFulfillment: { state: shopifyFulfillment.status, detail: shopifyFulfillment.detail },
     pickupPlan,
+    /*
+     * Both addresses this booking will print, with their verdicts, read here
+     * rather than fetched from the panel's own endpoint: the panel exists to
+     * answer "may I book", and a page that draws a Book button before it knows
+     * the answer is a page that offers an action it will refuse.
+     *
+     * The pickup end is keyed on the DOCK, which is the same record the origins
+     * page validates — one verdict per address, however many screens read it.
+     * It is null when no dock is mapped, which is a different problem with its
+     * own message, already shown on this page.
+     */
+    addressGate: {
+      delivery: await addressStatus("DELIVERY", order.id),
+      pickup: resolvedDock?.location?.id ? await addressStatus("PICKUP", resolvedDock.location.id) : null,
+      // The id travels with the status so the panel's Check and Accept buttons
+      // name the same record the status was read from, rather than re-deriving
+      // the dock in the component.
+      pickupSubjectId: resolvedDock?.location?.id ?? null,
+    },
     trackingEvents: shipment.trackingEvents,
     // Deciding that a booking which timed out did not happen is a judgement
     // about money and about whether a second label may be bought. It is not a
@@ -472,6 +511,37 @@ export async function action({ request, params }: ActionFunctionArgs) {
         },
         actor
       );
+    } else if (intent === "check_address") {
+      /*
+       * An address is checked here, on the booking screen, because that is where
+       * the refusal lands. Sending an operator to another page to press a button
+       * that unblocks this one is how a missing step turns into a workaround.
+       *
+       * `refresh: true` — a person pressed Check now, so the stored verdict is
+       * not reused; every page render goes through the cached path instead.
+       */
+      const subject = addressSubject(form);
+      const address = await loadSubjectAddress(subject.type, subject.id);
+      if (!address) throw new Error("That address could not be found.");
+      const outcome = await validateAddress(address, { refresh: true });
+      await recordValidation({ subjectType: subject.type, subjectId: subject.id, outcome });
+      if (outcome.verdict === "ACCEPTED") return redirect(back);
+      return {
+        error: `${addressSubjectLabel(subject.type)}: ${
+          outcome.reason ?? "the address needs review before it can be booked against."
+        }`,
+      };
+    } else if (intent === "override_address") {
+      // The role check that matters is inside the service, against the stored
+      // account: a role posted by this form would be a role the submitter chose.
+      const subject = addressSubject(form);
+      const result = await recordAddressOverride({
+        subjectType: subject.type,
+        subjectId: subject.id,
+        actorId: user.id,
+        reason: String(form.get("reason") || ""),
+      });
+      if (!result.ok) return { error: result.error };
     } else if (intent === "schedule_pickup") {
       await schedulePickupForShipment(
         shipmentId,
@@ -714,7 +784,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, isOwner } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -808,6 +878,45 @@ export default function AdminShipmentDetail() {
             {addr.deliveryInstructions ? <div style={{ color: "#94a3b8" }}>Instructions: {addr.deliveryInstructions}</div> : null}
           </div>
         </div>
+      </div>
+
+      <div style={card}>
+        <h2 style={h2}>Addresses on this label</h2>
+        {/*
+          * Both ends are shown, not just the destination: a booking is refused
+          * when either one is unchecked, and an operator who can only see one of
+          * them is left guessing which end the refusal is about. The pickup
+          * address is the dock's own record — the same row the Pickup locations
+          * page validates — so checking it here checks it there.
+          */}
+        <p style={{ fontSize: "0.72rem", color: "#64748b", margin: "0 0 0.2rem" }}>
+          Booking needs both addresses accepted. A check that could not be performed is not an
+          acceptance: an address the validator never reached blocks the booking the same way a
+          rejected one does, until it is checked or an owner accepts it on the record.
+        </p>
+        {addressGate.pickup ? (
+          <AddressGateCard
+            title="Pickup address"
+            subjectType="PICKUP"
+            subjectId={addressGate.pickupSubjectId ?? ""}
+            status={addressGate.pickup}
+            isOwner={isOwner}
+            editHref="/admin/origins"
+            editLabel="Edit this location's address"
+          />
+        ) : (
+          <p style={{ fontSize: "0.78rem", color: "#b45309", marginTop: "0.8rem" }}>
+            The pickup address could not be resolved, so there is nothing to check and booking is
+            blocked. Map this shipment&apos;s items to a pickup location first.
+          </p>
+        )}
+        <AddressGateCard
+          title="Delivery address"
+          subjectType="DELIVERY"
+          subjectId={order.id}
+          status={addressGate.delivery}
+          isOwner={isOwner}
+        />
       </div>
 
       <div style={card}>
@@ -930,7 +1039,7 @@ export default function AdminShipmentDetail() {
           packages={packages.length}
           selectedQuote={selectedQuote}
           canBook={canBook}
-          isOwner={data.isOwner}
+          isOwner={isOwner}
         />
       </div>
 
