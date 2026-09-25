@@ -647,7 +647,12 @@ async function main() {
     // =====================================================================
     // Refusals: what must never be sent
     // =====================================================================
-    async function refusalFor(input: {
+    // A const arrow rather than a function declaration: this helper belongs
+    // with the refusals it drives, which are inside the fixture's `try` block,
+    // and this repo refuses a function declared inside a block. It closes over
+    // the product and the run's asset list it was written against, so moving it
+    // up to the body root would mean threading both through as arguments.
+    const refusalFor = async (input: {
       category: "WHITE_BACKGROUND_IMAGE" | "DOCUMENT" | "PRODUCT_VIDEO";
       mimeType: string;
       kind: "MEDIA" | "FILE";
@@ -658,7 +663,7 @@ async function main() {
       processingError?: string | null;
       imported?: boolean;
       otherProduct?: boolean;
-    }): Promise<{ called: number; error: string | null }> {
+    }): Promise<{ called: number; error: string | null }> => {
       const owner = input.otherProduct ? await makeProduct("Other product") : product;
       const asset = await makeAsset({
         productId: owner.id,
@@ -684,7 +689,7 @@ async function main() {
         fetchImpl: makeUploader().fetchImpl,
       });
       return { called: store.calls.length, error: outcome.error };
-    }
+    };
 
     const notApproved = await refusalFor({
       category: "WHITE_BACKGROUND_IMAGE",
