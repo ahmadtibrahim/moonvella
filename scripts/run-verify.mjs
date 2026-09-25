@@ -326,6 +326,22 @@ const CHECKS = [
     file: "scripts/verify-stores-ui.ts",
     requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
   },
+  // The embedded Shopify session, over HTTP, against the MERCHANT surface —
+  // which is why it asks for APP_SURFACE_BASE rather than a credential: the
+  // merchant app is not signed into, it is presented a session token, and the
+  // harness that sets that variable is the one that also resolves the app's
+  // hostname. Without it the suite is skipped rather than failed, because a
+  // suite with no server to probe has proved nothing either way.
+  //
+  // It is registered because of what it pins: the frame context surviving every
+  // internal redirect. That defect shipped once, and the check that catches it
+  // is a check, not a paragraph in a commit message.
+  {
+    name: "embedded-auth",
+    kind: "ts",
+    file: "scripts/verify-embedded-auth.ts",
+    requires: ["APP_SURFACE_BASE"],
+  },
   // BLOCKED as a real status, at the level every merchant screen reads it.
   // Needs no session: it drives the services directly, which is the same code
   // the routes call, and it asserts the four permission booleans rather than

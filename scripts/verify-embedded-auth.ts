@@ -193,7 +193,19 @@ async function ask(path: string, options: Ask = {}) {
   if (tokenIn === "query" && token) search.set("id_token", token);
   for (const [key, value] of Object.entries(params)) search.set(key, value);
 
-  const url = `${base}${path}${search.toString() ? `?${search}` : ""}`;
+  // Merged into the target rather than pasted on the end, so this can be handed
+  // a Location that already carries the frame parameters — which is exactly what
+  // "follow the redirect" means. Concatenating a second `?` instead swallows
+  // every parameter after it into the value of the last one, and the token that
+  // comes out the far side is not the token that went in: the suite then reports
+  // a 302 as though the app had refused a valid session, when what it actually
+  // sent was a malformed URL.
+  const target = new URL(path, base);
+  for (const [key, value] of search) {
+    if (!target.searchParams.has(key)) target.searchParams.set(key, value);
+  }
+
+  const url = target.toString();
   const sent: Record<string, string> = {
     "User-Agent": bot ? "Googlebot/2.1 (+http://www.google.com/bot.html)" : BROWSER_UA,
     Accept: "text/html,application/xhtml+xml",
@@ -214,18 +226,41 @@ function rendered(html: string): string {
     .replace(/\s+/g, " ");
 }
 
-/** The App Bridge bootstrap page the framework throws when it cannot authenticate. */
+/**
+ * The App Bridge bootstrap page the framework throws when it cannot
+ * authenticate, told apart from the app it is bootstrapping.
+ *
+ * Both carry the script tag — `AppProvider` renders App Bridge on every page of
+ * the app, which is the whole point of it — so a check for the script alone
+ * matches both and is worth nothing. What the bootstrap page does not have is
+ * any of the app: it is a document whose only job is to mint a token and
+ * redirect. The nav is the cheapest thing to look for, and it is present on
+ * every merchant page because the layout renders it.
+ */
 function isBootstrap(html: string): boolean {
-  return html.includes("data-api-key") && html.includes("app-bridge.js");
+  return html.includes("app-bridge.js") && !html.includes("<s-app-nav");
 }
 
 /** Whether the merchant app itself rendered, rather than a bootstrap or an error. */
 function isApp(html: string): boolean {
-  return html.includes("<s-app-nav") && !isBootstrap(html);
+  return html.includes("<s-app-nav");
 }
 
 function frameOf(location: string): URLSearchParams {
   return new URL(location, APP_BASE).searchParams;
+}
+
+/**
+ * Where a redirect points, as a path this suite can ask for.
+ *
+ * Resolved rather than string-sliced: the destination of the hop under test is
+ * `/app`, and reading the parameters off the end of a Location while asking for
+ * a different path is how the first run of this suite reported the app as broken
+ * when it was the harness asking the wrong question.
+ */
+function nextPath(location: string): string {
+  const url = new URL(location, APP_BASE);
+  return `${url.pathname}${url.search}`;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -319,34 +354,35 @@ async function main() {
     const landed = frameOf(application.location);
 
     check(
-      "1. An approved store asking for /app/application is redirected",
+      "An approved store asking for /app/application is redirected",
       application.status >= 300 && application.status < 400 && application.location !== "",
       `${application.status} ${application.location.slice(0, 80)}`
     );
     check(
-      "2. The redirect still names the store (shop)",
+      "The redirect still names the store (shop)",
       landed.get("shop") === SHOP_A,
       landed.get("shop") || "(none)"
     );
     check(
-      "3. The redirect still names the admin frame (host)",
+      "The redirect still names the admin frame (host)",
       landed.get("host") === hostParam(SHOP_A),
       landed.get("host") || "(none)"
     );
-    check("4. The redirect still declares the app embedded", landed.get("embedded") === "1");
+    check("The redirect still declares the app embedded", landed.get("embedded") === "1");
     check(
-      "5. The redirect still carries the session token App Bridge minted",
+      "The redirect still carries the session token App Bridge minted",
       landed.get("id_token") === tokenA,
       landed.get("id_token") ? "present" : "(none)"
     );
 
-    const afterHop = await ask(
-      `/app/application${application.location.includes("?") ? application.location.slice(application.location.indexOf("?")) : ""}`,
-      { shop: SHOP_A, token: tokenA, tokenIn: "query" }
-    );
+    const afterHop = await ask(nextPath(application.location), {
+      shop: SHOP_A,
+      token: tokenA,
+      tokenIn: "query",
+    });
     const hopText = rendered(afterHop.html);
     check(
-      "6. Following that hop lands on the seller app, not on the sentence",
+      "Following that hop lands on the seller app, not on the sentence",
       isApp(afterHop.html) && !hopText.includes(SENTENCE),
       `HTTP ${afterHop.status}`
     );
@@ -358,7 +394,7 @@ async function main() {
     const entry = await ask("/", { shop: SHOP_A, token: tokenA, tokenIn: "query" });
     const entryFrame = frameOf(entry.location);
     check(
-      "7. The app's entry route hands the frame context on, unaltered",
+      "The app's entry route hands the frame context on, unaltered",
       entry.status >= 300 &&
         entry.status < 400 &&
         entryFrame.get("shop") === SHOP_A &&
@@ -374,15 +410,15 @@ async function main() {
     const dashboard = await ask("/app", { shop: SHOP_A, token: tokenA, tokenIn: "query" });
     const dashboardText = rendered(dashboard.html);
     check(
-      "8. A valid embedded session renders the seller application",
+      "A valid embedded session renders the seller application",
       dashboard.status === 200 && isApp(dashboard.html),
       `HTTP ${dashboard.status}`
     );
-    check("9. And it names the store the token names", dashboardText.includes(NAME_A));
-    check("10. And it does not show the sentence", !dashboardText.includes(SENTENCE));
-    check("11. And it is not the App Bridge bootstrap page", !isBootstrap(dashboard.html));
+    check("And it names the store the token names", dashboardText.includes(NAME_A));
+    check("And it does not show the sentence", !dashboardText.includes(SENTENCE));
+    check("And it is not the App Bridge bootstrap page", !isBootstrap(dashboard.html));
     check(
-      "12. And it offers the seller navigation",
+      "And it offers the seller navigation",
       ["/app/catalog", "/app/status", "/app/settings", "/app/orders"].every((href) =>
         dashboard.html.includes(`href="${href}"`)
       )
@@ -400,7 +436,7 @@ async function main() {
      */
     const bare = await ask("/app", { token: tokenA, tokenIn: "header", embedded: false, shop: "" });
     check(
-      "13. A token in the header authenticates with no shop/host/embedded on the URL",
+      "A token in the header authenticates with no shop/host/embedded on the URL",
       bare.status === 200 && isApp(bare.html) && rendered(bare.html).includes(NAME_A),
       `HTTP ${bare.status}`
     );
@@ -413,7 +449,7 @@ async function main() {
       headers: { Accept: "application/json" },
     });
     check(
-      "14. The data request behind a client-side navigation is authenticated too",
+      "The data request behind a client-side navigation is authenticated too",
       dataRequest.status === 200 && !isBootstrap(dataRequest.html),
       `HTTP ${dataRequest.status}`
     );
@@ -423,7 +459,7 @@ async function main() {
     /* ------------------------------------------------------------------ */
     const asB = await ask("/app", { shop: SHOP_B, token: tokenB, tokenIn: "query" });
     check(
-      "15. A second store's token renders that store's data",
+      "A second store's token renders that store's data",
       isApp(asB.html) && rendered(asB.html).includes(NAME_B),
       `HTTP ${asB.status}`
     );
@@ -437,14 +473,14 @@ async function main() {
     const forged = await ask("/app", { shop: SHOP_B, token: tokenA, tokenIn: "query" });
     const forgedText = rendered(forged.html);
     check(
-      "16. A `shop` parameter cannot redirect a valid token to another store",
+      "A `shop` parameter cannot redirect a valid token to another store",
       isApp(forged.html) && forgedText.includes(NAME_A) && !forgedText.includes(NAME_B),
       `HTTP ${forged.status}`
     );
 
     const listA = await ask("/app/status", { shop: SHOP_A, token: tokenA, tokenIn: "query" });
     check(
-      "17. Another store's records are not in the page at all",
+      "Another store's records are not in the page at all",
       !rendered(listA.html).includes(NAME_B) && !listA.html.includes(SHOP_B)
     );
 
@@ -457,7 +493,7 @@ async function main() {
       tokenIn: "query",
     });
     check(
-      "18. A token signed with the wrong secret is refused",
+      "A token signed with the wrong secret is refused",
       !isApp(wrongSignature.html) && !rendered(wrongSignature.html).includes(NAME_A),
       `HTTP ${wrongSignature.status}`
     );
@@ -468,14 +504,14 @@ async function main() {
       tokenIn: "query",
     });
     check(
-      "19. A token minted for a different app is refused",
+      "A token minted for a different app is refused",
       !isApp(wrongAudience.html),
       `HTTP ${wrongAudience.status}`
     );
 
     const noToken = await ask("/app", { shop: SHOP_A, tokenIn: "none" });
     check(
-      "20. An embedded request with no token at all is bounced, not rendered",
+      "An embedded request with no token at all is bounced, not rendered",
       noToken.status >= 300 && noToken.status < 400 && !isApp(noToken.html),
       `HTTP ${noToken.status}`
     );
@@ -490,12 +526,12 @@ async function main() {
     });
     const expiredTo = frameOf(expired.location);
     check(
-      "21. An expired token on a document request goes to the bounce page",
+      "An expired token on a document request goes to the bounce page",
       expired.status >= 300 && expired.status < 400 && expired.location.startsWith("/auth/session-token"),
       `HTTP ${expired.status} ${expired.location.slice(0, 60)}`
     );
     check(
-      "22. And the bounce names the page to come back to",
+      "And the bounce names the page to come back to",
       (expiredTo.get("shopify-reload") || "").includes("/app"),
       expiredTo.get("shopify-reload") || "(none)"
     );
@@ -505,12 +541,12 @@ async function main() {
       { shop: SHOP_A, tokenIn: "none" }
     );
     check(
-      "23. The bounce page carries App Bridge and the app's client id",
+      "The bounce page carries App Bridge and the app's client id",
       bounce.status === 200 && bounce.html.includes('data-api-key="') && bounce.html.includes(API_KEY),
       `HTTP ${bounce.status}`
     );
     check(
-      "24. And it carries the client SECRET nowhere",
+      "And it carries the client SECRET nowhere",
       !bounce.html.includes(API_SECRET),
       "a secret in HTML is a secret in the browser"
     );
@@ -523,7 +559,7 @@ async function main() {
       headers: { Accept: "application/json" },
     });
     check(
-      "25. An expired token on a data request asks App Bridge to retry with a fresh one",
+      "An expired token on a data request asks App Bridge to retry with a fresh one",
       expiredData.status === 401 &&
         expiredData.headers.get("X-Shopify-Retry-Invalid-Session-Request") === "1",
       `HTTP ${expiredData.status}`
@@ -536,11 +572,11 @@ async function main() {
      * The explanatory sentence belongs here and only here. What must not happen
      * is any of the store's own facts arriving with it.
      */
-    for (const [index, path] of ["/app", "/app/catalog", "/app/orders", "/app/application"].entries()) {
+    for (const path of ["/app", "/app/catalog", "/app/orders", "/app/application"]) {
       const external = await ask(path, { tokenIn: "none", embedded: false, shop: "" });
       const text = rendered(external.html);
       check(
-        `${26 + index}. A direct visit to ${path} exposes no seller data`,
+        `A direct visit to ${path} exposes no seller data`,
         !isApp(external.html) &&
           !text.includes(NAME_A) &&
           !text.includes(NAME_B) &&
@@ -552,7 +588,7 @@ async function main() {
 
     const doorway = await ask("/app/orders", { shop: SHOP_A, tokenIn: "none", embedded: false });
     check(
-      "30. A store-named visit from outside the frame is sent to the admin entry point",
+      "A store-named visit from outside the frame is sent to the admin entry point",
       doorway.status >= 300 &&
         doorway.status < 400 &&
         doorway.location.startsWith(`https://admin.shopify.com/store/${SHOP_A.replace(".myshopify.com", "")}/apps/`),
@@ -566,7 +602,7 @@ async function main() {
       embedded: false,
     });
     check(
-      "31. A valid token does not make a non-embedded visit an embedded one",
+      "A valid token does not make a non-embedded visit an embedded one",
       tokenOutside.status >= 300 &&
         tokenOutside.status < 400 &&
         !isApp(tokenOutside.html),
@@ -581,22 +617,16 @@ async function main() {
      * the destination of §1's hop, token and all. Nothing is consumed by the
      * first render, so the second one behaves identically.
      */
-    const landing = `${application.location}`;
-    const first = await ask(
-      landing.includes("?") ? `/app${landing.slice(landing.indexOf("?"))}` : "/app",
-      { shop: SHOP_A, token: tokenA, tokenIn: "query" }
-    );
-    const second = await ask(
-      landing.includes("?") ? `/app${landing.slice(landing.indexOf("?"))}` : "/app",
-      { shop: SHOP_A, token: tokenA, tokenIn: "query" }
-    );
+    const landing = nextPath(application.location);
+    const first = await ask(landing, { shop: SHOP_A, token: tokenA, tokenIn: "query" });
+    const second = await ask(landing, { shop: SHOP_A, token: tokenA, tokenIn: "query" });
     check(
-      "32. Refreshing the embedded page renders the app again",
+      "Refreshing the embedded page renders the app again",
       first.status === 200 && isApp(first.html) && rendered(first.html).includes(NAME_A),
       `HTTP ${first.status}`
     );
     check(
-      "33. And it still does on a second refresh",
+      "And it still does on a second refresh",
       second.status === 200 && isApp(second.html) && rendered(second.html).includes(NAME_A),
       `HTTP ${second.status}`
     );
@@ -614,7 +644,7 @@ async function main() {
       ? dashboard.headers.getSetCookie()
       : [dashboard.headers.get("set-cookie")].filter((value): value is string => value !== null);
     check(
-      "34. The merchant app sets no session cookie at all",
+      "The merchant app sets no session cookie at all",
       !setCookie.some((cookie) => /session|auth|token/i.test(cookie)),
       setCookie.join("; ").slice(0, 80) || "(none)"
     );
@@ -624,7 +654,7 @@ async function main() {
     /* ------------------------------------------------------------------ */
     const bot = await ask("/app", { shop: SHOP_A, token: tokenA, tokenIn: "query", bot: true });
     check(
-      "35. A crawler is refused before authentication even starts",
+      "A crawler is refused before authentication even starts",
       bot.status === 410,
       `HTTP ${bot.status}`
     );
@@ -641,7 +671,7 @@ async function main() {
       body: "{}",
     });
     check(
-      "36. A webhook with no HMAC is still refused",
+      "A webhook with no HMAC is still refused",
       noHmac.status === 401 || noHmac.status === 400,
       `HTTP ${noHmac.status}`
     );
@@ -653,7 +683,7 @@ async function main() {
       shop: "",
     });
     check(
-      "37. The job runner still fails closed without its secret",
+      "The job runner still fails closed without its secret",
       unconfiguredJobs.status === 401 || unconfiguredJobs.status === 503,
       `HTTP ${unconfiguredJobs.status}`
     );
@@ -663,14 +693,14 @@ async function main() {
     /* ------------------------------------------------------------------ */
     const adminLogin = await ask("/admin/login", { base: ADMIN_BASE, tokenIn: "none", embedded: false, shop: "" });
     check(
-      "38. The owner panel still answers on its own host",
+      "The owner panel still answers on its own host",
       adminLogin.status === 200 && !isApp(adminLogin.html),
       `HTTP ${adminLogin.status}`
     );
 
     const adminOnAppHost = await ask("/admin", { base: APP_BASE, tokenIn: "none", embedded: false, shop: "" });
     check(
-      "39. Owner routes are not served on the merchant host",
+      "Owner routes are not served on the merchant host",
       adminOnAppHost.status === 302 && adminOnAppHost.location.startsWith("http"),
       `HTTP ${adminOnAppHost.status} ${adminOnAppHost.location.slice(0, 50)}`
     );
@@ -683,7 +713,7 @@ async function main() {
       shop: "",
     });
     check(
-      "40. A Shopify session token is not an owner session",
+      "A Shopify session token is not an owner session",
       adminWithShopifyToken.status >= 300 && adminWithShopifyToken.status < 400,
       `HTTP ${adminWithShopifyToken.status}`
     );
@@ -707,7 +737,7 @@ async function main() {
         headers: cookie ? { Cookie: cookie } : {},
       });
       check(
-        "41. An owner session cookie opens nothing in the merchant app",
+        "An owner session cookie opens nothing in the merchant app",
         cookie !== "" && !isApp(merchantWithAdminCookie.html),
         cookie ? `HTTP ${merchantWithAdminCookie.status}` : "login produced no cookie"
       );
@@ -744,7 +774,7 @@ async function main() {
       if (/\bredirect\(\s*[`"']\/app/.test(code)) offenders.push(entry);
     }
     check(
-      "42. No merchant route redirects internally with a bare path",
+      "No merchant route redirects internally with a bare path",
       offenders.length === 0,
       offenders.join(", ") || "every internal redirect goes through merchantRedirect"
     );
@@ -763,13 +793,13 @@ async function main() {
       select: { id: true, expires: true, accessToken: true },
     });
     check(
-      "43. Both fixture sessions are still the ones written (nothing re-exchanged)",
+      "Both fixture sessions are still the ones written (nothing re-exchanged)",
       stale.length === 2 &&
         stale.every((row) => row.accessToken === "mvverify-not-a-real-token"),
       stale.map((row) => row.id).join(", ")
     );
     check(
-      "44. And neither store's application was touched by a read",
+      "And neither store's application was touched by a read",
       (await prisma.merchantApplication.count({
         where: { shopDomain: SHOP_A, contactName: "Alpha Contact" },
       })) === 1
@@ -801,12 +831,12 @@ async function main() {
     const writtenA = await prisma.merchantApplication.findUnique({ where: { id: a.application.id } });
     const writtenB = await prisma.merchantApplication.findUnique({ where: { id: b.application.id } });
     check(
-      "45. An action writes the store the token names",
+      "An action writes the store the token names",
       writtenA?.contactName === "Written By Alpha",
       `HTTP ${write.status}`
     );
     check(
-      "46. And cannot write the store the body names",
+      "And cannot write the store the body names",
       writtenB?.contactName === "Bravo Contact",
       writtenB?.contactName || "(missing)"
     );
