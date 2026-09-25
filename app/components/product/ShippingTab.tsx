@@ -18,6 +18,7 @@ import { convertedDisplay, type UnitsView } from "~/utils/measurementUnits";
 import {
   fieldError,
   fillPackagingRow,
+  newCartonText,
   preservePackagingRows,
   refusedEditorRows,
   type EditorRowFields,
@@ -118,7 +119,13 @@ export default function ShippingTab({
   units,
   refused = null,
 }: {
-  product: { id: string; name: string; pickupLocationId: string | null };
+  product: {
+    id: string;
+    name: string;
+    /** The family's description, seeding a new carton row. See `newCartonText`. */
+    description: string | null;
+    pickupLocationId: string | null;
+  };
   variants: ShippingVariant[];
   locations: ShippingLocation[];
   packages: ProductPackageRow[];
@@ -345,14 +352,22 @@ export default function ShippingTab({
         canManage={canManage}
         units={units}
         refused={refused}
+        // This editor belongs to the family, so a new row is named for the
+        // family: there is no one variant it could be named after. Only a row
+        // that does not exist yet reads it — see `newCartonText`.
+        defaults={newCartonText({
+          productName: product.name,
+          productDescription: product.description,
+        })}
       />
 
       <div style={card}>
         <h2 style={sectionTitle}>What each variant is quoted from</h2>
         <p style={sectionNote}>
-          A variant with its own cartons is quoted from those; a variant without them is quoted from
-          the product defaults above. Nothing is copied at save time, so changing a default changes
-          the quote for every variant that inherits it — and leaves the ones that do not alone.
+          This product is sold as one configuration, so a variant with cartons of its own is quoted
+          from those and a variant without is quoted from the product defaults above. Nothing is
+          copied at save time, so changing a default changes the quote for every variant that
+          inherits it — and leaves the ones that do not alone.
         </p>
         <ul style={{ margin: 0, paddingLeft: "1.1rem", fontSize: "0.78rem", lineHeight: 1.8, color: MUTED }}>
           {variants.map((variant) => (
@@ -416,6 +431,7 @@ function PackagingDefaults({
   canManage,
   units,
   refused,
+  defaults,
 }: {
   packages: ProductPackageRow[];
   presets: ShippingPreset[];
@@ -423,6 +439,8 @@ function PackagingDefaults({
   units: UnitsView;
   /** A refused save: the rows it was carrying, and the messages about them. */
   refused: RefusedPackaging | null;
+  /** What a brand-new row starts out saying. See `newCartonText`. */
+  defaults: { label: string; description: string };
 }) {
   const [rows, setRows] = useState<(EditorRowFields | null)[]>(() => {
     // A stored row and a refused submission are the same table drawn from two
@@ -588,7 +606,7 @@ function PackagingDefaults({
                   <input
                     style={input}
                     name="pkg_label"
-                    defaultValue={row?.label ?? ""}
+                    defaultValue={row?.label ?? defaults.label}
                     aria-label={`Carton ${index + 1} label`}
                     disabled={!canManage}
                   />
@@ -606,7 +624,7 @@ function PackagingDefaults({
                   <input
                     style={input}
                     name="pkg_description"
-                    defaultValue={row?.description ?? ""}
+                    defaultValue={row?.description ?? defaults.description}
                     placeholder="what is in this box"
                     aria-label={`Carton ${index + 1} description`}
                     disabled={!canManage}

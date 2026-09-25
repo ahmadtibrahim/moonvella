@@ -256,6 +256,18 @@ async function main() {
     /* ------------------------------------------------------------------ */
     /* Carton measurements                                                   */
     /* ------------------------------------------------------------------ */
+    /**
+     * The family is given a description before the packaging rows are read, and
+     * it is given it here rather than through the form above on purpose: the
+     * carton default is seeded FROM this value, so a check that ran against a
+     * blank one would pass on a row that was never seeded at all. The form's own
+     * description handling is checked by the save-and-read-back above it.
+     */
+    const FAMILY_DESCRIPTION = "Written by verify-editor-ui.";
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { description: FAMILY_DESCRIPTION },
+    });
     const variants = await get(`/admin/products/${product.id}?tab=variants`, cookie);
     const dimTag = tagWithAttribute(variants.html, 'name="pkg_dimUnit"');
     const weightTag = tagWithAttribute(variants.html, 'name="pkg_weightUnit"');
@@ -310,6 +322,43 @@ async function main() {
       rowCountTag.slice(0, 60)
     );
 
+    /**
+     * A BRAND-NEW CARTON ROW ARRIVES ALREADY SAYING SOMETHING.
+     *
+     * An empty label beside "Carton 1" tells the next person nothing, and the
+     * packing list three months later reads "Box" for a carton that was
+     * obviously the pillow. The row starts from facts that are already true —
+     * the variant it belongs to, and the family's description — and both stay
+     * editable, which the check after the save proves, because a default that
+     * came back over a typed label would be worse than a blank one.
+     */
+    const labelTag = tagWithAttribute(variants.html, 'name="pkg_label"');
+    const descriptionTag = tagWithAttribute(variants.html, 'name="pkg_description"');
+    check(
+      "A new carton row is named after the variant it belongs to",
+      /value="One size"/.test(labelTag),
+      labelTag.slice(0, 90)
+    );
+    check(
+      "And described with the family's description",
+      descriptionTag.includes(`value="${FAMILY_DESCRIPTION}"`),
+      descriptionTag.slice(0, 90)
+    );
+
+    const shipping = await get(`/admin/products/${product.id}?tab=shipping`, cookie);
+    const productRowLabel = tagWithAttribute(shipping.html, 'name="pkg_label"');
+    const productRowDescription = tagWithAttribute(shipping.html, 'name="pkg_description"');
+    check(
+      "The product-level editor names its row after the family, since it has no variant to name",
+      /value="Verify Editor UI"/.test(productRowLabel),
+      productRowLabel.slice(0, 90)
+    );
+    check(
+      "And describes it the same way",
+      productRowDescription.includes(`value="${FAMILY_DESCRIPTION}"`),
+      productRowDescription.slice(0, 90)
+    );
+
     await post(`/admin/products/${product.id}`, cookie, {
       intent: "save_packaging",
       tab: "variants",
@@ -317,12 +366,10 @@ async function main() {
       // The count a browser sends with this one row. Stating it is what lets a
       // submit that arrives with no rows be told from a page that had none: the
       // save is a whole-set replace, so the two are the same request otherwise,
-      // and the second one is how a variant silently lost its packaging. A
-      // payload that does not state a count is read as having drawn rows, which
-      // refuses the empty case rather than trusting it. NOTE this suite cannot
-      // run in this environment (it needs the owner's password), so this pin has
-      // not been executed here.
+      // and the second one is how a variant silently lost its packaging.
       pkg_rowCount: "1",
+      // Deliberately NOT the default: the reload check below proves the typed
+      // label is what came back.
       pkg_label: "Carton",
       pkg_packageType: "carton",
       pkg_presetId: "",
@@ -369,6 +416,17 @@ async function main() {
     check(
       "The editor then shows the carton in the units it was entered in",
       /10 × 8 × 6 in, 5 lb/.test(afterPackaging.html)
+    );
+    /**
+     * The default is a starting point, not a decision. A saved row that carried
+     * a typed label comes back with the typed label — the check that fails if
+     * the default is ever applied to a row that already exists.
+     */
+    const reloadedLabel = tagWithAttribute(afterPackaging.html, 'name="pkg_label"');
+    check(
+      "A saved row keeps the label somebody typed, rather than reverting to the default",
+      /value="Carton"/.test(reloadedLabel) && !/value="One size"/.test(reloadedLabel),
+      reloadedLabel.slice(0, 90)
     );
 
     /* ------------------------------------------------------------------ */

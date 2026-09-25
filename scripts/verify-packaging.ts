@@ -16,6 +16,9 @@ import {
   setPresetActive,
   updatePreset,
 } from "../app/services/packaging.server";
+// The editor's own function, not a copy of it: what a new carton row says is
+// the editor's rule, and a second implementation here would agree with itself.
+import { newCartonText } from "../app/components/product/packagingRows";
 
 const prisma = new PrismaClient();
 const ACTOR = {
@@ -55,6 +58,48 @@ async function main() {
     packages: [],
   });
   check("missing packaging is reported, not guessed", missing.packages.length === 0 && missing.missing.some((m) => m.includes("packaging incomplete")), JSON.stringify(missing.missing));
+
+  /* -------------------------------------------------------------------- */
+  /* What a new carton row starts out saying                               */
+  /* -------------------------------------------------------------------- */
+  /**
+   * The row's label and description are seeded from facts that are already true
+   * of it, and this is a PURE check: `newCartonText` is the same function the
+   * editor calls, so what is asserted here is what the form is drawn from
+   * rather than a description of it. The rendered result is checked over HTTP
+   * in `verify-editor-ui`, where a blank row's two inputs are read out of the
+   * page; this is the half that runs without a server.
+   *
+   * The fallbacks are the point. A variant always has a name in the editor, but
+   * a row made by an import may not, and the description has only one source —
+   * `ProductVariant` has no description column, so the family's is what the
+   * directive's fallback resolves to in every reachable case.
+   */
+  check(
+    "a new carton row is named after the variant, and described with the family's description",
+    JSON.stringify(
+      newCartonText({
+        variantName: "Queen",
+        productName: "Cooling Pillow",
+        productDescription: "A pillow that stays cool.",
+      }),
+    ) === JSON.stringify({ label: "Queen", description: "A pillow that stays cool." }),
+    JSON.stringify(newCartonText({ variantName: "Queen", productName: "Cooling Pillow" })),
+  );
+  check(
+    "a variant with no name falls back to the family's, rather than leaving the box blank",
+    newCartonText({ variantName: "   ", productName: "Cooling Pillow" }).label === "Cooling Pillow",
+  );
+  check(
+    "a family with no description seeds an empty one, and does not invent one",
+    newCartonText({ variantName: "Queen", productName: "Cooling Pillow", productDescription: null })
+      .description === "",
+  );
+  check(
+    "and a description is not padded with whitespace it was stored with",
+    newCartonText({ productDescription: "  A pillow.  " }).description === "A pillow.",
+    JSON.stringify(newCartonText({ productDescription: "  A pillow.  " }).description),
+  );
 
   /* -------------------------------------------------------------------- */
   /* Packs: a box recorded once, chosen by a dropdown                      */

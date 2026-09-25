@@ -865,7 +865,15 @@ export default function AdminProductDetail() {
       ) : null}
       {tab === "shipping" && shipping ? (
         <ShippingTab
-          product={{ id: product.id, name: product.name, pickupLocationId: product.pickupLocationId }}
+          product={{
+            id: product.id,
+            name: product.name,
+            // Read only to seed a new carton row's description — see
+            // `newCartonText`. The narrow object is deliberate: this tab has no
+            // business with the rest of the family record.
+            description: product.description,
+            pickupLocationId: product.pickupLocationId,
+          }}
           variants={shipping.variants}
           locations={shipping.locations}
           packages={shipping.packages}

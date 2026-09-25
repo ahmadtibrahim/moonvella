@@ -22,6 +22,7 @@ import { convertedDisplay, storedToDisplay, type UnitsView } from "~/utils/measu
 import {
   fieldError,
   fillPackagingRow,
+  newCartonText,
   preservePackagingRows,
   refusedEditorRows,
   type EditorRowFields,
@@ -126,6 +127,12 @@ interface Preset {
 interface Product {
   id: string;
   currency: string;
+  /**
+   * Read for one purpose only: what a new carton row is called and described
+   * before anyone types in it. See `newCartonText`.
+   */
+  name: string;
+  description: string | null;
   variants: Variant[];
 }
 
@@ -225,6 +232,16 @@ export default function VariantsTab({
             presets={presets}
             units={units}
             refused={refused && refused.variantId === variant.id ? refused : null}
+            /*
+              What a carton row added to THIS variant starts out saying. Built
+              here, where the family and the variant are both in scope, rather
+              than further down where only the variant is.
+            */
+            cartonDefaults={newCartonText({
+              variantName: variant.name,
+              productName: product.name,
+              productDescription: product.description,
+            })}
           />
         )
       )}
@@ -243,6 +260,7 @@ function VariantCard({
   presets,
   units,
   refused,
+  cartonDefaults,
 }: {
   variant: Variant;
   currency: string;
@@ -250,6 +268,8 @@ function VariantCard({
   presets: Preset[];
   units: UnitsView;
   refused: RefusedPackaging | null;
+  /** What a carton row added here starts out saying. See `newCartonText`. */
+  cartonDefaults: { label: string; description: string };
 }) {
   const carton = variant.packages[0] ?? null;
   const margin =
@@ -362,7 +382,14 @@ function VariantCard({
         </a>
       </div>
 
-      <PackagingEditor variant={variant} presets={presets} units={units} refused={refused} />
+      <PackagingEditor
+        variant={variant}
+        presets={presets}
+        units={units}
+        refused={refused}
+        // Only ever read by a row that does not exist yet — see `newCartonText`.
+        defaults={cartonDefaults}
+      />
     </div>
   );
 }
@@ -408,11 +435,14 @@ function PackagingEditor({
   presets,
   units,
   refused,
+  defaults,
 }: {
   variant: Variant;
   presets: Preset[];
   units: UnitsView;
   refused: RefusedPackaging | null;
+  /** What a brand-new row starts out saying. See `newCartonText`. */
+  defaults: { label: string; description: string };
 }) {
   /*
    * WHICH ROWS THE TABLE DRAWS, and why a refused save changes the answer.
@@ -512,7 +542,7 @@ function PackagingEditor({
                   <input
                     style={input}
                     name="pkg_label"
-                    defaultValue={row?.label ?? ""}
+                    defaultValue={row?.label ?? defaults.label}
                     aria-label={`Carton ${index + 1} label`}
                   />
                 </td>
@@ -528,7 +558,7 @@ function PackagingEditor({
                   <input
                     style={input}
                     name="pkg_description"
-                    defaultValue={row?.description ?? ""}
+                    defaultValue={row?.description ?? defaults.description}
                     placeholder="what is in this box"
                     aria-label={`Carton ${index + 1} description`}
                   />

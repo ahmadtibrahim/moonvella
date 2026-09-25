@@ -97,6 +97,49 @@ export interface PackagingRowValues {
 }
 
 /**
+ * What a carton row says on the day it is added, before anyone types in it.
+ *
+ * A BLANK ROW IS A TRAP OF ITS OWN. The label and the description are free
+ * text, and an empty box beside "Carton 1" tells the next person nothing: three
+ * months later the packing list reads "Box" for a carton that was obviously the
+ * pillow. So a new row starts from the facts that are already true of it — the
+ * thing being sold is the thing in the box — and both remain editable, because
+ * a default is a starting point and not a decision.
+ *
+ * WHICH FACTS, exactly:
+ *
+ *   label        the variant's name, because a carton belongs to a variant (a
+ *                queen pillow and a king pillow ship in different boxes and a
+ *                label that said "Cooling Pillow" twice would not tell them
+ *                apart). Falls back to the product's name where the variant has
+ *                none — the editor requires one, so this only covers a row made
+ *                by an import.
+ *
+ *   description  the product's description. The directive asks for the variant's
+ *                description first, and there is deliberately no such branch
+ *                here: `ProductVariant` has no description column, so the
+ *                variant's description does not exist to prefer. Should one ever
+ *                be added, this is the line that changes and the fallback below
+ *                is already the right answer for a variant without one.
+ *
+ * NOTHING ELSE IS DEFAULTED. The measurements come from the pack when one is
+ * chosen (see `fillPackagingRow`), the gross weight is typed because only the
+ * packer knows it, and the counts are per carton decisions. A row that is
+ * already stored is never re-defaulted — `defaultValue` is only read for a row
+ * that does not exist yet — so a custom label survives every later save.
+ */
+export function newCartonText(source: {
+  variantName?: string | null;
+  productName?: string | null;
+  productDescription?: string | null;
+}): { label: string; description: string } {
+  return {
+    label: (source.variantName ?? "").trim() || (source.productName ?? "").trim(),
+    description: (source.productDescription ?? "").trim(),
+  };
+}
+
+/**
  * A refused save, and the rows to put back on the screen.
  *
  * THIS IS THE HALF OF THE PACKAGING FAILURE THAT IS EASIEST TO MISS. The page
