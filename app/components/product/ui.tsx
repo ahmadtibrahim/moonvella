@@ -318,7 +318,11 @@ export function StatusChip({ status }: { status: string }) {
     DRAFT: { bg: "#f1f5f9", fg: "#475569" },
     DEFAULT: { bg: "#e0e7ff", fg: "#3730a3" },
     INACTIVE: { bg: "#e2e8f0", fg: "#64748b" },
-    PENDING_APPROVAL: { bg: "#fef3c7", fg: "#92400e" },
+    // No PENDING_APPROVAL tone: the state is retired and no product carries it
+    // after migration 20260925000000. A chip that still coloured it would be
+    // the last place in the interface still treating it as a state someone
+    // expects to see. The fallback below renders it plainly if a restored
+    // database ever produces one.
     PUBLISHED: { bg: "#d1fae5", fg: "#065f46" },
     ARCHIVED: { bg: "#e2e8f0", fg: "#475569" },
     APPROVED: { bg: "#d1fae5", fg: "#065f46" },

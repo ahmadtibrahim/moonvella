@@ -1643,6 +1643,11 @@ model PadMandate {
 /// keeps the two consistent — nothing sets PUBLISHED without passing it.
 enum ProductStatus {
   DRAFT
+  /// LEGACY. Nothing writes this and no screen offers it. It is kept only
+  /// because Postgres cannot drop a value from a populated enum, and because
+  /// rows written before 2026-09-25 are history. Do not re-add it to a form, a
+  /// filter, a badge or a service check: the state never had an approver, which
+  /// is why it was retired. Publishing is now the `products.publish` permission.
   PENDING_APPROVAL
   PUBLISHED
   ARCHIVED

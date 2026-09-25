@@ -132,11 +132,6 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     shipping: tab === "shipping" ? await shippingContext(product) : null,
     tab,
     /**
-     * "Preview seller view" is a navigation rather than a client-side toggle, so
-     * the preview is a URL someone can send to a colleague and reload.
-     */
-    preview: url.searchParams.get("preview") === "1",
-    /**
      * Which packaging a redirect just saved, so the page can say so.
      *
      * Named rather than merely "saved": a confirmation with no subject is the
@@ -152,6 +147,12 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     can: {
       manage: held.has("products.manage"),
       cost: held.has("products.cost.edit"),
+      /*
+       * Publishing is its own permission since the approval step was removed.
+       * Drawn from here so the buttons match the policy; the control itself is
+       * the check in the action and in the service behind it.
+       */
+      publish: held.has("products.publish"),
     },
   };
 }
@@ -414,24 +415,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
             materials: listValue(form, "materials"),
             careInstructions: optional("careInstructions"),
             currency: catalogueValue(form, "currency") || "CAD",
-          },
-          actor
-        );
-        break;
-
-      case "submit_for_approval":
-        await updateProduct(
-          productId,
-          {
-            name: text("name"),
-            productCode: text("productCode"),
-            category: catalogueValue(form, "category"),
-            description: optional("description"),
-            features: listValue(form, "features"),
-            materials: listValue(form, "materials"),
-            careInstructions: optional("careInstructions"),
-            currency: catalogueValue(form, "currency") || "CAD",
-            status: "PENDING_APPROVAL",
           },
           actor
         );
@@ -754,7 +737,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
 }
 
 export default function AdminProductDetail() {
-  const { product, presets, media, readiness, pack, shipping, tab, can, preview, units, savedPackaging } =
+  const { product, presets, media, readiness, pack, shipping, tab, can, units, savedPackaging } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
 
@@ -858,10 +841,9 @@ export default function AdminProductDetail() {
       {tab === "details" ? (
         <DetailsTab
           product={product}
-          media={media}
           readiness={readiness}
           canManage={can.manage}
-          preview={preview}
+          canPublish={can.publish}
         />
       ) : null}
       {tab === "variants" ? (

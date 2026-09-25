@@ -1,7 +1,5 @@
 import { Link, Form } from "react-router";
 import { PRODUCT_CODE_HELP } from "~/utils/productCode";
-// Type-only, so nothing from the server module reaches the client bundle.
-import type { MediaAssetView } from "~/services/media.server";
 import {
   card,
   input,
@@ -16,7 +14,6 @@ import {
   Field,
   StatusChip,
   ConfirmForm,
-  money,
   INK,
   MUTED,
   FAINT,
@@ -34,8 +31,8 @@ import {
  *
  * Everything is one form. The publication actions are submit buttons in that
  * same form rather than separate forms, so the values the merchant has just
- * typed are saved by the same press that submits the product for approval —
- * "Submit for approval" that discarded unsaved edits would be a trap.
+ * typed are saved by the same press that publishes — a Publish button that
+ * discarded unsaved edits would be a trap.
  */
 
 type Readiness = {
@@ -71,20 +68,16 @@ interface Product {
   variants: Variant[];
 }
 
-const IMAGE_CATEGORIES = ["WHITE_BACKGROUND_IMAGE", "LIFESTYLE_IMAGE"];
-
 export default function DetailsTab({
   product,
-  media,
   readiness,
   canManage,
-  preview,
+  canPublish,
 }: {
   product: Product;
-  media: MediaAssetView[];
   readiness: Readiness;
   canManage: boolean;
-  preview: boolean;
+  canPublish: boolean;
 }) {
   const published = product.status === "PUBLISHED";
   const disabled = !canManage;
@@ -95,9 +88,8 @@ export default function DetailsTab({
         product={product}
         readiness={readiness}
         canManage={canManage}
+        canPublish={canPublish}
       />
-
-      {preview ? <SellerPreview product={product} media={media} /> : null}
 
       <div style={card}>
         <h2 style={sectionTitle}>Product details</h2>
@@ -219,32 +211,39 @@ export default function DetailsTab({
               <button type="submit" name="intent" value="update_details" style={btn(INK, { solid: true })}>
                 Save draft
               </button>
-              {!published ? (
-                <button type="submit" name="intent" value="submit_for_approval" style={btn("#0369a1")}>
-                  Submit for approval
+              {/*
+                No "Submit for approval", and no "Preview seller view".
+
+                The approval step is gone because it never had anywhere to go:
+                PENDING_APPROVAL was written by that button and read by nothing —
+                no queue, no screen, no approver. A product sat in a state that
+                meant "waiting for a person" and no person was ever shown it.
+                The owner is the approver, so the button that asks them to wait
+                for themselves is the button to delete.
+
+                The preview is gone because it showed a rendering of the product
+                that no seller would ever see — it was a picture built from the
+                same rows the catalogue reads, drawn on a tab sellers cannot
+                open. The catalogue itself is the honest answer to "what does a
+                seller see", and it is one click away.
+              */}
+              {canPublish ? (
+                <button
+                  type="submit"
+                  name="intent"
+                  value={published ? "unpublish" : "publish"}
+                  style={btn(published ? "#92400e" : "#065f46")}
+                  title={
+                    published
+                      ? "Withdraw this product from sellers. Existing orders are unaffected."
+                      : readiness.ready
+                        ? "Make this product available to sellers."
+                        : "This product does not meet the publication requirements yet."
+                  }
+                >
+                  {published ? "Unpublish" : "Publish to sellers"}
                 </button>
               ) : null}
-              <button
-                type="submit"
-                name="intent"
-                value={published ? "unpublish" : "publish"}
-                style={btn(published ? "#92400e" : "#065f46")}
-                title={
-                  published
-                    ? "Withdraw this product from sellers. Existing orders are unaffected."
-                    : readiness.ready
-                      ? "Make this product available to sellers."
-                      : "This product does not meet the publication requirements yet."
-                }
-              >
-                {published ? "Unpublish" : "Publish to sellers"}
-              </button>
-              <Link
-                to={`?tab=details${preview ? "" : "&preview=1"}`}
-                style={btn(MUTED)}
-              >
-                {preview ? "Hide seller view" : "Preview seller view"}
-              </Link>
             </div>
           ) : (
             <p style={{ ...helpText, marginTop: "0.85rem" }}>
@@ -318,10 +317,12 @@ function StatusPanel({
   product,
   readiness,
   canManage,
+  canPublish,
 }: {
   product: Product;
   readiness: Readiness;
   canManage: boolean;
+  canPublish: boolean;
 }) {
   const mine = readiness.checks.filter((check) => check.tab === "details");
   const outstanding = mine.filter((check) => !check.ok);
@@ -353,117 +354,25 @@ function StatusPanel({
         </p>
       )}
 
+      {/*
+        Two different reasons a person cannot publish, and they need different
+        sentences: "you cannot edit this at all" and "you can edit it, but an
+        owner has to release it" are not the same problem and do not have the
+        same remedy. The second case is the catalogue role, which writes every
+        field on this page and does not decide when it goes live.
+      */}
       {!canManage ? (
-        <p style={{ ...helpText }}>Your role can view this product but cannot publish it.</p>
+        <p style={{ ...helpText }}>Your role can view this product but cannot edit it.</p>
+      ) : !canPublish ? (
+        <p style={{ ...helpText }}>
+          Your role can prepare this product but cannot publish it. When it is ready, an
+          owner or administrator releases it to sellers.
+        </p>
       ) : null}
       <p style={{ ...helpText, borderTop: `1px solid ${LINE}`, paddingTop: "0.5rem" }}>
         The publication checks run on the server each time Publish is pressed. A product that
         does not pass is refused here, and would be refused by any other caller too.
       </p>
-    </div>
-  );
-}
-
-/**
- * What a seller will see.
- *
- * Deliberately built from the same fields the seller's catalogue reads and from
- * nothing else, so this is a statement about the data rather than a mock-up:
- * if the preview shows no image, the catalogue will show no image, because
- * "no approved, seller-visible image" is one condition with one meaning.
- */
-function SellerPreview({ product, media }: { product: Product; media: MediaAssetView[] }) {
-  const images = media.filter(
-    (asset) =>
-      IMAGE_CATEGORIES.includes(asset.category) &&
-      asset.approvalStatus === "APPROVED" &&
-      asset.sellerVisible
-  );
-  const active = product.variants.filter((variant) => variant.isActive);
-  const cheapest = active.reduce<Variant | null>(
-    (best, variant) => (!best || variant.wholesalePrice < best.wholesalePrice ? variant : best),
-    null
-  );
-
-  return (
-    <div style={{ ...card, background: "#f8fafc" }}>
-      <h2 style={sectionTitle}>Seller view</h2>
-      <p style={sectionNote}>
-        Exactly what an approved seller sees in their catalogue. Prices shown are the entry
-        price — the cheapest active variant — which is the same rule the catalogue uses.
-      </p>
-
-      <div style={{ display: "flex", gap: "1rem", alignItems: "flex-start", flexWrap: "wrap" }}>
-        <div
-          style={{
-            width: 140,
-            height: 140,
-            borderRadius: 10,
-            background: "white",
-            border: `1px solid ${LINE}`,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: FAINT,
-            fontSize: "0.75rem",
-            overflow: "hidden",
-          }}
-        >
-          {images.length ? (
-            <img
-              src={images[0].url}
-              alt={images[0].altText ?? product.name}
-              style={{ width: "100%", height: "100%", objectFit: "cover" }}
-            />
-          ) : (
-            "No approved image"
-          )}
-        </div>
-
-        <div style={{ flex: 1, minWidth: 240 }}>
-          <div style={{ fontWeight: 700, color: INK }}>{product.name}</div>
-          <div style={{ fontSize: "0.75rem", color: MUTED, marginBottom: "0.5rem" }}>
-            {product.category} &middot; {product.productCode}
-          </div>
-          <p style={{ fontSize: "0.82rem", color: MUTED, margin: "0 0 0.5rem" }}>
-            {product.description || "No description yet."}
-          </p>
-
-          {cheapest ? (
-            <div style={{ fontSize: "0.82rem", color: INK }}>
-              From <strong>{money(cheapest.wholesalePrice, product.currency)}</strong> wholesale
-              <span style={{ color: MUTED }}>
-                {" "}
-                &middot; suggested retail {money(cheapest.suggestedRetailPrice, product.currency)}
-              </span>
-            </div>
-          ) : (
-            <div style={{ fontSize: "0.82rem", color: "#92400e" }}>
-              No active variant, so there is no price to show.
-            </div>
-          )}
-
-          {active.length > 1 ? (
-            <ul style={{ margin: "0.5rem 0 0", paddingLeft: "1.1rem", fontSize: "0.78rem", color: MUTED }}>
-              {active.map((variant) => (
-                <li key={variant.id}>
-                  {variant.name} — {money(variant.wholesalePrice, product.currency)}
-                  {variant.variantOptions.length
-                    ? ` (${variant.variantOptions.map((o) => `${o.name}: ${o.value}`).join(", ")})`
-                    : ""}
-                </li>
-              ))}
-            </ul>
-          ) : null}
-
-          {product.status !== "PUBLISHED" ? (
-            <p style={{ ...helpText, marginTop: "0.6rem" }}>
-              This product is not published, so a seller cannot see it yet. This preview shows
-              the draft.
-            </p>
-          ) : null}
-        </div>
-      </div>
     </div>
   );
 }

@@ -12,18 +12,23 @@ import {
 } from "~/services/products.server";
 import { permissionsFor } from "~/services/permissions";
 
-const STATUSES = ["ALL", "DRAFT", "PENDING_APPROVAL", "PUBLISHED", "ARCHIVED"] as const;
+/*
+ * PENDING_APPROVAL is absent on purpose. Nothing ever read it — there was no
+ * approver queue to read it from — so the filter offered a view of products
+ * that were, in every way the app consults, drafts. The enum value survives in
+ * the database for history and for rows that were parked there before this
+ * change; no screen offers it, and none should.
+ */
+const STATUSES = ["ALL", "DRAFT", "PUBLISHED", "ARCHIVED"] as const;
 
 const STATUS_LABELS: Record<string, string> = {
   DRAFT: "Draft",
-  PENDING_APPROVAL: "Pending approval",
   PUBLISHED: "Published",
   ARCHIVED: "Archived",
 };
 
 const STATUS_COLOURS: Record<string, string> = {
   DRAFT: "#64748b",
-  PENDING_APPROVAL: "#b45309",
   PUBLISHED: "#059669",
   ARCHIVED: "#94a3b8",
 };
@@ -45,7 +50,8 @@ const DONE_MESSAGES: Record<string, string> = {
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
-  await requirePermission(request, "products.view");
+  const user = await requirePermission(request, "products.view");
+  const held = permissionsFor(user.role);
   const url = new URL(request.url);
   const statusParam = url.searchParams.get("status") || "ALL";
   const status = (STATUSES.includes(statusParam as (typeof STATUSES)[number])
@@ -61,6 +67,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
   return {
     ...result,
     done: DONE_MESSAGES[done] ?? "",
+    // Whether to draw the Publish and Withdraw buttons at all. The control is
+    // the check in the action and the service behind it, not this flag.
+    canPublish: held.has("products.publish"),
     filters: {
       q: url.searchParams.get("q") || "",
       category: url.searchParams.get("category") || "",
@@ -293,14 +302,22 @@ export default function AdminProducts() {
                 <Form method="post" style={{ display: "flex", gap: "0.35rem", flexWrap: "wrap" }}>
                   <input type="hidden" name="productId" value={p.id} />
                   <input type="hidden" name="returnTo" value={returnTo} />
-                  <button
-                    type="submit"
-                    name="intent"
-                    value={p.status === "PUBLISHED" ? "unpublish" : "publish"}
-                    style={btn("#0369a1")}
-                  >
-                    {p.status === "PUBLISHED" ? "Unpublish" : "Publish"}
-                  </button>
+                  {/*
+                    Publishing is a separate permission from editing, so this
+                    button is drawn only for the roles that hold it. A row
+                    without it is still fully editable — the catalogue role
+                    prepares the record, an owner or administrator releases it.
+                  */}
+                  {data.canPublish ? (
+                    <button
+                      type="submit"
+                      name="intent"
+                      value={p.status === "PUBLISHED" ? "unpublish" : "publish"}
+                      style={btn("#0369a1")}
+                    >
+                      {p.status === "PUBLISHED" ? "Unpublish" : "Publish"}
+                    </button>
+                  ) : null}
                   <Link to={`/admin/products/${p.id}`} style={{ ...btn("#64748b"), textDecoration: "none" }}>
                     Edit
                   </Link>

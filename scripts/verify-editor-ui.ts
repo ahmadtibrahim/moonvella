@@ -22,7 +22,9 @@
  *   node scripts/run-verify.mjs scripts/verify-editor-ui.ts
  */
 import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
 import { ADMIN_SESSION_COOKIE } from "~/utils/adminAuth.server";
+import { publicationReadiness } from "~/services/publication.server";
 // The same conversion the packing screen applies to a stored carton, so the
 // check is about the application's arithmetic rather than a copy of it.
 import { toCm, toKg } from "~/services/packaging.server";
@@ -43,12 +45,19 @@ function check(name: string, pass: boolean, detail = "") {
   console.log(`${pass ? "PASS" : "FAIL"}  ${total}. ${name}${detail ? ` — ${detail}` : ""}`);
 }
 
-async function login(): Promise<string> {
+/**
+ * Sign in, as the harness's throwaway owner by default or as an account this
+ * suite made for itself. The role checks further down need two people at once,
+ * and the harness provides exactly one — so the second account is created here
+ * and removed in the cleanup, which is the same rule the harness states for
+ * every other precondition: the suite's fixtures are its own.
+ */
+async function login(asEmail = EMAIL, asPassword = PASSWORD): Promise<string> {
   const res = await fetch(`${BASE}/admin/login`, {
     method: "POST",
     redirect: "manual",
     headers: { "Content-Type": "application/x-www-form-urlencoded", Origin: BASE },
-    body: new URLSearchParams({ email: EMAIL, password: PASSWORD }),
+    body: new URLSearchParams({ email: asEmail, password: asPassword }),
   });
   const cookies: string[] =
     typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
@@ -533,6 +542,206 @@ async function main() {
     await prisma.variantPackage.deleteMany({ where: { variantId: doomed.variants[0].id } });
     await prisma.productVariant.deleteMany({ where: { productId: doomed.id } });
     await prisma.product.deleteMany({ where: { id: doomed.id } });
+
+    /* ------------------------------------------------------------------ */
+    /* Publishing is a permission, not a stage                              */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Two accounts, two roles, one product — because the question is not "does
+     * Publish work" but "who does it work for", and a single signed-in person
+     * cannot answer that.
+     *
+     * The product starts deliberately UNPUBLISHABLE. The first half of this
+     * section is therefore about the gate refusing everyone, including the
+     * owner: a permission that lets a person press a button is worthless if the
+     * button ignores the readiness checks. Only once the product is made ready
+     * does the role difference become visible at all.
+     */
+    const detailsBeforeReady = await get(`/admin/products/${product.id}?tab=details`, cookie);
+    check(
+      "A product with no image is told what it is missing, next to Publish",
+      detailsBeforeReady.html.includes("At least one approved, seller-visible image") &&
+        detailsBeforeReady.html.includes("Publish to sellers"),
+      "the requirement and the control are on the same screen"
+    );
+
+    const ownerBlocked = await post(`/admin/products/${product.id}`, cookie, {
+      intent: "publish",
+      tab: "details",
+    });
+    const stillDraft = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "The owner is refused too while the product is not ready",
+      ownerBlocked.status !== 302 && stillDraft?.status === "DRAFT",
+      `HTTP ${ownerBlocked.status}, status ${stillDraft?.status}`
+    );
+    check(
+      "And the refusal names the requirement rather than saying no",
+      (await ownerBlocked.text()).includes("approved, seller-visible image"),
+      "a refusal that does not say what to fix is a dead end"
+    );
+
+    // Make it publishable: a description, an approved seller-visible image with
+    // alt text, and that image marked primary. Written directly, because the
+    // media forms have their own suite and a failure there would be reported
+    // here as the wrong defect.
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { description: "Written by verify-editor-ui." },
+    });
+    const image = await prisma.mediaAsset.create({
+      data: {
+        productId: product.id,
+        category: "WHITE_BACKGROUND_IMAGE",
+        title: "Verify Editor UI image",
+        altText: "A pillow on a white background.",
+        originalFilename: "verify-editor-ui.png",
+        storageKey: `verify-editor-ui/${Date.now()}.png`,
+        mimeType: "image/png",
+        fileSize: 1024,
+        checksum: `verify-editor-ui-${Date.now()}`,
+        processingStatus: "READY",
+        approvalStatus: "APPROVED",
+        sellerVisible: true,
+        assignments: { create: [{ variantId: null, isPrimary: true }] },
+      },
+    });
+    const readyNow = await publicationReadiness(product.id);
+    check(
+      "The fixture is now publishable, so what follows is about permission",
+      readyNow.ready,
+      readyNow.blockers.map((blocker) => blocker.label).join("; ") || "ready"
+    );
+
+    const publishControl = (html: string) =>
+      countNamed(html, "intent") > 0 && /value="publish"/.test(html);
+    const withdrawControl = (html: string) => /value="unpublish"/.test(html);
+
+    // A CATALOG account, made here and removed in the cleanup below. The hash
+    // comes from the same bcrypt the app verifies with, so it cannot drift.
+    const catalogEmail = `verify-catalog-${Date.now()}@mvverify.invalid`;
+    const catalogPassword = `MvCatalog-${Math.random().toString(36).slice(2)}${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    const catalog = await prisma.adminUser.create({
+      data: {
+        email: catalogEmail,
+        name: "Verify Catalog",
+        role: "CATALOG",
+        passwordHash: bcrypt.hashSync(catalogPassword, 12),
+        emailVerifiedAt: new Date(),
+      },
+    });
+    const catalogCookie = await login(catalogEmail, catalogPassword);
+    check(
+      "A catalogue-role account can sign in",
+      catalogCookie.includes(ADMIN_SESSION_COOKIE),
+      "the role that prepares the record"
+    );
+
+    const ownerList = await get("/admin/products", cookie);
+    const catalogList = await get("/admin/products", catalogCookie);
+    check(
+      "The product list offers the owner a publish control",
+      publishControl(ownerList.html),
+      "the control exists — the difference below is the role"
+    );
+    check(
+      "And offers the catalogue role none at all",
+      !publishControl(catalogList.html) && !withdrawControl(catalogList.html),
+      "a button that always answers 403 is worse than no button"
+    );
+
+    const catalogEditor = await get(`/admin/products/${product.id}?tab=details`, catalogCookie);
+    check(
+      "The catalogue role still gets the whole editor",
+      catalogEditor.status === 200 && catalogEditor.html.includes("Save draft"),
+      `HTTP ${catalogEditor.status}`
+    );
+    check(
+      "But no Publish button on it",
+      !publishControl(catalogEditor.html),
+      "writing the record and releasing it are different decisions"
+    );
+    check(
+      "And is told who does publish it, rather than left to guess",
+      catalogEditor.html.includes("an owner or administrator releases it to sellers"),
+      "the sentence that replaces the approval step"
+    );
+
+    const catalogPublish = await post(`/admin/products/${product.id}`, catalogCookie, {
+      intent: "publish",
+      tab: "details",
+    });
+    const afterCatalogPublish = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "A posted publish from the catalogue role is refused, not merely unrendered",
+      catalogPublish.status !== 302 && afterCatalogPublish?.status === "DRAFT",
+      `HTTP ${catalogPublish.status}, status ${afterCatalogPublish?.status}`
+    );
+    check(
+      "And says why in the role's own terms",
+      (await catalogPublish.text()).includes("does not permit publishing"),
+      "hiding the button is a convenience; this is the control"
+    );
+
+    const ownerEditor = await get(`/admin/products/${product.id}?tab=details`, cookie);
+    check(
+      "The owner sees Publish on the same product",
+      publishControl(ownerEditor.html),
+      "same product, same page, different role"
+    );
+
+    const ownerPublish = await post(`/admin/products/${product.id}`, cookie, {
+      intent: "publish",
+      tab: "details",
+    });
+    const published = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "The owner's press publishes it",
+      ownerPublish.status === 302 && published?.status === "PUBLISHED",
+      `HTTP ${ownerPublish.status}, status ${published?.status}`
+    );
+    check(
+      "And the flags the seller-facing queries read agree",
+      published?.isPublished === true,
+      "the gate is what keeps the status and the flag consistent"
+    );
+
+    const catalogWithdraw = await post(`/admin/products/${product.id}`, catalogCookie, {
+      intent: "unpublish",
+      tab: "details",
+    });
+    const stillPublished = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "Withdrawing is the same permission, and is refused the same way",
+      catalogWithdraw.status !== 302 && stillPublished?.status === "PUBLISHED",
+      `HTTP ${catalogWithdraw.status}, status ${stillPublished?.status}`
+    );
+
+    // The retired state must not come back through the editor: the field is
+    // gone from the form, but a hand-made POST is the thing worth refusing.
+    const parkAttempt = await post(`/admin/products/${product.id}`, cookie, {
+      intent: "update_details",
+      tab: "details",
+      name: "Verify Editor UI",
+      productCode: CODE,
+      category: "Bedding",
+      currency: "CAD",
+      status: "PENDING_APPROVAL",
+    });
+    const afterPark = await prisma.product.findUnique({ where: { id: product.id } });
+    check(
+      "A hand-made POST cannot park a product in the retired approval state",
+      parkAttempt.status !== 500 && afterPark?.status === "PUBLISHED",
+      `HTTP ${parkAttempt.status}, status ${afterPark?.status}`
+    );
+
+    await prisma.mediaAssetAssignment.deleteMany({ where: { assetId: image.id } });
+    await prisma.mediaAsset.deleteMany({ where: { id: image.id } });
+    await prisma.adminSession.deleteMany({ where: { userId: catalog.id } });
+    await prisma.adminUser.deleteMany({ where: { id: catalog.id } });
   } finally {
     // Audit rows are append-only at the database level and are deliberately
     // left behind; everything else this suite made goes.

@@ -62,6 +62,24 @@ function assertMayManage(actor: CatalogActor, context: string) {
   }
 }
 
+/**
+ * Publishing is its own permission, checked in the same place and for the same
+ * reason as the cost check above.
+ *
+ * The owner removed the approval step that used to sit between preparing a
+ * product and releasing it, so this is where "may this person put a product in
+ * front of sellers" is answered. It is deliberately NOT products.manage:
+ * CATALOG writes every field on the record and must not be able to publish it.
+ * Unpublishing needs it too — withdrawing a product is no less consequential
+ * than releasing one — but is never blocked by the readiness gate, because
+ * taking something down must always be possible.
+ */
+function assertMayPublish(actor: CatalogActor, context: string) {
+  if (!actor.permissions.includes("products.publish")) {
+    throw new Error(`Your role does not permit ${context}.`);
+  }
+}
+
 /** True when the actor supplied a cost at all, as opposed to leaving it blank. */
 function costWasSupplied(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
@@ -82,7 +100,13 @@ export interface ProductInput {
   materials?: string | null;
   careInstructions?: string | null;
   currency?: string;
-  status?: "DRAFT" | "PENDING_APPROVAL" | "PUBLISHED" | "ARCHIVED";
+  /*
+   * PUBLISHED is here because the editor saves and publishes in one press, so
+   * the status travels with the rest of the fields. PENDING_APPROVAL is not:
+   * nothing ever read that state, so the type no longer lets a caller park a
+   * product in it. See the migration 20260925000000.
+   */
+  status?: "DRAFT" | "PUBLISHED" | "ARCHIVED";
 }
 
 export interface VariantOptionInput {
@@ -223,7 +247,10 @@ async function replaceVariantOptions(
 export interface ProductListFilters {
   search?: string;
   category?: string;
-  status?: "ALL" | "DRAFT" | "PENDING_APPROVAL" | "PUBLISHED" | "ARCHIVED";
+  // No PENDING_APPROVAL: the list filter stopped offering it, and a filter that
+  // can be typed into a URL but never drawn in the interface is a state kept
+  // alive by accident. See app/routes/admin.products.tsx.
+  status?: "ALL" | "DRAFT" | "PUBLISHED" | "ARCHIVED";
   page?: number;
   pageSize?: number;
 }
@@ -382,10 +409,16 @@ export async function updateProduct(id: string, input: ProductInput, actor: Cata
     }
   }
 
-  // Status changes are routed through the same gate as the Publish action.
-  // Editing the details form while setting status to PUBLISHED would otherwise
-  // be a second way into a published state, checked by nothing.
+  // Status changes are routed through the same rules as the Publish action:
+  // the same permission, and the same readiness gate. Editing the details form
+  // while setting status to PUBLISHED would otherwise be a second way into a
+  // published state, checked by nothing — and a way for a role that cannot
+  // publish to publish, by saving a form.
   const nextStatus = input.status ?? before.status;
+  const changesPublication = (nextStatus === "PUBLISHED") !== (before.status === "PUBLISHED");
+  if (changesPublication) {
+    assertMayPublish(actor, nextStatus === "PUBLISHED" ? "publishing a product" : "unpublishing a product");
+  }
   if (nextStatus === "PUBLISHED" && before.status !== "PUBLISHED") {
     await assertPublishable(id);
   }
@@ -502,7 +535,7 @@ export async function deleteProduct(id: string, actor: CatalogActor) {
  * what they were.
  */
 export async function setPublished(id: string, published: boolean, actor: CatalogActor) {
-  assertMayManage(actor, published ? "publishing a product" : "unpublishing a product");
+  assertMayPublish(actor, published ? "publishing a product" : "unpublishing a product");
 
   // The gate is here, not in the route, so that every caller passes through it:
   // the editor's Publish button, the list's Publish button, and anything added

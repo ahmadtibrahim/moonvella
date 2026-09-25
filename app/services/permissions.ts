@@ -68,6 +68,16 @@ export const PERMISSIONS = [
   // Cost and margin are financial data wearing a product's clothes, so this is
   // its own permission rather than part of products.manage.
   "products.cost.edit",
+  /*
+   * Publishing to sellers, split out of products.manage.
+   *
+   * Curating a product and DECIDING THAT SELLERS MAY SEE IT are different
+   * acts, and the second one is the one with consequences: a published
+   * product leaves this building. The catalogue role still writes every word,
+   * image and carton on the record — it just does not get to say when the
+   * record goes live. See the CATALOG grant below.
+   */
+  "products.publish",
 
   // Orders and fulfilment.
   "orders.view",
@@ -122,6 +132,7 @@ const GRANTS: Record<AdminRole, readonly Permission[]> = {
     "products.view",
     "products.manage",
     "products.cost.edit",
+    "products.publish",
     "orders.view",
     "orders.manage",
     "orders.fulfill",
@@ -153,6 +164,7 @@ const GRANTS: Record<AdminRole, readonly Permission[]> = {
     "products.view",
     "products.manage",
     "products.cost.edit",
+    "products.publish",
     "orders.view",
     "orders.manage",
     "orders.fulfill",
@@ -197,6 +209,13 @@ const GRANTS: Record<AdminRole, readonly Permission[]> = {
    * remit was the product record — descriptions, images, variants,
    * availability and export data — not its margin. Give OWNER or ADMIN the
    * cost change if it is needed.
+   *
+   * products.publish is NOT granted either, and for a plainer reason: writing
+   * a product and releasing it to sellers are different decisions, and only
+   * the second one sends work out of the building. The owner removed the
+   * approval step that used to sit between them, so the separation now lives
+   * here — catalog prepares the record, an owner or administrator publishes
+   * it. Everything else on the product still belongs to catalog.
    */
   CATALOG: [
     "dashboard.view",
