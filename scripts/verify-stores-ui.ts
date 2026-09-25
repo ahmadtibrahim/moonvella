@@ -9,12 +9,22 @@
  * returns a redirect and changes nothing is the failure mode that matters here,
  * and a status code cannot tell the two apart.
  *
- * The second is whether the screen is honest. All of the money on these pages
- * is drawn rather than read: MoonVella has no ledger. A panel of confident
- * figures with no statement of where they came from is the kind of screen
- * somebody eventually makes a credit decision from, so the sample notice, the
- * per-figure chip and the one figure that *is* real are asserted too. Those
- * checks are as much the deliverable as the buttons are.
+ * The second is whether the screen is honest. There is no ledger behind these
+ * pages, and the figures that used to be drawn here — a worked example of five
+ * invoices, a part-payment, a credit note and a correspondence timeline, each
+ * stamped as a sample — were removed rather than labelled: a fabricated balance
+ * beside a real store's name, in the store's own currency, is a figure somebody
+ * eventually makes a credit decision from, and the stamp does not survive being
+ * read once. What is asserted now is the replacement: the standing notice, a
+ * "No ledger"/"Not connected" chip wherever a figure would have been, the one
+ * figure that *is* real and labelled Live, and the empty states that name the
+ * system each panel is waiting for.
+ *
+ * This was rewritten rather than deleted when the sample ledger went: the two
+ * checks that stood here asserted the retired behaviour, so the suite was red
+ * from that day until now — which is how a suite that nobody runs reports.
+ * `--all` skips it without OWNER_EMAIL/OWNER_PASSWORD, and only the HTTP harness
+ * provides those.
  *
  * IT NEEDS A RUNNING SERVER AND AN ADMIN ACCOUNT. The throwaway OWNER account
  * is made by the harness that calls this, not here — the owner's own password
@@ -152,16 +162,21 @@ async function main() {
     /* Honesty about the money                                              */
     /* ------------------------------------------------------------------ */
     check(
-      "The roster states that the balances are a design preview, and why",
-      /design preview/.test(roster.html) &&
-        /holds no ledger/.test(roster.html) &&
-        /must not be used to make a credit decision/.test(roster.html),
-      "a sample figure with no notice is a figure somebody will act on"
+      "The roster says no accounting is connected, and that nothing on it is a figure",
+      /No accounting is connected, so no invoices or balances are shown/.test(roster.html) &&
+        /does not hold a ledger/.test(roster.html) &&
+        /filled in with an example/.test(roster.html) &&
+        // The currency is interpolated, so the serialised HTML carries React's
+        // `<!-- -->` boundary through the middle of the sentence. The assertion
+        // reads around it rather than through it.
+        /appears here, so nothing on this page can be read as a statement of what this store owes/
+          .test(roster.html),
+      "an empty panel with no explanation is indistinguishable from a broken one"
     );
     check(
-      "The balances carry their own chip, so the notice is not the only clue",
-      (roster.html.match(/>Sample</g) ?? []).length >= 1,
-      `${(roster.html.match(/>Sample</g) ?? []).length} sample chip(s)`
+      "And every row carries its own chip, so the notice is not the only clue",
+      (roster.html.match(/>No ledger</g) ?? []).length >= 1,
+      `${(roster.html.match(/>No ledger</g) ?? []).length} no-ledger chip(s)`
     );
 
     /* ------------------------------------------------------------------ */
@@ -175,9 +190,12 @@ async function main() {
       /Sales balance/.test(detail.html) && /Account balance/.test(detail.html)
     );
     check(
-      "The account balance is derived in the open, not asserted",
-      /How the account balance is made up/.test(detail.html) &&
-        /Balance owed/.test(detail.html)
+      "The balance cards refuse an amount, and say that refusing is the point",
+      /No ledger connected/.test(detail.html) &&
+        /No amount is shown, because none has been read/.test(detail.html) &&
+        /deliberately no/.test(detail.html) &&
+        /how the balance is made up/.test(detail.html),
+      "a reconciliation of absent figures is arithmetic performed on nothing"
     );
     check(
       "One figure on the page is real, and says so",
@@ -185,31 +203,35 @@ async function main() {
     );
 
     check(
-      "Invoices are listed with paid, part-paid, unpaid and overdue states",
-      /Paid/.test(detail.html) &&
-        /Part paid/.test(detail.html) &&
-        /Not paid/.test(detail.html) &&
-        /Overdue/.test(detail.html)
+      "The invoices panel lists none, and says which system will fill it",
+      /Invoices &amp; payments/.test(detail.html) &&
+        /No invoices are recorded against this store/.test(detail.html) &&
+        /Will be read from/.test(detail.html) &&
+        /Odoo accounting \(account\.move — customer invoices\)/.test(detail.html)
     );
     check(
-      "Payments received are listed against the invoices they settle",
-      /Payments received/.test(detail.html) && /PAY-3391/.test(detail.html)
+      "Payments and credit notes are named as the same absence, not left to be discovered",
+      /Payments received, applications of those payments to invoices, and credit notes are absent/
+        .test(detail.html) && /there is no ledger behind this page/.test(detail.html)
     );
     check(
-      "Credit notes are shown as credits, in brackets",
-      /Credit notes/.test(detail.html) && /CN-118/.test(detail.html)
+      "The three states the panel exists to separate are still stated, on a panel with no rows",
+      /A part-paid invoice is a state of its own/.test(detail.html) &&
+        /it is not unpaid, and it is not settled/.test(detail.html)
     );
     check(
-      "Goods supplied but not yet invoiced have their own panel",
-      /Awaiting invoice/.test(detail.html) && /ORD-5312/.test(detail.html)
+      "Goods supplied but not yet invoiced keep their own panel, and it refuses to guess",
+      /Awaiting invoice/.test(detail.html) &&
+        /whether an order has been billed is a fact about a ledger/.test(detail.html) &&
+        /Listing every order as uninvoiced would be a guess/.test(detail.html)
     );
 
     check(
-      "The communication record shows both directions and the internal notes",
+      "The communication record covers both directions and the internal notes",
       /Communication record/.test(detail.html) &&
-        /from the store/.test(detail.html) &&
-        /to the store/.test(detail.html) &&
-        /internal/.test(detail.html),
+        /email in both directions/.test(detail.html) &&
+        /calls, notes written by staff, and the system/.test(detail.html) &&
+        /No correspondence is listed/.test(detail.html),
       "email in, email out, calls, staff notes and the system's own decisions"
     );
     check(
@@ -271,8 +293,8 @@ async function main() {
       /Activate store/.test(suspendedPage.html) && !/Deactivate store/.test(suspendedPage.html)
     );
     check(
-      "And the confirmation is shown on the page it returns to",
-      /Store deactivated\./.test(suspendedPage.html)
+      "And the confirmation is shown on the page it returns to, in the words of the action taken",
+      /Store suspended\./.test(suspendedPage.html)
     );
 
     const activated = await post("/admin/stores", cookie, {
