@@ -1925,3 +1925,102 @@ export async function importProductForSeller(
     return { ok: false, error: message };
   }
 }
+
+const PRODUCT_DELETE = `#graphql
+  mutation MoonVellaProductDelete($input: ProductDeleteInput!) {
+    productDelete(input: $input) {
+      deletedProductId
+      userErrors { field message }
+    }
+  }`;
+
+export interface RemoveFromStoreResult {
+  ok: boolean;
+  /** False when the product was not in the store — nothing to remove. */
+  removed?: boolean;
+  error?: string;
+}
+
+/**
+ * Take the product back OUT of the seller's store.
+ *
+ * THE STORE PRODUCT IS DELETED, not archived: the seller asked to remove it
+ * completely, and a deleted product is the state the storefront cannot show at
+ * all. A product a seller has already sold is deletable all the same — past
+ * orders keep their line items, which is why this application's own mapping row
+ * is kept and only cleared of the store's identity: `OrderItem` still points
+ * at it, and deleting the row would orphan what the orders record.
+ *
+ * THE CLEARING IS ONE TRANSACTION and it runs only after the store has said the
+ * product is gone. The mapping loses its shopify ids and re-arms for import, and
+ * the seller's image choices keep their selections but lose their upload
+ * outcome: those media ids belonged to the deleted product and are gone with
+ * it, so a re-import must upload them again rather than reference dead media.
+ */
+export async function removeProductFromStore(
+  admin: AdminGraphql,
+  sellerId: string,
+  productId: string
+): Promise<RemoveFromStoreResult> {
+  const mapping = await prisma.sellerProduct.findUnique({
+    where: { sellerId_productId: { sellerId, productId } },
+    select: { id: true, shopifyProductId: true },
+  });
+
+  if (!mapping?.shopifyProductId) {
+    // Not in the store. Not an error: the button asks for a state, and the
+    // state is already the one asked for.
+    return { ok: true, removed: false };
+  }
+
+  let response: Response;
+  try {
+    response = await admin.graphql(PRODUCT_DELETE, {
+      variables: { input: { id: mapping.shopifyProductId } },
+    });
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+
+  const json = (await response.json()) as {
+    data?: { productDelete?: { deletedProductId?: string; userErrors?: { message: string }[] } };
+  };
+  const errors = json?.data?.productDelete?.userErrors ?? [];
+  const gone = json?.data?.productDelete?.deletedProductId != null;
+  /*
+   * A product deleted by hand from the Shopify admin leaves a mapping behind;
+   * the store answering "no such product" is the same outcome the button asks
+   * for, so the local record is cleared rather than the seller meeting an error
+   * about a product their storefront already cannot show.
+   */
+  const alreadyGone = errors.some((error) => /not found|does not exist|no longer exists/i.test(error.message));
+  if (!gone && !alreadyGone) {
+    return { ok: false, error: errors.map((error) => error.message).join("; ") };
+  }
+
+  await prisma.$transaction([
+    prisma.sellerProductVariant.deleteMany({ where: { sellerProductId: mapping.id } }),
+    prisma.sellerProduct.update({
+      where: { id: mapping.id },
+      data: {
+        shopifyProductId: null,
+        shopifyVariantIds: "[]",
+        importedAt: null,
+        importStatus: "NEVER",
+        lastImportError: null,
+      },
+    }),
+    prisma.importMediaSelection.updateMany({
+      where: { sellerId, productId },
+      data: {
+        uploadStatus: "PENDING",
+        providerMediaId: null,
+        uploadAttempts: 0,
+        lastUploadError: null,
+        uploadedAt: null,
+      },
+    }),
+  ]);
+
+  return { ok: true, removed: true };
+}

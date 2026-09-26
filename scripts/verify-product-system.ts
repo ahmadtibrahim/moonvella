@@ -70,7 +70,7 @@ import { permissionsFor, can } from "../app/services/permissions";
 import { checkProductCode, PRODUCT_CODE_HELP } from "../app/utils/productCode";
 import { isSafeEntryPath } from "../app/utils/zip";
 import { intakeOrder } from "../app/services/orderIntake.server";
-import { importProductForSeller, retailPriceFor, sellerCostFor } from "../app/services/shopifyImport.server";
+import { importProductForSeller, removeProductFromStore, retailPriceFor, sellerCostFor } from "../app/services/shopifyImport.server";
 import { readObject, deleteObject, objectExists } from "../app/services/storage.server";
 import { planInventoryPush, pushInventoryForVariants } from "../app/services/inventoryPush.server";
 import { bufferedQuantity } from "../app/utils/inventorySync";
@@ -2235,6 +2235,8 @@ async function main() {
       /** The file being added, so the media it becomes can be named. */
       media?: { originalSource?: string }[];
       input?: {
+        /** The store product being deleted. */
+        id?: string;
         name?: string;
         reason?: string;
         variants?: SentVariant[];
@@ -2384,6 +2386,15 @@ async function main() {
         }
         if (query.includes("MoonVellaVariantsUpdate")) {
           return reply({ productVariantsBulkUpdate: { productVariants: [], userErrors: [] } });
+        }
+        /*
+         * The way back out. The store answers a deletion by handing the id
+         * back, so the check below can read that the request named exactly the
+         * product the import recorded — deleting the wrong thing is worse than
+         * deleting nothing.
+         */
+        if (query.includes("MoonVellaProductDelete")) {
+          return reply({ productDelete: { deletedProductId: variables.input?.id, userErrors: [] } });
         }
         return reply({});
       },
@@ -2812,10 +2823,119 @@ async function main() {
     `asked=${askedTheItem} locations=${JSON.stringify([...quantitiesAt])} stocked=${first.stockedLocationId}`
   );
 
+  /* ======================================================================= */
+  console.log("\nL. Removal — the way back out of a seller's store");
+  /* ======================================================================= */
+  /*
+   * THE INVERSE OF EVERYTHING ABOVE. A seller who changed their mind removes
+   * the product from their store. The store product is DELETED — there is no
+   * archive to bring it back to — and everything this app recorded about it is
+   * cleared so the card goes back to offering an import. The mapping row itself
+   * survives, because an order line still points at it; only its Shopify half
+   * is forgotten. The same fake store answers the delete, so the request can be
+   * read back exactly as it left.
+   */
+
+  const mappingBeforeRemoval = await prisma.sellerProduct.findUnique({
+    where: { sellerId_productId: { sellerId: seller.id, productId: storeBody.id } },
+    select: { id: true, shopifyProductId: true },
+  });
+  /*
+   * THE UPLOAD OUTCOME CLAIMS THE STORE ALREADY HAS THE IMAGE. It is planted
+   * before the removal because the removal's own transaction is what resets it:
+   * the store product's media ids die with the product, so a row still saying
+   * UPLOADED would make the next import skip the upload and send media ids the
+   * store no longer knows. Reset means the next import uploads from scratch.
+   */
+  const mediaRowBeforeRemoval = await prisma.importMediaSelection.create({
+    data: {
+      sellerId: seller.id,
+      productId: storeBody.id,
+      mediaAssetId: "removal-fixture-asset",
+      selected: true,
+      uploadStatus: "UPLOADED",
+      providerMediaId: "gid://shopify/MediaImage/removal-fixture",
+      uploadAttempts: 2,
+      uploadedAt: new Date(),
+    },
+  });
+
+  const deleteCallCount = () =>
+    first.calls.filter((call) => call.query.includes("MoonVellaProductDelete")).length;
+
+  // 100
+  const removal = await removeProductFromStore(first.admin, seller.id, storeBody.id);
+  const deleteCalls = first.calls.filter((call) => call.query.includes("MoonVellaProductDelete"));
+  check(
+    100,
+    "Removal deletes the store product by the exact id the import recorded",
+    removal.ok === true &&
+      removal.removed === true &&
+      deleteCallCount() === 1 &&
+      deleteCalls[0]?.variables.input?.id === mappingBeforeRemoval?.shopifyProductId,
+    `ok=${removal.ok} removed=${removal.removed} calls=${deleteCallCount()} id=${deleteCalls[0]?.variables.input?.id} expected=${mappingBeforeRemoval?.shopifyProductId}`
+  );
+
+  // 101
+  /*
+   * THE MAPPING ROW IS KEPT, NOT DELETED — `OrderItem.sellerProductId` points
+   * at it, so deleting the row would orphan every order line that ever sold
+   * this product. What is cleared is its Shopify half: no store id, no variant
+   * ids, no import status. The variant mapping rows ARE deleted, because
+   * nothing points at them and a stale `shopifyVariantId` would poison the next
+   * import's variant id math.
+   */
+  const mappingAfterRemoval = await prisma.sellerProduct.findUnique({
+    where: { id: mappingBeforeRemoval!.id },
+    select: { shopifyProductId: true, shopifyVariantIds: true, importStatus: true },
+  });
+  const variantRowsAfter = await prisma.sellerProductVariant.count({
+    where: { sellerProductId: mappingBeforeRemoval!.id },
+  });
+  check(
+    101,
+    "The mapping row is kept but cleared, so orders keep their reference and the card re-arms",
+    mappingAfterRemoval?.shopifyProductId === null &&
+      mappingAfterRemoval?.shopifyVariantIds === "[]" &&
+      mappingAfterRemoval?.importStatus === "NEVER" &&
+      variantRowsAfter === 0,
+    `shopifyProductId=${mappingAfterRemoval?.shopifyProductId} variantIds=${mappingAfterRemoval?.shopifyVariantIds} status=${mappingAfterRemoval?.importStatus} variantRows=${variantRowsAfter}`
+  );
+
+  // 102
+  const mediaRowAfterRemoval = await prisma.importMediaSelection.findUnique({
+    where: { id: mediaRowBeforeRemoval.id },
+    select: { uploadStatus: true, providerMediaId: true, uploadAttempts: true, uploadedAt: true },
+  });
+  check(
+    102,
+    "Upload outcomes are reset so a re-import uploads again instead of referencing media that died with the product",
+    mediaRowAfterRemoval?.uploadStatus === "PENDING" &&
+      mediaRowAfterRemoval?.providerMediaId === null &&
+      mediaRowAfterRemoval?.uploadAttempts === 0 &&
+      mediaRowAfterRemoval?.uploadedAt === null,
+    `status=${mediaRowAfterRemoval?.uploadStatus} mediaId=${mediaRowAfterRemoval?.providerMediaId} attempts=${mediaRowAfterRemoval?.uploadAttempts}`
+  );
+
+  // 103
+  /*
+   * THE STORE IS NOT ASKED TWICE. A second removal of an already-removed
+   * product must send nothing — the store product is gone, so a delete call
+   * would fail on an unknown id, and a no-op removal is a success for the
+   * seller who just wants the card back.
+   */
+  const secondRemoval = await removeProductFromStore(first.admin, seller.id, storeBody.id);
+  check(
+    103,
+    "Removing a product that is not in the store is a no-op that sends nothing",
+    secondRemoval.ok === true && secondRemoval.removed === false && deleteCallCount() === 1,
+    `ok=${secondRemoval.ok} removed=${secondRemoval.removed} calls=${deleteCallCount()}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 99) {
+  if (total !== 103) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 13 from the Shopify-mapping correction`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave, 13 from the Shopify-mapping correction and 4 from the removal wave`);
   }
 }
 

@@ -70,6 +70,13 @@ export interface ApprovedCatalogProduct extends PublicCatalogProduct {
   /** Total across active variants. */
   inventory: number;
   variants: ApprovedCatalogVariant[];
+  /**
+   * True when this seller has this product in their Shopify store right now.
+   * The card swaps the Import button for a removal offer, so the field must
+   * reflect the store, not the mapping alone: a mapping whose product was
+   * deleted by hand in the Shopify admin answers false.
+   */
+  imported: boolean;
 }
 
 export type CatalogProduct = PublicCatalogProduct | ApprovedCatalogProduct;
@@ -265,6 +272,16 @@ export async function listCatalog(
         ])
       : [new Map<string, number>(), new Map<string, number>()];
 
+  /*
+   * Which of these products are currently in THIS seller's store. One query for
+   * the page, and asked only when there is a seller to ask about — the answer is
+   * what turns a card's Import button into a removal offer, and a preview with
+   * no import button has no button to turn.
+   */
+  const importedByProduct = context.sellerId
+    ? await loadImportedProductIds(context.sellerId)
+    : new Set<string>();
+
   return products.map((product) => {
     const defaultVariant =
       product.variants.find((variant) => variant.isDefault) ?? product.variants[0] ?? null;
@@ -299,6 +316,7 @@ export async function listCatalog(
       wholesalePrice: cheapest?.wholesalePrice ?? 0,
       suggestedRetailPrice: cheapest?.suggestedRetailPrice ?? 0,
       inventory: product.variants.reduce((sum, v) => sum + v.inventory, 0),
+      imported: importedByProduct.has(product.id),
       variants: product.variants.map((v) => {
         const custom = pricedByVariant.get(v.id) ?? legacyByProduct.get(product.id) ?? null;
         const retailPrice = custom ?? v.suggestedRetailPrice;
@@ -325,4 +343,19 @@ export function isApprovedCatalogProduct(
   product: CatalogProduct
 ): product is ApprovedCatalogProduct {
   return "wholesalePrice" in product;
+}
+
+/**
+ * The products this seller currently lists, by catalogue id.
+ *
+ * `shopifyProductId` set and the last import a success: a FAILED row may still
+ * carry the id of a product the store never finished receiving, and a row
+ * cleared by a removal has none.
+ */
+async function loadImportedProductIds(sellerId: string): Promise<Set<string>> {
+  const rows = await prisma.sellerProduct.findMany({
+    where: { sellerId, shopifyProductId: { not: null }, importStatus: "SUCCESS" },
+    select: { productId: true },
+  });
+  return new Set(rows.map((row) => row.productId));
 }

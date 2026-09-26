@@ -1,4 +1,5 @@
 import React from "react";
+import PropTypes from "prop-types";
 import { Link, useFetcher, useLoaderData } from "react-router";
 import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
 import { listCatalog } from "../services/catalog.server";
@@ -162,6 +163,22 @@ export const action = async ({ request }) => {
   }
 
   const { admin } = await authenticate.admin(request);
+
+  /*
+   * Removing is the inverse of importing, with the same gate and the same
+   * store client. The service deletes the store product and clears this
+   * application's mapping, so the card goes back to offering an import.
+   */
+  if (intent === "remove-import") {
+    const { removeProductFromStore } = await import(
+      "../services/shopifyImport.server"
+    );
+    const result = await removeProductFromStore(admin, context.seller.id, productId);
+    return result.ok
+      ? { ok: true, removed: result.removed === true, productId }
+      : { ok: false, error: result.error || "Removal failed." };
+  }
+
   const result = await importProductForSeller(admin, context.seller.id, productId, {});
 
   if (!result.ok) {
@@ -207,6 +224,53 @@ function variantLabel(variant) {
   const values = (variant.options ?? []).map((option) => option.value).filter(Boolean);
   return values.length ? values.join(" · ") : variant.name;
 }
+
+/**
+ * The inverse of the import button, armed twice.
+ *
+ * Deleting the product out of the seller's storefront is the one action on this
+ * card that cannot be undone, so the first click arms it and the second commits
+ * — a modal would be a second window for one more click, and `window.confirm`
+ * is a browser chrome this app deliberately does not use. The arm decays after
+ * a few seconds so a stray first click does not leave a loaded button behind.
+ *
+ * It posts through the page's fetcher, not one of its own: both buttons on the
+ * card move the same store state, and one fetcher means one busy flag.
+ */
+function RemoveFromStoreButton({ productId, fetcher }) {
+  const [armed, setArmed] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!armed) return undefined;
+    const timer = setTimeout(() => setArmed(false), 5000);
+    return () => clearTimeout(timer);
+  }, [armed]);
+
+  return (
+    <fetcher.Form method="post">
+      <input type="hidden" name="intent" value="remove-import" />
+      <input type="hidden" name="productId" value={productId} />
+      <button
+        type="submit"
+        className={`mv-import-btn mv-remove-btn${armed ? " mv-remove-btn-armed" : ""}`}
+        disabled={fetcher.state !== "idle"}
+        onClick={(event) => {
+          if (!armed) {
+            event.preventDefault();
+            setArmed(true);
+          }
+        }}
+      >
+        {armed ? "Click again to confirm removal" : "Remove from Store"}
+      </button>
+    </fetcher.Form>
+  );
+}
+
+RemoveFromStoreButton.propTypes = {
+  productId: PropTypes.string.isRequired,
+  fetcher: PropTypes.object.isRequired,
+};
 
 export default function CatalogPage() {
   const { access, canViewWholesale, canImport, products, blockedMessage } = useLoaderData();
@@ -481,6 +545,11 @@ export default function CatalogPage() {
                         boxes above have been filled in. The refusal still
                         exists in the service: this is the page agreeing with
                         it, not replacing it.
+
+                        For a product already in the store the same button is
+                        a re-sync: prices and stock typed here are pushed to
+                        the store product, and it says so instead of offering
+                        a second import of the same thing.
                       */}
                       <button
                         type="submit"
@@ -493,10 +562,12 @@ export default function CatalogPage() {
                         }
                       >
                         {fetcher.state !== "idle"
-                          ? "Importing..."
+                          ? "Working..."
                           : unpriced.length > 0
                             ? "Set prices to import"
-                            : "Import to Store"}
+                            : product.imported
+                              ? "Update Store"
+                              : "Import to Store"}
                       </button>
                     </fetcher.Form>
                   ) : (
@@ -510,6 +581,14 @@ export default function CatalogPage() {
                       Wholesale pricing and import unlock after approval.
                     </div>
                   )}
+
+                  {/* The way back out. Offered only while the product is
+                      actually in the store: the removal deletes the store
+                      product, and a card offering it for a product the store
+                      does not have would be a button that undoes nothing. */}
+                  {canImport && product.imported ? (
+                    <RemoveFromStoreButton productId={product.id} fetcher={fetcher} />
+                  ) : null}
                 </div>
               </div>
             );
@@ -534,7 +613,15 @@ export default function CatalogPage() {
           </div>
         ) : null}
 
-        {fetcher.data?.ok && !fetcher.data?.variantId && (
+        {fetcher.data?.ok && fetcher.data.removed && (
+          <div className="mv-section-card" style={{ marginTop: "1rem" }}>
+            <p style={{ color: "#059669", fontSize: "0.875rem", margin: 0 }}>
+              Removed from your Shopify store. Import it again any time.
+            </p>
+          </div>
+        )}
+
+        {fetcher.data?.ok && !fetcher.data?.variantId && !fetcher.data.removed && (
           <div className="mv-section-card" style={{ marginTop: "1rem" }}>
             <p style={{ color: "#059669", fontSize: "0.875rem", margin: 0 }}>
               {fetcher.data.updated
