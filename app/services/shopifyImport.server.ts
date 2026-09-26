@@ -178,10 +178,44 @@ interface ShopifyVariant {
   inventoryItem?: { id: string } | null;
 }
 
-const PRODUCT_CREATE = `#graphql
-  mutation MoonVellaProductCreate($product: ProductCreateInput!) {
-    productCreate(product: $product) {
-      product { id title }
+/*
+ * CREATING A PRODUCT IS ONE CALL, AND IT HAS TO BE.
+ *
+ * This was `productCreate` followed by `productVariantsBulkCreate`, and the two
+ * cannot be made to work together for a product with options:
+ *
+ *   • `ProductCreateInput` has `productOptions` but no `variants`. A product
+ *     created there carries only the default "Title" option, so the follow-up
+ *     call naming the catalogue's real option ("size") was refused with
+ *     "Option does not exist" and created nothing. Every import of a new
+ *     product failed this way; the defect was hidden behind the SKU rejection
+ *     that preceded it and then behind the retail-price gate.
+ *
+ *   • Declaring the options on create is not a fix on its own. The store then
+ *     makes one variant for the first option value — with no SKU, no price —
+ *     and that variant blocks its own value: creating the real "Standard"
+ *     returned "The variant 'Standard' already exists", and because the bulk
+ *     create is all-or-nothing the other two sizes were refused with it.
+ *
+ * `productSet` takes the options AND the variants in a single input, and
+ * creates exactly what it is given. Verified against the live store before
+ * this was written: one call produced the option `size` with its three values
+ * and three variants carrying the right SKU, price and inventory item, with no
+ * stray variant and no userErrors.
+ *
+ * `synchronous: true` is what makes the variants readable in the response, so
+ * the mapping below can be written from the same call that created them
+ * instead of re-querying. The variants come back for `matchStoreVariants`,
+ * which pairs them by SKU rather than by position.
+ */
+const PRODUCT_SET = `#graphql
+  mutation MoonVellaProductSet($input: ProductSetInput!) {
+    productSet(input: $input, synchronous: true) {
+      product {
+        id
+        title
+        variants(first: 100) { nodes { id sku inventoryItem { id } } }
+      }
       userErrors { field message }
     }
   }`;
@@ -750,6 +784,47 @@ function mappedOptionValues(
 }
 
 /**
+ * The product's option structure, built from its variants.
+ *
+ * A store product must declare its options BEFORE any variant can name one —
+ * that is the rule `productVariantsBulkCreate` was failing on. The catalogue
+ * keeps that structure only on the variants (each carries `Size = Queen`), so
+ * it is reassembled here: every option name any variant uses, and every value
+ * used for it, in the order the variants were read.
+ *
+ * THE ORDER IS THE MERCHANT'S. The caller reads variants by `sortOrder`, the
+ * same field the products screen orders by, so the values come out in the order
+ * the merchant arranged them — Standard, Queen, King rather than the King-first
+ * order the SKUs happen to sort into. A size picker is read by shoppers, and
+ * this is the only ordering signal the catalogue carries.
+ *
+ * A value appears once per option however many variants share it, and the
+ * first-appearance order is kept, so a second dimension (Colour, with the same
+ * value on many sizes) collapses to its distinct values rather than repeating.
+ */
+function productOptionsInput(
+  variants: ImportableVariant[]
+): { name: string; values: { name: string }[] }[] {
+  const valuesByName = new Map<string, string[]>();
+
+  for (const variant of variants) {
+    for (const option of mappedOptionValues(variant)) {
+      const values = valuesByName.get(option.optionName);
+      if (!values) {
+        valuesByName.set(option.optionName, [option.name]);
+        continue;
+      }
+      if (!values.includes(option.name)) values.push(option.name);
+    }
+  }
+
+  return [...valuesByName.entries()].map(([name, values]) => ({
+    name,
+    values: values.map((value) => ({ name: value })),
+  }));
+}
+
+/**
  * The option values to send for a variant being ADDED to a product that already
  * exists, given the options the store product already has.
  *
@@ -1074,73 +1149,62 @@ async function createNewProduct(
   product: ImportableProduct,
   opts: ResolvedPricing
 ): Promise<ImportResult> {
-  const createRes = await admin.graphql(PRODUCT_CREATE, {
-    variables: { product: productInput(product, opts) },
+  const setRes = await admin.graphql(PRODUCT_SET, {
+    variables: {
+      input: {
+        ...productInput(product, opts),
+        productOptions: productOptionsInput(product.variants),
+        /*
+         * NO TOP-LEVEL `sku`, and its absence is deliberate — it is carried at
+         * `inventoryItem.sku` inside `variantPriceInput`, which is the field
+         * that owns it. `ProductVariantSetInput` does have a `sku` of its own,
+         * and a second copy is exactly the redundancy that broke this import:
+         * a top-level `sku` on `ProductVariantsBulkInput`, a type that has no
+         * such field, was refused with "Field is not defined on
+         * ProductVariantsBulkInput" and created nothing at all. One SKU, in one
+         * place, is the shape that survives an API version that reads its own
+         * schema strictly.
+         */
+        variants: product.variants.map((variant) => ({
+          optionValues: mappedOptionValues(variant),
+          ...variantPriceInput(variant),
+        })),
+      },
+    },
   });
-  const createJson = await createRes.json();
-  const createErrors = createJson?.data?.productCreate?.userErrors ?? [];
-  if (createErrors.length || !createJson?.data?.productCreate?.product?.id) {
-    const message = joinErrors(createErrors, "productCreate failed");
+  const setJson = await setRes.json();
+  const setErrors: { message: string }[] = setJson?.data?.productSet?.userErrors ?? [];
+  const storeProduct = setJson?.data?.productSet?.product ?? null;
+  const createdVariants: ShopifyVariant[] = storeProduct?.variants?.nodes ?? [];
+
+  /*
+   * NOTHING CREATED IS A FAILURE; SOMETHING CREATED IS NOT NECESSARILY A
+   * SUCCESS. A store that refuses one size and accepts the rest hands back a
+   * product and a userError together, and that used to be reported as a clean
+   * import — the seller was told their product was in the store while a size
+   * was missing from it. The refusal below is for the run that produced
+   * nothing to map; the warnings below are for the run that produced less than
+   * was asked for, which the mapping records as PARTIAL because a catalogue
+   * variant comes back unmatched.
+   */
+  if (!storeProduct?.id || (setErrors.length && createdVariants.length === 0)) {
+    const message = joinErrors(setErrors, "productSet failed");
     await setIntegrationState("product_import", { status: "FAILED", error: message });
     await markImportFailed(seller.id, product.id, message);
     return { ok: false, error: message };
   }
-  const shopifyProductId: string = createJson.data.productCreate.product.id;
+
+  const shopifyProductId: string = storeProduct.id;
 
   const upload = await addSelectedProductMedia(admin, shopifyProductId, opts.images, opts.transferFetch);
   const warnings = [...upload.warnings];
 
-  /*
-   * NO TOP-LEVEL `sku`, and its absence is deliberate.
-   *
-   * The sku goes to the store at `inventoryItem.sku`, inside
-   * `variantPriceInput`. A second copy was also being sent on the variant
-   * itself, which `ProductVariantsBulkInput` has no field for — Shopify
-   * answered every create with "Field is not defined on ProductVariantsBulkInput"
-   * and created nothing at all. Older API versions ignored the unknown field;
-   * the version this app pins does not, which is how a long-standing
-   * redundancy became the reason a seller could not import a new product.
-   *
-   * Nothing is lost by its removal: the value was never read from here, and
-   * `inventoryItem.sku` carries the same string.
-   */
-  const variantInputs = product.variants.map((variant) => ({
-    optionValues: mappedOptionValues(variant),
-    ...variantPriceInput(variant),
-  }));
-
-  let createdVariants: ShopifyVariant[] = [];
-  if (variantInputs.length) {
-    const variantRes = await admin.graphql(VARIANTS_BULK_CREATE, {
-      variables: { productId: shopifyProductId, variants: variantInputs },
-    });
-    const variantJson = await variantRes.json();
-    const variantErrors = variantJson?.data?.productVariantsBulkCreate?.userErrors ?? [];
-    createdVariants = variantJson?.data?.productVariantsBulkCreate?.productVariants ?? [];
-    if (variantErrors.length && createdVariants.length === 0) {
-      const message = joinErrors(variantErrors, "productVariantsBulkCreate failed");
-      await setIntegrationState("product_import", { status: "FAILED", error: message });
-      await markImportFailed(seller.id, product.id, message);
-      return { ok: false, error: message };
-    }
-    /*
-     * A PARTIAL CREATE IS NOT A SUCCESS, and it used to be reported as one.
-     *
-     * The check above only fails when the store created nothing at all, so a
-     * run that created two variants of three returned ok, set the integration
-     * to HEALTHY and told the seller the product was imported — while one size
-     * was missing from their store. The errors are carried into `warnings`,
-     * which is what the caller shows, and the mapping below records PARTIAL
-     * because one catalogue variant comes back unmatched.
-     */
-    if (variantErrors.length) {
-      warnings.push(
-        ...variantErrors.map(
-          (error: { message?: string }) =>
-            `Some sizes were not created: ${error.message ?? "unknown error"}`
-        )
-      );
-    }
+  if (setErrors.length) {
+    warnings.push(
+      ...setErrors.map(
+        (error) => `Some sizes were not created: ${error.message ?? "unknown error"}`
+      )
+    );
   }
 
   /*
@@ -1455,7 +1519,19 @@ export async function importProductForSeller(
     include: {
       variants: {
         where: { isActive: true },
-        orderBy: { sku: "asc" },
+        /*
+         * THE MERCHANT'S ORDER, not the SKU's.
+         *
+         * This was `{ sku: "asc" }`, which happens to be arbitrary with respect
+         * to size: TEST PILLOW's SKUs sort King, Queen, Standard. The variant
+         * order decides the order of the store product's option VALUES, so the
+         * picker in the merchant's storefront came out reversed from the one
+         * they arranged in their catalogue. `sortOrder` is the same field the
+         * products screen orders by, so the store now matches what the merchant
+         * sees here — and a product whose sizes are not alphabetical is the
+         * normal case, not the exception.
+         */
+        orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
         include: {
           // The variant's own option pairs — Size = King — which become the
           // store product's option structure. Ordered the way the merchant

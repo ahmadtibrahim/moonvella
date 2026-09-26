@@ -2220,9 +2220,18 @@ async function main() {
     inventoryItem?: { sku?: string; cost?: number };
     price?: string;
   };
+  /** The option structure the import declares on the product it creates. */
+  type SentOption = { name?: string; values?: { name?: string }[] };
   type StoreCall = {
     query: string;
-    variables: { variants?: SentVariant[]; input?: { quantities?: { quantity: number }[] } };
+    variables: {
+      variants?: SentVariant[];
+      input?: {
+        variants?: SentVariant[];
+        productOptions?: SentOption[];
+        quantities?: { quantity: number }[];
+      };
+    };
   };
 
   let storeSeq = 0;
@@ -2251,9 +2260,36 @@ async function main() {
       graphql: async (query: string, options?: { variables?: StoreCall["variables"] }) => {
         const variables = options?.variables ?? {};
         calls.push({ query, variables });
-        if (query.includes("MoonVellaProductCreate")) {
+        /*
+         * THE CREATE IS ONE MUTATION, so the store answers one. The variants
+         * come back nested under the product — which is what `synchronous: true`
+         * buys, and why the mapping can be written from the same response that
+         * created them. A store that refuses a size answers with a product AND
+         * a userError, exactly as here, which is the shape the partial checks
+         * below are built on.
+         */
+        if (query.includes("MoonVellaProductSet")) {
+          const sent: SentVariant[] = variables.input?.variants ?? [];
+          const outcome = onCreate
+            ? onCreate(sent)
+            : {
+                variants: sent.map((input) => ({
+                  id: nextGid("ProductVariant"),
+                  sku: input.inventoryItem?.sku ?? "",
+                  inventoryItem: { id: nextGid("InventoryItem") },
+                })),
+                errors: [],
+              };
+          for (const variant of outcome.variants) bySku.set(variant.sku, variant);
           return reply({
-            productCreate: { product: { id: nextGid("Product"), title: "t" }, userErrors: [] },
+            productSet: {
+              product: {
+                id: nextGid("Product"),
+                title: "t",
+                variants: { nodes: outcome.variants },
+              },
+              userErrors: outcome.errors,
+            },
           });
         }
         if (query.includes("MoonVellaVariantsCreate")) {
@@ -2292,7 +2328,11 @@ async function main() {
   }
 
   const sentVariants = (calls: StoreCall[]): SentVariant[] =>
-    calls.find((call) => call.query.includes("MoonVellaVariantsCreate"))?.variables.variants ?? [];
+    calls.find((call) => call.query.includes("MoonVellaProductSet"))?.variables.input?.variants ?? [];
+
+  const sentProductOptions = (calls: StoreCall[]): SentOption[] =>
+    calls.find((call) => call.query.includes("MoonVellaProductSet"))?.variables.input
+      ?.productOptions ?? [];
 
   const sentQuantities = (calls: StoreCall[]): { quantity: number }[] =>
     calls.find((call) => call.query.includes("MoonVellaInventory"))?.variables.input?.quantities ?? [];
@@ -2396,6 +2436,36 @@ async function main() {
 
   // 90
   /*
+   * THE PRODUCT HAS TO DECLARE THE OPTION BEFORE A VARIANT CAN NAME ONE, and
+   * this is the check that was missing when the import could not create a
+   * product at all.
+   *
+   * It replaces the SKU defect with a second one of the same family: the
+   * product was created carrying only the store's default "Title" option,
+   * while the variants named "Size", so the store refused them with "Option
+   * does not exist" and created nothing. Every import of a new product failed
+   * — invisibly, because the sentinel every earlier check used only ever
+   * compared the request against itself.
+   *
+   * THE VALUES ARE ASSERTED IN THE MERCHANT'S ORDER, which is the other half of
+   * it. `addVariant` writes `sortOrder` as it goes, so the fixture's Standard,
+   * Queen, King is an arrangement a merchant made; an import that reads the
+   * catalogue by SKU instead puts King first, and that ordering reaches the
+   * storefront's picker.
+   */
+  const declaredOptions = sentProductOptions(first.calls);
+  check(
+    90,
+    "The product declares the Size option with every value, in the order the merchant arranged them",
+    declaredOptions.length === 1 &&
+      declaredOptions[0]?.name === "Size" &&
+      JSON.stringify(declaredOptions[0]?.values?.map((value) => value.name)) ===
+        JSON.stringify(["Standard", "Queen", "King"]),
+    JSON.stringify(declaredOptions)
+  );
+
+  // 91
+  /*
    * Each stored row must name the store variant the fake created FOR THAT
    * SIZE'S OWN SKU. Comparing against what the store minted is what makes this
    * a statement about identity; comparing counts alone would pass just as
@@ -2403,25 +2473,25 @@ async function main() {
    */
   const firstMapped = await mappedCorrectly(storeBody.id, first);
   check(
-    90,
+    91,
     "Every size is written to the mapping with the store variant created for that size's own SKU",
     firstMapped.length === 3 && firstMapped.every((row) => row.correct),
     firstMapped.map((row) => `${row.sku}:${row.correct ? "ok" : "wrong"}`).join(" ")
   );
 
-  // 91
+  // 92
   const quantities = sentQuantities(first.calls);
   const expectedQuantities = bodySizes.map((size) => size.inventory - 3).sort((a, b) => a - b);
   const actualQuantities = quantities.map((q) => q.quantity).sort((a, b) => a - b);
   check(
-    91,
+    92,
     "The quantity pushed to each store variant is the stock less the seller's buffer",
     quantities.length === 3 &&
       JSON.stringify(actualQuantities) === JSON.stringify(expectedQuantities),
     `sent=${JSON.stringify(actualQuantities)} expected=${JSON.stringify(expectedQuantities)}`
   );
 
-  // 92
+  // 93
   /*
    * A STORE THAT CREATES SOME AND REJECTS OTHERS, and hands them back in an
    * order the import did not send. Under the positional matching this replaced,
@@ -2461,7 +2531,7 @@ async function main() {
   const partialMapped = await mappedCorrectly(partialBody.id, partial);
   const refusedSizeMapped = partialMapped.filter((row) => row.sku.endsWith("-QN"));
   check(
-    92,
+    93,
     "When a store rejects one size and shuffles the rest, each remaining size is still mapped to its own variant",
     partialResult.ok === true &&
       partialMapped.length === 2 &&
@@ -2470,21 +2540,21 @@ async function main() {
     `ok=${partialResult.ok} mapped=${partialMapped.map((row) => `${row.sku}:${row.correct ? "ok" : "wrong"}`).join(" ")} refused-size-mapped=${refusedSizeMapped.length}`
   );
 
-  // 93
+  // 94
   const partialWarnings = partialResult.warnings ?? [];
   const partialExternal = await prisma.externalProductMapping.findFirst({
     where: { provider: "SHOPIFY", shopDomain: SHOP, productId: partialBody.id },
     select: { importStatus: true },
   });
   check(
-    93,
+    94,
     "A size the store refused is reported to the seller and recorded as a partial import, not passed off as success",
     partialWarnings.some((warning) => /not created/i.test(warning)) &&
       partialExternal?.importStatus === "PARTIAL",
     `warnings=${JSON.stringify(partialWarnings)} status=${partialExternal?.importStatus}`
   );
 
-  // 94
+  // 95
   /*
    * The buffer is a floor, not a subtraction. A seller who holds back more than
    * they hold is saying "do not sell this", and a negative available quantity is
@@ -2492,16 +2562,16 @@ async function main() {
    * product rather than empty one shelf.
    */
   check(
-    94,
+    95,
     "A buffer larger than the stock leaves nothing listed rather than a negative quantity",
     bufferedQuantity(2, 5) === 0 && bufferedQuantity(9, 3) === 6 && bufferedQuantity(4, null) === 4,
     `${bufferedQuantity(2, 5)}, ${bufferedQuantity(9, 3)}, ${bufferedQuantity(4, null)}`
   );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 94) {
+  if (total !== 95) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 8 from the Shopify-mapping correction`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 9 from the Shopify-mapping correction`);
   }
 }
 
