@@ -307,6 +307,16 @@ export interface ResolvedImportImage {
   sortOrder: number;
   isMain: boolean;
   variantIds: string[];
+  /**
+   * The variants this image is the primary picture FOR.
+   *
+   * Carried past this module because the store's own model is one picture per
+   * variant, so the import has to choose — and the merchant's "Make primary" on
+   * a variant is the choice. See `linkVariantImages` for how it is applied.
+   */
+  primaryForVariantIds: string[];
+  /** The shared-row primary: the fallback for a variant with no primary of its own. */
+  isProductPrimary: boolean;
   /** Set when a previous attempt already put this image in the store. */
   alreadyUploadedAs: string | null;
 }
@@ -364,6 +374,8 @@ export async function resolveImagesForImport(
         sortOrder: image.sortOrder,
         isMain: image.isMain,
         variantIds: image.variantIds,
+        primaryForVariantIds: image.primaryForVariantIds,
+        isProductPrimary: image.isProductPrimary,
         alreadyUploadedAs: image.providerMediaId,
       });
       continue;
@@ -377,6 +389,8 @@ export async function resolveImagesForImport(
         sortOrder: image.sortOrder,
         isMain: image.isMain,
         variantIds: image.variantIds,
+        primaryForVariantIds: image.primaryForVariantIds,
+        isProductPrimary: image.isProductPrimary,
         alreadyUploadedAs: null,
       });
       continue;
@@ -402,6 +416,8 @@ export async function resolveImagesForImport(
         sortOrder: image.sortOrder,
         isMain: image.isMain,
         variantIds: image.variantIds,
+        primaryForVariantIds: image.primaryForVariantIds,
+        isProductPrimary: image.isProductPrimary,
         alreadyUploadedAs: null,
       });
       continue;

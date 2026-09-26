@@ -384,11 +384,19 @@ async function setQuantities(
         input: {
           name: "available",
           reason: SYNC_REASON,
-          // The quantity here is authoritative and the store's current value is
-          // not known, so the comparison is skipped deliberately. Comparing
-          // would need a read first, and the read would be of the number this
-          // call is about to overwrite.
-          ignoreCompareQuantity: true,
+          /*
+           * The quantity here is authoritative and the store's current value is
+           * not known, so nothing is compared — and that is now expressed by
+           * sending no comparison at all.
+           *
+           * This said `ignoreCompareQuantity: true`, which the API version this
+           * app pins does not define on `InventorySetQuantitiesInput`: the store
+           * refused the entire call and no quantity ever reached a storefront.
+           * The check it opted out of is per-quantity and opt-in now —
+           * `changeFromQuantity` on each entry, which nothing here sends — so
+           * the request below is the one that was always intended, in the shape
+           * this version accepts.
+           */
           quantities,
         },
       },

@@ -169,6 +169,14 @@ interface ImportImageRequest {
   alt?: string;
   /** MoonVella variant ids this image is attached to, for the store-side link. */
   variantIds: string[];
+  /** The variants this image is the merchant's chosen picture FOR. */
+  primaryForVariantIds: string[];
+  /** The shared-row primary, the fallback when a variant has no primary of its own. */
+  isProductPrimary: boolean;
+  /** The product's main image, the next fallback. */
+  isMain: boolean;
+  /** The merchant's ordering, the last tiebreak. */
+  sortOrder: number;
   alreadyUploadedAs: string | null;
 }
 
@@ -243,6 +251,67 @@ const VARIANTS_BULK_UPDATE = `#graphql
       userErrors { field message }
     }
   }`;
+
+/*
+ * ATTACHING A PICTURE TO A SIZE, WHICH TOOK FOUR TRIES TO GET RIGHT.
+ *
+ * Everything below was measured against the live store before it was written,
+ * because each plausible shape is refused for a different reason and none of
+ * them says what the accepted one is:
+ *
+ *   • `productVariantsBulkUpdate` with a `mediaId` per entry — what this used to
+ *     send — is refused with "Duplicated input value" as soon as one variant
+ *     carries two pictures, because a variant may appear in that list only once.
+ *
+ *   • This mutation with one entry per variant carrying a `mediaIds` LIST is
+ *     refused with "Only one mediaId is allowed per media input."
+ *
+ *   • The same variant named twice in one request is refused with "Variant was
+ *     specified in more than one media input."
+ *
+ *   • Media that is still PROCESSING is refused with "Non-ready media cannot be
+ *     attached to variants" — and the upload path returns ids the moment the
+ *     store accepts the file, so on a fresh import that is the normal state.
+ *
+ * What the API version this app pins actually models is ONE PICTURE PER VARIANT:
+ * a single request takes at most one entry per variant, each carrying exactly one
+ * media id, and a variant that already has one is refused — "The given variant
+ * already has attached media." The product keeps the rest of the pictures in its
+ * gallery; the variant link is the "this size looks like this" pointer, and the
+ * store allows exactly one of them.
+ *
+ * So this is not a loop over a merchant's assignments. It is a CHOICE per
+ * variant, and the merchant has already made it: "Make primary" in the product
+ * editor writes `isPrimary` on an assignment, and the schema's rule is that a
+ * primary on a variant row overrides the shared-row primary. That is the picture
+ * the store is given, falling back to the main image and then to the first
+ * selected, so a variant always gets the best answer available rather than none.
+ */
+const VARIANT_APPEND_MEDIA = `#graphql
+  mutation MoonVellaVariantAppendMedia(
+    $productId: ID!
+    $variantMedia: [ProductVariantAppendMediaInput!]!
+  ) {
+    productVariantAppendMedia(productId: $productId, variantMedia: $variantMedia) {
+      productVariants { id }
+      userErrors { field message }
+    }
+  }`;
+
+/**
+ * The media ids of a product, and whether each is usable yet.
+ *
+ * Needed because a variant link cannot be made to media the store is still
+ * processing, and an upload hands back its id before the file is ready.
+ */
+const PRODUCT_MEDIA_STATUS = `#graphql
+  query MoonVellaMediaStatus($id: ID!) {
+    product(id: $id) { media(first: 100) { nodes { id status } } }
+  }`;
+
+/** How long to wait for the store to finish processing, before giving up. */
+const MEDIA_READY_ATTEMPTS = 10;
+const MEDIA_READY_DELAY_MS = 600;
 
 const INVENTORY_SET = `#graphql
   mutation MoonVellaInventory($input: InventorySetQuantitiesInput!, $idempotencyKey: String!) {
@@ -594,6 +663,12 @@ async function addSelectedProductMedia(
  * A link that cannot be made is a warning, not a failure: the image is already
  * in the store and usable, and the seller can attach it by hand. Failing the
  * whole import over a variant link would be a worse trade.
+ *
+ * A VARIANT THAT ALREADY HAS ITS PICTURE IS THE RE-SYNC CASE, NOT AN ERROR. The
+ * store refuses the second attempt with "The given variant already has attached
+ * media", which is exactly what a re-import of an unchanged product produces.
+ * Reporting that as a warning would put a failure on a screen for a listing that
+ * is correct, so it is recognised and dropped.
  */
 async function linkVariantImages(
   admin: AdminGraphql,
@@ -603,28 +678,35 @@ async function linkVariantImages(
   shopifyVariantByLocal: Map<string, string>
 ): Promise<string[]> {
   const warnings: string[] = [];
-  const updates: { id: string; mediaId: string }[] = [];
+  const chosen = chooseVariantImages(images, mediaIdByAsset, shopifyVariantByLocal);
+  if (!chosen.size) return warnings;
 
-  for (const image of images) {
-    if (!image.mediaAssetId || image.variantIds.length === 0) continue;
-    const mediaId = mediaIdByAsset.get(image.mediaAssetId);
-    if (!mediaId) continue;
-    for (const localVariantId of image.variantIds) {
-      const shopifyVariantId = shopifyVariantByLocal.get(localVariantId);
-      if (!shopifyVariantId) continue;
-      updates.push({ id: shopifyVariantId, mediaId });
-    }
+  const ready = await waitForReadyMedia(admin, shopifyProductId, new Set(chosen.values()));
+  if (ready.size === 0) {
+    return ["No size image was linked: the store was still processing the pictures."];
   }
-  if (!updates.length) return warnings;
+
+  const variantMedia = [...chosen.entries()]
+    .filter(([, mediaId]) => ready.has(mediaId))
+    .map(([variantId, mediaId]) => ({ variantId, mediaIds: [mediaId] }));
+  if (!variantMedia.length) return warnings;
+  if (variantMedia.length < chosen.size) {
+    warnings.push(
+      `${chosen.size - variantMedia.length} size image(s) were not linked: the store was still processing them.`
+    );
+  }
 
   try {
-    const res = await admin.graphql(VARIANTS_BULK_UPDATE, {
-      variables: { productId: shopifyProductId, variants: updates },
+    const res = await admin.graphql(VARIANT_APPEND_MEDIA, {
+      variables: { productId: shopifyProductId, variantMedia },
     });
     const json = await res.json();
-    const errors = json?.data?.productVariantsBulkUpdate?.userErrors ?? [];
+    const errors: { message?: string }[] =
+      json?.data?.productVariantAppendMedia?.userErrors ?? [];
     for (const error of errors) {
-      warnings.push(`Variant image not linked: ${error.message}`);
+      const message = error.message ?? "unknown error";
+      if (ALREADY_LINKED.test(message)) continue;
+      warnings.push(`Variant image not linked: ${message}`);
     }
   } catch (error) {
     warnings.push(
@@ -632,6 +714,113 @@ async function linkVariantImages(
     );
   }
   return warnings;
+}
+
+/**
+ * What the store refuses when a variant already carries its picture.
+ *
+ * Matched on the sentence rather than on a field path because the error names
+ * the variant, not the state, and a re-sync is the only thing that produces it.
+ */
+const ALREADY_LINKED = /already has attached media/i;
+
+/**
+ * One picture per store variant, which is all the store accepts.
+ *
+ * THE MERCHANT'S CHOICE FIRST. "Make primary" writes `isPrimary` on an
+ * assignment; the schema's rule is that a primary on a variant row overrides the
+ * shared-row primary, and this follows it in that order — the variant's own
+ * primary, then the product's, then the main image, then the first selected.
+ * The image has to actually be attached to the variant to be eligible for it, so
+ * a primary that the merchant never assigned to this size cannot win.
+ *
+ * A variant with no picture left to choose is simply absent from the result and
+ * keeps whatever the store has.
+ */
+function chooseVariantImages(
+  images: ResolvedPricing["images"],
+  mediaIdByAsset: Map<string, string>,
+  shopifyVariantByLocal: Map<string, string>
+): Map<string, string> {
+  interface Candidate {
+    mediaId: string;
+    /** 0 = this variant's own primary, 1 = the product's, 2 = main, 3 = the rest. */
+    rank: number;
+    order: number;
+  }
+
+  const byVariant = new Map<string, Candidate>();
+
+  for (const image of images) {
+    if (!image.mediaAssetId || image.variantIds.length === 0) continue;
+    const mediaId = mediaIdByAsset.get(image.mediaAssetId);
+    if (!mediaId) continue;
+
+    for (const localVariantId of image.variantIds) {
+      const shopifyVariantId = shopifyVariantByLocal.get(localVariantId);
+      if (!shopifyVariantId) continue;
+
+      const rank = image.primaryForVariantIds.includes(localVariantId)
+        ? 0
+        : image.isProductPrimary
+          ? 1
+          : image.isMain
+            ? 2
+            : 3;
+      const candidate: Candidate = { mediaId, rank, order: image.sortOrder };
+
+      const current = byVariant.get(shopifyVariantId);
+      if (
+        !current ||
+        candidate.rank < current.rank ||
+        (candidate.rank === current.rank && candidate.order < current.order)
+      ) {
+        byVariant.set(shopifyVariantId, candidate);
+      }
+    }
+  }
+
+  return new Map(
+    [...byVariant.entries()].map(([variantId, candidate]) => [variantId, candidate.mediaId])
+  );
+}
+
+/**
+ * The subset of these media the store has finished processing, waiting briefly.
+ *
+ * Bounded, like every other wait in this codebase: an import is a request a
+ * merchant is watching, and a file the store takes minutes over is reported
+ * rather than waited on. Only the images about to be linked are waited for, so a
+ * product with thirty pictures pays for the three that matter.
+ */
+async function waitForReadyMedia(
+  admin: AdminGraphql,
+  shopifyProductId: string,
+  wanted: Set<string>
+): Promise<Set<string>> {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  let ready = new Set<string>();
+
+  for (let attempt = 1; attempt <= MEDIA_READY_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await admin.graphql(PRODUCT_MEDIA_STATUS, {
+        variables: { id: shopifyProductId },
+      });
+      const json = await res.json();
+      const nodes: { id: string; status: string }[] =
+        json?.data?.product?.media?.nodes ?? [];
+      ready = new Set(
+        nodes.filter((node) => node.status === "READY" && wanted.has(node.id)).map((node) => node.id)
+      );
+      if (ready.size === wanted.size) return ready;
+    } catch {
+      // A failed read is retried inside the budget like any other attempt. If
+      // every attempt fails, the caller is told nothing was ready.
+    }
+    if (attempt < MEDIA_READY_ATTEMPTS) await sleep(MEDIA_READY_DELAY_MS);
+  }
+
+  return ready;
 }
 
 async function fetchFirstLocationId(admin: AdminGraphql): Promise<string | null> {
@@ -683,7 +872,20 @@ async function setInventoryQuantities(
         input: {
           name: "available",
           reason: "correction",
-          ignoreCompareQuantity: true,
+          /*
+           * NO `ignoreCompareQuantity`, and its absence is the instruction.
+           *
+           * It was sent as `true` and `InventorySetQuantitiesInput` has no such
+           * field, so the store refused the whole call: "Field is not defined on
+           * InventorySetQuantitiesInput", and every quantity on every import
+           * was left at zero. The field belonged to an older API version, where
+           * it meant "set this number without checking what is there now".
+           *
+           * That is what omitting the field does today. The check it opted out
+           * of is now per-quantity and opt-IN — `changeFromQuantity` on each
+           * entry, which nothing here sends. So this is not a lost guarantee
+           * but the same request, spelled the way this version reads it.
+           */
           quantities,
         },
       },
@@ -1643,6 +1845,10 @@ export async function importProductForSeller(
       mediaContentType: "IMAGE" as const,
       ...(image.alt ? { alt: image.alt } : {}),
       variantIds: image.variantIds,
+      primaryForVariantIds: image.primaryForVariantIds,
+      isProductPrimary: image.isProductPrimary,
+      isMain: image.isMain,
+      sortOrder: image.sortOrder,
       alreadyUploadedAs: image.alreadyUploadedAs,
     })),
   };

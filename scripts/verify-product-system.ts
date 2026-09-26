@@ -2222,11 +2222,21 @@ async function main() {
   };
   /** The option structure the import declares on the product it creates. */
   type SentOption = { name?: string; values?: { name?: string }[] };
+  /** One variant's picture, as the append mutation takes it. */
+  type SentVariantMedia = { variantId?: string; mediaIds?: string[] };
   type StoreCall = {
     query: string;
     variables: {
       variants?: SentVariant[];
+      /** The product a media call is about. */
+      productId?: string;
+      id?: string;
+      variantMedia?: SentVariantMedia[];
+      /** The file being added, so the media it becomes can be named. */
+      media?: { originalSource?: string }[];
       input?: {
+        name?: string;
+        reason?: string;
         variants?: SentVariant[];
         productOptions?: SentOption[];
         quantities?: { quantity: number }[];
@@ -2255,6 +2265,10 @@ async function main() {
      * against the id the import wrote down for that size.
      */
     const bySku = new Map<string, StoreVariant>();
+    /** Media ids the fake has minted, per product, in the order it accepted them. */
+    const productMedia = new Map<string, string[]>();
+    /** Which store media a source URL became, so a link can be traced to a picture. */
+    const mediaIdBySource = new Map<string, string>();
     const reply = (data: unknown) => ({ json: async () => ({ data }) });
     const admin = {
       graphql: async (query: string, options?: { variables?: StoreCall["variables"] }) => {
@@ -2312,6 +2326,43 @@ async function main() {
             },
           });
         }
+        /*
+         * THE MEDIA PATH, in the order the import walks it: read what the
+         * product already holds, add one file, read again, diff. The fake keeps
+         * the set per product so the diff finds exactly one new id, which is
+         * what a store that accepted the file does — and it remembers which
+         * source URL became which id, so a check can name the picture a size
+         * was given rather than counting links.
+         */
+        if (query.includes("MoonVellaProductMediaIds")) {
+          const held = productMedia.get(variables.id ?? "") ?? [];
+          return reply({ product: { media: { nodes: held.map((id) => ({ id })) } } });
+        }
+        if (query.includes("MoonVellaProductMedia(")) {
+          const productId = variables.productId ?? "";
+          const held = productMedia.get(productId) ?? [];
+          const added = (variables.media ?? []).map((entry) => {
+            const id = nextGid("Media");
+            if (entry?.originalSource) mediaIdBySource.set(entry.originalSource, id);
+            return id;
+          });
+          productMedia.set(productId, [...held, ...added]);
+          return reply({ productUpdate: { product: { id: productId }, userErrors: [] } });
+        }
+        /*
+         * The two calls the variant link makes. Every media the fake minted is
+         * READY, because the store finishes with a small image quickly and a
+         * suite must not depend on how quickly.
+         */
+        if (query.includes("MoonVellaMediaStatus")) {
+          const held = productMedia.get(variables.id ?? "") ?? [];
+          return reply({
+            product: { media: { nodes: held.map((id) => ({ id, status: "READY" })) } },
+          });
+        }
+        if (query.includes("MoonVellaVariantAppendMedia")) {
+          return reply({ productVariantAppendMedia: { productVariants: [], userErrors: [] } });
+        }
         if (query.includes("MoonVellaLocations")) {
           return reply({ locations: { nodes: [{ id: nextGid("Location") }] } });
         }
@@ -2324,7 +2375,12 @@ async function main() {
         return reply({});
       },
     };
-    return { admin: admin as unknown as Parameters<typeof importProductForSeller>[0], calls, bySku };
+    return {
+      admin: admin as unknown as Parameters<typeof importProductForSeller>[0],
+      calls,
+      bySku,
+      mediaIdBySource,
+    };
   }
 
   const sentVariants = (calls: StoreCall[]): SentVariant[] =>
@@ -2336,6 +2392,15 @@ async function main() {
 
   const sentQuantities = (calls: StoreCall[]): { quantity: number }[] =>
     calls.find((call) => call.query.includes("MoonVellaInventory"))?.variables.input?.quantities ?? [];
+
+  const sentInventoryInput = (calls: StoreCall[]) =>
+    calls.find((call) => call.query.includes("MoonVellaInventory"))?.variables.input;
+
+  const appendCalls = (calls: StoreCall[]) =>
+    calls.filter((call) => call.query.includes("MoonVellaVariantAppendMedia"));
+
+  const sentVariantMedia = (calls: StoreCall[]): SentVariantMedia[] =>
+    appendCalls(calls).flatMap((call) => call.variables.variantMedia ?? []);
 
   /** The catalogue SKU behind each local variant id, so a mapping row can be named. */
   const skuByLocalVariant = async (productId: string) =>
@@ -2568,10 +2633,125 @@ async function main() {
     `${bufferedQuantity(2, 5)}, ${bufferedQuantity(9, 3)}, ${bufferedQuantity(4, null)}`
   );
 
+  // 96
+  /*
+   * THE INVENTORY INPUT, FIELD FOR FIELD.
+   *
+   * `ignoreCompareQuantity` was sent here for years and the version this app
+   * pins does not define it, so the store refused the whole call — the stock
+   * count never reached a storefront. Asserted as the exact set of keys rather
+   * than the absence of one, because the defect is a field that does not exist
+   * and the next one will be too: a list of what IS sent cannot quietly grow.
+   */
+  const inventoryInput = sentInventoryInput(first.calls);
+  const inventoryKeys = Object.keys(inventoryInput ?? {}).sort();
+  check(
+    96,
+    "The inventory call sends only the fields the store defines, so the stock count is accepted",
+    JSON.stringify(inventoryKeys) === JSON.stringify(["name", "quantities", "reason"]),
+    JSON.stringify(inventoryKeys)
+  );
+
+  // 97
+  /*
+   * ONE PICTURE PER SIZE, IN ONE CALL.
+   *
+   * Three shapes were refused by the live store before this one was found, each
+   * for a different reason and none of them naming the accepted shape: a variant
+   * repeated across `productVariantsBulkUpdate` entries ("Duplicated input
+   * value"), a `mediaIds` list ("Only one mediaId is allowed per media input"),
+   * and a variant named twice in one append ("Variant was specified in more than
+   * one media input"). What is left is one entry per variant, one media each.
+   *
+   * THE PICTURE ASSERTED IS THE MERCHANT'S CHOICE. Queen carries two photographs
+   * and one of them was marked primary for that size in the product editor, so a
+   * check that only counted links would pass on the wrong one. The link is
+   * traced back through the store's own media ids to the file it came from.
+   */
+  const imageBody = await createProduct(
+    { name: "Store images", productCode: `${CODE}-IMG`, category: "Test" },
+    owner
+  );
+  const imageSizes: { name: string; id: string }[] = [];
+  for (const size of ["Standard", "Queen", "King"]) {
+    const variant = await addVariant(
+      imageBody.id,
+      {
+        name: size,
+        sku: `${CODE}-IMG-${size.slice(0, 3).toUpperCase()}`,
+        suggestedRetailPrice: 5000,
+        wholesalePrice: 2000,
+        inventory: 4,
+        options: [{ name: "Size", value: size }],
+      },
+      owner
+    );
+    imageSizes.push({ name: size, id: variant.id });
+  }
+  const imageVariantId = (name: string) => imageSizes.find((size) => size.name === name)!.id;
+
+  const photograph = async (title: string, fileName: string) => {
+    const source = `https://images.example.invalid/${fileName}`;
+    const asset = await prisma.mediaAsset.create({
+      data: {
+        productId: imageBody.id,
+        category: "WHITE_BACKGROUND_IMAGE",
+        title,
+        originalFilename: fileName,
+        storageKey: `${imageBody.id}-${fileName}`,
+        sourceUrl: source,
+        mimeType: "image/jpeg",
+        fileSize: 0,
+        checksum: `images-${fileName}`,
+        processingStatus: "READY",
+        approvalStatus: "APPROVED",
+        sellerVisible: true,
+        altText: title,
+      },
+    });
+    return { id: asset.id, source };
+  };
+
+  const front = await photograph("Front", "front.jpg");
+  const queenDetail = await photograph("Queen detail", "queen.jpg");
+  const kingDetail = await photograph("King detail", "king.jpg");
+  await attachMediaToVariants(front.id, [imageVariantId("Standard"), imageVariantId("Queen")], owner);
+  await attachMediaToVariants(queenDetail.id, [imageVariantId("Queen")], owner);
+  await attachMediaToVariants(kingDetail.id, [imageVariantId("King")], owner);
+  // The merchant marks the Queen's own photograph as that size's picture.
+  const queenAssignment = await prisma.mediaAssetAssignment.findFirst({
+    where: { assetId: queenDetail.id, variantId: imageVariantId("Queen") },
+    select: { id: true },
+  });
+  await setPrimaryAssignment(queenAssignment!.id, owner);
+
+  const images = fakeStore();
+  const imageResult = await importProductForSeller(images.admin, seller.id, imageBody.id);
+  const variantMedia = sentVariantMedia(images.calls);
+  const variantIdsSent = variantMedia.map((entry) => entry.variantId);
+  const queenMedia = images.mediaIdBySource.get(queenDetail.source);
+  const queenLinked = variantMedia.find(
+    (entry) => entry.variantId === images.bySku.get(`${CODE}-IMG-QUE`)?.id
+  );
+  check(
+    97,
+    "Each size is linked to one picture, the one the merchant chose, in a single call the store accepts",
+    imageResult.ok === true &&
+      appendCalls(images.calls).length === 1 &&
+      variantMedia.length === 3 &&
+      variantMedia.every((entry) => entry.mediaIds?.length === 1) &&
+      new Set(variantIdsSent).size === variantIdsSent.length &&
+      Boolean(queenMedia) &&
+      queenLinked?.mediaIds?.[0] === queenMedia,
+    `ok=${imageResult.ok} calls=${appendCalls(images.calls).length} entries=${variantMedia.length} queen=${
+      queenLinked?.mediaIds?.[0] === queenMedia ? "the chosen one" : "wrong picture"
+    }`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 95) {
+  if (total !== 97) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 9 from the Shopify-mapping correction`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 11 from the Shopify-mapping correction`);
   }
 }
 
