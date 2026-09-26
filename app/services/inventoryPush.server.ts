@@ -1,6 +1,6 @@
 import { prisma } from "~/db.server";
 import { JOB_KIND, enqueueJob, jobKey } from "./jobs.server";
-import { AUTO_SYNC_OFF_REASON } from "~/utils/inventorySync";
+import { AUTO_SYNC_OFF_REASON, bufferedQuantity } from "~/utils/inventorySync";
 
 /**
  * TELLING THE SELLER'S STORE HOW MANY ARE LEFT.
@@ -208,7 +208,7 @@ export async function pushInventoryForVariants(
               id: true,
               shopDomain: true,
               status: true,
-              settings: { select: { autoSyncInventory: true } },
+              settings: { select: { autoSyncInventory: true, quantityBuffer: true } },
             },
           },
         },
@@ -233,6 +233,18 @@ export async function pushInventoryForVariants(
 
   const quantityByVariant = new Map(variants.map((variant) => [variant.id, variant.inventory]));
   const variantByMapping = new Map(mappings.map((row) => [row.id, row.productVariantId]));
+  /*
+   * The seller's hold-back, by store. Read here rather than folded into the
+   * candidate because it decides the number that is sent, not whether this
+   * store is pushed to at all — `planInventoryPush` answers the second question
+   * and is left alone.
+   */
+  const bufferBySeller = new Map(
+    mappings.map((row) => [
+      row.sellerProduct.seller.id,
+      row.sellerProduct.seller.settings?.quantityBuffer ?? 0,
+    ])
+  );
 
   for (const [sellerId, group] of plan.byStore) {
     const shopDomain = plan.shopDomainByStore.get(sellerId) ?? sellerId;
@@ -253,10 +265,14 @@ export async function pushInventoryForVariants(
       continue;
     }
 
+    const buffer = bufferBySeller.get(sellerId) ?? 0;
     const quantities = group.map((candidate) => ({
       inventoryItemId: candidate.shopifyInventoryItemId as string,
       locationId,
-      quantity: quantityByVariant.get(variantByMapping.get(candidate.mappingId) as string) ?? 0,
+      quantity: bufferedQuantity(
+        quantityByVariant.get(variantByMapping.get(candidate.mappingId) as string) ?? 0,
+        buffer
+      ),
     }));
 
     const failure = await setQuantities(admin, quantities);

@@ -472,15 +472,15 @@ export default function SettingsPage() {
                   defaultValue={settings ? settings.quantityBuffer : 5}
                   disabled={!canEdit}
                 />
-                {/* Stored, and not applied to anything. Said out loud rather
-                    than left to look like a setting that works: a seller who
-                    sets a buffer of 5 and watches their storefront keep the
-                    full quantity would reasonably conclude the sync is broken,
-                    when the number has simply never been used. */}
+                {/* This said "saved, but not applied yet" while the number was
+                    read by nothing. It is applied now — on both the import that
+                    creates a listing and the sync that keeps it current — so the
+                    sentence describes a real effect rather than a promise. */}
                 <p className="mv-settings-hint">
-                  Saved, but not applied yet: quantities are pushed exactly as the catalogue
-                  holds them. Tell MoonVella if you want the buffer subtracted from what your
-                  store shows.
+                  Held back from your storefront: your store is offered this many fewer than
+                  the catalogue holds, so you keep stock in hand for damages, recounts or
+                  walk-in orders. It never goes below zero, so a buffer larger than your stock
+                  simply leaves nothing listed.
                 </p>
               </div>
               <label className="mv-settings-checkbox">

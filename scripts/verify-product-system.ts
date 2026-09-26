@@ -73,6 +73,7 @@ import { intakeOrder } from "../app/services/orderIntake.server";
 import { importProductForSeller, retailPriceFor, sellerCostFor } from "../app/services/shopifyImport.server";
 import { readObject, deleteObject, objectExists } from "../app/services/storage.server";
 import { planInventoryPush, pushInventoryForVariants } from "../app/services/inventoryPush.server";
+import { bufferedQuantity } from "../app/utils/inventorySync";
 
 const prisma = new PrismaClient();
 
@@ -2196,10 +2197,311 @@ async function main() {
     `disabled=${disabledOutcome.disabled} pushed=${disabledOutcome.pushed} considered=${disabledOutcome.quantities.length}`
   );
 
+  /* ======================================================================= */
+  console.log("\nK. What actually reaches a Shopify store");
+  /* ======================================================================= */
+  /*
+   * UNTIL THIS SECTION, EVERY CHECK ABOUT THE IMPORT USED A SENTINEL THAT
+   * THROWS. That proves the refusals refuse; it says nothing about the request
+   * that is sent when the guard passes, and nothing at all about what is
+   * written afterwards. A defect that lived entirely in the shape of the
+   * mutation — a field Shopify does not define, which made every create fail
+   * while every test passed — is invisible to a sentinel by construction.
+   *
+   * So this section runs the import against a store that answers, and reads
+   * back both halves: the request that went out and the mapping that was
+   * written. The store echoes the SKU it was sent, as Shopify does, which is
+   * what makes the pairing a real test rather than a restatement of the code.
+   */
+  type StoreVariant = { id: string; sku: string; inventoryItem: { id: string } };
+  /** A variant as the import builds it — the shape Shopify accepts or rejects. */
+  type SentVariant = {
+    optionValues?: { optionName?: string; name?: string }[];
+    inventoryItem?: { sku?: string; cost?: number };
+    price?: string;
+  };
+  type StoreCall = {
+    query: string;
+    variables: { variants?: SentVariant[]; input?: { quantities?: { quantity: number }[] } };
+  };
+
+  let storeSeq = 0;
+  const nextGid = (kind: string) => `gid://shopify/${kind}/${++storeSeq}${Date.now() % 1000}`;
+
+  /**
+   * A store that answers every mutation the import makes.
+   *
+   * `onCreate` receives the variant inputs exactly as the import built them,
+   * and returns what the store did with them — which is how a partial create is
+   * staged. The default echoes one variant per input, in order, as Shopify does
+   * when nothing is rejected.
+   */
+  function fakeStore(
+    onCreate?: (sent: SentVariant[]) => { variants: StoreVariant[]; errors: { message: string }[] }
+  ) {
+    const calls: StoreCall[] = [];
+    /*
+     * Which store variant the fake minted for each SKU. This is the other half
+     * of the comparison the mapping checks make: the store's own id for a size,
+     * against the id the import wrote down for that size.
+     */
+    const bySku = new Map<string, StoreVariant>();
+    const reply = (data: unknown) => ({ json: async () => ({ data }) });
+    const admin = {
+      graphql: async (query: string, options?: { variables?: StoreCall["variables"] }) => {
+        const variables = options?.variables ?? {};
+        calls.push({ query, variables });
+        if (query.includes("MoonVellaProductCreate")) {
+          return reply({
+            productCreate: { product: { id: nextGid("Product"), title: "t" }, userErrors: [] },
+          });
+        }
+        if (query.includes("MoonVellaVariantsCreate")) {
+          const sent: SentVariant[] = variables.variants ?? [];
+          const outcome = onCreate
+            ? onCreate(sent)
+            : {
+                variants: sent.map((input) => ({
+                  id: nextGid("ProductVariant"),
+                  sku: input.inventoryItem?.sku ?? "",
+                  inventoryItem: { id: nextGid("InventoryItem") },
+                })),
+                errors: [],
+              };
+          for (const variant of outcome.variants) bySku.set(variant.sku, variant);
+          return reply({
+            productVariantsBulkCreate: {
+              productVariants: outcome.variants,
+              userErrors: outcome.errors,
+            },
+          });
+        }
+        if (query.includes("MoonVellaLocations")) {
+          return reply({ locations: { nodes: [{ id: nextGid("Location") }] } });
+        }
+        if (query.includes("MoonVellaInventory")) {
+          return reply({ inventorySetQuantities: { userErrors: [] } });
+        }
+        if (query.includes("MoonVellaVariantsUpdate")) {
+          return reply({ productVariantsBulkUpdate: { productVariants: [], userErrors: [] } });
+        }
+        return reply({});
+      },
+    };
+    return { admin: admin as unknown as Parameters<typeof importProductForSeller>[0], calls, bySku };
+  }
+
+  const sentVariants = (calls: StoreCall[]): SentVariant[] =>
+    calls.find((call) => call.query.includes("MoonVellaVariantsCreate"))?.variables.variants ?? [];
+
+  const sentQuantities = (calls: StoreCall[]): { quantity: number }[] =>
+    calls.find((call) => call.query.includes("MoonVellaInventory"))?.variables.input?.quantities ?? [];
+
+  /** The catalogue SKU behind each local variant id, so a mapping row can be named. */
+  const skuByLocalVariant = async (productId: string) =>
+    new Map(
+      (
+        await prisma.productVariant.findMany({
+          where: { productId },
+          select: { id: true, sku: true },
+        })
+      ).map((variant) => [variant.id, variant.sku])
+    );
+
+  /**
+   * The mappings for a product, each paired with whether it names the store
+   * variant the fake actually created for that size's own SKU.
+   */
+  const mappedCorrectly = async (
+    productId: string,
+    store: { bySku: Map<string, StoreVariant> }
+  ) => {
+    const skuByLocal = await skuByLocalVariant(productId);
+    const mappings = await prisma.sellerProductVariant.findMany({
+      where: { sellerProduct: { sellerId: seller.id, productId } },
+      select: { productVariantId: true, shopifyVariantId: true, shopifyInventoryItemId: true },
+    });
+    return mappings.map((mapping) => {
+      const sku = skuByLocal.get(mapping.productVariantId);
+      const expected = sku ? store.bySku.get(sku) : undefined;
+      return { sku: sku ?? "(unknown)", correct: Boolean(expected) && expected!.id === mapping.shopifyVariantId };
+    });
+  };
+
+  const storeBody = await createProduct(
+    { name: "Store body", productCode: `${CODE}-BODY`, category: "Test" },
+    owner
+  );
+  const bodySizes = [
+    { name: "Standard", sku: `${CODE}-B-STD`, suggestedRetailPrice: 4500, inventory: 9 },
+    { name: "Queen", sku: `${CODE}-B-QN`, suggestedRetailPrice: 4900, inventory: 7 },
+    { name: "King", sku: `${CODE}-B-KG`, suggestedRetailPrice: 5400, inventory: 4 },
+  ];
+  for (const size of bodySizes) {
+    // The option row is what makes this the catalogue's real shape: without it
+    // a variant has no option pairs and the import falls back to `Title`, which
+    // is correct for a single-thing product and wrong for a family of three.
+    await addVariant(
+      storeBody.id,
+      { ...size, wholesalePrice: 2000, options: [{ name: "Size", value: size.name }] },
+      owner
+    );
+  }
+  // A buffer the seller has actually chosen, so the quantity assertion below is
+  // about the setting being applied rather than about a default.
+  await prisma.sellerSettings.upsert({
+    where: { sellerId: seller.id },
+    create: { sellerId: seller.id, quantityBuffer: 3 },
+    update: { quantityBuffer: 3 },
+  });
+
+  // 87
+  const first = fakeStore();
+  const firstResult = await importProductForSeller(first.admin, seller.id, storeBody.id);
+  const firstInputs = sentVariants(first.calls);
+  check(
+    87,
+    "Every size is sent to the store as its own variant",
+    firstResult.ok === true && firstInputs.length === 3,
+    `ok=${firstResult.ok} sent=${firstInputs.length} error=${firstResult.error ?? "-"}`
+  );
+
+  // 88
+  /*
+   * The field that broke every create. `ProductVariantsBulkInput` has no `sku`,
+   * and the version this app pins rejects an unknown field outright — the import
+   * failed with "Field is not defined on ProductVariantsBulkInput" and created
+   * nothing, for every product, until this was removed. Asserted as an absence
+   * on the request itself, because that is the only place it was ever visible.
+   */
+  const topLevelSku = firstInputs.filter((input) => "sku" in input);
+  const nestedSku = firstInputs.filter((input) => typeof input.inventoryItem?.sku === "string");
+  check(
+    88,
+    "The SKU is sent under inventoryItem and nowhere else, which is the shape the store accepts",
+    topLevelSku.length === 0 && nestedSku.length === 3,
+    `top-level=${topLevelSku.length} nested=${nestedSku.length}`
+  );
+
+  // 89
+  const sizeOption = firstInputs.map((input) => input.optionValues?.[0]);
+  check(
+    89,
+    "The sizes arrive as one Size option with a value each, not as three unrelated variants",
+    sizeOption.length === 3 &&
+      sizeOption.every((option) => option?.optionName === "Size") &&
+      new Set(sizeOption.map((option) => option?.name)).size === 3,
+    JSON.stringify(sizeOption)
+  );
+
+  // 90
+  /*
+   * Each stored row must name the store variant the fake created FOR THAT
+   * SIZE'S OWN SKU. Comparing against what the store minted is what makes this
+   * a statement about identity; comparing counts alone would pass just as
+   * happily on three rows pointing at the wrong variants.
+   */
+  const firstMapped = await mappedCorrectly(storeBody.id, first);
+  check(
+    90,
+    "Every size is written to the mapping with the store variant created for that size's own SKU",
+    firstMapped.length === 3 && firstMapped.every((row) => row.correct),
+    firstMapped.map((row) => `${row.sku}:${row.correct ? "ok" : "wrong"}`).join(" ")
+  );
+
+  // 91
+  const quantities = sentQuantities(first.calls);
+  const expectedQuantities = bodySizes.map((size) => size.inventory - 3).sort((a, b) => a - b);
+  const actualQuantities = quantities.map((q) => q.quantity).sort((a, b) => a - b);
+  check(
+    91,
+    "The quantity pushed to each store variant is the stock less the seller's buffer",
+    quantities.length === 3 &&
+      JSON.stringify(actualQuantities) === JSON.stringify(expectedQuantities),
+    `sent=${JSON.stringify(actualQuantities)} expected=${JSON.stringify(expectedQuantities)}`
+  );
+
+  // 92
+  /*
+   * A STORE THAT CREATES SOME AND REJECTS OTHERS, and hands them back in an
+   * order the import did not send. Under the positional matching this replaced,
+   * the King's mapping would have been written against the Queen's store
+   * variant — a wrong SKU in a merchant's store, silently. Matching by SKU is
+   * what makes the shuffle harmless, so the shuffle is the test.
+   */
+  const partialBody = await createProduct(
+    { name: "Store partial", productCode: `${CODE}-PART`, category: "Test" },
+    owner
+  );
+  for (const size of [
+    { name: "Standard", sku: `${CODE}-P-STD`, suggestedRetailPrice: 4500, inventory: 5 },
+    { name: "Queen", sku: `${CODE}-P-QN`, suggestedRetailPrice: 4900, inventory: 5 },
+    { name: "King", sku: `${CODE}-P-KG`, suggestedRetailPrice: 5400, inventory: 5 },
+  ]) {
+    await addVariant(
+      partialBody.id,
+      { ...size, wholesalePrice: 2000, options: [{ name: "Size", value: size.name }] },
+      owner
+    );
+  }
+
+  const partial = fakeStore((sent) => {
+    const kept = sent
+      .filter((input) => !String(input.inventoryItem?.sku ?? "").endsWith("-QN"))
+      .reverse()
+      .map((input) => ({
+        id: nextGid("ProductVariant"),
+        sku: input.inventoryItem?.sku ?? "",
+        inventoryItem: { id: nextGid("InventoryItem") },
+      }));
+    return { variants: kept, errors: [{ message: "Queen: option value is not allowed" }] };
+  });
+  const partialResult = await importProductForSeller(partial.admin, seller.id, partialBody.id);
+
+  const partialMapped = await mappedCorrectly(partialBody.id, partial);
+  const refusedSizeMapped = partialMapped.filter((row) => row.sku.endsWith("-QN"));
+  check(
+    92,
+    "When a store rejects one size and shuffles the rest, each remaining size is still mapped to its own variant",
+    partialResult.ok === true &&
+      partialMapped.length === 2 &&
+      partialMapped.every((row) => row.correct) &&
+      refusedSizeMapped.length === 0,
+    `ok=${partialResult.ok} mapped=${partialMapped.map((row) => `${row.sku}:${row.correct ? "ok" : "wrong"}`).join(" ")} refused-size-mapped=${refusedSizeMapped.length}`
+  );
+
+  // 93
+  const partialWarnings = partialResult.warnings ?? [];
+  const partialExternal = await prisma.externalProductMapping.findFirst({
+    where: { provider: "SHOPIFY", shopDomain: SHOP, productId: partialBody.id },
+    select: { importStatus: true },
+  });
+  check(
+    93,
+    "A size the store refused is reported to the seller and recorded as a partial import, not passed off as success",
+    partialWarnings.some((warning) => /not created/i.test(warning)) &&
+      partialExternal?.importStatus === "PARTIAL",
+    `warnings=${JSON.stringify(partialWarnings)} status=${partialExternal?.importStatus}`
+  );
+
+  // 94
+  /*
+   * The buffer is a floor, not a subtraction. A seller who holds back more than
+   * they hold is saying "do not sell this", and a negative available quantity is
+   * not something the store will accept — it would fail the push for the whole
+   * product rather than empty one shelf.
+   */
+  check(
+    94,
+    "A buffer larger than the stock leaves nothing listed rather than a negative quantity",
+    bufferedQuantity(2, 5) === 0 && bufferedQuantity(9, 3) === 6 && bufferedQuantity(4, null) === 4,
+    `${bufferedQuantity(2, 5)}, ${bufferedQuantity(9, 3)}, ${bufferedQuantity(4, null)}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 86) {
+  if (total !== 94) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave and 2 from the inventory-push wave`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 8 from the Shopify-mapping correction`);
   }
 }
 

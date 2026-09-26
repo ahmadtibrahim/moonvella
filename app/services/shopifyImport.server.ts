@@ -4,6 +4,7 @@ import { recordImageOutcomes, resolveImagesForImport } from "./importMediaSelect
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import { readObject } from "./storage.server";
+import { bufferedQuantity } from "~/utils/inventorySync";
 import {
   addProductMedia,
   stageAndUpload,
@@ -113,6 +114,12 @@ interface SellerLike {
   id: string;
   shopDomain: string;
   storeName: string;
+  /**
+   * How many units the seller's storefront is told to hold back. Read from
+   * `SellerSettings` on every import; see `bufferedQuantity` for why an absent
+   * value is zero rather than the schema's default.
+   */
+  quantityBuffer: number | null;
 }
 
 /**
@@ -816,6 +823,92 @@ function variantPriceInput(variant: ImportableVariant) {
   };
 }
 
+/**
+ * Pairs the variants a store just handed back with the catalogue variants they
+ * were sent for.
+ *
+ * BY SKU, NOT BY POSITION — and this is the difference between a mapping that
+ * is right and one that is merely plausible.
+ *
+ * The variants were matched by array index, which holds only while the store
+ * returns exactly one variant per variant sent, in the order sent. A store that
+ * creates some and rejects others breaks that quietly: the returned array comes
+ * back one shorter, every variant after the rejected one shifts up by one, and
+ * each is then written to `SellerProductVariant` against the wrong catalogue
+ * variant — with `ExternalVariantMapping` recording the same wrong id and the
+ * inventory below pushed to the wrong inventory item. Nothing throws, and the
+ * row it writes looks exactly like a correct one. A missing variant is a
+ * nuisance; a misfiled one is a wrong SKU in a merchant's store, and the second
+ * is what positional matching produces.
+ *
+ * A SKU IS THE IDENTITY BECAUSE IT IS THE ONE WE CHOSE. It is sent on the way
+ * out at `inventoryItem.sku` and read back on both bulk mutations, so it is the
+ * only field that can be compared across the two sides. It is matched only when
+ * it is unique on both sides: the catalogue does not require SKUs to be unique,
+ * and two variants sharing one cannot be told apart, so they are left unmatched
+ * rather than guessed at.
+ *
+ * WHAT IS NOT MATCHED IS REPORTED, NOT INVENTED. A catalogue variant this
+ * cannot identify comes back null, and its callers already treat null as "no
+ * mapping written" — the import is marked PARTIAL and the caller gets a warning
+ * naming it. A store that returns variants with no SKUs at all falls back to
+ * position, but only across the leftovers on both sides, so the variants that
+ * were identified by SKU cannot shift it.
+ */
+function matchStoreVariants(
+  localVariants: ImportableVariant[],
+  storeVariants: ShopifyVariant[],
+  alreadyMapped: Set<string> = new Set()
+): { local: ImportableVariant; shopifyVariant: ShopifyVariant | null }[] {
+  const unclaimed = storeVariants.filter((variant) => !alreadyMapped.has(variant.id));
+
+  const bySku = new Map<string, ShopifyVariant[]>();
+  for (const variant of unclaimed) {
+    const sku = variant.sku?.trim();
+    if (!sku) continue;
+    const bucket = bySku.get(sku);
+    if (bucket) bucket.push(variant);
+    else bySku.set(sku, [variant]);
+  }
+
+  const claimed = new Set<string>();
+  const matched = localVariants.map((local) => {
+    const sku = local.sku?.trim();
+    // A SKU that appears twice on either side identifies nothing, so it matches
+    // nothing — see the note above.
+    const bucket = sku ? bySku.get(sku) : undefined;
+    if (!bucket || bucket.length !== 1) return { local, shopifyVariant: null };
+    const found = bucket[0];
+    if (claimed.has(found.id)) return { local, shopifyVariant: null };
+    claimed.add(found.id);
+    return { local, shopifyVariant: found };
+  });
+
+  /*
+   * The positional fallback, deliberately narrow: only when both sides have the
+   * same number of leftovers AND none of the leftover catalogue variants
+   * carries a SKU. If any of them does, it was already tried above and failed
+   * to identify — pairing it by luck is how the wrong variant gets written.
+   */
+  // Annotated rather than inferred: TypeScript narrows a `.filter` on a null
+  // check into a predicate, which would freeze these elements at
+  // `shopifyVariant: null` and make the pairing below unassignable.
+  const leftoverLocals: { local: ImportableVariant; shopifyVariant: ShopifyVariant | null }[] =
+    matched.filter((item) => !item.shopifyVariant);
+  const leftoverStores = unclaimed.filter((variant) => !claimed.has(variant.id));
+  if (
+    leftoverLocals.length > 0 &&
+    leftoverLocals.length === leftoverStores.length &&
+    leftoverLocals.every((item) => !item.local.sku?.trim())
+  ) {
+    leftoverLocals.forEach((item, index) => {
+      item.shopifyVariant = leftoverStores[index];
+    });
+  }
+
+  return matched;
+}
+
 /** The vendor every imported product carries. */
 const MOONVELLA_VENDOR = "MoonVella";
 
@@ -997,9 +1090,22 @@ async function createNewProduct(
   const upload = await addSelectedProductMedia(admin, shopifyProductId, opts.images, opts.transferFetch);
   const warnings = [...upload.warnings];
 
+  /*
+   * NO TOP-LEVEL `sku`, and its absence is deliberate.
+   *
+   * The sku goes to the store at `inventoryItem.sku`, inside
+   * `variantPriceInput`. A second copy was also being sent on the variant
+   * itself, which `ProductVariantsBulkInput` has no field for — Shopify
+   * answered every create with "Field is not defined on ProductVariantsBulkInput"
+   * and created nothing at all. Older API versions ignored the unknown field;
+   * the version this app pins does not, which is how a long-standing
+   * redundancy became the reason a seller could not import a new product.
+   *
+   * Nothing is lost by its removal: the value was never read from here, and
+   * `inventoryItem.sku` carries the same string.
+   */
   const variantInputs = product.variants.map((variant) => ({
     optionValues: mappedOptionValues(variant),
-    sku: variant.sku,
     ...variantPriceInput(variant),
   }));
 
@@ -1017,26 +1123,47 @@ async function createNewProduct(
       await markImportFailed(seller.id, product.id, message);
       return { ok: false, error: message };
     }
+    /*
+     * A PARTIAL CREATE IS NOT A SUCCESS, and it used to be reported as one.
+     *
+     * The check above only fails when the store created nothing at all, so a
+     * run that created two variants of three returned ok, set the integration
+     * to HEALTHY and told the seller the product was imported — while one size
+     * was missing from their store. The errors are carried into `warnings`,
+     * which is what the caller shows, and the mapping below records PARTIAL
+     * because one catalogue variant comes back unmatched.
+     */
+    if (variantErrors.length) {
+      warnings.push(
+        ...variantErrors.map(
+          (error: { message?: string }) =>
+            `Some sizes were not created: ${error.message ?? "unknown error"}`
+        )
+      );
+    }
   }
+
+  /*
+   * Matched before anything is written, and before inventory is pushed: the
+   * inventory below has to name the store's own inventory item for each
+   * catalogue variant, and the mapping has to name its variant. Both come from
+   * this one pairing rather than each computing its own by position.
+   */
+  const resolved = matchStoreVariants(product.variants, createdVariants);
 
   const locationId = await fetchFirstLocationId(admin);
   if (locationId) {
-    const quantities = product.variants
-      .map((variant, index) => ({
-        inventoryItemId: createdVariants[index]?.inventoryItem?.id,
+    const quantities = resolved
+      .map((item) => ({
+        inventoryItemId: item.shopifyVariant?.inventoryItem?.id,
         locationId,
-        quantity: variant.inventory,
+        quantity: bufferedQuantity(item.local.inventory, seller.quantityBuffer),
       }))
       .filter((q): q is { inventoryItemId: string; locationId: string; quantity: number } =>
         Boolean(q.inventoryItemId)
       );
     warnings.push(...(await setInventoryQuantities(admin, quantities)));
   }
-
-  const resolved = product.variants.map((local, index) => ({
-    local,
-    shopifyVariant: createdVariants[index] ?? null,
-  }));
 
   // Variant links come after the variants exist, which is why this is here and
   // not beside the upload: a media id can be attached to a variant only once
@@ -1143,7 +1270,6 @@ async function resyncExistingProduct(
     } else {
       createInputs.push({
         optionValues: optionValuesForStore(storeOptionNames, variant),
-        sku: variant.sku,
         ...variantPriceInput(variant),
       });
     }
@@ -1165,6 +1291,16 @@ async function resyncExistingProduct(
       await markImportFailed(seller.id, product.id, message);
       return { ok: false, error: message };
     }
+    // A store that updated some of the variants and refused others: reported
+    // rather than passed over, for the reason spelled out in `createNewProduct`.
+    if (errors.length) {
+      warnings.push(
+        ...errors.map(
+          (error: { message?: string }) =>
+            `Some sizes were not updated: ${error.message ?? "unknown error"}`
+        )
+      );
+    }
     for (const variant of variants) updatedVariants.set(variant.id, variant);
   }
 
@@ -1181,10 +1317,32 @@ async function resyncExistingProduct(
       await markImportFailed(seller.id, product.id, message);
       return { ok: false, error: message };
     }
+    if (errors.length) {
+      warnings.push(
+        ...errors.map(
+          (error: { message?: string }) =>
+            `Some new sizes were not created: ${error.message ?? "unknown error"}`
+        )
+      );
+    }
     createdVariants.push(...variants);
   }
 
-  let createdCursor = 0;
+  /*
+   * The variants this product already had are matched by the stored Shopify
+   * variant id — an identity — and the ones just created are matched to what is
+   * left by SKU. Both halves are matched by identity; neither is matched by
+   * position. The already-mapped store ids are excluded so a new size cannot be
+   * matched onto a variant that belongs to another catalogue row.
+   */
+  const newVariants = product.variants.filter((variant) => !mappingByVariant.has(variant.id));
+  const newlyMatched = matchStoreVariants(
+    newVariants,
+    createdVariants,
+    new Set(existing.variantMappings.map((mapping) => mapping.shopifyVariantId))
+  );
+  const newByLocal = new Map(newlyMatched.map((item) => [item.local.id, item.shopifyVariant]));
+
   const resolved = product.variants.map((local) => {
     const mapping = mappingByVariant.get(local.id);
     if (mapping) {
@@ -1201,9 +1359,7 @@ async function resyncExistingProduct(
           } as ShopifyVariant),
       };
     }
-    const created = createdVariants[createdCursor] ?? null;
-    createdCursor += 1;
-    return { local, shopifyVariant: created };
+    return { local, shopifyVariant: newByLocal.get(local.id) ?? null };
   });
 
   const locationId = await fetchFirstLocationId(admin);
@@ -1212,7 +1368,7 @@ async function resyncExistingProduct(
       .map((item) => ({
         inventoryItemId: item.shopifyVariant?.inventoryItem?.id,
         locationId,
-        quantity: item.local.inventory,
+        quantity: bufferedQuantity(item.local.inventory, seller.quantityBuffer),
       }))
       .filter((q): q is { inventoryItemId: string; locationId: string; quantity: number } =>
         Boolean(q.inventoryItemId)
@@ -1273,11 +1429,26 @@ export async function importProductForSeller(
   productId: string,
   options: ImportOptions = {}
 ): Promise<ImportResult> {
-  const seller = await prisma.seller.findUnique({ where: { id: sellerId } });
+  /*
+   * The settings come along because the quantity buffer is applied to every
+   * inventory push this import makes — see `bufferedQuantity`. An absent
+   * settings row is not an error: it means the seller has never opened the
+   * settings screen, and the buffer is then zero.
+   */
+  const seller = await prisma.seller.findUnique({
+    where: { id: sellerId },
+    include: { settings: { select: { quantityBuffer: true } } },
+  });
   if (!seller) return { ok: false, error: "Seller not found." };
   if (seller.status !== "APPROVED") {
     return { ok: false, error: `Import requires an approved seller (current: ${seller.status}).` };
   }
+  const sellerForImport: SellerLike = {
+    id: seller.id,
+    shopDomain: seller.shopDomain,
+    storeName: seller.storeName,
+    quantityBuffer: seller.settings?.quantityBuffer ?? null,
+  };
 
   const product = await prisma.product.findUnique({
     where: { id: productId },
@@ -1409,9 +1580,9 @@ export async function importProductForSeller(
 
   try {
     if (existing?.shopifyProductId && existing.variantMappings.length > 0) {
-      return await resyncExistingProduct(admin, seller, priced, existing, opts);
+      return await resyncExistingProduct(admin, sellerForImport, priced, existing, opts);
     }
-    return await createNewProduct(admin, seller, priced, opts);
+    return await createNewProduct(admin, sellerForImport, priced, opts);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Import failed";
     await setIntegrationState("product_import", { status: "FAILED", error: message });
