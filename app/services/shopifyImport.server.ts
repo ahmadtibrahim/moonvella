@@ -323,6 +323,25 @@ const INVENTORY_SET = `#graphql
 const LOCATIONS_QUERY = `#graphql
   query MoonVellaLocations { locations(first: 1) { nodes { id } } }`;
 
+/*
+ * WHERE AN INVENTORY ITEM IS ACTUALLY STOCKED.
+ *
+ * Asked of the item rather than of the shop, because "the first location" and
+ * "the shelf this item is on" are not the same place, and the difference is
+ * invisible until a shopper sees no stock. This store has two locations, and
+ * `locations(first: 1)` answers with "My Custom Location" while every product
+ * is stocked at "Shop location" — so a quantity written to the first location
+ * lands beside the item instead of on it, and the storefront stays at zero.
+ * The item's own `inventoryLevels` names the location the number belongs at,
+ * and a new product already has a level at the shop's default location.
+ */
+const INVENTORY_ITEM_LOCATIONS = `#graphql
+  query MoonVellaItemLocations($id: ID!) {
+    inventoryItem(id: $id) {
+      inventoryLevels(first: 10) { nodes { location { id } } }
+    }
+  }`;
+
 /**
  * The option structure a store product already has.
  *
@@ -823,7 +842,30 @@ async function waitForReadyMedia(
   return ready;
 }
 
-async function fetchFirstLocationId(admin: AdminGraphql): Promise<string | null> {
+/**
+ * The location this product's stock belongs at.
+ *
+ * THE ITEM'S OWN SHELF FIRST, the shop's first location only as a fallback for
+ * an item the store has not stocked anywhere yet. See
+ * `INVENTORY_ITEM_LOCATIONS` for why the two are not interchangeable.
+ */
+async function fetchFirstLocationId(
+  admin: AdminGraphql,
+  inventoryItemIds: string[]
+): Promise<string | null> {
+  for (const inventoryItemId of inventoryItemIds.filter(Boolean)) {
+    try {
+      const res = await admin.graphql(INVENTORY_ITEM_LOCATIONS, {
+        variables: { id: inventoryItemId },
+      });
+      const json = await res.json();
+      const stocked = json?.data?.inventoryItem?.inventoryLevels?.nodes?.[0]?.location?.id;
+      if (stocked) return stocked;
+    } catch {
+      // Try the next item; a single unreadable item says nothing about the rest.
+    }
+  }
+
   try {
     const res = await admin.graphql(LOCATIONS_QUERY);
     const json = await res.json();
@@ -873,20 +915,25 @@ async function setInventoryQuantities(
           name: "available",
           reason: "correction",
           /*
-           * NO `ignoreCompareQuantity`, and its absence is the instruction.
+           * SETTING A NUMBER OUTRIGHT TAKES TWO FIELDS AND A NULL.
            *
-           * It was sent as `true` and `InventorySetQuantitiesInput` has no such
-           * field, so the store refused the whole call: "Field is not defined on
-           * InventorySetQuantitiesInput", and every quantity on every import
-           * was left at zero. The field belonged to an older API version, where
-           * it meant "set this number without checking what is there now".
+           * This sent `ignoreCompareQuantity: true`, which the API version this
+           * app pins does not define on `InventorySetQuantitiesInput`: the store
+           * refused the whole call and no quantity ever reached a storefront.
+           * The check it opted out of is per-quantity now, and the field that
+           * carries it is REQUIRED — omitting it is refused with
+           * "InventoryQuantityInput must include the following argument:
+           * changeFromQuantity", which is the refusal this import met next.
            *
-           * That is what omitting the field does today. The check it opted out
-           * of is now per-quantity and opt-IN — `changeFromQuantity` on each
-           * entry, which nothing here sends. So this is not a lost guarantee
-           * but the same request, spelled the way this version reads it.
+           * The field is nullable, and a null is what "compare nothing" is
+           * spelled as here: the store accepts it, and a deliberately wrong
+           * number in its place is refused with "The changeFromQuantity argument
+           * no longer matches the persisted quantity", so the comparison is real
+           * and the null is what turns it off. Measured against the live store
+           * before it was written, because every one of these refusals names a
+           * field and none of them names the shape that works.
            */
-          quantities,
+          quantities: quantities.map((quantity) => ({ ...quantity, changeFromQuantity: null })),
         },
       },
     });
@@ -1417,7 +1464,10 @@ async function createNewProduct(
    */
   const resolved = matchStoreVariants(product.variants, createdVariants);
 
-  const locationId = await fetchFirstLocationId(admin);
+  const locationId = await fetchFirstLocationId(
+    admin,
+    resolved.map((item) => item.shopifyVariant?.inventoryItem?.id ?? "")
+  );
   if (locationId) {
     const quantities = resolved
       .map((item) => ({
@@ -1628,7 +1678,10 @@ async function resyncExistingProduct(
     return { local, shopifyVariant: newByLocal.get(local.id) ?? null };
   });
 
-  const locationId = await fetchFirstLocationId(admin);
+  const locationId = await fetchFirstLocationId(
+    admin,
+    resolved.map((item) => item.shopifyVariant?.inventoryItem?.id ?? "")
+  );
   if (locationId) {
     const quantities = resolved
       .map((item) => ({

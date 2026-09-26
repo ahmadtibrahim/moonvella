@@ -67,6 +67,21 @@ const INVENTORY_SET = `#graphql
 const LOCATIONS_QUERY = `#graphql
   query MoonVellaPushLocations { locations(first: 1) { nodes { id } } }`;
 
+/*
+ * WHERE THIS ITEM IS STOCKED, asked of the item.
+ *
+ * "The shop's first location" is not the shelf an item is on: this store
+ * answers `locations(first: 1)` with "My Custom Location" while its products
+ * are stocked at "Shop location", so a quantity written there lands beside the
+ * item and the storefront keeps showing zero.
+ */
+const ITEM_LOCATIONS_QUERY = `#graphql
+  query MoonVellaPushItemLocations($id: ID!) {
+    inventoryItem(id: $id) {
+      inventoryLevels(first: 10) { nodes { location { id } } }
+    }
+  }`;
+
 interface PushAdmin {
   graphql: (
     query: string,
@@ -386,18 +401,20 @@ async function setQuantities(
           reason: SYNC_REASON,
           /*
            * The quantity here is authoritative and the store's current value is
-           * not known, so nothing is compared — and that is now expressed by
-           * sending no comparison at all.
+           * not known, so nothing is compared — and nothing being compared is
+           * written as an explicit null.
            *
            * This said `ignoreCompareQuantity: true`, which the API version this
            * app pins does not define on `InventorySetQuantitiesInput`: the store
            * refused the entire call and no quantity ever reached a storefront.
-           * The check it opted out of is per-quantity and opt-in now —
-           * `changeFromQuantity` on each entry, which nothing here sends — so
-           * the request below is the one that was always intended, in the shape
-           * this version accepts.
+           * The comparison is per-quantity now and its field is REQUIRED —
+           * omitting it is refused with "InventoryQuantityInput must include the
+           * following argument: changeFromQuantity". It is nullable, and a null
+           * is what turns the comparison off: the store accepts it, while a
+           * wrong number in its place fails with "The changeFromQuantity
+           * argument no longer matches the persisted quantity".
            */
-          quantities,
+          quantities: quantities.map((quantity) => ({ ...quantity, changeFromQuantity: null })),
         },
       },
     });
@@ -425,9 +442,14 @@ async function recordFailure(ids: string[]): Promise<void> {
  * The mapping's own recorded location first — a store with several locations
  * has been told where the MoonVella stock lives, and re-deciding that on every
  * push is how a quantity ends up in a warehouse the merchant does not ship
- * from. Otherwise the store's first location, which is what the import used,
- * and it is written onto the mappings by the caller so the next push does not
+ * from. It is written onto the mappings by the caller so the next push does not
  * ask again.
+ *
+ * Otherwise the item's OWN shelf, and only then the shop's first location. The
+ * middle step matters: a mapping written before the location was recorded has
+ * none, and the first location a shop lists is not necessarily the one its
+ * stock is on — this store answers with "My Custom Location" while its products
+ * sit at "Shop location".
  */
 async function resolveLocationId(
   admin: PushAdmin,
@@ -435,6 +457,22 @@ async function resolveLocationId(
 ): Promise<string | null> {
   const known = group.find((candidate) => candidate.shopifyLocationId)?.shopifyLocationId;
   if (known) return known;
+
+  for (const candidate of group) {
+    if (!candidate.shopifyInventoryItemId) continue;
+    try {
+      const response = await admin.graphql(ITEM_LOCATIONS_QUERY, {
+        variables: { id: candidate.shopifyInventoryItemId },
+      });
+      const json = (await response.json()) as {
+        data?: { inventoryItem?: { inventoryLevels?: { nodes?: { location?: { id: string } }[] } } };
+      };
+      const stocked = json?.data?.inventoryItem?.inventoryLevels?.nodes?.[0]?.location?.id;
+      if (stocked) return stocked;
+    } catch {
+      // Try the next item; one unreadable item says nothing about the rest.
+    }
+  }
 
   try {
     const response = await admin.graphql(LOCATIONS_QUERY);

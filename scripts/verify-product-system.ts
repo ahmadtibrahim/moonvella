@@ -2239,7 +2239,7 @@ async function main() {
         reason?: string;
         variants?: SentVariant[];
         productOptions?: SentOption[];
-        quantities?: { quantity: number }[];
+        quantities?: { quantity: number; locationId?: string; changeFromQuantity?: unknown }[];
       };
     };
   };
@@ -2269,6 +2269,9 @@ async function main() {
     const productMedia = new Map<string, string[]>();
     /** Which store media a source URL became, so a link can be traced to a picture. */
     const mediaIdBySource = new Map<string, string>();
+    /** The location the shop lists first, and the one its stock is actually on. */
+    const firstLocationId = nextGid("Location");
+    const stockedLocationId = nextGid("Location");
     const reply = (data: unknown) => ({ json: async () => ({ data }) });
     const admin = {
       graphql: async (query: string, options?: { variables?: StoreCall["variables"] }) => {
@@ -2363,8 +2366,18 @@ async function main() {
         if (query.includes("MoonVellaVariantAppendMedia")) {
           return reply({ productVariantAppendMedia: { productVariants: [], userErrors: [] } });
         }
+        /*
+         * TWO DIFFERENT LOCATIONS, DELIBERATELY. This store answers
+         * `locations(first: 1)` with a place its stock is not, so a check can
+         * tell which one the import believed.
+         */
+        if (query.includes("MoonVellaItemLocations")) {
+          return reply({
+            inventoryItem: { inventoryLevels: { nodes: [{ location: { id: stockedLocationId } }] } },
+          });
+        }
         if (query.includes("MoonVellaLocations")) {
-          return reply({ locations: { nodes: [{ id: nextGid("Location") }] } });
+          return reply({ locations: { nodes: [{ id: firstLocationId }] } });
         }
         if (query.includes("MoonVellaInventory")) {
           return reply({ inventorySetQuantities: { userErrors: [] } });
@@ -2380,6 +2393,8 @@ async function main() {
       calls,
       bySku,
       mediaIdBySource,
+      firstLocationId,
+      stockedLocationId,
     };
   }
 
@@ -2390,7 +2405,9 @@ async function main() {
     calls.find((call) => call.query.includes("MoonVellaProductSet"))?.variables.input
       ?.productOptions ?? [];
 
-  const sentQuantities = (calls: StoreCall[]): { quantity: number }[] =>
+  const sentQuantities = (
+    calls: StoreCall[]
+  ): { quantity: number; locationId?: string; changeFromQuantity?: unknown }[] =>
     calls.find((call) => call.query.includes("MoonVellaInventory"))?.variables.input?.quantities ?? [];
 
   const sentInventoryInput = (calls: StoreCall[]) =>
@@ -2748,10 +2765,57 @@ async function main() {
     }`
   );
 
+  // 98
+  /*
+   * THE FIELD THAT IS REQUIRED BUT MEANS "COMPARE NOTHING" WHEN NULL.
+   *
+   * Removing `ignoreCompareQuantity` was half the fix and left the other half
+   * invisible: this version requires `changeFromQuantity` on every entry, so the
+   * call was refused with "InventoryQuantityInput must include the following
+   * argument: changeFromQuantity" and the stock still never arrived. The field
+   * is nullable, and an explicit null is what turns the comparison off — a
+   * deliberately wrong number in its place is refused as not matching the
+   * persisted quantity, so the null is doing real work rather than being
+   * ignored. Asserted as present-and-null rather than absent, which is the
+   * distinction the live store draws.
+   */
+  const quantityEntries = sentQuantities(first.calls);
+  check(
+    98,
+    "Each quantity carries the comparison field the store requires, set to null so nothing is compared",
+    quantityEntries.length === 3 &&
+      quantityEntries.every(
+        (entry) => "changeFromQuantity" in entry && entry.changeFromQuantity === null
+      ),
+    JSON.stringify(quantityEntries)
+  );
+
+  // 99
+  /*
+   * THE SHELF THE STOCK IS ON, NOT THE FIRST ONE THE SHOP LISTS.
+   *
+   * A number written to a location where the item is not stocked leaves the
+   * storefront at zero — which is what this store would have done, since it
+   * answers `locations(first: 1)` with "My Custom Location" while its products
+   * sit at "Shop location". The fake answers the two questions differently for
+   * exactly this check.
+   */
+  const askedTheItem = first.calls.some((call) => call.query.includes("MoonVellaItemLocations"));
+  const quantitiesAt = new Set(quantityEntries.map((entry) => entry.locationId));
+  check(
+    99,
+    "The quantity is set where the item is stocked, not at whichever location the shop lists first",
+    askedTheItem &&
+      quantitiesAt.size === 1 &&
+      quantitiesAt.has(first.stockedLocationId) &&
+      !quantitiesAt.has(first.firstLocationId),
+    `asked=${askedTheItem} locations=${JSON.stringify([...quantitiesAt])} stocked=${first.stockedLocationId}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 97) {
+  if (total !== 99) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 11 from the Shopify-mapping correction`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave, 2 from the inventory-push wave and 13 from the Shopify-mapping correction`);
   }
 }
 
