@@ -16,6 +16,7 @@ import {
   removePaymentMethod,
 } from "../services/sellerBilling.server";
 import { isStripeConfigured } from "../services/payments.server";
+import { useCurrency } from "../components/CurrencyDisplay";
 
 export const loader = async ({ request }) =>
   withMerchantAccess(request, "VIEW", async (context) => {
@@ -161,16 +162,17 @@ export const action = async ({ request }) => {
   }
 };
 
-function money(cents, currency = "CAD") {
-  return `${(cents / 100).toFixed(2)} ${currency}`;
-}
-
 const card = { background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1.5rem", marginBottom: "1.5rem" };
 const label = { display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" };
 const input = { padding: "0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.85rem", boxSizing: "border-box" };
 
 export default function BillingPage() {
   const { access, settings, methods, invoices, attempts, stripe } = useLoaderData();
+  const { format } = useCurrency();
+  // An invoice's own currency is printed, and only Canadian amounts are
+  // converted — the same rule the order history applies, for the same reason.
+  const money = (cents, code) =>
+    !code || code === "CAD" ? format(cents) : `${(cents / 100).toFixed(2)} ${code}`;
   const actionData = useActionData();
   const setupFetcher = useFetcher();
   const [mode, setMode] = React.useState(settings?.mode ?? "MANUAL");

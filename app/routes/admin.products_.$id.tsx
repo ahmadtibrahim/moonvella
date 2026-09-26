@@ -30,6 +30,7 @@ import {
   createTemplateAsset,
 } from "~/services/media.server";
 import { retryVideoProbe } from "~/services/mediaProbe.server";
+import { pushVariantInventory, queueInventoryRetries } from "~/services/inventoryPush.server";
 import { publicationReadiness, PublicationRefused } from "~/services/publication.server";
 import { previewMarketingPack } from "~/services/marketingPack.server";
 import {
@@ -547,7 +548,25 @@ export async function action({ request, params }: ActionFunctionArgs) {
         if (intent === "add_variant") {
           await addVariant(productId, variantInput, actor);
         } else {
-          await updateVariant(text("variantId"), variantInput, actor);
+          const variantId = text("variantId");
+          await updateVariant(variantId, variantInput, actor);
+          /*
+           * THE QUANTITY A MERCHANT TYPES HERE IS THE ONE THE STOREFRONT SHOWS.
+           *
+           * `updateVariant` writes this database and knows nothing about the
+           * stores that list the product, so before this the number moved in the
+           * admin panel and nowhere else — the catalogue and the storefront
+           * disagreed until somebody pressed Re-sync, which is exactly what the
+           * owner reported. The push therefore happens in the request, so a
+           * quantity that is saved is a quantity that has been sent.
+           *
+           * Not throwing on failure: the merchant's edit is committed, and one
+           * store's expired session must not turn their save into an error page.
+           * A store that could not be reached is recorded as a failure on its
+           * mapping rows and queued for retry, so it converges on its own.
+           */
+          const pushed = await pushVariantInventory(variantId);
+          await queueInventoryRetries(pushed);
         }
         break;
       }

@@ -1,6 +1,7 @@
 import { useLoaderData } from "react-router";
 import { prisma } from "../db.server";
 import { withMerchantAccess } from "../services/seller.server";
+import { useCurrency } from "../components/CurrencyDisplay";
 
 /**
  * The shipping table is global data rather than this seller's, which is why
@@ -31,12 +32,10 @@ export const loader = async ({ request }) =>
   };
   });
 
-function money(cents) {
-  return `$${(Number(cents || 0) / 100).toFixed(2)}`;
-}
-
 export default function ShippingPage() {
   const { zones } = useLoaderData();
+  const { format } = useCurrency();
+  const money = (cents) => format(Number(cents || 0));
   const previewZones = zones.slice(0, 3);
 
   return (
@@ -65,9 +64,9 @@ export default function ShippingPage() {
                 <thead>
                   <tr>
                     <th>Zone / Province</th>
-                    <th>Supplier Shipping Cost (CAD)</th>
+                    <th>Supplier Shipping Cost</th>
                     <th>Transit Time</th>
-                    <th>Free Shipping Threshold (CAD)</th>
+                    <th>Free Shipping Threshold</th>
                     <th>Customer Display</th>
                     <th>Status</th>
                   </tr>

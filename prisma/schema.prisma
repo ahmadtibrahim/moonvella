@@ -320,9 +320,52 @@ model Seller {
   contactMappings    ExternalContactMapping[]
   jobs               BackgroundJob[]
   fileTransfers      ShopifyFileTransfer[]
+  variantPrices      SellerVariantPrice[]
 
   @@index([status])
   @@index([shopDomain])
+}
+
+/// What one store sells one MoonVella variant for.
+///
+/// THE SELLER'S PRICE, AND THE ONLY PLACE IT LIVES. It is what their Shopify
+/// product is listed at, it starts from the catalogue's suggested retail, and
+/// the seller may change it. Nothing else writes it.
+///
+/// WHY IT IS NOT ON `SellerProductVariant`. That row is the *mapping* between a
+/// MoonVella variant and one the store owns, and it cannot exist before the
+/// import — its `shopifyVariantId` is what the import discovers. The seller
+/// prices a product on the catalogue card and imports it afterwards, so a price
+/// stored there would be unsettable at the moment it is needed, and the only
+/// alternative inside that row would be to make the store's variant id
+/// nullable, which would silently break the "have we imported this?" test that
+/// chooses between creating and re-syncing.
+///
+/// WHY IT IS NOT ON `SellerProduct`. That is the family: one row for a product
+/// with three sizes, so one price for three sellable units. A King and a
+/// Standard cannot be sold at the same figure, and the only way to price them
+/// apart from there was a percentage applied to all of them at once — which is
+/// the markup the owner asked to have removed.
+///
+/// A ROW WITH NO MAPPING IS NORMAL, NOT AN ORPHAN. It is the price a seller set
+/// on a product they have not imported yet, and the import reads it on the way
+/// past. It is keyed on the variant rather than on the mapping precisely so that
+/// it survives the import instead of being created by it.
+model SellerVariantPrice {
+  id               String         @id @default(cuid())
+  sellerId         String
+  seller           Seller         @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  productVariantId String
+  productVariant   ProductVariant @relation(fields: [productVariantId], references: [id], onDelete: Cascade)
+  /// In cents, and always positive: the action that writes it refuses a zero,
+  /// because a variant listed at zero takes real orders at zero.
+  retailPrice      Int
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@unique([sellerId, productVariantId])
+  @@index([sellerId])
+  @@index([productVariantId])
 }
 
 enum SellerStatus {
@@ -596,6 +639,7 @@ model ProductVariant {
   mediaAssignments MediaAssetAssignment[]
   externalMappings ExternalVariantMapping[]
   stockRecords     VariantStockRecord[]
+  sellerPrices     SellerVariantPrice[]
 
   @@index([productId, sortOrder])
 }

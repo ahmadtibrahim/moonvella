@@ -12,6 +12,7 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
 import { resolveSellerContext } from "../services/seller.server";
+import { CurrencyProvider, CurrencyToggle } from "../components/CurrencyDisplay";
 // From the shared module, not from seller.server: the error boundary below
 // renders in the browser, and a `.server` import reaching client code fails the
 // build rather than the page.
@@ -128,7 +129,16 @@ export default function App() {
         <s-link href="/app/shipping">Shipping</s-link>
         <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
-      <Outlet />
+      {/*
+        Every price under this layout is rendered through the provider, so a
+        seller who reads in US dollars reads the whole app that way. It sits
+        above the outlet rather than inside a page because the choice is about
+        the reader, not about the screen they happen to be on.
+      */}
+      <CurrencyProvider>
+        <CurrencyToggle />
+        <Outlet />
+      </CurrencyProvider>
     </AppProvider>
   );
 }

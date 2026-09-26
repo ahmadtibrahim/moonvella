@@ -89,6 +89,17 @@ export const JOB_KIND = {
    * uploaded before the fix shipped and will never ask for it themselves.
    */
   MEDIA_VIDEO_PROBE_SWEEP: "MEDIA_VIDEO_PROBE_SWEEP",
+  /**
+   * Tell the stores that list a variant how many are left.
+   *
+   * Queued when a Shopify push did not go through — usually because the
+   * merchant's session needed refreshing — and never queued for a push that
+   * already succeeded, which is what keeps the queue from becoming a second
+   * synchroniser. The handler re-reads the quantity when it runs, so the
+   * number that lands in the store is the current one and not the one that
+   * was current when the change was made.
+   */
+  INVENTORY_PUSH: "INVENTORY_PUSH",
 } as const;
 
 export type JobKind = (typeof JOB_KIND)[keyof typeof JOB_KIND];

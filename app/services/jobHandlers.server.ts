@@ -14,6 +14,7 @@ import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
 import { syncOdooCatalog } from "./odooSync.server";
 import { probeVideoAsset, sweepVideoProbes } from "./mediaProbe.server";
+import { pushVariantInventory } from "./inventoryPush.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
@@ -234,6 +235,42 @@ export const jobHandlers: Record<string, JobHandler> = {
         ...swept,
       },
     };
+  },
+
+  /**
+   * Push a variant's quantity to the stores that list it.
+   *
+   * Idempotent in the way that matters here: the payload names a variant, not a
+   * quantity, and the handler reads the current number when it runs. So the
+   * third queued retry of one edit pushes the same value as the first and
+   * leaves the store showing what the catalogue shows — running this job twice
+   * is indistinguishable from running it once.
+   */
+  [JOB_KIND.INVENTORY_PUSH]: async (job) => {
+    const productVariantId = (job.payload as { productVariantId?: unknown } | null)
+      ?.productVariantId;
+    if (typeof productVariantId !== "string" || !productVariantId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no productVariantId, so there is no quantity to push.`,
+      );
+    }
+
+    const outcome = await pushVariantInventory(productVariantId);
+    const failed = outcome.failures.length > 0;
+    const named = outcome.quantities[0];
+    const summary =
+      `${named ? `${named.sku}: ${named.quantity}` : productVariantId} sent to ${outcome.pushed} listing(s)` +
+      (outcome.skipped ? `, ${outcome.skipped} skipped` : "") +
+      (outcome.disabled ? ", nothing sent: the inventory push is switched off in this process" : "") +
+      (failed ? `, ${outcome.failures.length} store(s) could not be reached` : "");
+
+    // Throwing on a store that could not be reached is what makes this a retry
+    // rather than a silently-dropped update. A permanent answer — a store that
+    // is not approved, a variant that no longer exists — comes back as zero
+    // failures and zero pushes, and ends the job quietly, which is correct:
+    // there is nothing left to try.
+    if (failed) throw new Error(summary);
+    return { summary, detail: { ...outcome } };
   },
 
   [JOB_KIND.SHOPIFY_FULFILLMENT_SYNC]: async (job) => {

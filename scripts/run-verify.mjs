@@ -73,6 +73,26 @@ const SIMULATED_STRIPE = { MOONVELLA_STRIPE_MODE: "simulated" };
 const SANDBOX_STRIPE = { MOONVELLA_STRIPE_MODE: "test" };
 
 /**
+ * Every verify suite runs with the inventory push switched off.
+ *
+ * A suite that edits a variant's quantity would otherwise be a second writer to
+ * a real storefront: the admin product editor pushes the quantity in the
+ * request, and the Odoo sync pushes the products whose stock moved. The clone
+ * these suites run against is a copy of a deployed database, so its seller
+ * mappings point at real Shopify inventory items — a suite that saved an
+ * inventory of 3 to test a validator would set a sandbox store's shelf to 3 and
+ * leave it there. `pushInventoryForVariants` reports the switch rather than
+ * silently doing nothing, and the decision about WHO would be told is covered
+ * by `planInventoryPush`, which is pure and needs no store at all.
+ *
+ * An operator who has set the variable themselves keeps it, so one suite can
+ * still be pointed at a real store on purpose.
+ */
+const NO_INVENTORY_PUSH = process.env.MOONVELLA_INVENTORY_PUSH
+  ? {}
+  : { MOONVELLA_INVENTORY_PUSH: "off" };
+
+/**
  * Refuse to run a verify suite against a database that is not a throwaway.
  *
  * The suites are not read-only: verify-payments and verify-wholesale call
@@ -158,6 +178,7 @@ function runScript(scriptRel, scriptArgs = [], extraEnv = null) {
     // defaults; both are layered over the process environment rather than
     // replacing it.
     return runNode([outfile, ...scriptArgs], scriptRel, {
+      ...NO_INVENTORY_PUSH,
       ...envFor(scriptRel),
       ...(extraEnv ?? {}),
     });

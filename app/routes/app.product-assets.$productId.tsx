@@ -5,6 +5,7 @@ import { authenticate } from "../shopify.server";
 import { listProductMedia } from "../services/media.server";
 import { withMerchantAccess } from "../services/seller.server";
 import { isReadyForSellers } from "../services/mediaState";
+import { downloadUrl, mintDownloadToken } from "../services/downloadToken.server";
 import {
   listTransferStates,
   mediaContentTypeFor,
@@ -71,7 +72,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
 
     const visible = (await listProductMedia(productId)).filter(isReadyForSellers);
 
-    const [transfers, mapping] = await Promise.all([
+    const [transfers, mapping, keyRows] = await Promise.all([
       listTransferStates(
         sellerId,
         visible.map((asset) => asset.id)
@@ -80,8 +81,27 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
         where: { sellerId_productId: { sellerId, productId } },
         select: { shopifyProductId: true },
       }),
+      /*
+       * The stored keys, read here rather than taken from the listing.
+       *
+       * A download link has to be signed, and the signature is bound to the
+       * object's key — the thing the `/uploads` route is asked for. The media
+       * view deliberately carries no key (a URL is what a screen needs, and a
+       * key is a locator), so the keys are read for exactly the assets on this
+       * page, in one query, and used for nothing else.
+       */
+      prisma.mediaAsset.findMany({
+        where: { id: { in: visible.map((asset) => asset.id) } },
+        select: { id: true, storageKey: true, sourceUrl: true },
+      }),
     ]);
     const imported = Boolean(mapping?.shopifyProductId);
+
+    // A legacy asset is a row pointing at somebody else's address: there is no
+    // stored object of ours to sign for, and its URL is already absolute.
+    const keyById = new Map(
+      keyRows.map((row) => [row.id, row.sourceUrl?.trim() ? null : row.storageKey])
+    );
 
     const assets = visible.map((asset) => {
       const kind = kindOf(asset);
@@ -109,12 +129,44 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
         refusal = "This file is marked as not downloadable, so it cannot be copied to your store.";
       }
 
+      /*
+       * THE DOWNLOAD ADDRESS, SIGNED FOR THIS SELLER.
+       *
+       * The page is inside the admin's frame, where an attachment cannot be
+       * delivered: the sandbox has no `allow-downloads`, and a document
+       * navigation loses the parameters that authenticate it. So the link opens
+       * a new top-level window — which has no Shopify session — carrying a
+       * token minted for exactly this object and this seller. The `/uploads`
+       * route verifies the signature against the key in its path and re-reads
+       * the seller's access state before a byte is served, so this hands out
+       * nothing that the session it was drawn from would not have given.
+       *
+       * A LEGACY ASSET KEEPS ITS OWN ADDRESS. A migrated row points at somebody
+       * else's origin and has no object of ours to sign for, so its URL is used
+       * as it always was — absolute, and out of this application's hands.
+       *
+       * The permission itself is `downloadAllowed`, which the merchant sets per
+       * file and the route checks again on the way through. This decides only
+       * whether the permission can be carried in the URL.
+       */
+      const downloadKey = keyById.get(asset.id) ?? null;
+      const canDownload = asset.downloadAllowed;
+      const downloadHref = downloadKey
+        ? downloadUrl(
+            `/uploads/${downloadKey}`,
+            mintDownloadToken({ kind: "media", resourceId: downloadKey, sellerId }),
+            { download: "1" }
+          )
+        : asset.url;
+
       return {
         id: asset.id,
         title: asset.title,
         kind,
         transferKind,
         url: asset.url,
+        downloadHref,
+        canDownload,
         /** Only for things a browser can display in place. */
         previewUrl: kind === "IMAGE" || kind === "VIDEO" ? asset.url : null,
         mimeType: asset.mimeType,
@@ -293,16 +345,16 @@ function AssetCard({
         ) : null}
 
         <div className="mv-asset-actions">
-          {/* A download is a link to the file's own address. It is offered for
-              anything the merchant marked downloadable, and it is the original
-              file — not a re-encode or a thumbnail. */}
-          {asset.downloadAllowed ? (
+          {/* A download is a link to the file's own address, in a new top-level
+              window because the admin's frame blocks the attachment. It is
+              offered for anything the merchant marked downloadable, and it is
+              the original file — not a re-encode or a thumbnail. */}
+          {asset.canDownload ? (
             <a
               className="mv-asset-link"
-              href={asset.url}
+              href={asset.downloadHref}
               target="_blank"
               rel="noreferrer"
-              download
             >
               Download
             </a>

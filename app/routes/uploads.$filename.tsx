@@ -3,6 +3,7 @@ import { prisma } from "~/db.server";
 import { contentTypeForKey, isStorageKey, readObject } from "~/services/storage.server";
 import { getCurrentUser } from "~/utils/adminAuth.server";
 import { isReadyForSellers } from "~/services/mediaState";
+import { verifyDownloadToken } from "~/services/downloadToken.server";
 
 /**
  * Serves a stored object by its key.
@@ -37,15 +38,31 @@ import { isReadyForSellers } from "~/services/mediaState";
  * streaming belongs in the backend interface, and until it is there the honest
  * cost is one full read per request rather than a video that does not play.
  *
+ * A SELLER'S DOWNLOAD IS CARRIED BY A SIGNED TOKEN, NOT BY A SESSION. The
+ * merchant app downloads from a link that opens a new top-level window, because
+ * a download cannot happen inside the admin's frame — see
+ * `downloadToken.server.ts` for both halves of why. That window has no Shopify
+ * session, so the permission travels in the URL: a token minted for this key,
+ * for this seller, minutes ago. It is verified against the key in the path, so
+ * a token for one file cannot fetch another, and the seller it names is
+ * re-read from the database on the way through — a store blocked between the
+ * click and the fetch gets a 404, not a file.
+ *
+ * The token replaces the session. It does not replace the decision: a
+ * token-bearing request still has to be an asset that is offered to sellers,
+ * finished processing, and on a published product, which is exactly the gate
+ * the page that drew the link applied.
+ *
  * NOT IMPLEMENTED, and worth knowing:
  *   • Multi-range requests. `bytes=0-1,5-6` is answered with the whole object,
  *     which RFC 9110 allows and which no video element asks for.
- *   • Seller-scoped access. A seller sees catalogue imagery because it is
- *     public; they cannot reach another seller's private material because
- *     there is none in this table. If per-seller private files are added, this
- *     is the route that must learn about them.
+ *   • Per-seller private files. There is no such thing in this table: every
+ *     asset is either public catalogue imagery or merchant material held back
+ *     from sellers. If a file that belongs to one seller is ever added, this is
+ *     the route that must learn about them.
  */
 export async function loader({ params, request }: LoaderFunctionArgs) {
+  const url = new URL(request.url);
   const key = String(params.filename || "");
 
   // The key is the only thing that can name an object. Anything else — a path,
@@ -61,6 +78,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
       approvalStatus: true,
       sellerVisible: true,
       processingStatus: true,
+      downloadAllowed: true,
       product: { select: { status: true, isActive: true, isArchived: true } },
     },
   });
@@ -80,7 +98,17 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     asset.product.isActive &&
     !asset.product.isArchived;
 
-  if (!isPublicCatalogueImage) {
+  /*
+   * The token, if one was presented. Verified against the key in the path
+   * before it is trusted for anything, and answered with the same 404 as a
+   * missing key when it fails — a wrong signature and a key that does not exist
+   * must be indistinguishable from outside.
+   */
+  const tokenSellerId = isPublicCatalogueImage
+    ? null
+    : await sellerForDownloadToken(request, key, asset);
+
+  if (!isPublicCatalogueImage && !tokenSellerId) {
     const user = await getCurrentUser(request);
     // 404 rather than 403: a 403 would confirm that this key names a real
     // object, which is exactly what someone enumerating keys wants to learn.
@@ -93,6 +121,21 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
   if (!bytes) {
     throw new Response("Not found", { status: 404 });
   }
+
+  /*
+   * A DOWNLOAD, RATHER THAN A PREVIEW, WHEN THE CALLER SAYS SO.
+   *
+   * The same bytes served with `inline` are what a video element plays and what
+   * an `<img>` shows; the same bytes with `attachment` are a file the browser
+   * saves under a name. The seller's "Download" link asks for the second, and
+   * it is the only thing that gives the saved file a name at all — without it a
+   * merchant ends up with `9f2c…e1` in their downloads folder. `nosniff` and
+   * the content type still come from the key, so the name cannot dress the
+   * bytes up as something they are not.
+   */
+  const wantsDownload = url.searchParams.get("download") === "1";
+  const disposition =
+    wantsDownload || contentTypeForKey(key) === "application/pdf" ? "attachment" : "inline";
 
   const headers: Record<string, string> = {
     // From the key's extension, which the storage module chose after
@@ -122,7 +165,7 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
     // display one: a document is downloaded and opened by the person who
     // wanted it, in whatever they trust. The application itself never parses
     // a PDF beyond its signature either.
-    "Content-Disposition": contentTypeForKey(key) === "application/pdf" ? "attachment" : "inline",
+    "Content-Disposition": disposition,
   };
 
   const range = parseRange(request.headers.get("Range"), bytes.byteLength);
@@ -151,6 +194,59 @@ export async function loader({ params, request }: LoaderFunctionArgs) {
   return new Response(bytes as unknown as BodyInit, {
     headers: { ...headers, "Content-Length": String(bytes.byteLength) },
   });
+}
+
+/**
+ * The seller a valid download token names, or null when there is no usable one.
+ *
+ * THREE QUESTIONS, AND ALL THREE HAVE TO BE YES. Each is a way the token alone
+ * would have been enough for something it should not be:
+ *
+ *   • Is the signature ours, for THIS key, and unexpired? `verifyDownloadToken`
+ *     answers that, and the key in the path is passed as the expected resource
+ *     so a token minted for one file cannot be spent on another.
+ *   • Is the seller still allowed to have it? The token was minted when the
+ *     page was drawn; the store may have been blocked, suspended or deleted
+ *     since. This is re-read here rather than trusted from the token, because a
+ *     token that carried "this seller is approved" would still say so after the
+ *     owner withdrew it. There is no seller named "no seller", so a deleted
+ *     store fails closed.
+ *   • Is this file one a seller may be given at all? Offered to sellers,
+ *     finished processing, and on a published, active, unarchived product, with
+ *     `downloadAllowed` honoured for anything that is a document rather than
+ *     catalogue imagery. A file withdrawn after the page was drawn stops being
+ *     served here.
+ */
+async function sellerForDownloadToken(
+  request: Request,
+  key: string,
+  asset: {
+    sellerVisible: boolean;
+    approvalStatus: string;
+    processingStatus: string;
+    downloadAllowed: boolean;
+    product: { status: string; isActive: boolean; isArchived: boolean };
+  }
+): Promise<string | null> {
+  const url = new URL(request.url);
+  const claims = verifyDownloadToken(url.searchParams.get("token"), {
+    kind: "media",
+    resourceId: key,
+  });
+  if (!claims) return null;
+
+  if (!isReadyForSellers(asset)) return null;
+  if (asset.product.status !== "PUBLISHED") return null;
+  if (!asset.product.isActive || asset.product.isArchived) return null;
+  if (!asset.downloadAllowed) return null;
+
+  const seller = await prisma.seller.findUnique({
+    where: { id: claims.sellerId },
+    select: { status: true },
+  });
+  if (!seller || seller.status !== "APPROVED") return null;
+
+  return claims.sellerId;
 }
 
 /** A single range to serve, "unsatisfiable", or null to serve everything. */

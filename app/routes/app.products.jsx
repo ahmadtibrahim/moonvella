@@ -1,5 +1,7 @@
 import { Link, useFetcher, useLoaderData } from "react-router";
 import { withMerchantAccess } from "../services/seller.server";
+import { loadLegacyFamilyRetailPrices, loadSellerRetailPrices } from "../services/sellerPricing.server";
+import { useCurrency } from "../components/CurrencyDisplay";
 import { prisma } from "../db.server";
 
 /**
@@ -27,7 +29,13 @@ export const loader = async ({ request }) =>
         importedAt: true,
         importStatus: true,
         lastImportError: true,
-        customRetailPrice: true,
+        /*
+         * The family's legacy override is still read, and nothing writes it any
+         * more: the screen that set it is gone, the price lives per variant now,
+         * and a store that set a family price under the old screen must keep
+         * being shown the price it is actually listed at. See
+         * `loadLegacyFamilyRetailPrices`.
+         */
         customWholesalePrice: true,
         // Prices and SKUs live on the sellable variant now, not on the family.
         // A family is a name and a code; the thing with a price is the variant.
@@ -40,6 +48,8 @@ export const loader = async ({ request }) =>
               where: { isActive: true },
               orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
               select: {
+                // The id, because the seller's prices are keyed on it.
+                id: true,
                 sku: true,
                 wholesalePrice: true,
                 suggestedRetailPrice: true,
@@ -53,6 +63,16 @@ export const loader = async ({ request }) =>
         },
       },
     });
+
+    /*
+     * The seller's own prices, in two queries for the whole page. `?` because
+     * the row below shows the entry variant's price, which is the figure a
+     * family is listed from and the one a seller compares with the catalogue.
+     */
+    const [pricedByVariant, legacyByProduct] = await Promise.all([
+      loadSellerRetailPrices(context.seller.id),
+      loadLegacyFamilyRetailPrices(context.seller.id),
+    ]);
     imported = rows.map((row) => {
       const variants = row.product.variants;
       // What the seller actually imported, when the import recorded it. Mappings
@@ -76,6 +96,10 @@ export const loader = async ({ request }) =>
         (best, variant) => (!best || variant.wholesalePrice < best.wholesalePrice ? variant : best),
         null
       );
+      const familyLegacy = legacyByProduct.get(row.productId) ?? null;
+      const cheapestRetail = cheapest
+        ? pricedByVariant.get(cheapest.id) ?? familyLegacy ?? cheapest.suggestedRetailPrice
+        : 0;
 
       return {
         id: row.id,
@@ -88,7 +112,10 @@ export const loader = async ({ request }) =>
         importedAt: row.importedAt,
         importStatus: row.importStatus,
         lastImportError: row.lastImportError,
-        retailPrice: row.customRetailPrice ?? cheapest?.suggestedRetailPrice ?? 0,
+        retailPrice: cheapestRetail,
+        // "Cost" is what MoonVella invoices the seller — never `costPrice`,
+        // which is MoonVella's own acquisition cost and none of the seller's
+        // business. See `sellerCostFor` in the import service.
         moonvillaCost: row.customWholesalePrice ?? cheapest?.wholesalePrice ?? 0,
         isActive: row.isActive,
       };
@@ -143,10 +170,6 @@ export const action = async ({ request }) => {
   };
 };
 
-function money(cents) {
-  return `$${(cents / 100).toFixed(2)}`;
-}
-
 const SYNC_LABELS = {
   NEVER: "Never synced",
   SYNCING: "Syncing",
@@ -163,6 +186,7 @@ function syncBadgeClass(status) {
 export default function ProductsPage() {
   const { access, canImport, imported } = useLoaderData();
   const fetcher = useFetcher();
+  const currency = useCurrency();
 
   if (!canImport) {
     return (
@@ -235,8 +259,8 @@ export default function ProductsPage() {
                 <tr style={{ textAlign: "left", color: "#64748b", fontSize: "0.7rem" }}>
                   <th style={{ padding: "0.5rem" }}>Product</th>
                   <th style={{ padding: "0.5rem" }}>SKU</th>
-                  <th style={{ padding: "0.5rem" }}>Retail</th>
-                  <th style={{ padding: "0.5rem" }}>MoonVella cost</th>
+                  <th style={{ padding: "0.5rem" }}>Your retail</th>
+                  <th style={{ padding: "0.5rem" }}>Cost</th>
                   <th style={{ padding: "0.5rem" }}>Sync</th>
                   <th style={{ padding: "0.5rem" }}>Shopify</th>
                   <th style={{ padding: "0.5rem" }}>Actions</th>
@@ -258,8 +282,8 @@ export default function ProductsPage() {
                         </span>
                       ) : null}
                     </td>
-                    <td style={{ padding: "0.5rem" }}>{money(p.retailPrice)}</td>
-                    <td style={{ padding: "0.5rem" }}>{money(p.moonvillaCost)}</td>
+                    <td style={{ padding: "0.5rem" }}>{currency.format(p.retailPrice)}</td>
+                    <td style={{ padding: "0.5rem" }}>{currency.format(p.moonvillaCost)}</td>
                     <td style={{ padding: "0.5rem" }}>
                       <span
                         className={syncBadgeClass(p.importStatus)}

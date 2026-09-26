@@ -3,6 +3,7 @@ import { requireMerchantAccess, withMerchantAccess, AccessError } from "../servi
 import { prisma } from "../db.server";
 import { recordAudit, AUDIT_ENTITY } from "../services/audit.server";
 import { JOB_KIND, enqueueJob, jobKey } from "../services/jobs.server";
+import { AUTO_SYNC_DESCRIPTION } from "../utils/inventorySync";
 
 export const loader = async ({ request }) =>
   withMerchantAccess(request, "VIEW", async (context) => {
@@ -66,7 +67,6 @@ export const loader = async ({ request }) =>
           lowStockAlerts: settings.lowStockAlerts,
           autoImportOrders: settings.autoImportOrders,
           estimatedDeliveryMsg: settings.estimatedDeliveryMsg,
-          defaultMarkup: settings.defaultMarkup,
         }
       : null,
   };
@@ -205,7 +205,12 @@ export const action = async ({ request }) => {
     estimatedDeliveryMsg:
       String(form.get("estimatedDeliveryMsg") || "").trim().slice(0, 300) ||
       "Typically ships within 2–4 business days.",
-    defaultMarkup: clampInt(form.get("defaultMarkup"), 0, 100000, 200),
+    /*
+     * `defaultMarkup` IS NOT WRITTEN, AND NOT SENT. The field is gone from this
+     * form, and a save that wrote a default for it would be inventing a value
+     * for a setting nobody can see. The column keeps whatever it holds until a
+     * migration removes it; nothing reads it.
+     */
   };
 
   const before = await prisma.sellerSettings.findUnique({ where: { sellerId: context.seller.id } });
@@ -229,7 +234,6 @@ export const action = async ({ request }) => {
           lowStockAlerts: before.lowStockAlerts,
           autoImportOrders: before.autoImportOrders,
           estimatedDeliveryMsg: before.estimatedDeliveryMsg,
-          defaultMarkup: before.defaultMarkup,
         }
       : null,
     afterData: data,
@@ -422,19 +426,24 @@ export default function SettingsPage() {
                 <input type="checkbox" disabled readOnly />
                 <span>Import product descriptions (not configurable yet)</span>
               </label>
-              <div className="mv-settings-field">
-                <span className="mv-settings-label">Default price markup (%)</span>
-                <input
-                  type="number"
-                  min="0"
-                  max="100000"
-                  step="1"
-                  className="mv-settings-input"
-                  name="defaultMarkup"
-                  defaultValue={settings ? settings.defaultMarkup : 200}
-                  disabled={!canEdit}
-                />
-              </div>
+              {/*
+                THERE IS NO MARKUP SETTING ANY MORE, AND NO PRICE SETTING HERE
+                AT ALL. A percentage applied to every variant was a second,
+                invisible opinion about what a product should cost, and it could
+                not express "the King is ten dollars more" in any case — it
+                multiplies, so it moves the dearest variant furthest. The price
+                is now a figure the seller chooses per size, on the product's
+                own card in the catalog, which is the screen that knows what the
+                sizes are. A note here says where, because a seller who set a
+                markup on this page will come back to it looking for the field.
+              */}
+              <p className="mv-branding-message" style={{ fontSize: "0.78rem", margin: 0 }}>
+                Retail prices are set per size on each product&rsquo;s card in the{" "}
+                {/* A Link, not an anchor: a document navigation inside the
+                    admin's frame loses the parameters that authenticate it. */}
+                <Link to="/app/catalog">Product Catalog</Link>, where you can see
+                MoonVella&rsquo;s suggested price and set your own.
+              </p>
             </div>
 
             <div className="mv-settings-card">
@@ -448,6 +457,9 @@ export default function SettingsPage() {
                 />
                 <span>Auto-sync inventory</span>
               </label>
+              {/* The sentence the push service uses for this switch, so the
+                  description and the behaviour cannot drift apart. */}
+              <p className="mv-settings-hint">{AUTO_SYNC_DESCRIPTION}</p>
               <div className="mv-settings-field">
                 <span className="mv-settings-label">Quantity buffer</span>
                 <input
@@ -460,6 +472,16 @@ export default function SettingsPage() {
                   defaultValue={settings ? settings.quantityBuffer : 5}
                   disabled={!canEdit}
                 />
+                {/* Stored, and not applied to anything. Said out loud rather
+                    than left to look like a setting that works: a seller who
+                    sets a buffer of 5 and watches their storefront keep the
+                    full quantity would reasonably conclude the sync is broken,
+                    when the number has simply never been used. */}
+                <p className="mv-settings-hint">
+                  Saved, but not applied yet: quantities are pushed exactly as the catalogue
+                  holds them. Tell MoonVella if you want the buffer subtracted from what your
+                  store shows.
+                </p>
               </div>
               <label className="mv-settings-checkbox">
                 <input

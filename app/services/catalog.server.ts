@@ -1,5 +1,6 @@
 import { prisma } from "~/db.server";
 import { assetUrl } from "./media.server";
+import { loadLegacyFamilyRetailPrices, loadSellerRetailPrices } from "./sellerPricing.server";
 import type { SellerContext } from "./seller.server";
 
 export interface PublicCatalogProduct {
@@ -15,8 +16,32 @@ export interface ApprovedCatalogVariant {
   id: string;
   sku: string;
   name: string;
+  /**
+   * What the variant costs the seller. Read-only on every seller-facing screen:
+   * it is the price MoonVella invoices, and the owner's instruction is that a
+   * seller may change what they charge their own customers and not what they
+   * are charged.
+   */
   wholesalePrice: number;
+  /** The catalogue's recommended retail price: the default the card pre-fills. */
   suggestedRetailPrice: number;
+  /**
+   * The price THIS store sells it at: the seller's own figure when they have
+   * set one, otherwise the catalogue's. This is what the import lists, and what
+   * the item card pre-fills the editable field with.
+   */
+  retailPrice: number;
+  /**
+   * True when neither the catalogue nor the seller has a usable price, so the
+   * store cannot be given this variant until one is typed. The card says so
+   * rather than letting the seller find out from a refused import.
+   */
+  needsRetailPrice: boolean;
+  /**
+   * True when `retailPrice` is the seller's own number rather than the
+   * catalogue's, so the card can mark it as changed and offer to put it back.
+   */
+  hasRetailOverride: boolean;
   inventory: number;
   isActive: boolean;
   /** Option pairs, e.g. [{ name: "Size", value: "Queen" }]. */
@@ -33,7 +58,15 @@ export interface ApprovedCatalogProduct extends PublicCatalogProduct {
    */
   wholesalePrice: number;
   suggestedRetailPrice: number;
-  estimatedProfit: number;
+  /**
+   * NO `estimatedProfit`, AND ITS ABSENCE IS A DECISION. It used to be
+   * `suggestedRetailPrice - wholesalePrice` at the family level, and once the
+   * seller can set their own retail it measures the wrong thing: a seller who
+   * has priced their King at $149 would be shown a profit calculated from the
+   * catalogue's $128, which is a number that describes nobody's business. The
+   * two figures it was made of are on the card, per variant, with the currency
+   * attached; the subtraction is the seller's to make.
+   */
   /** Total across active variants. */
   inventory: number;
   variants: ApprovedCatalogVariant[];
@@ -149,7 +182,7 @@ function pickPrimaryImage(
  * an inactive one is excluded by the same rule that hides it on the storefront.
  */
 export async function listCatalog(
-  context: Pick<SellerContext, "canViewWholesale">
+  context: Pick<SellerContext, "canViewWholesale"> & { sellerId?: string | null }
 ): Promise<CatalogProduct[]> {
   const products = await prisma.product.findMany({
     where: { status: "PUBLISHED", isActive: true, isArchived: false },
@@ -205,6 +238,33 @@ export async function listCatalog(
     },
   });
 
+  /*
+   * The seller's own prices, read once for the whole catalogue.
+   *
+   * TWO QUERIES FOR THE WHOLE PAGE, NOT ONE PER PRODUCT, and the price a seller
+   * set is the price the catalogue shows them — the number they typed is their
+   * number here, on My Products and in the next import, so re-importing never
+   * silently replaces it with the catalogue's.
+   *
+   * The price is keyed on the VARIANT, and a seller may set one before importing
+   * anything: `SellerVariantPrice` is deliberately not tied to an import, so a
+   * price typed on this page is read straight back on the next render. The
+   * family column is read behind it as the fallback for a store that set a price
+   * under the screen that had one box; see `loadLegacyFamilyRetailPrices`.
+   *
+   * Both reads are skipped entirely for a caller who may not see wholesale
+   * figures. That is not an optimisation — the loader's return value is
+   * serialized into the page, so a price fetched for a pending seller would be
+   * sent to them whether or not the markup renders it.
+   */
+  const [pricedByVariant, legacyByProduct] =
+    context.canViewWholesale && context.sellerId
+      ? await Promise.all([
+          loadSellerRetailPrices(context.sellerId),
+          loadLegacyFamilyRetailPrices(context.sellerId),
+        ])
+      : [new Map<string, number>(), new Map<string, number>()];
+
   return products.map((product) => {
     const defaultVariant =
       product.variants.find((variant) => variant.isDefault) ?? product.variants[0] ?? null;
@@ -238,20 +298,25 @@ export async function listCatalog(
       productCode: product.productCode,
       wholesalePrice: cheapest?.wholesalePrice ?? 0,
       suggestedRetailPrice: cheapest?.suggestedRetailPrice ?? 0,
-      estimatedProfit: cheapest
-        ? cheapest.suggestedRetailPrice - cheapest.wholesalePrice
-        : 0,
       inventory: product.variants.reduce((sum, v) => sum + v.inventory, 0),
-      variants: product.variants.map((v) => ({
-        id: v.id,
-        sku: v.sku,
-        name: v.name,
-        wholesalePrice: v.wholesalePrice,
-        suggestedRetailPrice: v.suggestedRetailPrice,
-        inventory: v.inventory,
-        isActive: v.isActive,
-        options: v.variantOptions,
-      })),
+      variants: product.variants.map((v) => {
+        const custom = pricedByVariant.get(v.id) ?? legacyByProduct.get(product.id) ?? null;
+        const retailPrice = custom ?? v.suggestedRetailPrice;
+
+        return {
+          id: v.id,
+          sku: v.sku,
+          name: v.name,
+          wholesalePrice: v.wholesalePrice,
+          suggestedRetailPrice: v.suggestedRetailPrice,
+          retailPrice,
+          needsRetailPrice: !(retailPrice > 0),
+          hasRetailOverride: custom !== null,
+          inventory: v.inventory,
+          isActive: v.isActive,
+          options: v.variantOptions,
+        };
+      }),
     };
   });
 }

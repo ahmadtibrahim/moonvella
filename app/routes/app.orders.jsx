@@ -1,5 +1,6 @@
 import { Link, useLoaderData } from "react-router";
 import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
+import { useCurrency } from "../components/CurrencyDisplay";
 import { prisma } from "../db.server";
 
 /**
@@ -57,12 +58,21 @@ export const loader = async ({ request }) =>
   };
   });
 
-function money(cents, currency = "CAD") {
-  return `${(cents / 100).toFixed(2)} ${currency}`;
-}
-
 export default function OrdersPage() {
   const { access, canViewOrders, orders, blockedMessage } = useLoaderData();
+  const { format } = useCurrency();
+
+  /*
+   * An order's own currency is printed, and only Canadian amounts are converted.
+   *
+   * Every order this application writes is Canadian — see `utils/money` — but
+   * the column exists and a row that said otherwise would be misrepresented by
+   * a conversion, so the code the row carries wins for any currency that is not
+   * the base one. A USD view is a reading of Canadian prices, not a claim about
+   * what some other amount was.
+   */
+  const money = (cents, code) =>
+    !code || code === "CAD" ? format(cents) : `${(cents / 100).toFixed(2)} ${code}`;
   const isBlocked = access === "BLOCKED";
 
   if (!canViewOrders) {

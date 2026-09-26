@@ -1,5 +1,6 @@
 import { Link, useLoaderData } from "react-router";
 import { BLOCKED_MESSAGE, requireMerchantAccess } from "../services/seller.server";
+import { useCurrency } from "../components/CurrencyDisplay";
 import { prisma } from "../db.server";
 
 export const loader = async ({ request }) => {
@@ -66,15 +67,11 @@ export const loader = async ({ request }) => {
   };
 };
 
-function money(cents) {
-  return `$${(cents / 100).toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
 export default function DashboardPage() {
   const { access, sellerName, stats, recentOrders, blockedMessage } = useLoaderData();
+  // Every amount on this page is Canadian and says so; the header's currency
+  // control decides whether it is also shown in US dollars. See `utils/money`.
+  const { format } = useCurrency();
   const isApproved = access === "APPROVED";
   const isBlocked = access === "BLOCKED";
 
@@ -134,7 +131,7 @@ export default function DashboardPage() {
           </div>
           <div className="mv-stat-card">
             <div className="mv-stat-title">MoonVella wholesale sales</div>
-            <div className="mv-stat-value">{money(stats.moonvellaSales)}</div>
+            <div className="mv-stat-value">{format(stats.moonvellaSales)}</div>
           </div>
         </div>
 
@@ -155,7 +152,7 @@ export default function DashboardPage() {
                     </td>
                     <td style={{ padding: "0.5rem" }}>{order.customerName || "—"}</td>
                     <td style={{ padding: "0.5rem" }}>
-                      {money(order.moonvellaTotal)}
+                      {format(order.moonvellaTotal)}
                     </td>
                     <td style={{ padding: "0.5rem" }}>{order.fulfillmentStatus}</td>
                   </tr>

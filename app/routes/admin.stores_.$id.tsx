@@ -559,10 +559,12 @@ export default function AdminStoreDetail() {
               <span style={keyStyle}>Auto import orders</span>
               <span>{seller.settings.autoImportOrders ? "On" : "Off"}</span>
             </div>
-            <div style={rowStyle}>
-              <span style={keyStyle}>Default markup</span>
-              <span>{seller.settings.defaultMarkup}%</span>
-            </div>
+            {/*
+              No markup row. The setting was retired along with the field that
+              wrote it: retail prices are chosen per variant on the catalogue
+              card now, so a store's "default markup" would be a number with no
+              effect being displayed as though it were a term of trade.
+            */}
             <div style={rowStyle}>
               <span style={keyStyle}>Estimated delivery</span>
               <span>{val(seller.settings.estimatedDeliveryMsg)}</span>

@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { loadSellerRetailPrices } from "./sellerPricing.server";
 import { recordImageOutcomes, resolveImagesForImport } from "./importMediaSelection.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
@@ -28,10 +29,6 @@ import {
  */
 export interface ImportOptions {
   publish?: boolean;
-  markupPercent?: number;
-  /** Minor units (cents). `null` clears, `undefined` keeps the stored value. */
-  customWholesalePrice?: number | null;
-  customRetailPrice?: number | null;
   resync?: boolean;
   /**
    * The network seam for staged uploads, so a test can run an import that sends
@@ -65,6 +62,29 @@ interface ImportableVariant {
   suggestedRetailPrice: number;
   costPrice: number | null;
   inventory: number;
+  /**
+   * The seller's own price for this variant, already resolved against the
+   * family's older override — the number their listing shows.
+   *
+   * Null means "no opinion", and the catalogue's suggested retail is used; see
+   * `resolveRetailCents`. Resolved before it gets here rather than looked up
+   * inside the price call, so that the refusal below and the price that is
+   * actually sent are the same calculation. They used to be two.
+   *
+   * NOT `costPrice` AND NOT `wholesalePrice`. What the variant costs the seller
+   * is theirs to see and not to set, and it is sent separately as the store's
+   * "cost per item" — see `sellerCostFor`.
+   */
+  sellerRetailPrice?: number | null;
+  /** Optional barcode/UPC, sent as the store variant's barcode when present. */
+  barcode?: string | null;
+  /**
+   * The variant's own option pairs, e.g. Size = King. Empty for a product sold
+   * as one thing, which the store then receives as a single "Title" option.
+   */
+  variantOptions?: { name: string; value: string }[];
+  /** Canonical kilograms, converted from Odoo's weight at import. */
+  productWeightKg?: number | string | { toString(): string } | null;
 }
 
 interface ImportableProduct {
@@ -72,6 +92,8 @@ interface ImportableProduct {
   name: string;
   description: string | null;
   category: string;
+  /** The family code, sent to the store as a metafield. Not a SKU. */
+  productCode: string;
   variants: ImportableVariant[];
   mediaAssets: ImportableMediaAsset[];
 }
@@ -93,10 +115,19 @@ interface SellerLike {
   storeName: string;
 }
 
+/**
+ * What a previous import left behind: which store product it created, and which
+ * store variant each MoonVella variant became.
+ *
+ * NO PRICES, AND THEIR ABSENCE IS THE POINT. These rows used to carry the
+ * seller's retail override too, which made the import a second writer of a
+ * number the seller owns — and an import called without a price would have wiped
+ * one. The seller's price lives in `SellerVariantPrice` now and is read from
+ * there by `importProductForSeller`, so this interface is identity only, which
+ * is all a mapping ever was.
+ */
 interface ExistingMapping {
   shopifyProductId: string | null;
-  customWholesalePrice: number | null;
-  customRetailPrice: number | null;
   variantMappings: {
     productVariantId: string;
     shopifyVariantId: string;
@@ -106,9 +137,6 @@ interface ExistingMapping {
 
 interface ResolvedPricing {
   publish?: boolean;
-  markupPercent: number;
-  customWholesalePrice: number | null;
-  customRetailPrice: number | null;
   images: ImportImageRequest[];
   /** Test seam for staged uploads; see `ImportOptions.transferFetch`. */
   transferFetch?: TransferFetch;
@@ -185,13 +213,60 @@ const INVENTORY_SET = `#graphql
 const LOCATIONS_QUERY = `#graphql
   query MoonVellaLocations { locations(first: 1) { nodes { id } } }`;
 
+/**
+ * The option structure a store product already has.
+ *
+ * Read only on the re-sync path, and only to answer one question: can this
+ * product accept the options the catalogue now describes? A product's options
+ * are fixed at creation — every variant must carry one value per option — so a
+ * product imported before this mapping existed has a single "Title" option, and
+ * sending a new variant with `Size` would ask the store to add an option that
+ * its existing variants have no value for.
+ */
+const PRODUCT_OPTIONS_QUERY = `#graphql
+  query MoonVellaProductOptions($id: ID!) {
+    product(id: $id) { options { name } }
+  }`;
+
+/**
+ * The price a variant is listed at, as a Shopify decimal string.
+ *
+ * THREE SOURCES, IN THE ORDER THE SELLER'S OWN DECISION COMES FIRST:
+ *
+ *   1. the variant's own price, which is what the seller typed in the app;
+ *   2. the family's older override, which is where that number used to live and
+ *      is still honoured so a store that set one keeps the price it has;
+ *   3. the catalogue's suggested retail.
+ *
+ * The first two are resolved into `sellerRetailPrice` before this is called —
+ * see `importProductForSeller` — so by the time a price is formatted the choice
+ * has already been made, once, for the guard and for the mutation alike.
+ *
+ * NO MARKUP TERM. There used to be a fourth path — a percentage applied to the
+ * suggested retail — and it has been removed rather than defaulted to zero. The
+ * seller's price is a number the seller chose, and the catalogue's figure is
+ * the default they start from; a multiplier on top of that is a second,
+ * invisible opinion about what the product should cost, and it cannot express
+ * "the King size is ten dollars more" in any case, because it moves the dearest
+ * variant furthest. The owner's instruction is that the suggested retail *is*
+ * the listed price and that the seller may change it, which leaves no room for
+ * a percentage of anything.
+ */
 export function retailPriceFor(
   suggestedRetailCents: number,
-  markupPercent = 0,
-  customRetailPrice?: number | null
+  sellerRetailPrice?: number | null
 ): string {
-  if (customRetailPrice != null) return (customRetailPrice / 100).toFixed(2);
-  return ((suggestedRetailCents * (100 + markupPercent)) / 100 / 100).toFixed(2);
+  const resolved = resolveRetailCents(suggestedRetailCents, sellerRetailPrice);
+  return (resolved / 100).toFixed(2);
+}
+
+/** The same resolution in cents, for the checks that must reason about it. */
+export function resolveRetailCents(
+  suggestedRetailCents: number,
+  sellerRetailPrice?: number | null
+): number {
+  if (sellerRetailPrice != null) return sellerRetailPrice;
+  return suggestedRetailCents;
 }
 
 /**
@@ -209,40 +284,67 @@ export function retailPriceFor(
  *     is how a shop ends up losing money on every unit without anyone having
  *     chosen to.
  *
- * So the answer is a refusal naming the variants, not a default. The override
- * for one store (`customRetailPrice`) is used when it is set, including when it
- * is set to something unusable — an explicit zero is a decision, and a decision
- * to sell at zero is refused rather than quietly replaced by the catalogue
- * figure.
+ * So the answer is a refusal naming the variants, not a default. A price the
+ * seller set is used when it is set, including when it is set to something
+ * unusable — an explicit zero is a decision, and a decision to sell at zero is
+ * refused rather than quietly replaced by the catalogue figure. (The action that
+ * writes a price refuses a zero as well, so a zero can only reach here from the
+ * old family-level screen. It is still refused rather than defaulted below,
+ * because that column is a price somebody chose.)
+ *
+ * PER VARIANT, because the price is per variant. It used to take one number for
+ * the whole family, which meant a family of three sizes was refused or accepted
+ * as a unit: the seller could not list the two sizes they had priced without
+ * also listing the one they had not. Now each variant is judged on its own
+ * price, and the refusal names the ones that are missing.
  */
 export function unpricedRetailVariants(
-  variants: { sku: string; name: string; suggestedRetailPrice: number }[],
-  customRetailPrice: number | null
+  variants: { sku: string; name: string; suggestedRetailPrice: number; sellerRetailPrice?: number | null }[]
 ): { sku: string; name: string }[] {
   return variants
-    .filter((variant) => {
-      const retail = customRetailPrice ?? variant.suggestedRetailPrice;
-      return !(retail > 0);
-    })
+    .filter((variant) => !(resolveRetailCents(variant.suggestedRetailPrice, variant.sellerRetailPrice) > 0))
     .map((variant) => ({ sku: variant.sku, name: variant.name }));
 }
 
-/** The refusal, in the seller's terms: what is missing and what to do about it. */
+/**
+ * The refusal, in the seller's terms: what is missing and what to do about it.
+ *
+ * IT NAMES THE CONTROL THAT FIXES IT. The refusal is read on the catalogue page
+ * by somebody who is holding a product card, and "set a suggested retail price"
+ * is only useful if it says where. The seller's screen now has one field per
+ * variant for exactly this, so the message points at it — and at the fact that
+ * the other variants are already fine, because a refusal that reads like the
+ * whole product failed is what makes a seller abandon an import that was one
+ * number away from working.
+ */
 export function retailPriceRefusal(unpriced: { sku: string; name: string }[]): string {
   const who = unpriced.map((variant) => variant.sku).join(", ");
   return (
-    `Import refused: ${unpriced.length} variant(s) have no retail price to sell at — ${who}. ` +
+    `Import refused: ${unpriced.length} variant(s) have no suggested retail price to sell at — ${who}. ` +
     `A store must show a price for every variant, so MoonVella will not list these at zero and ` +
-    `will not use your wholesale cost as the retail price. Set a suggested retail price on the ` +
-    `product in MoonVella, or a custom retail price for this store, then import again.`
+    `will not use your cost as the retail price. Set the Suggested Retail for ` +
+    `${unpriced.length === 1 ? "that variant" : "those variants"} on the product card, then import again.`
   );
 }
 
-export function wholesaleCostFor(
-  wholesaleCents: number,
-  customWholesalePrice?: number | null
-): number {
-  if (customWholesalePrice != null) return customWholesalePrice / 100;
+/**
+ * What the variant costs the seller, as a Shopify decimal string.
+ *
+ * THIS IS WHAT THE SELLER PAYS, WHICH IS NOT THE SAME NUMBER AS WHAT MOONVELLA
+ * PAID. It used to send `costPrice ?? wholesalePrice`: `costPrice` is
+ * MoonVella's acquisition cost, recorded in the admin behind an
+ * edit-cost permission, and it was being written into the merchant's own
+ * Shopify product as "cost per item" — visible to them, and the basis of every
+ * margin report their store produces. A seller whose Shopify admin says a
+ * pillow cost them $30 when they paid MoonVella $59.99 has a store that
+ * believes it is profitable on every unit it loses money on.
+ *
+ * `wholesalePrice` is the invoice price, and it is the only figure of the two
+ * the seller is entitled to see. There is no override: the owner's instruction
+ * is that the seller cannot change what the item costs them, and a per-store
+ * cost that only one side can see is the shape a billing dispute takes.
+ */
+export function sellerCostFor(wholesaleCents: number): number {
   return wholesaleCents / 100;
 }
 
@@ -501,6 +603,32 @@ async function fetchFirstLocationId(admin: AdminGraphql): Promise<string | null>
   }
 }
 
+/**
+ * The names of the options a store product already has, sorted.
+ *
+ * Best effort, like the location lookup: a store that cannot answer means the
+ * catalogue's mapping is sent, and a mismatch comes back as a userError naming
+ * the option rather than as an import that quietly did nothing.
+ */
+async function fetchProductOptionNames(
+  admin: AdminGraphql,
+  shopifyProductId: string
+): Promise<string[]> {
+  try {
+    const res = await admin.graphql(PRODUCT_OPTIONS_QUERY, {
+      variables: { id: shopifyProductId },
+    });
+    const json = await res.json();
+    const options = json?.data?.product?.options ?? [];
+    return options
+      .map((option: { name?: string }) => option.name)
+      .filter((name: unknown): name is string => typeof name === "string" && name.length > 0)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 /** Best effort; returns warning strings rather than throwing. */
 async function setInventoryQuantities(
   admin: AdminGraphql,
@@ -527,26 +655,169 @@ async function setInventoryQuantities(
   }
 }
 
+/**
+ * The product fields the store receives.
+ *
+ * WHAT IS SENT AND WHY EACH ONE IS HERE. `title` and `descriptionHtml` are the
+ * listing; `status` is whether shoppers can see it; `tags` are how the merchant
+ * finds the MoonVella lines in their own admin afterwards. The rest closes gaps
+ * that made an imported product a stranger in the store it was imported into:
+ *
+ *   • `productType` was not sent, so every product landed with an empty type
+ *     while the merchant's own products had one, and their collections and
+ *     filters — which read the type — quietly skipped everything MoonVella.
+ *   • `vendor` was not sent either. MoonVella is the vendor; a store where the
+ *     brand column is blank cannot answer "what do I stock from MoonVella".
+ *   • `seo` was not sent, so the search result for the listing was whatever the
+ *     store guessed from the body text. The product already has a name and a
+ *     description; the title and the first line of the description are the
+ *     honest summary of them, and they cost nothing to send.
+ *   • `productCode` goes as a metafield rather than into `sku`, because it
+ *     identifies the family and not the sellable unit — the schema comment on
+ *     `Product.productCode` says exactly this and has been waiting for it. A
+ *     store that later reads MoonVella's code off a product can match it to the
+ *     right family rather than to whichever size happened to be imported first.
+ */
 function productInput(product: ImportableProduct, opts: ResolvedPricing, includeId?: string) {
+  const description = (product.description ?? "").trim();
+
   return {
     ...(includeId ? { id: includeId } : {}),
     title: product.name,
     descriptionHtml: product.description ?? "",
     status: opts.publish === false ? "DRAFT" : "ACTIVE",
     tags: ["MoonVella", product.category],
+    productType: product.category,
+    vendor: MOONVELLA_VENDOR,
+    seo: {
+      title: product.name,
+      description: (description || product.name).slice(0, 320),
+    },
+    metafields: [
+      {
+        namespace: "moonvella",
+        key: "product_code",
+        value: product.productCode,
+        type: "single_line_text_field",
+      },
+    ],
   };
 }
 
-function variantPriceInput(variant: ImportableVariant, opts: ResolvedPricing) {
+/**
+ * The variant's option values, as the store's own option structure.
+ *
+ * A SHOPIFY OPTION IS A NAME AND A SET OF VALUES, and `productVariantsBulkCreate`
+ * builds them from the `optionName` on each variant. Every MoonVella variant
+ * therefore has to say which option it belongs to and what its value is: a
+ * pillow sold in three sizes is ONE option called "Size" with three values, not
+ * three unrelated variants.
+ *
+ * WHAT WAS SENT BEFORE. Every variant was sent as `Title = <variant name>`,
+ * which the store accepts and which produces a product whose only option is
+ * "Title" with a value per variant. It looks plausible in the admin and is
+ * wrong in the two places it matters: the storefront renders a variant picker
+ * labelled "Title" holding "Standard", "Queen" and "King", and any collection
+ * or report that groups by option sees one meaningless option instead of a
+ * size. It also cannot express a second dimension — a colour and a size would
+ * both have had to be folded into the variant's name.
+ *
+ * The fallback to `Title` is deliberate and is not a leftover: a product sold
+ * as a single thing has no option rows, and Shopify requires at least one
+ * option value per variant. For those, the variant's own name is the honest
+ * value — it is what the seller sees in the catalogue.
+ *
+ * SORTED, so the store's option values come out in the order the merchant
+ * arranged them rather than in whatever order the rows were read.
+ */
+function mappedOptionValues(
+  variant: ImportableVariant
+): { optionName: string; name: string }[] {
+  const options = (variant.variantOptions ?? []).filter(
+    (option) => option.name?.trim() && option.value?.trim()
+  );
+
+  if (!options.length) return [{ optionName: "Title", name: variant.name }];
+
+  return options.map((option) => ({ optionName: option.name, name: option.value }));
+}
+
+/**
+ * The option values to send for a variant being ADDED to a product that already
+ * exists, given the options the store product already has.
+ *
+ * The catalogue's mapping is used when it matches, which is the normal case for
+ * a product imported by this code: a re-sync that meets a new size sends
+ * `Size = Queen` and the store files it under the option it already has.
+ *
+ * When it does not match, the store's own single option wins. That is not a
+ * fallback for convenience — a product whose only option is "Title" cannot
+ * accept a second option without every existing variant being given a value for
+ * it, and `productVariantsBulkCreate` will not do that. Sending the compatible
+ * shape keeps the variant creation working and leaves the option structure
+ * alone, which is the most that can be done from here.
+ *
+ * A product with several options that match nothing is sent the catalogue's
+ * mapping anyway. There is no compatible value to guess — the merchant chose
+ * those options by hand in their own admin — and an honest userError naming the
+ * mismatch is a better outcome than a variant silently filed under the wrong
+ * one.
+ */
+function optionValuesForStore(
+  storeOptionNames: string[],
+  variant: ImportableVariant
+): { optionName: string; name: string }[] {
+  const mapped = mappedOptionValues(variant);
+  const mappedNames = [...new Set(mapped.map((option) => option.optionName))].sort();
+
+  if (sameNames(mappedNames, storeOptionNames)) return mapped;
+  if (storeOptionNames.length === 1) {
+    return [{ optionName: storeOptionNames[0], name: variant.name }];
+  }
+  return mapped;
+}
+
+function sameNames(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((name, index) => name === b[index]);
+}
+
+/**
+ * The weight, in the unit the store's API expects.
+ *
+ * Stored canonically in kilograms (see `ProductVariant.productWeightKg`) and
+ * sent as KILOGRAMS rather than converted: the number the merchant typed is the
+ * number the carrier bills on, and round-tripping it through pounds to satisfy
+ * an imperial default would put a rounding error into a shipping label. A
+ * missing weight sends nothing at all — an absent weight is a fact about the
+ * record, and a zero would be read by the store as a product that weighs
+ * nothing.
+ */
+function weightMeasurement(variant: ImportableVariant): Record<string, unknown> {
+  const raw = variant.productWeightKg;
+  if (raw === null || raw === undefined) return {};
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return {};
+  return { measurement: { weight: { value, unit: "KILOGRAMS" } } };
+}
+
+function variantPriceInput(variant: ImportableVariant) {
+  const barcode = variant.barcode?.trim();
+
   return {
-    price: retailPriceFor(variant.suggestedRetailPrice, opts.markupPercent, opts.customRetailPrice),
+    price: retailPriceFor(variant.suggestedRetailPrice, variant.sellerRetailPrice),
     inventoryItem: {
       tracked: true,
-      cost: wholesaleCostFor(variant.costPrice ?? variant.wholesalePrice, opts.customWholesalePrice),
+      cost: sellerCostFor(variant.wholesalePrice),
       sku: variant.sku,
+      ...weightMeasurement(variant),
     },
+    ...(barcode ? { barcode } : {}),
   };
 }
+
+/** The vendor every imported product carries. */
+const MOONVELLA_VENDOR = "MoonVella";
 
 /**
  * Writes the record of what was imported, in the seller's own store.
@@ -572,8 +843,7 @@ function persistMappings(
   product: ImportableProduct,
   shopifyProductId: string,
   locationId: string | null,
-  resolved: { local: ImportableVariant; shopifyVariant: ShopifyVariant | null }[],
-  opts: ResolvedPricing
+  resolved: { local: ImportableVariant; shopifyVariant: ShopifyVariant | null }[]
 ) {
   const sellerId = seller.id;
   const provider = "SHOPIFY";
@@ -593,9 +863,24 @@ function persistMappings(
         importStatus: "SUCCESS",
         isActive: true,
         shopifyVariantIds: JSON.stringify(shopifyVariantIds),
-        customWholesalePrice: opts.customWholesalePrice,
-        customRetailPrice: opts.customRetailPrice,
       },
+      /*
+       * THE PRICES ARE NOT WRITTEN HERE, AND THAT IS THE POINT.
+       *
+       * `SellerProduct.customWholesalePrice` and `customRetailPrice` are the
+       * family-level overrides from the screen that had one price box per
+       * product. They used to be overwritten with whatever the import was
+       * passed, which was harmless only because the form sent back the same
+       * numbers. Now that the seller's price lives on the variant row and is
+       * written by the action that edits it, an import that echoed a value back
+       * would be a second writer of a price the seller owns — and an import
+       * called with no price at all would wipe a legacy override that a store
+       * is still listed at.
+       *
+       * So the import reads prices and writes mappings, and nothing else. The
+       * family columns keep whatever they were set to; see `customRetailPrice`
+       * on the interface for why they are still read.
+       */
       update: {
         shopifyProductId,
         importedAt: new Date(),
@@ -603,8 +888,6 @@ function persistMappings(
         lastImportError: null,
         isActive: true,
         shopifyVariantIds: JSON.stringify(shopifyVariantIds),
-        customWholesalePrice: opts.customWholesalePrice,
-        customRetailPrice: opts.customRetailPrice,
       },
     });
 
@@ -715,9 +998,9 @@ async function createNewProduct(
   const warnings = [...upload.warnings];
 
   const variantInputs = product.variants.map((variant) => ({
-    optionValues: [{ optionName: "Title", name: variant.name }],
+    optionValues: mappedOptionValues(variant),
     sku: variant.sku,
-    ...variantPriceInput(variant, opts),
+    ...variantPriceInput(variant),
   }));
 
   let createdVariants: ShopifyVariant[] = [];
@@ -771,14 +1054,7 @@ async function createNewProduct(
 
   await persistMediaOutcomes(seller.id, product.id, upload.outcomes);
 
-  const result = await persistMappings(
-    seller,
-    product,
-    shopifyProductId,
-    locationId,
-    resolved,
-    opts
-  );
+  const result = await persistMappings(seller, product, shopifyProductId, locationId, resolved);
 
   await recordAudit({
     actorType: "MERCHANT",
@@ -820,6 +1096,12 @@ async function resyncExistingProduct(
   const shopifyProductId = existing.shopifyProductId as string;
   const warnings: string[] = [];
 
+  // Read before anything is sent, because it decides the shape of the variant
+  // inputs below and the product update above it is not reversible in the
+  // meantime. A store that does not answer leaves the list empty, which sends
+  // the catalogue's mapping — see `optionValuesForStore`.
+  const storeOptionNames = await fetchProductOptionNames(admin, shopifyProductId);
+
   const updateRes = await admin.graphql(PRODUCT_UPDATE, {
     variables: { product: productInput(product, opts, shopifyProductId) },
   });
@@ -857,12 +1139,12 @@ async function resyncExistingProduct(
   for (const variant of product.variants) {
     const mapping = mappingByVariant.get(variant.id);
     if (mapping) {
-      updateInputs.push({ id: mapping.shopifyVariantId, ...variantPriceInput(variant, opts) });
+      updateInputs.push({ id: mapping.shopifyVariantId, ...variantPriceInput(variant) });
     } else {
       createInputs.push({
-        optionValues: [{ optionName: "Title", name: variant.name }],
+        optionValues: optionValuesForStore(storeOptionNames, variant),
         sku: variant.sku,
-        ...variantPriceInput(variant, opts),
+        ...variantPriceInput(variant),
       });
     }
   }
@@ -951,14 +1233,7 @@ async function resyncExistingProduct(
 
   await persistMediaOutcomes(seller.id, product.id, upload.outcomes);
 
-  const result = await persistMappings(
-    seller,
-    product,
-    shopifyProductId,
-    locationId,
-    resolved,
-    opts
-  );
+  const result = await persistMappings(seller, product, shopifyProductId, locationId, resolved);
 
   await recordAudit({
     actorType: "MERCHANT",
@@ -1007,7 +1282,16 @@ export async function importProductForSeller(
   const product = await prisma.product.findUnique({
     where: { id: productId },
     include: {
-      variants: { where: { isActive: true }, orderBy: { sku: "asc" } },
+      variants: {
+        where: { isActive: true },
+        orderBy: { sku: "asc" },
+        include: {
+          // The variant's own option pairs — Size = King — which become the
+          // store product's option structure. Ordered the way the merchant
+          // arranged them so the storefront's picker matches the catalogue's.
+          variantOptions: { orderBy: { sortOrder: "asc" }, select: { name: true, value: true } },
+        },
+      },
       // Only approved, seller-visible images may leave for a merchant store,
       // which is the same gate the seller catalog applies.
       mediaAssets: {
@@ -1028,14 +1312,36 @@ export async function importProductForSeller(
     include: { variantMappings: true },
   });
 
-  const customWholesalePrice =
-    options.customWholesalePrice !== undefined
-      ? options.customWholesalePrice
-      : existing?.customWholesalePrice ?? null;
-  const customRetailPrice =
-    options.customRetailPrice !== undefined
-      ? options.customRetailPrice
-      : existing?.customRetailPrice ?? null;
+  /*
+   * THE SELLER'S PRICE FOR EACH VARIANT, READ AND RESOLVED ONCE, HERE.
+   *
+   * Three sources, in the order the seller's own decision comes first: the price
+   * the seller set for this variant, then the family's older override, then the
+   * catalogue's suggested retail — which `resolveRetailCents` applies at the
+   * moment a price is formatted, so a variant with neither simply carries null.
+   *
+   * IT IS READ FROM THE DATABASE ON EVERY IMPORT, INCLUDING A RE-SYNC, rather
+   * than passed in. That is what makes the number typed on the catalogue card
+   * the number the store is listed at, and it is why an import cannot be talked
+   * into a price by whatever a form happened to post.
+   *
+   * Resolving it here rather than inside the price call is what makes the guard
+   * below and the price that is actually sent the same calculation. They were
+   * two, once: the guard took one family-level number while the price call
+   * applied a markup on top of the catalogue figure, so a variant the guard had
+   * approved could still be listed at a number nobody chose.
+   */
+  const sellerPriceByVariant = await loadSellerRetailPrices(
+    sellerId,
+    product.variants.map((variant) => variant.id)
+  );
+  const familyRetailOverride = existing?.customRetailPrice ?? null;
+
+  const variants: ImportableVariant[] = product.variants.map((variant) => ({
+    ...variant,
+    sellerRetailPrice:
+      sellerPriceByVariant.get(variant.id) ?? familyRetailOverride ?? null,
+  }));
 
   /*
    * EVERY VARIANT MUST HAVE A RETAIL PRICE BEFORE ANYTHING IS SENT.
@@ -1044,12 +1350,11 @@ export async function importProductForSeller(
    * cannot refuse — it formats a number, and given nothing it formats "0.00",
    * which Shopify accepts. A store listed at zero takes real orders at zero.
    *
-   * The seller's own custom price is carried forward from the stored record
-   * when this call does not pass one, so a re-sync of a store that already has
-   * a price never re-derives it from the catalogue: a retail price set for one
-   * store survives every later import of the same product.
+   * A price the seller set for this store is read from the stored record on
+   * every import, so a re-sync never re-derives it from the catalogue: a retail
+   * price set for one store survives every later import of the same product.
    */
-  const unpriced = unpricedRetailVariants(product.variants, customRetailPrice);
+  const unpriced = unpricedRetailVariants(variants);
   if (unpriced.length > 0) {
     const message = retailPriceRefusal(unpriced);
     await markImportFailed(sellerId, productId, message);
@@ -1083,9 +1388,6 @@ export async function importProductForSeller(
   const selection = await resolveImagesForImport(sellerId, productId);
   const opts: ResolvedPricing = {
     publish: options.publish,
-    markupPercent: options.markupPercent ?? 0,
-    customWholesalePrice,
-    customRetailPrice,
     ...(options.transferFetch ? { transferFetch: options.transferFetch } : {}),
     images: selection.images.map((image) => ({
       mediaAssetId: image.mediaAssetId,
@@ -1098,11 +1400,18 @@ export async function importProductForSeller(
     })),
   };
 
+  /*
+   * The product the rest of this function works on carries the resolved
+   * per-variant price, not the catalogue's raw one. The guard above and the
+   * price that gets sent are then the same number by construction.
+   */
+  const priced: ImportableProduct = { ...product, variants };
+
   try {
     if (existing?.shopifyProductId && existing.variantMappings.length > 0) {
-      return await resyncExistingProduct(admin, seller, product, existing, opts);
+      return await resyncExistingProduct(admin, seller, priced, existing, opts);
     }
-    return await createNewProduct(admin, seller, product, opts);
+    return await createNewProduct(admin, seller, priced, opts);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Import failed";
     await setIntegrationState("product_import", { status: "FAILED", error: message });

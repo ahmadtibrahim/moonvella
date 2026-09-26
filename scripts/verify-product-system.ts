@@ -2,13 +2,17 @@
  * Phase 21 — the numbered acceptance suite for the product, variant, media,
  * document and marketing system.
  *
- * SIXTY-FOUR CHECKS, IN TEN GROUPS. The numbering is not decoration: each
+ * EIGHTY-SIX CHECKS, IN TEN GROUPS. The numbering is not decoration: each
  * group corresponds to one promise the directive makes, and `check()` asserts
  * that the number it is handed is the next one, so a check cannot be dropped or
  * reordered without the suite failing on the numbering itself. The first
  * fifty-nine are the directive's; group J was added when Odoo became the
  * pricing authority, and covers the two price rules that decide what may be
- * listed — that suggested retail is optional, and that wholesale is not.
+ * listed — that suggested retail is optional, and that wholesale is not. Two
+ * more were added when the seller's price moved from the family to the
+ * variant: one for the old family price still being honoured, one for the two
+ * numbers a store is actually given. The final two cover the inventory push:
+ * who a quantity change is sent to, and that this suite sends it to nobody.
  *
  * WHAT THIS IS NOT. It is not a unit-test suite. Every check goes through the
  * same service functions the admin interface calls — the ones that already
@@ -66,8 +70,9 @@ import { permissionsFor, can } from "../app/services/permissions";
 import { checkProductCode, PRODUCT_CODE_HELP } from "../app/utils/productCode";
 import { isSafeEntryPath } from "../app/utils/zip";
 import { intakeOrder } from "../app/services/orderIntake.server";
-import { importProductForSeller } from "../app/services/shopifyImport.server";
+import { importProductForSeller, retailPriceFor, sellerCostFor } from "../app/services/shopifyImport.server";
 import { readObject, deleteObject, objectExists } from "../app/services/storage.server";
+import { planInventoryPush, pushInventoryForVariants } from "../app/services/inventoryPush.server";
 
 const prisma = new PrismaClient();
 
@@ -405,7 +410,7 @@ async function main() {
   // storage, so it points at an external address and its key names no object.
   // The system has to tell that apart from a file that has genuinely gone.
   const legacyKey = `legacy-${suffix.toLowerCase()}-vpslegacy`;
-  const legacy = await prisma.mediaAsset.create({
+  await prisma.mediaAsset.create({
     data: {
       productId: family.id,
       category: "WHITE_BACKGROUND_IMAGE",
@@ -1545,12 +1550,24 @@ async function main() {
   );
 
   // 64
-  // The seller's own retail price for this store, set beforehand. It is the
+  // The seller's own retail price for this variant, set beforehand. It is the
   // price the store is meant to show, so the import is not refused — and the
   // sentinel is what proves the guard was passed rather than short-circuited.
+  //
+  // It is written to `SellerVariantPrice`, the table the seller's own screen
+  // writes, and NOT to the family's older column: the import must read the
+  // price the seller set for the size, and a test that satisfied it through the
+  // legacy fallback would pass while the real path was broken.
+  const strVariant = await prisma.productVariant.findFirstOrThrow({
+    where: { sku: `${CODE}-STR-1` },
+    select: { id: true },
+  });
   await prisma.sellerProduct.update({
     where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
-    data: { customRetailPrice: 6400, importStatus: "NEVER", lastImportError: null },
+    data: { importStatus: "NEVER", lastImportError: null },
+  });
+  await prisma.sellerVariantPrice.create({
+    data: { sellerId: seller.id, productVariantId: strVariant.id, retailPrice: 6400 },
   });
   // The function reports a failed import rather than throwing — the sentinel's
   // message comes back on the result, which is what "the guard was passed"
@@ -1563,15 +1580,17 @@ async function main() {
   } catch (error) {
     sentinelReached = error instanceof Error ? error.message : String(error);
   }
-  const keptRetail = await prisma.sellerProduct.findUnique({
-    where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
+  const keptRetail = await prisma.sellerVariantPrice.findUnique({
+    where: {
+      sellerId_productVariantId: { sellerId: seller.id, productVariantId: strVariant.id },
+    },
   });
   check(
     64,
-    "A retail price the seller already set for this store is used instead, and survives the import attempt",
+    "A retail price the seller already set for this variant is used instead, and survives the import attempt",
     sentinelReached === "SENTINEL: a Shopify call was attempted" &&
-      keptRetail?.customRetailPrice === 6400,
-    `${sentinelReached || "the guard refused again"} / retail ${keptRetail?.customRetailPrice}`
+      keptRetail?.retailPrice === 6400,
+    `${sentinelReached || "the guard refused again"} / retail ${keptRetail?.retailPrice}`
   );
 
   /* ======================================================================= */
@@ -2019,10 +2038,168 @@ async function main() {
     `${refusedReport.blockers.length} blocker(s): ${refusedReport.blockers.map((row) => row.key).join(", ")}`
   );
 
+  // 83
+  /*
+   * THE OLD FAMILY-LEVEL PRICE IS STILL HONOURED, and this check is what keeps
+   * it that way. A store that set one price for a family under the screen that
+   * had a single box was listed at that price. The price now belongs to the
+   * variant, and the family figure has to keep pricing every variant that has
+   * none of its own — otherwise the next import silently moves that store to
+   * MoonVella's suggested retail, which is a price change nobody chose. Written
+   * directly, because the screen that produced this state no longer exists.
+   */
+  await prisma.sellerVariantPrice.deleteMany({
+    where: { sellerId: seller.id, productVariantId: strVariant.id },
+  });
+  await prisma.sellerProduct.update({
+    where: { sellerId_productId: { sellerId: seller.id, productId: storeFamily.id } },
+    data: { customRetailPrice: 5100 },
+  });
+  let legacyReached = "";
+  try {
+    const result = await importProductForSeller(sentinel, seller.id, storeFamily.id);
+    legacyReached = result.ok ? "the import reported success" : result.error ?? "";
+  } catch (error) {
+    legacyReached = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    83,
+    "A price set under the old family-level screen still prices every variant that has none of its own",
+    legacyReached === "SENTINEL: a Shopify call was attempted",
+    legacyReached || "the guard refused, so the family price was not read"
+  );
+
+  // 84
+  /*
+   * THE TWO NUMBERS A STORE IS GIVEN, AT THE MOMENT THEY ARE FORMATTED.
+   *
+   * `retailPriceFor` is what the listing is priced at: the seller's own figure
+   * when they have set one, and the catalogue's recommendation when they have
+   * not. There is no third path — the markup percentage that used to be applied
+   * here is gone, and a price the seller typed must reach Shopify unchanged
+   * rather than multiplied by anything.
+   *
+   * `sellerCostFor` is what the variant costs THE SELLER, which is the price
+   * MoonVella invoices and not MoonVella's own acquisition cost. Sending the
+   * latter was the defect: a store whose "cost per item" is below what it
+   * actually pays believes it is profitable on every unit it loses money on.
+   */
+  check(
+    84,
+    "The listed price is the seller's own figure or the catalogue's, and the cost sent is what the seller pays",
+    retailPriceFor(12800, 14900) === "149.00" &&
+      retailPriceFor(12800, null) === "128.00" &&
+      retailPriceFor(12800, undefined) === "128.00" &&
+      sellerCostFor(5999) === 59.99,
+    `${retailPriceFor(12800, 14900)} / ${retailPriceFor(12800, null)} / cost ${sellerCostFor(5999)}`
+  );
+
+  // 85
+  /*
+   * WHO A QUANTITY CHANGE IS SENT TO, DECIDED WITHOUT CALLING ANYONE.
+   *
+   * The push itself is a Shopify call, so the suite runs with it switched off —
+   * see `NO_INVENTORY_PUSH` in run-verify.mjs; the clone's mappings point at a
+   * real store's inventory items and a suite must not move a shelf. What is
+   * tested instead is the whole of the decision: the store that is approved and
+   * has an inventory item is told, and each of the three reasons not to tell one
+   * — a store that is not approved, a mapping the import never recorded a
+   * Shopify inventory item for, and the seller's own auto-sync switch — keeps
+   * that store's shelf exactly as it is.
+   *
+   * The switch being off is itself checked, because a suite that silently
+   * pushed would be the failure this whole arrangement exists to prevent.
+   */
+  const planned = planInventoryPush([
+    {
+      mappingId: "m1",
+      shopifyInventoryItemId: "gid://shopify/InventoryItem/1",
+      shopifyLocationId: null,
+      sellerId: "s1",
+      shopDomain: "one.myshopify.com",
+      sellerStatus: "APPROVED",
+      autoSyncInventory: true,
+    },
+    {
+      mappingId: "m2",
+      shopifyInventoryItemId: "gid://shopify/InventoryItem/2",
+      shopifyLocationId: null,
+      sellerId: "s1",
+      shopDomain: "one.myshopify.com",
+      sellerStatus: "APPROVED",
+      autoSyncInventory: true,
+    },
+    {
+      mappingId: "m3",
+      shopifyInventoryItemId: "gid://shopify/InventoryItem/3",
+      shopifyLocationId: null,
+      sellerId: "s2",
+      shopDomain: "two.myshopify.com",
+      sellerStatus: "PENDING",
+      autoSyncInventory: true,
+    },
+    {
+      mappingId: "m4",
+      shopifyInventoryItemId: null,
+      shopifyLocationId: null,
+      sellerId: "s3",
+      shopDomain: "three.myshopify.com",
+      sellerStatus: "APPROVED",
+      autoSyncInventory: true,
+    },
+    {
+      mappingId: "m5",
+      shopifyInventoryItemId: "gid://shopify/InventoryItem/5",
+      shopifyLocationId: null,
+      sellerId: "s4",
+      shopDomain: "four.myshopify.com",
+      sellerStatus: "APPROVED",
+      autoSyncInventory: false,
+    },
+  ]);
+  const plannedOne = planned.byStore.get("s1") ?? [];
+  check(
+    85,
+    "A quantity goes to approved stores that have an inventory item and auto-sync on, and to nobody else",
+    planned.byStore.size === 1 &&
+      plannedOne.length === 2 &&
+      plannedOne.every((candidate) => candidate.shopifyInventoryItemId) &&
+      planned.skipped.length === 3 &&
+      planned.skipped.every((row) => Boolean(row.reason)) &&
+      ["s2", "s3", "s4"].every(
+        (sellerId) => !planned.byStore.has(sellerId)
+      ),
+    `${planned.byStore.size} store(s), ${plannedOne.length} in it, ${planned.skipped.length} skipped: ${planned.skipped
+      .map((row) => row.reason)
+      .join(" / ")}`
+  );
+
+  // 86
+  /*
+   * AND NOTHING LEAVES THE PROCESS WHILE THE SUITE IS RUNNING.
+   *
+   * The switch is the promise this suite makes to the storefront the clone was
+   * taken from. It is asserted rather than assumed, so the day somebody runs a
+   * suite without the runner's environment, this fails instead of quietly
+   * writing quantities into a store.
+   */
+  const pushOutcome = await pushInventoryForVariants([]);
+  const disabledOutcome = await pushInventoryForVariants([measured.id]);
+  check(
+    86,
+    "With the push switched off, a push reports that it reached no store instead of reaching one",
+    pushOutcome.pushed === 0 &&
+      disabledOutcome.disabled === true &&
+      disabledOutcome.pushed === 0 &&
+      disabledOutcome.failures.length === 0 &&
+      disabledOutcome.quantities.length === 1,
+    `disabled=${disabledOutcome.disabled} pushed=${disabledOutcome.pushed} considered=${disabledOutcome.quantities.length}`
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
-  if (total !== 82) {
+  if (total !== 86) {
     failures += 1;
-    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave and 13 from the media-scope and publication correction`);
+    console.log(`FAIL  the suite ran ${total} checks; 59 are from the original directive, 5 from the pricing wave, 5 from the shipping-and-media wave, 13 from the media-scope and publication correction, 2 from the seller-pricing wave and 2 from the inventory-push wave`);
   }
 }
 

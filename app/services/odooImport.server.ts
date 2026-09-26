@@ -89,6 +89,7 @@ import {
   type OdooRecord,
 } from "./odoo.server";
 import { checkProductCode } from "~/utils/productCode";
+import { pushProductsInventory, queueInventoryRetries } from "./inventoryPush.server";
 
 /**
  * The currency MoonVella bills a seller in. Odoo's own currency for a product
@@ -1251,6 +1252,19 @@ export async function importOdooProducts(options: {
     templates: [],
   };
 
+  /*
+   * The products whose stock figures this run actually moved.
+   *
+   * Odoo is the authority on what is on the shelf, and this sync is how that
+   * authority reaches the catalogue — so it is also how it has to reach the
+   * storefronts. Collected per product rather than per variant because the push
+   * sends one call per store carrying every size, and only for what changed:
+   * re-sending the whole catalogue every six hours would be thousands of
+   * pointless inventory writes a day, and a store whose quantities are steady
+   * would see no difference at all.
+   */
+  const stockMoved = new Set<string>();
+
   for (const template of writable) {
     await prisma.$transaction(async (tx) => {
       const existing = await tx.externalProductMapping.findFirst({
@@ -1381,7 +1395,12 @@ export async function importOdooProducts(options: {
             shopDomain: database,
             externalVariantId: String(variant.odooVariantId),
           },
-          select: { variantId: true },
+          select: {
+            variantId: true,
+            // Read to answer one question: did the shelf move since the last
+            // sync? Only the variants where it did are pushed to the stores.
+            variant: { select: { inventory: true, reserved: true, isActive: true } },
+          },
         });
 
         const variantFields = {
@@ -1429,6 +1448,22 @@ export async function importOdooProducts(options: {
                 suggestedRetailPrice: 0,
               },
             });
+
+        /*
+         * A NEW VARIANT ALWAYS COUNTS, because its quantity has never been sent
+         * anywhere. An existing one counts when any of the three figures a store
+         * can be affected by has moved — the sellable count, what is held back,
+         * or whether the size is on sale at all.
+         */
+        const previous = existingVariant?.variant;
+        if (
+          !previous ||
+          previous.inventory !== variantFields.inventory ||
+          previous.reserved !== variantFields.reserved ||
+          previous.isActive !== variantFields.isActive
+        ) {
+          stockMoved.add(product.id);
+        }
 
         await tx.externalVariantMapping.upsert({
           where: {
@@ -1562,6 +1597,19 @@ export async function importOdooProducts(options: {
       })),
     },
   });
+
+  /*
+   * THE SHELF HAS MOVED, SO THE STOREFRONTS ARE TOLD.
+   *
+   * Runs after the audit, outside every transaction, and it never throws: the
+   * sync has already written the catalogue successfully, and a Shopify outage
+   * must not turn that into a failed sync — the numbers here are still right,
+   * and a retry is queued for the stores that were not reached.
+   */
+  if (stockMoved.size) {
+    const pushed = await pushProductsInventory([...stockMoved]);
+    await queueInventoryRetries(pushed);
+  }
 
   return { preview, executed: true, result };
 }

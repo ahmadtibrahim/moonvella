@@ -513,6 +513,43 @@ body {
   box-shadow: 0 0 0 3px var(--accent-blue);
 }
 
+/*
+ * The currency bar, which sits above every page under the merchant layout.
+ *
+ * Deliberately quiet: it is a reading preference, and it must not compete with
+ * the page's own headings for attention. The note beside it is the part that
+ * matters — it carries the rate and the day that rate was true — so it is
+ * allowed to wrap and to be read, rather than truncated to a chip.
+ */
+.mv-currency-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.5rem 1rem;
+  margin: 0 auto 0.5rem;
+  max-width: 1400px;
+}
+
+.mv-currency-label {
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.mv-currency-bar .mv-filter-select {
+  min-width: 0;
+  padding: 0.35rem 0.625rem;
+  font-size: 0.8125rem;
+}
+
+.mv-currency-note {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
 .mv-search-input {
   flex: 1;
   min-width: 280px;
@@ -699,6 +736,16 @@ body {
 .mv-settings-checkbox span {
   font-size: 0.875rem;
   color: var(--text-primary);
+}
+
+/* The sentence under a setting that says what it does. A setting with no
+   explanation is one a seller has to guess at, and the guess is usually that it
+   works the way they would have written it. */
+.mv-settings-hint {
+  margin: -0.25rem 0 0.75rem 1.75rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
 }
 
 /* Billing Info */
