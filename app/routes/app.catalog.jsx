@@ -37,7 +37,17 @@ import RetailPriceField from "../components/RetailPriceField";
  */
 export const loader = async ({ request }) =>
   withMerchantAccess(request, "VIEW", async (context) => {
-    const products = await listCatalog(context);
+    /*
+     * The context carries `seller` (the whole row), never `sellerId` — so the
+     * id is picked off here. Without it, `listCatalog` skips the seller-price
+     * read and a price the seller saved shows as never set: the field falls
+     * back to the suggestion and the "Use MoonVella's price" reset never
+     * appears, even though the row is in `SellerVariantPrice`.
+     */
+    const products = await listCatalog({
+      canViewWholesale: context.canViewWholesale,
+      sellerId: context.seller?.id ?? null,
+    });
 
     /*
      * The marketing pack URL is minted here rather than on the client, because
