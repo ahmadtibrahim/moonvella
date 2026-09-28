@@ -1121,7 +1121,7 @@ async function main() {
           order: {
             id: `gid://shopify/Order/${REPLAY_ORDER}`,
             name: "#1001",
-            orderNumber: 1001,
+            number: 1001,
             email: "buyer@example.com",
             currencyCode: "CAD",
             displayFinancialStatus: "PAID",
@@ -1580,18 +1580,14 @@ async function main() {
    * line is a variant this seller does not list. That is genuinely "no MoonVella
    * items", and it must still be recorded as the success it is.
    */
-  const readable = await runDelivery(
-    unreadableShop,
-    unreadableSeller.id,
-    UNREADABLE_ORDER + 1,
-    makeAdmin((query) =>
+  const readableAdmin = makeAdmin((query) =>
       query.includes("MoonVellaOrderForEvent")
         ? {
             data: {
               order: {
                 id: `gid://shopify/Order/${UNREADABLE_ORDER + 1}`,
                 name: "#1002",
-                orderNumber: 1002,
+                number: 1002,
                 email: null,
                 currencyCode: "CAD",
                 displayFinancialStatus: "PAID",
@@ -1620,13 +1616,48 @@ async function main() {
               },
             },
           }
-        : { data: null }),
-  );
+        : { data: null });
+  const readable = await runDelivery(unreadableShop, unreadableSeller.id, UNREADABLE_ORDER + 1, readableAdmin);
   check(
     "a readable order with none of our lines is still the success it is",
     readable?.status === "SUCCESS" && readable?.errorMessage === "No MoonVella items",
     `${readable?.status}${readable?.errorMessage ? ` — ${readable.errorMessage}` : ""}`,
   );
+
+  /*
+   * THE QUERY ITSELF, READ BACK OFF THE CLIENT THAT SENT IT.
+   *
+   * The store's schema is the authority on its own field names and this suite
+   * cannot reach it, so a field the schema does not have is answered happily by
+   * a stub. That is exactly what happened: the hydration query asked for
+   * `orderNumber`, which `Order` does not have — the field is `number` — and
+   * every check here passed while the deployed system answered "Field
+   * 'orderNumber' doesn't exist on type 'Order'" for every replay, refund and
+   * routing event. Found by running it for real; the field list was then read
+   * off the live schema by introspection.
+   *
+   * This cannot prove the query is valid. It can prove the two names that were
+   * measured are the two names being sent, which is the most this side of the
+   * wire can honestly claim.
+   *
+   * The comments come out first. The query explains, in a GraphQL comment, that
+   * it used to ask for the wrong name — and a first cut of this check read that
+   * sentence and failed the fixed query for containing the word it was warning
+   * about. Prose cannot break the store; only the fields can, so only the
+   * fields are read.
+   */
+  const hydrationQuery = (
+    readableAdmin.calls.find((call) => call.query.includes("MoonVellaOrderForEvent"))?.query ?? ""
+  )
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+  check(
+    "the hydration query asks the store for the order number under its real field name",
+    /\bnumber\b/.test(hydrationQuery) && !/\borderNumber\b/.test(hydrationQuery),
+    hydrationQuery.includes("orderNumber") ? "still asks for orderNumber" : "asks for number",
+  );
+
 
   /* ====================================================================== */
   /* Done                                                                    */

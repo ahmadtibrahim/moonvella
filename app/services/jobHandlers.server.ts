@@ -771,13 +771,28 @@ async function hydrateOrderPayload(input: {
         return (await unauthenticated.admin(seller.shopDomain)).admin as unknown as AdminClient;
       })());
 
+    /*
+     * THE ORDER NUMBER IS `number`, AND ASKING FOR `orderNumber` BROKE EVERY
+     * HYDRATION. The deployment answered "Field 'orderNumber' doesn't exist on
+     * type 'Order'" — this is the fetch every replay, refund and routing event
+     * goes through, so all of them failed. The suite could not see it: its store
+     * is a stub that answers whatever the fixture says, so a field name the real
+     * schema does not have is a field name the stub happily returns. Found by
+     * running the replay against the deployed system; the field list was then
+     * read off the live schema by introspection, which is where `number`,
+     * `confirmationNumber` and `poNumber` come from and why `orderNumber` does
+     * not.
+     */
     const res = await admin.graphql(
       `#graphql
         query MoonVellaOrderForEvent($id: ID!) {
           order(id: $id) {
             id
             name
-            orderNumber
+            # The order number is "number" on this API version. See the note
+            # above the request: "orderNumber" does not exist on Order and
+            # asking for it failed every hydration.
+            number
             email
             currencyCode
             displayFinancialStatus
@@ -840,7 +855,7 @@ async function hydrateOrderPayload(input: {
       id: numericId(String(order.id)),
       order_id: numericId(String(order.id)),
       name: order.name,
-      order_number: order.orderNumber,
+      order_number: order.number,
       email: order.email,
       currency: order.currencyCode,
       financial_status: String(order.displayFinancialStatus ?? "").toLowerCase() || undefined,
