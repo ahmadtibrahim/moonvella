@@ -586,10 +586,20 @@ async function main() {
 
   const okOrder = await makeOrder(seller2.id);
   const created = await createOrReuseWholesalePayment(okOrder.id);
+  /*
+   * Building the bill must NOT touch Stripe.
+   *
+   * An earlier version created the PaymentIntent here, at bill time, which
+   * meant the seller could be sent a charge long before anyone asked for one
+   * and the intent was no longer tied to the moment of the decision. The bill
+   * is a priced record; the charge is the act. Keeping them apart is also what
+   * makes the idempotency key meaningful — it is claimed when the charge is
+   * attempted, not when the bill is drawn up.
+   */
   check(
-    "a real PaymentIntent was created with Stripe's id",
-    String(created.providerPaymentIntentId ?? "").startsWith("pi_"),
-    String(created.providerPaymentIntentId)
+    "building the bill does not create a PaymentIntent",
+    created.providerPaymentIntentId === null && created.status === "REQUIRES_PAYMENT",
+    `${created.status} / ${String(created.providerPaymentIntentId)}`
   );
 
   const actor = { actorId: "sandbox", actorName: "Sandbox" };
@@ -620,12 +630,12 @@ async function main() {
   const firstApply = await applyStripeEvent({
     id: paidEventId,
     type: "payment_intent.succeeded",
-    data: { object: { id: created.providerPaymentIntentId, metadata: { orderId: okOrder.id } } },
+    data: { object: { id: attempt?.providerPaymentIntentId, metadata: { orderId: okOrder.id } } },
   });
   const secondApply = await applyStripeEvent({
     id: paidEventId,
     type: "payment_intent.succeeded",
-    data: { object: { id: created.providerPaymentIntentId, metadata: { orderId: okOrder.id } } },
+    data: { object: { id: attempt?.providerPaymentIntentId, metadata: { orderId: okOrder.id } } },
   });
   check(
     "a repeated payment event is reported as a duplicate",

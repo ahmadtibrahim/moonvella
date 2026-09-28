@@ -49,7 +49,7 @@ import {
   scheduleProblem,
   type LocationSchedule,
 } from "./holidays";
-import { resolveFulfillmentOrders } from "./shopifyFulfillment.server";
+import { resolveFulfillmentOrders, type AdminClient } from "./shopifyFulfillment.server";
 import { assertBookingAddressesBookable, assertDeliveryAddressBookable } from "./addressValidation.server";
 
 /**
@@ -1466,7 +1466,21 @@ export async function resolveUnknownBooking(
 export async function syncShipmentTracking(
   shipmentId: string,
   actor: Actor,
-  opts?: { notifyCustomer?: boolean }
+  opts?: {
+    notifyCustomer?: boolean;
+    /**
+     * The store's admin client, when the caller already has one.
+     *
+     * Defaults to the real thing, which is what every production caller gets.
+     * It exists because the two decisions this function makes that are worth
+     * pinning — which fulfillment order is this shipment's, and which of its
+     * lines does this parcel actually fulfill — are decided from Shopify's
+     * answers, and both are decidable against a store that answers from a
+     * table. There is no other way to ask "would this send the wrong quantity"
+     * without sending it.
+     */
+    adminOverride?: AdminClient;
+  }
 ) {
   const shipment = await prisma.shipment.findUnique({
     where: { id: shipmentId },
@@ -1525,8 +1539,12 @@ export async function syncShipmentTracking(
   const notifyCustomer = Boolean(opts?.notifyCustomer) && !shipment.shopifyNotifiedAt;
 
   try {
-    const { unauthenticated } = await import("~/shopify.server");
-    const { admin } = await unauthenticated.admin(shipment.order.seller.shopDomain);
+    const admin =
+      opts?.adminOverride ??
+      (await (async () => {
+        const { unauthenticated } = await import("~/shopify.server");
+        return (await unauthenticated.admin(shipment.order.seller.shopDomain)).admin as unknown as AdminClient;
+      })());
 
     /*
      * Read the fulfillment order's lines first, so the quantities sent are ones
@@ -1535,7 +1553,7 @@ export async function syncShipmentTracking(
      * when they are missing, so a permission problem is reported as a permission
      * problem rather than as a failed fulfillment.
      */
-    const resolved = await resolveFulfillmentOrders(shipment.orderId);
+    const resolved = await resolveFulfillmentOrders(shipment.orderId, admin);
     const group =
       resolved.groups.find((g) => g.fulfillmentOrderId === shipment.order.shopifyFulfillmentOrderId) ??
       resolved.groups[0];

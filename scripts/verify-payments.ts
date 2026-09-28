@@ -67,6 +67,18 @@ async function main() {
       moonvellaDiscounts: 0,
       moonvellaTotal: 2598,
       paymentStatus: "PAID",
+      /*
+       * AWAITING_SELLER_PAYMENT, not the RECEIVED default.
+       *
+       * This suite writes its order straight to the database instead of taking
+       * it in through a webhook, so it has to state where in the pipeline the
+       * order is. The store has been paid and the seller has not, which is
+       * exactly what intake records. Leaving the default here would place the
+       * order BEFORE that point, and the state machine would then refuse the
+       * payment events below — correctly, because an order that MoonVella has
+       * not taken in cannot have a charge reported against it.
+       */
+      state: "AWAITING_SELLER_PAYMENT",
       fulfillmentStatus: "PENDING",
       shopifyCreatedAt: new Date(),
       shopifyUpdatedAt: new Date(),
@@ -79,6 +91,20 @@ async function main() {
 
   const payment = await createOrReuseWholesalePayment(order.id);
   check("created wholesale payment (simulated)", payment.status === "REQUIRES_PAYMENT", payment.status);
+  /*
+   * BILLING THE SELLER IS NOT CHARGING THE SELLER, and these two used to happen
+   * in one call. `createOrReuseWholesalePayment` built a PaymentIntent with no
+   * customer and no payment method — unconfirmable, and its webhook events could
+   * overwrite the status of an intent that HAD genuinely been charged. An order
+   * now has at most one PaymentIntent for its whole life, created by the charge.
+   */
+  check(
+    "billing the seller creates no PaymentIntent",
+    !payment.providerPaymentIntentId,
+    payment.providerPaymentIntentId ?? "none"
+  );
+  const again = await createOrReuseWholesalePayment(order.id);
+  check("re-billing the same order reuses the same row", again.id === payment.id, `${again.id} vs ${payment.id}`);
 
   // Fulfillment held before payment
   let held = false;

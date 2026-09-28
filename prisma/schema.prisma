@@ -302,6 +302,23 @@ model Seller {
   /// it was queued under and is cancelled if it no longer matches, so a job
   /// created while a seller was approved cannot run after they were blocked.
   accessVersion      Int                      @default(1)
+
+  /// THE MOONVELLA FULFILMENT SERVICE, AND THE LOCATION IT OWNS.
+  ///
+  /// MoonVella ships these products, so they must not be fulfilled from the
+  /// merchant's own "Shop location": that location is the merchant's shelf, and
+  /// stock sitting on it is stock the merchant believes they hold. A store
+  /// therefore gets a fulfillment service of its own — created once, on the
+  /// first import that needs it — and its dedicated location id is saved here.
+  ///
+  /// Saved per SELLER rather than derived on each run because both ids are
+  /// created objects in Shopify with generated ids, and re-resolving them by
+  /// name would eventually meet a second location with the same name and pick
+  /// the wrong one.
+  shopifyFulfillmentServiceId  String?
+  shopifyFulfillmentLocationId String?
+  fulfillmentLocationCheckedAt DateTime?
+
   createdAt          DateTime                 @default(now())
   updatedAt          DateTime                 @updatedAt
   installedAt        DateTime?
@@ -869,12 +886,36 @@ model Order {
   paymentStatus             PaymentStatus          @default(PENDING)
   fulfillmentStatus         FulfillmentStatus      @default(PENDING)
   financialStatus           String?
+  /// Shopify's own fulfillment state, verbatim, as the webhook reported it.
+  ///
+  /// `fulfillmentStatus` above is MoonVella's view — it advances when MoonVella
+  /// ships, and it has a PARTIAL that Shopify spells differently. This column is
+  /// what Shopify said, kept unmodified so a reconciliation can compare the two
+  /// without having to reverse a mapping that was never meant to be reversible.
+  shopifyFulfillmentState   String?
   shopifyCreatedAt          DateTime
   shopifyUpdatedAt          DateTime
   processedAt               DateTime?
   cancelledAt               DateTime?
   cancelReason              String?
   supplierReference         String?                @unique
+
+  /// THE PIPELINE STATE — where this order has got to, and the one field every
+  /// gate reads.
+  ///
+  /// It exists in addition to `paymentStatus`, `fulfillmentStatus` and
+  /// `wholesalePaymentStatus` rather than replacing them, because those three
+  /// are each a view of one subsystem and none of them can express the thing
+  /// that actually matters: whether the seller has paid MoonVella yet. The rule
+  /// this column makes checkable — fulfilment must never begin before the
+  /// seller's charge has succeeded — is a statement about their combination, and
+  /// a statement about a combination needs somewhere to live.
+  ///
+  /// `stateChangedAt` moves with it, so "stuck since when" is answerable from
+  /// the order alone. The full history is in OrderStateTransition.
+  state                     MoonvellaOrderState    @default(RECEIVED)
+  stateChangedAt            DateTime               @default(now())
+
   shopifyFulfillmentOrderId String?
   wholesalePaymentStatus    WholesalePaymentStatus @default(REQUIRES_PAYMENT)
   items                     OrderItem[]
@@ -884,6 +925,7 @@ model Order {
   fulfillmentRequest        FulfillmentRequest?
   shippingQuotes            ShippingQuote[]
   packages                  OrderPackage[]
+  stateTransitions          OrderStateTransition[]
   /// When the order's quotes stopped describing it, and why.
   ///
   /// A quote prices the parcels that existed when it was asked for. Change the
@@ -896,10 +938,87 @@ model Order {
   createdAt                 DateTime               @default(now())
   updatedAt                 DateTime               @updatedAt
 
+  /// One MoonVella order per Shopify order, per store.
+  ///
+  /// `supplierReference` already carries `${shop}#${orderId}` and is unique, so
+  /// this is a second statement of the same fact — deliberately. The reference
+  /// is a string a caller composes; this is the pair the ingestion actually
+  /// looks a shop up by, and a composed string can drift from its parts (a
+  /// trailing slash, a case difference) in a way the two columns cannot. The
+  /// duplicate order it prevents is one nobody sees until the seller is
+  /// charged twice.
+  @@unique([sellerId, shopifyOrderId])
   @@index([sellerId])
   @@index([shopifyOrderId])
+  @@index([state])
   @@index([shopifyCreatedAt])
   @@index([processedAt])
+}
+
+/// WHERE A MOONVELLA ORDER HAS GOT TO.
+///
+/// The sequence is the business process, and the one rule the whole workflow
+/// exists to enforce is legible in it: no state at or past READY_FOR_FULFILLMENT
+/// is reachable without passing through PAID, and PAID is only ever written by a
+/// verified Stripe event. Fulfilment is therefore not "blocked" by a check
+/// somebody has to remember — it is unreachable.
+enum MoonvellaOrderState {
+  /// Ingested from Shopify. The seller has not yet been asked for money.
+  RECEIVED
+  /// The customer paid Shopify; the seller now owes MoonVella for the goods.
+  AWAITING_SELLER_PAYMENT
+  /// An off-session charge is with Stripe; the outcome is not known yet.
+  PAYMENT_PROCESSING
+  /// The card needs the seller to authenticate. Not a failure — a pause that
+  /// only the seller can end, and one that holds fulfilment while it lasts.
+  PAYMENT_ACTION_REQUIRED
+  /// The charge was declined or errored. Retryable, and held.
+  PAYMENT_FAILED
+  /// Stripe confirmed the charge. The only door into fulfilment.
+  PAID
+  /// Paid, and the warehouse task exists. The fulfillment order has been
+  /// resolved and is assigned to the MoonVella location.
+  READY_FOR_FULFILLMENT
+  /// MoonVella has asked the store to fulfil it.
+  FULFILLMENT_REQUESTED
+  /// A shipment is being prepared or is with the carrier.
+  IN_FULFILLMENT
+  /// Every line has shipped, and the tracking went back to Shopify.
+  SHIPPED
+  /// The carrier confirmed delivery.
+  DELIVERED
+  /// Shopify cancelled it, or an operator did.
+  CANCELLED
+  /// Cancelled or refunded after payment and before shipment, so money has to
+  /// be looked at by a person. Deliberately a terminal state that does nothing
+  /// on its own: it exists to be noticed, not to act.
+  REFUND_REVIEW
+}
+
+/// One move of the state machine.
+///
+/// A table rather than a line in the audit log alone, because the two answer
+/// different questions. The audit log answers "what has happened in this
+/// system"; this answers "how did THIS order get here", in order, without
+/// filtering a stream that also carries logins and catalogue edits. Both are
+/// written on every move, from the one function that is allowed to move it.
+model OrderStateTransition {
+  id         String              @id @default(cuid())
+  orderId    String
+  order      Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromState  MoonvellaOrderState?
+  toState    MoonvellaOrderState
+  /// Who or what moved it: WEBHOOK, SYSTEM, ADMIN_USER or MERCHANT. The same
+  /// vocabulary the audit log uses, so the two can be read together.
+  actorType  ActorType
+  actorId    String
+  actorName  String?
+  /// The one line a person needs: "Stripe confirmed the charge (pi_…)".
+  reason     String?
+  createdAt  DateTime            @default(now())
+
+  @@index([orderId, createdAt])
+  @@index([toState])
 }
 
 enum PaymentStatus {
@@ -929,6 +1048,13 @@ model OrderItem {
   variant            ProductVariant? @relation("OrderItemVariant", fields: [variantId], references: [id])
   sellerProductId    String?
   sellerProduct      SellerProduct?  @relation("OrderItemSellerProduct", fields: [sellerProductId], references: [id])
+  /// The line's identity, and the key every reconciliation matches on.
+  ///
+  /// It is UNIQUE WITHIN THE ORDER, enforced by the database rather than by the
+  /// code that happens to iterate lines. An update delivered twice, or two
+  /// webhooks processed concurrently, must not be able to produce two rows for
+  /// one Shopify line: the duplicate is otherwise silent, and the order simply
+  /// costs twice as much — and so does the charge that follows it.
   shopifyLineItemId  String
   name               String
   sku                String
@@ -940,6 +1066,8 @@ model OrderItem {
   createdAt          DateTime        @default(now())
   refundItems        RefundItem[]
   shipmentItems      ShipmentItem[]
+
+  @@unique([orderId, shopifyLineItemId])
 
   // --- variant snapshot ---------------------------------------------------
   //
@@ -988,11 +1116,36 @@ model Refund {
   orderId         String
   order           Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
   shopifyRefundId String
+  /// What SHOPIFY refunded the customer, in minor units. It is the customer's
+  /// money and it is the seller's to give: MoonVella is not a party to it, and
+  /// nothing here acts on it automatically. See `stripeRefundId` for the refund
+  /// that is MoonVella's.
   amount          Int
   reason          String?
   processedAt     DateTime
+
+  /// THE MOONVELLA-SIDE REFUND — the one that gives the seller back money
+  /// MoonVella charged them.
+  ///
+  /// Kept on the same row as the customer refund because they are the same
+  /// event seen from two sides, but tracked separately because they are
+  /// different amounts to different parties and only one of them is MoonVella's
+  /// to make. A Shopify refund does NOT create one of these: the business rule
+  /// is that MoonVella refunds its own charge only by an explicit decision,
+  /// recorded here with the id Stripe returned.
+  stripeRefundId  String?      @unique
+  stripeStatus    String?
+  /// What MoonVella decided to do about this refund, in words, and who decided.
+  /// The decision is the thing that must survive: an operator reading this in a
+  /// year needs to know why MoonVella did not mirror the refund, not merely that
+  /// it did not.
+  reviewNote      String?
+  reviewedAt      DateTime?
+
   items           RefundItem[]
   createdAt       DateTime     @default(now())
+
+  @@unique([orderId, shopifyRefundId])
 }
 
 model RefundItem {
@@ -1296,6 +1449,23 @@ model WebhookEvent {
   id             String        @id @default(cuid())
   shopDomain     String
   topic          String
+  /// THE DELIVERY ID, and the only durable statement that Shopify sent this.
+  ///
+  /// Shopify puts it in `X-Shopify-Webhook-Id` and reuses it across every retry
+  /// of the same delivery, which is exactly what makes it the right dedup key.
+  /// `idempotencyKey` below cannot serve that purpose: it is derived from the
+  /// payload's own `updated_at`, so a redelivery whose payload is byte-identical
+  /// dedups and a redelivery that carries a newer timestamp does not — and a
+  /// retry after a 500 is the common case, not the rare one.
+  ///
+  /// Nullable because rows written before this column existed have no delivery
+  /// id, and a legacy row must stay readable rather than be back-filled with a
+  /// value that would look like it was observed.
+  shopifyWebhookId String?     @unique
+  /// What asked for this ingestion. WEBHOOK for a signed delivery, REPLAY for
+  /// the operator-run backfill, ADMIN for a manual reconcile. Recorded because
+  /// "why do we have this order" is the first question asked of a surprise.
+  source         String        @default("WEBHOOK")
   payload        String
   status         WebhookStatus @default(PENDING)
   errorMessage   String?
@@ -1363,6 +1533,10 @@ model WholesalePayment {
   provider                String                 @default("stripe")
   providerPaymentIntentId String?                @unique
   providerChargeId        String?
+  /// Retired. It held a PaymentIntent client secret, which is a credential for
+  /// confirming a payment and has no business being stored: nothing ever read
+  /// it, and the charge that actually happens is the off-session one. New rows
+  /// are written with null; the column stays so an old row is still readable.
   clientSecret            String?
   paymentMethodId         String?
   billingMode             String?
@@ -1375,6 +1549,27 @@ model WholesalePayment {
   requiresAction          Boolean                @default(false)
   failureMessage          String?
   idempotencyKey          String                 @unique
+
+  /// WHICH ATTEMPT THIS CHARGE IS.
+  ///
+  /// The Stripe idempotency key is `seller-charge:<orderId>:<paymentVersion>`.
+  /// A retry after a failure must produce a NEW intent — a declined card is not
+  /// something Stripe will reconsider under the same key — while a retry of the
+  /// same attempt must produce the SAME one. Bumping this on a deliberate retry
+  /// is what tells the two apart, and it is a counter rather than a timestamp so
+  /// the key stays deterministic and reproducible in an audit.
+  paymentVersion          Int                    @default(1)
+
+  /// WHAT WAS CHARGED, AND WHY IT IS THAT NUMBER.
+  ///
+  /// The line prices, quantities, currency and total the charge was computed
+  /// from, frozen at the moment it was computed. `OrderItem.wholesalePrice`
+  /// already snapshots the catalogue side; this snapshots the arithmetic — the
+  /// rounding, the tax treatment and the decision that shipping is inside the
+  /// price rather than added to it. When an amount is questioned later, this is
+  /// the record that answers it without re-deriving anything from a catalogue
+  /// that has moved on.
+  priceSnapshot           Json?
   authorizedAt            DateTime?
   capturedAt              DateTime?
   refundedAmount          Int                    @default(0)

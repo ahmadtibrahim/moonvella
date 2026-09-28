@@ -16,6 +16,15 @@ import { syncOdooCatalog } from "./odooSync.server";
 import { probeVideoAsset, sweepVideoProbes } from "./mediaProbe.server";
 import { pushVariantInventory } from "./inventoryPush.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
+import { intakeOrder } from "./orderIntake.server";
+import { chargeSellerForOrder } from "./sellerCharge.server";
+import {
+  routeFulfillmentOrdersToMoonvella,
+  numericId,
+  type AdminClient,
+} from "./shopifyFulfillment.server";
+import { ensureOrderWebhookSubscriptions } from "./shopifyWebhooks.server";
+import { transitionOrder, MONEY_CLEARED } from "./orderState.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
 
@@ -331,4 +340,522 @@ export const jobHandlers: Record<string, JobHandler> = {
       detail: { shipmentId, shopifyFulfillmentId: result.shopifyFulfillmentId },
     };
   },
+
+  /**
+   * Charge the seller's card for a MoonVella order.
+   *
+   * Three outcomes, and the difference between them is what makes this job
+   * safe to have queued before the customer has paid:
+   *
+   *   * Charged, or already charged — done, and the order is on its way.
+   *   * Nothing to do YET (the store has not been paid, or the charge needs the
+   *     seller to authenticate, or the seller's settings do not authorise an
+   *     automatic charge) — finished cleanly. The event that changes the answer
+   *     enqueues this same key again, which revives this row.
+   *   * Failed for a reason worth retrying — raised, so the queue backs off and
+   *     tries again.
+   *
+   * A transaction that goes through `chargeSellerForOrder` twice produces one
+   * PaymentIntent: the idempotency key is derived from the order and the
+   * payment version, both of which are read from the database.
+   */
+  [JOB_KIND.SHOPIFY_SELLER_CHARGE]: async (job) => {
+    const orderId = (job.payload as { orderId?: unknown } | null)?.orderId;
+    if (typeof orderId !== "string" || !orderId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no orderId, so there is nothing to charge for.`,
+      );
+    }
+
+    const outcome = await chargeSellerForOrder({
+      orderId,
+      trigger: "AUTOMATIC",
+      actor: { actorType: "SYSTEM", actorId: `job:${job.id}`, actorName: "Background job (seller charge)" },
+    });
+
+    if (outcome.ok) {
+      return {
+        summary: `Seller charged ${formatMinor(outcome.amountMinor, outcome.currency)} (${outcome.status}).`,
+        detail: { ...outcome },
+      };
+    }
+
+    if (outcome.awaitingCustomerPayment) {
+      return {
+        summary: "Waiting for the store to be paid; nothing charged.",
+        detail: { ...outcome },
+      };
+    }
+    if (outcome.requiresPaymentMethod) {
+      return {
+        summary: "The seller has no saved payment method; the order is held until they add one.",
+        detail: { ...outcome },
+      };
+    }
+    if (outcome.requiresAction) {
+      return {
+        summary: "The card issuer requires authentication; the order is held until the seller completes it.",
+        detail: { ...outcome },
+      };
+    }
+
+    /*
+     * A decline. Not permanent — the seller may add another card and the retry
+     * path bumps the payment version — but not worth burning five attempts on
+     * either, because nothing changes until a person acts. The job finishes
+     * with the reason recorded and the order sitting in PAYMENT_FAILED, which
+     * is what the seller's page and the admin queue both read.
+     */
+    return {
+      summary: `Charge failed: ${outcome.message ?? "no reason given"}`,
+      detail: { ...outcome },
+    };
+  },
+
+  /**
+   * Hand a paid order to the warehouse: route its MoonVella lines to MoonVella's
+   * location and open the fulfillment request.
+   *
+   * THE PAYMENT GATE IS RE-CHECKED HERE, not assumed from the fact that this job
+   * was queued. A job in the queue is a message, and a message can be wrong —
+   * queued by an older version of the code, by a manual replay, by a bug. The
+   * state is read from the order and the handler refuses unless the money has
+   * cleared, which is the same question the shipping code asks before it sends
+   * a fulfillment to Shopify. Two checks in the same shape, both reading the
+   * order rather than a flag somebody passed.
+   */
+  [JOB_KIND.SHOPIFY_FULFILLMENT_SUBMIT]: async (job) => {
+    const orderId = (job.payload as { orderId?: unknown } | null)?.orderId;
+    if (typeof orderId !== "string" || !orderId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no orderId, so there is nothing to route.`,
+      );
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, state: true, wholesalePaymentStatus: true },
+    });
+    if (!order) throw new PermanentJobError(`Order ${orderId} no longer exists.`);
+
+    if (!MONEY_CLEARED.has(order.state as never)) {
+      throw new PermanentJobError(
+        `Refusing to prepare order ${orderId} for fulfillment: it is ${order.state} and the seller's ` +
+          `charge is ${order.wholesalePaymentStatus}. Goods are never picked for an order that has not been paid for.`,
+      );
+    }
+
+    const routing = await routeFulfillmentOrdersToMoonvella(orderId);
+
+    await prisma.fulfillmentRequest.upsert({
+      where: { orderId },
+      create: { orderId, status: "PENDING" },
+      update: {},
+    });
+
+    if (order.state === "READY_FOR_FULFILLMENT") {
+      await transitionOrder(
+        {
+          orderId,
+          to: "FULFILLMENT_REQUESTED",
+          actor: { actorType: "SYSTEM", actorId: `job:${job.id}`, actorName: "Background job (fulfillment)" },
+          reason: "Routed to the MoonVella location and queued for the warehouse.",
+        },
+        undefined,
+      ).catch(() => undefined);
+    }
+
+    /*
+     * A routing refusal is raised, not swallowed: the order is paid for and the
+     * goods are owed, and an order whose lines are still assigned to the
+     * merchant's shelf cannot be shipped. Someone has to see it.
+     */
+    if (routing.refused.length) {
+      throw new Error(
+        `Order ${orderId} is paid but ${routing.refused.length} fulfillment order(s) could not be moved to ` +
+          `MoonVella's location: ${routing.refused.map((r) => `${r.fulfillmentOrderId} (${r.reason})`).join("; ")}`,
+      );
+    }
+
+    return {
+      summary:
+        `Routed to MoonVella location ${routing.locationId}: ` +
+        `${routing.moved.length} moved, ${routing.alreadyRouted.length} already there, ` +
+        `${routing.untouched} unrelated fulfillment order(s) left alone.`,
+      detail: { ...routing },
+    };
+  },
+
+  /**
+   * Ask Shopify to deliver this app's order events.
+   *
+   * IDEMPOTENT BY READING FIRST: the registrar lists the existing subscriptions
+   * and creates only the topics that are absent, so a beat that runs while the
+   * previous beat is still in flight cannot double-subscribe a topic — which
+   * would make Shopify deliver every event twice.
+   *
+   * A REFUSAL IS NOT A JOB FAILURE. Until the app is approved for Protected
+   * Customer Data, this call is refused every single time, and failing the job
+   * would fill the queue with retries of something no retry can fix and bury
+   * the failures that matter. The refusal is recorded on the integration row
+   * and in the audit log — where it is visible — and the job succeeds.
+   *
+   * Sellers with no session are skipped rather than attempted: a store that
+   * uninstalled the app leaves a Seller row behind, and calling `admin` for it
+   * throws for a reason that is not worth storing every fifteen minutes.
+   */
+  [JOB_KIND.SHOPIFY_WEBHOOK_SUBSCRIBE]: async (job) => {
+    const sessions = await prisma.session.findMany({ select: { shop: true } });
+    const shops = new Set(sessions.map((s) => s.shop));
+    const sellers = await prisma.seller.findMany({
+      where: { shopDomain: { in: [...shops] } },
+      select: { id: true, shopDomain: true },
+    });
+
+    if (!sellers.length) {
+      return { summary: "No store has a usable session, so there is nothing to subscribe." };
+    }
+
+    const results: {
+      shopDomain: string;
+      registered: number;
+      alreadyPresent: number;
+      refused: string[];
+      blockedBy: string | null;
+    }[] = [];
+
+    for (const seller of sellers) {
+      try {
+        const outcome = await ensureOrderWebhookSubscriptions(seller.id);
+        results.push({
+          shopDomain: seller.shopDomain,
+          registered: outcome.registered.length,
+          alreadyPresent: outcome.alreadyPresent.length,
+          refused: outcome.refused.map((r) => r.topic),
+          blockedBy: outcome.blockedBy ?? null,
+        });
+      } catch (error) {
+        /*
+         * A throw here is not the ordinary refusal — that is returned, not
+         * raised — so it is a genuinely unexpected failure for this one store.
+         * Recorded against the store and the sweep continues, because one
+         * broken store must not stop the others from being registered.
+         */
+        results.push({
+          shopDomain: seller.shopDomain,
+          registered: 0,
+          alreadyPresent: 0,
+          refused: [],
+          blockedBy: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    const blocked = results.filter((r) => r.blockedBy).length;
+    return {
+      summary:
+        `${results.length} store(s) checked; ` +
+        `${results.reduce((n, r) => n + r.registered, 0)} topic(s) newly registered, ` +
+        `${blocked} store(s) still blocked.`,
+      detail: { results, jobId: job.id },
+    };
+  },
 };
+
+/**
+ * Take one Shopify order event in.
+ *
+ * Idempotent three times over, which is what it takes to be safe here. The
+ * delivery row is claimed by `intakeOrder` and a delivery that is already
+ * SUCCESS returns immediately; `intakeOrder`'s own dedupe key is
+ * (shop, topic, order, payload version), so a redelivery with a new delivery
+ * id but identical content is still a duplicate; and the order table's unique
+ * (seller, shopifyOrderId) index is the last line of defence, which turns a
+ * race between two workers into a constraint violation rather than a second
+ * order.
+ *
+ * The payload is read back off the delivery row rather than carried on the
+ * job, and the row is rewritten with a redacted summary once the work is done
+ * — see `finishEvent`. That is what keeps a customer's address from living
+ * forever in a table nothing prunes.
+ *
+ * WHY THIS IS A FACTORY AND NOT ANOTHER ENTRY IN THE MAP.
+ *
+ * The handler above all others needs a live Shopify client: a replay, a refund
+ * or a routing event arrives without the order on it, and the order has to be
+ * fetched before there is anything to take in. That client is the one thing
+ * about this handler a test cannot fake — Shopify's own API client does not go
+ * through `globalThis.fetch`, so stubbing the global reaches nothing — and the
+ * behaviour most worth pinning is exactly the part that needs it: that a
+ * replay run twice creates one order and one payment.
+ *
+ * So the client is a parameter. Production calls this with none and gets the
+ * store's own authenticated client, unchanged; a harness passes one that
+ * answers from a table and gets the whole handler — the delivery claim, the
+ * hydration, the intake, the redaction, the queue's own attempt accounting —
+ * with only the network replaced. The alternative, testing the pieces either
+ * side of the fetch, is how a pipeline passes its tests and fails on the
+ * first real order.
+ */
+export function intakeJobHandler(adminOverride?: AdminClient): JobHandler {
+  return async (job) => {
+    const payload = job.payload as {
+      webhookEventId?: unknown;
+      topic?: unknown;
+      shop?: unknown;
+    } | null;
+    const webhookEventId = payload?.webhookEventId;
+    const topic = payload?.topic;
+    const shop = payload?.shop;
+    if (typeof webhookEventId !== "string" || typeof topic !== "string" || typeof shop !== "string") {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) is missing webhookEventId, topic or shop, so there is nothing to take in.`,
+      );
+    }
+
+    const delivery = await prisma.webhookEvent.findUnique({ where: { id: webhookEventId } });
+    if (!delivery) {
+      throw new PermanentJobError(`Delivery ${webhookEventId} no longer exists.`);
+    }
+    if (delivery.status === "SUCCESS") {
+      return {
+        summary: "Already taken in; nothing done.",
+        detail: { webhookEventId, duplicate: true },
+      };
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = JSON.parse(delivery.payload) as Record<string, unknown>;
+    } catch {
+      /*
+       * The body was already replaced by its summary, which means a previous
+       * run finished the work and the status write was lost. Re-running the
+       * summary would be intake on a payload that is not an order. The delivery
+       * is marked finished rather than retried forever over a body that cannot
+       * come back.
+       */
+      await prisma.webhookEvent.update({
+        where: { id: delivery.id },
+        data: {
+          status: "SUCCESS",
+          processedAt: new Date(),
+          errorMessage: "Body had already been redacted; treated as processed.",
+        },
+      });
+      return { summary: "Body already redacted; nothing done.", detail: { webhookEventId } };
+    }
+
+    /*
+     * A `refunds/create` or a routing event does not carry the order, and this
+     * handler is where the authenticated client lives. The order is fetched
+     * from Shopify so the rest of the pipeline sees the same shape it sees for
+     * an `orders/*` delivery — which is the whole reason the fetch is here and
+     * not inside `intakeOrder`: intake stays a pure function of its payload,
+     * and the one thing that needs a network call happens once, above it.
+     */
+    const result = await intakeOrder({
+      topic,
+      shop,
+      payload: (await hydrateOrderPayload({ topic, shop, payload: body, adminOverride })) as never,
+      source: delivery.source === "REPLAY" ? "REPLAY" : "WEBHOOK",
+      eventId: delivery.id,
+    });
+
+    if (!result.ok) {
+      // `intakeOrder` has already recorded the refusal on the delivery with its
+      // reason. Raising it here would make the queue retry something that will
+      // be refused identically — a blocked seller, a payload with no order id.
+      return { summary: `Not taken in: ${result.reason ?? "no reason given"}.`, detail: { ...result } };
+    }
+
+    return {
+      summary: result.duplicate
+        ? "Delivery was a duplicate of one already taken in."
+        : `Order taken in with ${result.moonvellaItems ?? 0} MoonVella line(s)` +
+          (result.updated ? " (updated an existing order)." : "."),
+      detail: { ...result },
+    };
+  };
+}
+
+/**
+ * Give a non-order event the order it is about.
+ *
+ * `refunds/create` carries a refund and `fulfillment_orders/order_routing_complete`
+ * carries a fulfillment order. Intake, though, is written against orders — that
+ * is the shape it has always taken and the shape its arithmetic is expressed
+ * in — so the order is fetched here, once, with an authenticated client, rather
+ * than teaching every branch of intake to accept three payload shapes.
+ *
+ * A fetch that fails returns the original payload unchanged. Intake then treats
+ * it as an order it does not have, which is the correct degradation: the
+ * delivery is recorded, the reason is on it, and nothing is invented.
+ */
+async function hydrateOrderPayload(input: {
+  topic: string;
+  shop: string;
+  payload: Record<string, unknown>;
+  /** The store's client, when the caller already has one. See `intakeJobHandler`. */
+  adminOverride?: AdminClient;
+}): Promise<unknown> {
+  const { topic, shop, payload } = input;
+  /*
+   * TWO REASONS TO GO AND FETCH THE ORDER.
+   *
+   * A `refunds/create` or a routing event does not carry the order at all, so
+   * there is nothing to take in until Shopify is asked. That was the original
+   * condition.
+   *
+   * The second reason is a REPLAY. A replay is a delivery this app mints for
+   * itself — it says "treat this order as though it had just arrived" — and its
+   * payload is an order id and nothing more, because a replayed order is by
+   * definition not a payload that was captured and kept. The condition is
+   * written as "the payload does not carry line items" rather than as "the
+   * topic is a replay", so that a genuine `orders/create` that somehow arrived
+   * without line items is repaired the same way instead of being intaken as an
+   * order with nothing on it.
+   */
+  const isRefundOrRouting =
+    topic === "REFUNDS_CREATE" || topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE";
+  const carriesTheOrder = Array.isArray(payload.line_items);
+  if (!isRefundOrRouting && carriesTheOrder) return payload;
+
+  const orderId = isRefundOrRouting ? payload.order_id : (payload.id ?? payload.order_id);
+  if (orderId === undefined || orderId === null) return payload;
+
+  try {
+    const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
+    if (!seller) return payload;
+    const admin =
+      input.adminOverride ??
+      (await (async () => {
+        const { unauthenticated } = await import("~/shopify.server");
+        return (await unauthenticated.admin(seller.shopDomain)).admin as unknown as AdminClient;
+      })());
+
+    const res = await admin.graphql(
+      `#graphql
+        query MoonVellaOrderForEvent($id: ID!) {
+          order(id: $id) {
+            id
+            name
+            orderNumber
+            email
+            currencyCode
+            displayFinancialStatus
+            displayFulfillmentStatus
+            createdAt
+            updatedAt
+            cancelledAt
+            totalTaxSet { shopMoney { amount } }
+            totalDiscountsSet { shopMoney { amount } }
+            subtotalPriceSet { shopMoney { amount } }
+            totalPriceSet { shopMoney { amount } }
+            totalShippingPriceSet { shopMoney { amount } }
+            shippingAddress {
+              name
+              company
+              address1
+              address2
+              city
+              province
+              provinceCode
+              country
+              countryCodeV2
+              zip
+            }
+            lineItems(first: 250) {
+              nodes {
+                id
+                sku
+                name
+                quantity
+                variant { id }
+                originalUnitPriceSet { shopMoney { amount } }
+              }
+            }
+          }
+        }`,
+      { variables: { id: `gid://shopify/Order/${orderId}` } },
+    );
+    const json: {
+      data?: { order?: Record<string, unknown> | null };
+      errors?: { message: string }[];
+    } = await res.json();
+    if (Array.isArray(json?.errors) && json.errors.length) return payload;
+
+    const order = json?.data?.order;
+    if (!order) return payload;
+
+    // Reshaped into the same field names the webhook payload uses, so intake
+    // has exactly one payload shape to understand.
+    const money = (set: unknown) =>
+      (set as { shopMoney?: { amount?: string } } | null)?.shopMoney?.amount ?? null;
+
+    return {
+      ...payload,
+      id: numericId(String(order.id)),
+      order_id: numericId(String(order.id)),
+      name: order.name,
+      order_number: order.orderNumber,
+      email: order.email,
+      currency: order.currencyCode,
+      financial_status: String(order.displayFinancialStatus ?? "").toLowerCase() || undefined,
+      fulfillment_status: order.displayFulfillmentStatus
+        ? String(order.displayFulfillmentStatus).toLowerCase()
+        : null,
+      created_at: order.createdAt,
+      updated_at: order.updatedAt,
+      cancelled_at: order.cancelledAt ?? null,
+      total_tax: money(order.totalTaxSet) ?? undefined,
+      total_discounts: money(order.totalDiscountsSet) ?? undefined,
+      subtotal_price: money(order.subtotalPriceSet) ?? undefined,
+      total_price: money(order.totalPriceSet) ?? undefined,
+      total_shipping_price_set: { shop_money: { amount: money(order.totalShippingPriceSet) } },
+      /*
+       * THE ADDRESS IS RESHAPED, NOT STORED AS RETURNED.
+       *
+       * Order.shippingAddress holds a JSON blob that was written from a webhook,
+       * so it wears the webhook's field names — `country_code`, not
+       * `countryCodeV2` — and the screens that read it look for those names.
+       * A fetched order written through unchanged would store `countryCodeV2`
+       * and every address gathered this way would render with no country on it.
+       * Two spellings of the same fact is exactly the kind of difference that
+       * shows up as a blank line on a shipping label rather than as an error.
+       */
+      shipping_address: order.shippingAddress
+        ? {
+            name: (order.shippingAddress as Record<string, unknown>).name ?? null,
+            company: (order.shippingAddress as Record<string, unknown>).company ?? null,
+            address1: (order.shippingAddress as Record<string, unknown>).address1 ?? null,
+            address2: (order.shippingAddress as Record<string, unknown>).address2 ?? null,
+            city: (order.shippingAddress as Record<string, unknown>).city ?? null,
+            province: (order.shippingAddress as Record<string, unknown>).province ?? null,
+            province_code: (order.shippingAddress as Record<string, unknown>).provinceCode ?? null,
+            country: (order.shippingAddress as Record<string, unknown>).country ?? null,
+            country_code: (order.shippingAddress as Record<string, unknown>).countryCodeV2 ?? null,
+            zip: (order.shippingAddress as Record<string, unknown>).zip ?? null,
+          }
+        : null,
+      line_items: ((order.lineItems as { nodes?: Record<string, unknown>[] } | null)?.nodes ?? []).map(
+        (li) => ({
+          id: numericId(String(li.id)),
+          variant_id: li.variant ? numericId(String((li.variant as { id: string }).id)) : null,
+          title: li.name,
+          sku: li.sku,
+          quantity: li.quantity,
+          price: money(li.originalUnitPriceSet) ?? "0",
+        }),
+      ),
+    };
+  } catch {
+    return payload;
+  }
+}
+
+/** Minor units to something a person reads, without a currency library. */
+function formatMinor(amount: number, currency: string): string {
+  const value = (amount / 100).toFixed(2);
+  return `${currency} ${value}`;
+}

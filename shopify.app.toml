@@ -21,9 +21,14 @@ name = "MoonVella"
 # write_inventory + read_locations: set inventory levels for imported variants at a location.
 # write_files: upload product images to Shopify files.
 # read_reports: ShopifyQL analytics (sales, sessions, visitors) for owner application review.
+# write_fulfillments: create the MoonVella fulfillment service that owns MoonVella's stock. Without it
+#   fulfillmentServiceCreate is refused with "Required access: write_fulfillments", and every order would
+#   stay routed to the merchant's own "Shop location".
+# write_locations: create and manage the location that fulfillment service owns. Without it there is
+#   nowhere to hold MoonVella stock that is not the merchant's own shelf.
 # NOT requested: write_orders (not required by fulfillmentCreate), read_all_orders (separate approval; 60-day
 #   window only until granted).
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,write_inventory,read_locations,write_files,read_reports"
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,write_fulfillments,write_locations,write_inventory,read_locations,write_files,read_reports"
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"
@@ -60,15 +65,44 @@ api_version = "2026-10"
   uri = "/webhooks/app/scopes_update"
   topics = [ "app/scopes_update" ]
 
-# NOTE: Order webhooks carry protected customer data. Shopify refuses to register
-# these subscriptions until the app is approved for protected customer data access,
-# and an unapproved subscription aborts `shopify app dev`. Intake is fully implemented
-# in app/services/orderIntake.server.ts; uncomment the block below after approval so
-# delivery starts automatically. orders/paid is intentionally not subscribed (payment
-# state also arrives via orders/updated).
-#   [[webhooks.subscriptions]]
-#   uri = "/webhooks/orders"
-#   topics = [ "orders/create", "orders/updated", "orders/cancelled" ]
+# THE ORDER SUBSCRIPTIONS. These are the fix for orders that never arrived.
+#
+# The merchant's orders did not appear in MoonVella because this block did not
+# exist in any form: it was commented out, so Shopify had no subscription to
+# deliver against and the app was never told an order had been placed. There is
+# no code change that can compensate for a subscription that was never declared
+# — the delivery has to be asked for.
+#
+# ORDER WEBHOOKS CARRY PROTECTED CUSTOMER DATA, and Shopify refuses to register
+# them until the app is approved for it, with "This app is not approved to
+# subscribe to webhook topics containing protected customer data." That refusal
+# is a Partner Dashboard action, not a code change, and it is the one remaining
+# prerequisite for live delivery. It is left ENABLED here deliberately: the
+# registration attempts are how the app finds out the moment approval lands, and
+# `ensureOrderWebhookSubscriptions` retries on a schedule rather than waiting for
+# someone to remember. Commenting it out again would return the app to the state
+# where it silently receives nothing.
+#
+# orders/paid IS subscribed, which it previously was not. A store can take
+# payment asynchronously — a bank transfer, a manual capture, a gateway callback
+# that lands a minute later — and for those orders the create carries no payment
+# and the paid arrives separately. Without it, the seller's card is never
+# charged for exactly the orders that took longest to confirm.
+#
+# refunds/create and fulfillment_orders/order_routing_complete are not optional
+# extras: a refund is the only way MoonVella learns a customer was given their
+# money back, and routing_complete is the earliest moment the fulfillment order
+# this app must act on exists.
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/orders"
+  topics = [
+    "orders/create",
+    "orders/paid",
+    "orders/updated",
+    "orders/cancelled",
+    "refunds/create",
+    "fulfillment_orders/order_routing_complete",
+  ]
 
 [auth]
 # The callback path is derived from `authPathPrefix` in app/shopify.server.js:

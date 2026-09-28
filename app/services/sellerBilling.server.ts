@@ -490,7 +490,14 @@ export async function chargeWholesaleOrder(
       actorType: "ADMIN_USER",
       actorId: opts.actor.actorId,
       actorName: opts.actor.actorName,
-      action: "payment.charge_succeeded",
+      /*
+       * "submitted", not "succeeded". A charge is not a fact until Stripe says
+       * so under signature; this records that the attempt was made and what it
+       * was made for. The action that says money moved is written by the
+       * webhook handler, and an audit where those two read the same would make
+       * "did the seller actually pay" unanswerable from the log.
+       */
+      action: "payment.charge_submitted",
       entityType: AUDIT_ENTITY.PAYMENT,
       entityId: payment.id,
       afterData: { status: "PROCESSING", trigger: opts.trigger, simulated: true },
@@ -511,6 +518,16 @@ export async function chargeWholesaleOrder(
     "charge a wholesale order"
   );
 
+  /*
+   * THE METADATA IS FOUR IDS AND NOTHING ELSE.
+   *
+   * It is written so that a person looking at a charge in the Stripe dashboard
+   * can find the MoonVella order without asking anyone, and so that a
+   * reconciliation job can match a Stripe object back to a row here. Every one
+   * of the four is an identifier this system or Shopify minted; none of them is
+   * a name, an address, an email or a card. Stripe's dashboard is a wider room
+   * than this database, and a customer's address does not belong in it.
+   */
   const params = new URLSearchParams({
     amount: String(payment.amount),
     currency: (payment.currency || "CAD").toLowerCase(),
@@ -518,11 +535,32 @@ export async function chargeWholesaleOrder(
     payment_method: paymentMethodId,
     off_session: "true",
     confirm: "true",
-    "metadata[orderId]": orderId,
+    "metadata[moonvellaOrderId]": orderId,
+    "metadata[shopifyOrderId]": order.shopifyOrderId,
+    "metadata[storeId]": order.sellerId,
+    "metadata[sellerId]": order.sellerId,
   });
 
   try {
-    const intent = await stripeForm("payment_intents", params, `charge:${orderId}`);
+    /*
+     * THE KEY IS DETERMINISTIC, AND IT IS THE ONLY THING STANDING BETWEEN A
+     * RETRY AND A SECOND CHARGE.
+     *
+     * `seller-charge:<orderId>:<paymentVersion>` — the same order at the same
+     * version produces the same key forever, so a webhook that arrives twice,
+     * a job that runs twice and two operators pressing the button at once all
+     * resolve to one PaymentIntent at Stripe. The version is what makes a
+     * deliberate retry AFTER A FAILURE a genuinely new charge: Stripe will not
+     * reconsider a declined card under a key it has already answered, so the
+     * retry must be a different request, and bumping the version is how it
+     * becomes one. A timestamp or a random suffix would have made every retry a
+     * new charge, including the retries nobody asked for.
+     */
+    const intent = await stripeForm(
+      "payment_intents",
+      params,
+      `seller-charge:${orderId}:${payment.paymentVersion}`
+    );
     const requiresAction = intent.status === "requires_action";
     await prisma.paymentAttempt.create({
       data: {
@@ -548,13 +586,16 @@ export async function chargeWholesaleOrder(
       actorType: "ADMIN_USER",
       actorId: opts.actor.actorId,
       actorName: opts.actor.actorName,
-      action: "payment.charge_succeeded",
+      // See the note on the simulated branch: this records the attempt, not the
+      // payment. `payment_intent.succeeded` is what records the payment.
+      action: "payment.charge_submitted",
       entityType: AUDIT_ENTITY.PAYMENT,
       entityId: payment.id,
       afterData: {
         status: requiresAction ? "REQUIRES_ACTION" : "PROCESSING",
         requiresAction,
         paymentIntentId: intent.id,
+        paymentVersion: payment.paymentVersion,
         trigger: opts.trigger,
       },
     });

@@ -1,10 +1,19 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
 import { persistPaymentMethodFromSetupIntent } from "./sellerBilling.server";
 import { redactSecrets, stripeSecretKey } from "./credentials.server";
-import { assertNotDisabled, stripeKeyKindProblem, stripeMode } from "./stripeMode.server";
+import {
+  assertNotDisabled,
+  isSimulatedId,
+  requireStripeProvider,
+  stripeKeyKindProblem,
+  stripeMode,
+} from "./stripeMode.server";
+import { computeSellerCharge } from "./sellerCharge.server";
+import { markPaid, transitionOrder, type OrderState } from "./orderState.server";
 
 /**
  * Wholesale payment integration.
@@ -103,145 +112,113 @@ export async function testStripeAuthentication(): Promise<StripeAuthTest> {
   }
 }
 
-function mapStripeStatus(status: string): string {
-  switch (status) {
-    case "requires_payment_method":
-      return "REQUIRES_PAYMENT";
-    case "requires_action":
-    case "requires_confirmation":
-      return "REQUIRES_ACTION";
-    case "processing":
-      return "PROCESSING";
-    case "succeeded":
-      return "SUCCEEDED";
-    case "canceled":
-      return "CANCELLED";
-    default:
-      return "REQUIRES_PAYMENT";
-  }
-}
-
-interface StripeIntent {
-  id: string;
-  client_secret?: string;
-  status: string;
-}
-
-async function createStripeIntent(
-  amount: number,
-  currency: string,
-  orderId: string,
-  idempotencyKey: string
-): Promise<StripeIntent> {
-  const key = await stripeSecretKey();
-  if (!key) throw new Error("Stripe is not configured; no secret key resolves.");
-
-  const params = new URLSearchParams({
-    amount: String(amount),
-    currency: currency.toLowerCase(),
-    "metadata[orderId]": orderId,
-    "automatic_payment_methods[enabled]": "true",
-  });
-  const res = await fetch(`${STRIPE_API}/payment_intents`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/x-www-form-urlencoded",
-      "Idempotency-Key": idempotencyKey,
-    },
-    body: params,
-  });
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json?.error?.message || `Stripe error ${res.status}`);
-  }
-  return json as StripeIntent;
-}
-
 /**
- * Create (or reuse) the wholesale payment for an order. Idempotent: the row is
- * keyed by order and carries a stable provider idempotency key so retries never
- * double-charge.
+ * Ensure the bill for an order exists and says the right number.
+ *
+ * THIS FUNCTION USED TO CREATE A PAYMENT INTENT, AND THAT WAS THE DEFECT.
+ *
+ * The intent it made had no `customer` and no `payment_method`, so it could
+ * never be confirmed by anyone — and it was not the intent that got charged.
+ * The charge that actually happens is the off-session one in
+ * `chargeWholesaleOrder`, which creates its own intent and stores its id on
+ * this same row. Two intents for one order, one of them unconfirmable, is bad
+ * enough on its own; what makes it dangerous is the webhook. A
+ * `payment_intent.canceled` or `.requires_payment_method` for the orphan would
+ * arrive, resolve to this row by its order metadata, and overwrite the status
+ * of the intent that was genuinely charged.
+ *
+ * So this now does the one thing that is safe to do repeatedly: it prices the
+ * bill from the line snapshot and leaves the provider alone. Money moves in
+ * exactly one place — `chargeSellerForOrder` — and one order therefore has at
+ * most one PaymentIntent for its whole life.
+ *
+ * The amount comes from `computeSellerCharge`, which reads the recorded
+ * wholesale unit price on each line, because that is the price of the goods.
+ * It used to read `order.moonvellaTotal`, which adds attributable tax and
+ * shipping on top of the goods; the wholesale price a seller is quoted already
+ * includes standard shipping, so that figure would have overcharged every
+ * order that had either.
  */
 export async function createOrReuseWholesalePayment(orderId: string) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { wholesalePayment: true, seller: true },
+    include: { wholesalePayment: true, seller: true, items: true },
   });
   if (!order) throw new Error("Order not found.");
-  if (order.moonvellaTotal <= 0) throw new Error("Order has no MoonVella amount.");
-  if (order.wholesalePayment?.status === "SUCCEEDED") {
-    return order.wholesalePayment;
+
+  const computation = computeSellerCharge({
+    id: order.id,
+    sellerId: order.sellerId,
+    currency: order.currency,
+    state: order.state as never,
+    moonvellaShipping: order.moonvellaShipping,
+    moonvellaDiscounts: order.moonvellaDiscounts,
+    moonvellaTax: order.moonvellaTax,
+    items: order.items.map((item) => ({
+      shopifyLineItemId: item.shopifyLineItemId,
+      sku: item.sku,
+      name: item.name,
+      quantity: item.quantity,
+      wholesalePrice: item.wholesalePrice,
+    })),
+  });
+
+  if (computation.amountMinor <= 0) {
+    throw new Error("This order has no MoonVella lines, so there is nothing to charge for.");
   }
 
   const idempotencyKey = `wholesale:${order.supplierReference ?? order.id}`;
-
   const mode = await assertNotDisabled("create a wholesale payment");
-  if (mode === "simulated") {
-    const payment = await prisma.wholesalePayment.upsert({
-      where: { orderId },
-      create: {
-        orderId,
-        sellerId: order.sellerId,
-        amount: order.moonvellaTotal,
-        currency: order.currency,
-        provider: "stripe",
-        providerPaymentIntentId: `sim_${order.id}`,
-        clientSecret: `sim_secret_${order.id}`,
-        status: "REQUIRES_PAYMENT",
-        idempotencyKey,
-      },
-      update: {
-        provider: "stripe",
-        providerPaymentIntentId: `sim_${order.id}`,
-        clientSecret: `sim_secret_${order.id}`,
-        status:
-          order.wholesalePayment &&
-          order.wholesalePayment.status !== "FAILED" &&
-          order.wholesalePayment.status !== "CANCELLED"
-            ? order.wholesalePayment.status
-            : "REQUIRES_PAYMENT",
-      },
-    });
-    await setIntegrationState("stripe", {
-      status: "NOT_CONFIGURED",
-      detail:
-        "Simulated mode: Stripe is in simulated mode, so no provider intent was created. Payment records are local simulations only, are not real charges, and are not bookable as shipments.",
-    });
-    return payment;
-  }
 
-  const intent = await createStripeIntent(
-    order.moonvellaTotal,
-    order.currency,
-    order.id,
-    idempotencyKey
-  );
+  /*
+   * A bill that has already been charged keeps the amount it was charged at.
+   * Re-pricing it here would make the stored total disagree with the seller's
+   * statement, which is the one disagreement nobody can resolve from this side.
+   */
+  const chargedAlready =
+    order.wholesalePayment !== null &&
+    ["SUCCEEDED", "REFUNDED", "PARTIALLY_REFUNDED", "PROCESSING", "REQUIRES_ACTION"].includes(
+      order.wholesalePayment.status
+    );
 
   const payment = await prisma.wholesalePayment.upsert({
     where: { orderId },
     create: {
       orderId,
       sellerId: order.sellerId,
-      amount: order.moonvellaTotal,
+      amount: computation.amountMinor,
+      subtotal: computation.amountMinor,
+      shippingAmount: 0,
+      taxAmount: 0,
       currency: order.currency,
       provider: "stripe",
-      providerPaymentIntentId: intent.id,
-      clientSecret: intent.client_secret ?? null,
-      status: mapStripeStatus(intent.status) as never,
+      status: "REQUIRES_PAYMENT",
       idempotencyKey,
+      priceSnapshot: computation as never,
     },
-    update: {
-      providerPaymentIntentId: intent.id,
-      clientSecret: intent.client_secret ?? null,
-      status: mapStripeStatus(intent.status) as never,
-    },
+    update: chargedAlready
+      ? {}
+      : {
+          amount: computation.amountMinor,
+          subtotal: computation.amountMinor,
+          // Zero, and recorded as zero rather than left null: shipping is
+          // inside the seller's price, so the seller's shipping charge is nil
+          // and the auto-pay ceiling on shipping can never be tripped by a
+          // number that was never billed.
+          shippingAmount: 0,
+          taxAmount: 0,
+          priceSnapshot: computation as never,
+        },
   });
 
-  await setIntegrationState("stripe", {
-    status: "HEALTHY",
-    detail: `Stripe ${mode} mode accepted an authenticated request. Payment intent ${intent.id}.`,
-  });
+  if (mode === "simulated") {
+    await setIntegrationState("stripe", {
+      status: "NOT_CONFIGURED",
+      detail:
+        "Simulated mode: Stripe is in simulated mode, so no provider charge can be made. " +
+        "The bill is priced and stored locally only, and is not a real charge.",
+    });
+  }
 
   return payment;
 }
@@ -405,14 +382,71 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
   }
 
   const intentId = resolveIntentId(event.type, object);
-  const metadataOrderId = (object.metadata as Record<string, unknown> | undefined)?.orderId;
+  /*
+   * BOTH SPELLINGS, AND THE ONE THE CHARGE WRITES COMES FIRST.
+   *
+   * The charge stamps four keys on every intent it creates — `moonvellaOrderId`,
+   * `shopifyOrderId`, `storeId`, `sellerId` — and this read `orderId`, a key
+   * nothing has ever written. The lookup below therefore had two ways to find a
+   * payment and only ever used one: the stored intent id. That is enough in the
+   * ordinary case, because the id is written back the moment Stripe answers.
+   *
+   * It is not enough in the case the fallback exists for. If the process dies
+   * between Stripe creating the intent and the id being stored — the exact
+   * crash the charge's own comment says the attempt rows survive — then the
+   * order has no intent id, the event carries the only link back to it, and the
+   * reader was looking for a key that is not there. `payment_intent.succeeded`
+   * would be filed as UNMATCHED, the money would be real, and the order would
+   * sit in PAYMENT_PROCESSING with fulfillment locked and nothing to say why.
+   *
+   * `orderId` is still read second, so any event already recorded under that
+   * spelling keeps resolving.
+   */
+  const metadata = (object.metadata as Record<string, unknown> | undefined) ?? {};
+  const metadataOrderId = metadata.moonvellaOrderId ?? metadata.orderId;
   const ref = intentId || String(metadataOrderId ?? "");
 
   let payment = intentId
     ? await prisma.wholesalePayment.findUnique({ where: { providerPaymentIntentId: intentId } })
     : null;
   if (!payment && metadataOrderId) {
-    payment = await prisma.wholesalePayment.findUnique({ where: { orderId: String(metadataOrderId) } });
+    const byOrder = await prisma.wholesalePayment.findUnique({
+      where: { orderId: String(metadataOrderId) },
+    });
+    /*
+     * A STALE INTENT MUST NOT SPEAK FOR THE ORDER.
+     *
+     * The metadata fallback exists so an event still finds its order if the
+     * payment row has not yet stored the intent id — a race of a few
+     * milliseconds during the first charge. It must not become a way for an
+     * intent that is no longer the order's to write to it: an abandoned intent
+     * from an earlier attempt, or one for a different order that happens to
+     * carry this order's metadata, would otherwise be able to move the money
+     * state of a row it does not own. If the row names an intent and this event
+     * is about a different one, the event is recorded as unmatched.
+     */
+    const ownsIntent =
+      byOrder &&
+      (!intentId ||
+        !byOrder.providerPaymentIntentId ||
+        byOrder.providerPaymentIntentId === intentId);
+    payment = ownsIntent ? byOrder : null;
+    if (byOrder && !ownsIntent) {
+      await prisma.paymentEvent.create({
+        data: {
+          provider: "stripe",
+          eventId: event.id,
+          type: event.type,
+          payload: JSON.stringify(event),
+          status: "UNMATCHED",
+          errorMessage:
+            `Event is about payment intent ${intentId}, but this order's payment is ` +
+            `${byOrder.providerPaymentIntentId}. Ignored so a superseded intent cannot change the order.`,
+          processedAt: new Date(),
+        },
+      });
+      return { matched: false, reason: "stale_intent" };
+    }
   }
   if (!payment) {
     await prisma.paymentEvent.create({
@@ -503,6 +537,26 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
       where: { id: payment!.orderId },
       data: { wholesalePaymentStatus: orderStatus as never },
     });
+
+    /*
+     * THE ORDER'S OWN STATE MOVES HERE, AND ONLY HERE, FOR ANYTHING TO DO WITH
+     * MONEY.
+     *
+     * This handler runs behind a verified signature, which is what makes it the
+     * only writer allowed to reach PAID. The synchronous response from the API
+     * call that created the intent is a hint about what to display; this event
+     * is the fact, and it can arrive minutes later or after the operator has
+     * closed the tab.
+     *
+     * A transition that the graph forbids is recorded and swallowed rather than
+     * thrown. The payment row above has been written either way, and the two
+     * cases that produce one — an event for an order already cancelled, an
+     * event redelivered after a later one — are both cases where the money
+     * record is still correct and returning a 500 would only make Stripe
+     * redeliver an event that will be refused identically.
+     */
+    await driveOrderStateFromEvent(tx, payment!.orderId, event.type, status);
+
     if (dispute) {
       await tx.paymentAttempt.create({
         data: {
@@ -552,6 +606,282 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
   });
 
   return { matched: true, ref, status };
+}
+
+/**
+ * Move the order to match a verified provider event.
+ *
+ * The mapping is deliberately partial. Every event that means "not paid" is
+ * mapped to a state that cannot precede fulfilment, and the two events that can
+ * mean "the seller's money is gone" — a refund and a dispute — are mapped to
+ * REFUND_REVIEW rather than to anything terminal, because what happens to the
+ * goods after the money moved is a decision, not a consequence.
+ *
+ * An illegal move is recorded, not raised. See the note at the call site.
+ */
+async function driveOrderStateFromEvent(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  eventType: string,
+  paymentStatus: string
+) {
+  const actor = { actorType: "WEBHOOK" as const, actorId: "stripe", actorName: "Stripe" };
+  const attempt = async (to: OrderState, reason: string) => {
+    try {
+      await transitionOrder({ orderId, to, actor, reason }, tx);
+    } catch (error) {
+      /*
+       * An event for an order that has already moved past the state this event
+       * describes. Recorded on the payment row's audit trail by the caller; the
+       * money record is unaffected, and Stripe must not be asked to redeliver
+       * an event that would be refused identically every time.
+       */
+      await recordAudit(
+        {
+          actorType: "WEBHOOK",
+          actorId: "stripe",
+          actorName: "Stripe",
+          action: "order.state_change_refused",
+          entityType: AUDIT_ENTITY.ORDER,
+          entityId: orderId,
+          afterData: {
+            eventType,
+            attemptedState: to,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        },
+        tx as never
+      );
+    }
+  };
+
+  switch (eventType) {
+    case "payment_intent.succeeded": {
+      /*
+       * PAID, AND ONLY FROM HERE.
+       *
+       * This is the single write in the system that says the seller's money has
+       * arrived, and it sits behind a verified signature. Everything that ships
+       * a parcel is downstream of it.
+       */
+      const paid = await markPaid(
+        { orderId, actor, reason: "Stripe reported the charge succeeded." },
+        tx
+      ).catch(async (error) => {
+        await recordAudit(
+          {
+            actorType: "WEBHOOK",
+            actorId: "stripe",
+            actorName: "Stripe",
+            action: "order.paid_refused",
+            entityType: AUDIT_ENTITY.ORDER,
+            entityId: orderId,
+            afterData: { reason: error instanceof Error ? error.message : String(error) },
+          },
+          tx as never
+        );
+        return null;
+      });
+
+      /*
+       * Then immediately ready to fulfil. The two are separate states because
+       * they are separate facts — "the seller paid" is about money and "the
+       * warehouse may start" is about work — and keeping them separate is what
+       * lets an operator hold an order at PAID without that looking like a
+       * payment failure.
+       */
+      if (paid) await attempt("READY_FOR_FULFILLMENT", "Seller payment cleared.");
+      break;
+    }
+    case "payment_intent.processing":
+      await attempt("PAYMENT_PROCESSING", "Stripe is processing the charge.");
+      break;
+    case "payment_intent.requires_action":
+      await attempt(
+        "PAYMENT_ACTION_REQUIRED",
+        "The card issuer requires the seller to authenticate this payment."
+      );
+      break;
+    case "payment_intent.payment_failed":
+      await attempt("PAYMENT_FAILED", "Stripe reported the charge failed.");
+      break;
+    case "payment_intent.canceled":
+      await attempt("PAYMENT_FAILED", "The payment was cancelled before it completed.");
+      break;
+    case "charge.refunded":
+      await attempt(
+        "REFUND_REVIEW",
+        paymentStatus === "REFUNDED"
+          ? "The seller's charge was refunded in full."
+          : "The seller's charge was partially refunded."
+      );
+      break;
+    case "charge.dispute.created":
+      await attempt("REFUND_REVIEW", "The seller's charge was disputed.");
+      break;
+    default:
+      break;
+  }
+}
+
+/**
+ * Give the seller back money MoonVella charged them.
+ *
+ * THE GUARD IS THE POINT. `Prevent refunding more than the seller was charged`
+ * is enforced here rather than trusted to whichever caller builds the request,
+ * because the amount is a number a person types and the ceiling is a fact from
+ * the payment row. A refund of the remainder is allowed; a refund of more than
+ * the remainder is refused with the arithmetic stated, and nothing is sent to
+ * Stripe.
+ *
+ * This is NOT how a Shopify customer refund is handled. That is the seller's
+ * money and the seller's decision, and MoonVella does not mirror it
+ * automatically — see `Refund` in the schema and §5 of the work order.
+ */
+export async function refundSellerCharge(input: {
+  orderId: string;
+  /** Minor units. Defaults to everything still refundable. */
+  amountMinor?: number;
+  reason: string;
+  actor: { actorType: "ADMIN_USER" | "SYSTEM"; actorId: string; actorName?: string | null };
+  /** The Shopify refund this decision was made about, when there is one. */
+  shopifyRefundId?: string | null;
+}) {
+  const payment = await prisma.wholesalePayment.findUnique({
+    where: { orderId: input.orderId },
+    include: { order: { select: { id: true, currency: true } } },
+  });
+  if (!payment) throw new Error("This order has no charge to refund.");
+  if (payment.status !== "SUCCEEDED" && payment.status !== "PARTIALLY_REFUNDED") {
+    throw new Error(
+      `Only a charge that succeeded can be refunded; this one is ${payment.status}.`
+    );
+  }
+  if (!payment.providerPaymentIntentId) {
+    throw new Error("This charge has no provider payment to refund against.");
+  }
+  if (isSimulatedId(payment.providerPaymentIntentId)) {
+    throw new Error(
+      "This is a simulated charge recorded while Stripe was in simulated mode. " +
+        "There is no provider payment behind it, so there is nothing to refund."
+    );
+  }
+
+  const refundable = payment.amount - payment.refundedAmount;
+  const requested = input.amountMinor ?? refundable;
+  if (requested <= 0) {
+    throw new Error("There is nothing left to refund on this charge.");
+  }
+  if (requested > refundable) {
+    throw new Error(
+      `Refusing to refund ${requested} when only ${refundable} of the ${payment.amount} charged ` +
+        `remains refundable.`
+    );
+  }
+
+  /*
+   * The key is derived from the amount and what is left, so a double-submit of
+   * the same refund resolves to one refund at Stripe while a deliberate second
+   * partial refund — a different amount — is a genuinely new request.
+   */
+  const idempotencyKey = `refund:${input.orderId}:${payment.refundedAmount}:${requested}`;
+  const params = new URLSearchParams({
+    payment_intent: payment.providerPaymentIntentId,
+    amount: String(requested),
+    "metadata[moonvellaOrderId]": input.orderId,
+    "metadata[reason]": input.reason.slice(0, 200),
+  });
+
+  const mode = await assertNotDisabled("refund a seller charge");
+  if (mode !== "test" && mode !== "live") {
+    throw new Error(
+      `Stripe is in ${mode} mode, so no refund was sent. A simulated charge has no provider payment to refund.`
+    );
+  }
+  const { key } = await requireStripeProvider("refund a seller charge");
+  const res = await fetch(`${STRIPE_API}/refunds`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Idempotency-Key": idempotencyKey,
+    },
+    body: params,
+  });
+  const json = (await res.json()) as {
+    id?: string;
+    status?: string;
+    amount?: number;
+    error?: { message?: string };
+  };
+  if (!res.ok) {
+    throw new Error(redactSecrets(json?.error?.message || `Stripe refused the refund (HTTP ${res.status}).`));
+  }
+
+  const refundId = String(json.id ?? "");
+  const nextRefunded = payment.refundedAmount + requested;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.wholesalePayment.update({
+      where: { id: payment.id },
+      data: {
+        refundedAmount: nextRefunded,
+        status: nextRefunded >= payment.amount ? "REFUNDED" : "PARTIALLY_REFUNDED",
+      },
+    });
+    /*
+     * The refund row is the MoonVella-side record, kept on the same row as the
+     * customer refund when there is one because they are the same event seen
+     * from two sides — and created on its own when there is not, because a
+     * refund MoonVella decided on for its own reasons is still a refund.
+     */
+    if (input.shopifyRefundId) {
+      await tx.refund.updateMany({
+        where: { orderId: input.orderId, shopifyRefundId: input.shopifyRefundId },
+        data: {
+          stripeRefundId: refundId || null,
+          stripeStatus: String(json.status ?? "pending"),
+          reviewNote: input.reason,
+          reviewedAt: new Date(),
+        },
+      });
+    }
+    await recordAudit(
+      {
+        actorType: input.actor.actorType,
+        actorId: input.actor.actorId,
+        actorName: input.actor.actorName ?? null,
+        action: "payment.refund_issued",
+        entityType: AUDIT_ENTITY.PAYMENT,
+        entityId: payment.id,
+        afterData: {
+          amountMinor: requested,
+          refundedTotalMinor: nextRefunded,
+          chargedMinor: payment.amount,
+          stripeRefundId: refundId,
+          stripeStatus: json.status ?? null,
+          reason: input.reason,
+        },
+      },
+      tx as never
+    );
+  });
+
+  await transitionOrder(
+    {
+      orderId: input.orderId,
+      to: "REFUND_REVIEW",
+      actor: {
+        actorType: input.actor.actorType === "SYSTEM" ? "SYSTEM" : "ADMIN_USER",
+        actorId: input.actor.actorId,
+        actorName: input.actor.actorName ?? null,
+      },
+      reason: input.reason,
+    },
+    undefined
+  ).catch(() => undefined);
+
+  return { refundId, status: String(json.status ?? "pending"), amountMinor: requested, refundedTotalMinor: nextRefunded };
 }
 
 /**

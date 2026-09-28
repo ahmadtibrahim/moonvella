@@ -1,7 +1,7 @@
 import "../styles/admin.css";
 import { Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
-import { requireAuth, userCan } from "~/utils/adminAuth.server";
+import { requireAuth } from "~/utils/adminAuth.server";
 import { can, type Permission } from "~/services/permissions";
 import type { AdminRole } from "@prisma/client";
 
@@ -41,6 +41,11 @@ const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permi
   // without being able to write it.
   { href: "/admin/odoo", label: "Odoo Import", icon: "I", permission: "products.view" },
   { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view" },
+  // The warehouse's own screen: the orders a seller has paid for and that are
+  // released for fulfillment, oldest first. It sits under Orders rather than
+  // under Shipping because it is a work list over orders — the shipping section
+  // begins later, at the parcel.
+  { href: "/admin/fulfillment", label: "Fulfillment", icon: "F", permission: "orders.view" },
   { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view" },
   // The docks goods are collected from. It sits next to Shipping rather than
   // under Settings because it is the record a shipping decision is made from:

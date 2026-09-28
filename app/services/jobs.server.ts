@@ -100,6 +100,59 @@ export const JOB_KIND = {
    * was current when the change was made.
    */
   INVENTORY_PUSH: "INVENTORY_PUSH",
+  /**
+   * Take one Shopify order event in.
+   *
+   * THE WEBHOOK ROUTE DOES NOT DO THIS WORK ITSELF, and that is the whole point
+   * of the job. Shopify gives a delivery a few seconds to be answered and then
+   * counts it failed and retries; everything this work needs — resolving the
+   * seller, reading the line bindings, pricing the lines, writing the order and
+   * its transition row — is a database round trip per step, and any one of them
+   * being slow turns a working webhook into a delivery Shopify believes was
+   * lost. So the route records the delivery and answers 200, and the work
+   * happens here, where being slow costs nobody a delivery.
+   *
+   * The payload is carried on the job rather than re-fetched, because the
+   * delivery id recorded with it is what makes a redelivery of the SAME event a
+   * no-op, and a re-fetch would produce a newer payload under an older id.
+   */
+  SHOPIFY_ORDER_INTAKE: "SHOPIFY_ORDER_INTAKE",
+  /**
+   * Charge the seller's saved method for a MoonVella order.
+   *
+   * Queued the moment an order is taken in, so the charge is not waiting on
+   * anybody opening a page, and queued again by the seller's Retry — the two
+   * are the same job with the same key, so a retry while the first attempt is
+   * still running does not become a second charge.
+   */
+  SHOPIFY_SELLER_CHARGE: "SHOPIFY_SELLER_CHARGE",
+  /**
+   * Route the MoonVella lines to the MoonVella location and submit the
+   * fulfillment order workflow.
+   *
+   * Queued only after the seller's charge has SUCCEEDED. That ordering is not a
+   * convention this job trusts the caller to have followed: the handler
+   * re-reads the order's state and refuses unless the money has cleared, so a
+   * job queued by a bug still cannot put stock on a truck.
+   */
+  SHOPIFY_FULFILLMENT_SUBMIT: "SHOPIFY_FULFILLMENT_SUBMIT",
+  /**
+   * Ask Shopify to start delivering this app's order events.
+   *
+   * RECURRING — see RECURRING_JOBS — and that is the point. Registration is
+   * refused until the app is approved for Protected Customer Data, and the
+   * approval is a Partner Dashboard review that lands at a moment nobody
+   * schedules. A one-shot registration at install time would have to be
+   * triggered again by hand after approval, and forgetting is silent: no
+   * subscription, no delivery, no error anywhere the merchant can see. Retrying
+   * on a beat turns "approved but not yet receiving" into a state that lasts
+   * fifteen minutes instead of one that lasts until someone notices.
+   *
+   * It is cheap when there is nothing to do — the handler reads the existing
+   * subscriptions first and creates only what is missing, so a store that is
+   * fully registered costs one GraphQL read per beat.
+   */
+  SHOPIFY_WEBHOOK_SUBSCRIBE: "SHOPIFY_WEBHOOK_SUBSCRIBE",
 } as const;
 
 export type JobKind = (typeof JOB_KIND)[keyof typeof JOB_KIND];
@@ -262,6 +315,15 @@ export const RECURRING_JOBS: readonly RecurringJob[] = [
     // after a deploy that fixes the probe should be measured in minutes.
     everyMs: 5 * 60 * 1000,
     summary: "Queue a probe for every video still waiting to be measured.",
+  },
+  {
+    kind: JOB_KIND.SHOPIFY_WEBHOOK_SUBSCRIBE,
+    // Fifteen minutes. Short enough that approval in the Partner Dashboard is
+    // followed by real deliveries within the same coffee break, long enough
+    // that a store permanently refused costs 96 reads a day and not 288. Once
+    // all six topics are present the handler writes nothing at all.
+    everyMs: 15 * 60 * 1000,
+    summary: "Register this app's order webhook subscriptions with Shopify.",
   },
   {
     kind: JOB_KIND.ODOO_CATALOG_SYNC,

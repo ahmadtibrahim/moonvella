@@ -505,7 +505,12 @@ async function main() {
   const afterCharge = await prisma.wholesalePayment.findUnique({ where: { orderId: order.id } });
   check("WholesalePayment PROCESSING after charge", afterCharge?.status === "PROCESSING", afterCharge?.status ?? "null");
   check("PaymentAttempt recorded", afterCharge ? (await prisma.paymentAttempt.count({ where: { paymentId: afterCharge.id } })) === 1 : false);
-  check("audit row for payment.charge_succeeded", afterCharge ? (await auditCount("payment.charge_succeeded", afterCharge.id)) >= 1 : false);
+  // The action is `payment.charge_submitted`, not `..._succeeded`, and that rename is
+  // deliberate: this row is written when Stripe ACCEPTS the charge for processing, which
+  // is not the same moment the seller's money moves. Calling it "succeeded" here made the
+  // audit log claim a payment that could still fail. Success is recorded separately, by
+  // the verified Stripe event handler, as `payment.succeeded`.
+  check("audit row for payment.charge_submitted", afterCharge ? (await auditCount("payment.charge_submitted", afterCharge.id)) >= 1 : false);
 
   const applied = await applyStripeEvent({
     id: `evt_e2e_${suffix}`,

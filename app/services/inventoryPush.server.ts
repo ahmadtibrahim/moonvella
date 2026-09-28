@@ -1,6 +1,7 @@
 import { prisma } from "~/db.server";
 import { JOB_KIND, enqueueJob, jobKey } from "./jobs.server";
 import { AUTO_SYNC_OFF_REASON, bufferedQuantity } from "~/utils/inventorySync";
+import { moonvellaStockLocationId } from "./shopifyFulfillment.server";
 
 /**
  * TELLING THE SELLER'S STORE HOW MANY ARE LEFT.
@@ -272,12 +273,56 @@ export async function pushInventoryForVariants(
       continue;
     }
 
-    const locationId = await resolveLocationId(admin, group);
+    /*
+     * MOONVELLA'S OWN LOCATION FIRST, and the reason is not tidiness.
+     *
+     * MoonVella ships these goods. Until they have a location of their own,
+     * every imported variant is stocked on the MERCHANT's shelf — "Shop
+     * location" — which tells the merchant's own records that their shop holds
+     * stock it does not hold, and tells MoonVella nothing about where the goods
+     * are. That is the same defect the fulfillment routing fixes, seen from the
+     * inventory side, and it is fixed in the same place: the number goes to the
+     * location MoonVella owns.
+     *
+     * When the location cannot be created — no `write_fulfillments`, or no
+     * Protected Customer Data approval — this falls through to the old
+     * behaviour rather than failing the push. A quantity that lands on the
+     * merchant's shelf is wrong but harmless; a push that refuses to run leaves
+     * the storefront showing a number that is wrong AND stale.
+     */
+    const ourLocation = await moonvellaStockLocationId(sellerId);
+    const locationId = ourLocation.locationId ?? (await resolveLocationId(admin, group));
     if (!locationId) {
       const message = "the store has no location to hold inventory";
       outcome.failures.push({ sellerId, shopDomain, message });
       await recordFailure(mappingIds);
       continue;
+    }
+
+    /*
+     * AND NOWHERE ELSE. A quantity at MoonVella's location that is still also
+     * available at the merchant's is worse than either alone: the storefront
+     * sells the same unit twice and both locations report it as sellable.
+     *
+     * This runs only while some mapping still remembers a different location,
+     * which is exactly once per mapping — the update below rewrites them all to
+     * the location used here, so the second push of the same variant has
+     * nothing to move and makes no extra call.
+     */
+    const needsRelocation =
+      Boolean(ourLocation.locationId) &&
+      group.some((candidate) => candidate.shopifyLocationId !== ourLocation.locationId);
+    if (needsRelocation && ourLocation.locationId) {
+      const cleared = await clearOtherStockLocations(admin, group, ourLocation.locationId);
+      if (cleared) {
+        // Not fatal: the number is already correct at MoonVella's location and
+        // the mapping update below will stop this from being retried forever.
+        outcome.failures.push({
+          sellerId,
+          shopDomain,
+          message: `the MoonVella location holds this stock but another location could not be cleared (${cleared})`,
+        });
+      }
     }
 
     const buffer = bufferBySeller.get(sellerId) ?? 0;
@@ -427,6 +472,55 @@ async function setQuantities(
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
+}
+
+/**
+ * Take this stock off every shelf except MoonVella's.
+ *
+ * Asked of each inventory item, because the locations an item has levels at is
+ * a property of the item and not of the shop — the same reason
+ * `resolveLocationId` asks the item rather than the shop. The number written is
+ * zero and not a deletion: an inventory level is not something this app can
+ * remove, and zero is the store's own way of saying "none here".
+ *
+ * Returns the first refusal, or null when every location was cleared. A
+ * refusal is reported and not thrown, because the quantity at MoonVella's
+ * location has already been written and is the part that matters.
+ */
+async function clearOtherStockLocations(
+  admin: PushAdmin,
+  group: PushCandidate[],
+  keepLocationId: string
+): Promise<string | null> {
+  const zeros: { inventoryItemId: string; locationId: string; quantity: number }[] = [];
+
+  for (const candidate of group) {
+    if (!candidate.shopifyInventoryItemId) continue;
+    try {
+      const response = await admin.graphql(ITEM_LOCATIONS_QUERY, {
+        variables: { id: candidate.shopifyInventoryItemId },
+      });
+      const json = (await response.json()) as {
+        data?: {
+          inventoryItem?: {
+            inventoryLevels?: { nodes?: { location?: { id: string } | null }[] };
+          };
+        };
+      };
+      const levels = json?.data?.inventoryItem?.inventoryLevels?.nodes ?? [];
+      for (const level of levels) {
+        const id = level?.location?.id;
+        if (id && id !== keepLocationId) {
+          zeros.push({ inventoryItemId: candidate.shopifyInventoryItemId, locationId: id, quantity: 0 });
+        }
+      }
+    } catch {
+      // Try the next item; one unreadable item says nothing about the rest.
+    }
+  }
+
+  if (!zeros.length) return null;
+  return setQuantities(admin, zeros);
 }
 
 async function recordFailure(ids: string[]): Promise<void> {

@@ -575,6 +575,17 @@ const CHECKS = [
     file: "scripts/verify-shopify-transfer.ts",
     requires: [],
   },
+  // The Shopify order pipeline. Every Shopify answer is injected, so this reaches
+  // no store — what it pins is the intake, the pricing, the seller charge, the
+  // state machine and what we send back. Simulated Stripe, pinned, for the same
+  // reason as payments and wholesale: none of it may charge anybody.
+  {
+    name: "shopify-orders",
+    kind: "ts",
+    file: "scripts/verify-shopify-orders.ts",
+    env: SIMULATED_STRIPE,
+    requires: [],
+  },
 ];
 
 async function runAll() {

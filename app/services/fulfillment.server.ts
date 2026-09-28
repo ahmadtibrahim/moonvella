@@ -4,6 +4,7 @@ import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./sh
 import { isFulfillmentMilestone } from "./shippingLogic";
 import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
 import { parcelProblems, ParcelValidationError } from "./packaging.server";
+import { isFulfillmentUnlocked } from "./orderState.server";
 
 export interface ShipmentInput {
   carrier: string;
@@ -50,6 +51,20 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
   if (order.wholesalePaymentStatus !== "SUCCEEDED") {
     throw new Error(
       `Fulfillment is held: wholesale payment status is ${order.wholesalePaymentStatus}, not SUCCEEDED.`
+    );
+  }
+  /*
+   * The payment status is not sufficient on its own, and that is not a
+   * belt-and-braces addition — it closes a real hole. `wholesalePaymentStatus`
+   * stays SUCCEEDED forever once a charge clears, so an order that was paid and
+   * then CANCELLED, or that a refund sent to REFUND_REVIEW, still reads
+   * SUCCEEDED and would ship goods nobody is going to pay for. The state is the
+   * thing that knows the order was called off; asking it is what stops a
+   * cancelled order from being loaded onto a truck.
+   */
+  if (!isFulfillmentUnlocked(order.state)) {
+    throw new Error(
+      `Fulfillment is held: order is in ${order.state} and has not been released for fulfillment.`
     );
   }
 

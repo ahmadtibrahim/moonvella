@@ -113,12 +113,246 @@ export const DEFAULTS: Record<
 
 export const INTEGRATION_KEYS = Object.keys(DEFAULTS) as IntegrationKey[];
 
+/**
+ * The integrations for which the GRANTED SCOPE really is the whole state.
+ *
+ * `shopify_orders` and `shopify_fulfillment` USED TO BE IN HERE AND ARE NOT ANY
+ * MORE, because for them the scope is not the state and the shortcut was a lie.
+ *
+ * `read_orders` appears in the session's granted scope list from the moment the
+ * merchant approves the OAuth prompt — and an app can hold `read_orders`, be
+ * completely unable to read a single order, and report HEALTHY, because Shopify
+ * gates the Order object behind a second approval that has nothing to do with
+ * scopes. That is exactly what was happening here: the settings page said the
+ * order integration was healthy while every order query came back "This app is
+ * not approved to access the Order object", and the merchant's orders silently
+ * did not exist. A health check that cannot fail is worse than no health check,
+ * because it is believed.
+ *
+ * What remains here are the integrations for which no cheap authenticated call
+ * exists and the scope genuinely is the precondition — analytics is a ShopifyQL
+ * capability that is either granted or not, and product import runs on scopes
+ * that were granted at install and cannot be withheld separately.
+ */
 const SHOPIFY_SCOPE_BY_KEY: Partial<Record<IntegrationKey, string>> = {
   shopify_analytics: "read_reports",
-  shopify_orders: "read_orders",
-  shopify_fulfillment: "write_merchant_managed_fulfillment_orders",
   product_import: "write_products",
 };
+
+/**
+ * Which of the seller's stores to probe, and what to probe it with.
+ *
+ * Shopify's answer depends on the store: an app can be approved for Protected
+ * Customer Data on one store's install and not another's. Probing one store and
+ * reporting for all of them would be the same class of mistake as reporting a
+ * scope as access.
+ */
+async function probeStore(): Promise<
+  { ok: true; shop: string } | { ok: false; reason: string; blocking: "SESSION" | "NONE" }
+> {
+  const session = await prisma.session.findFirst({
+    where: { scope: { contains: "read_orders" } },
+    orderBy: { expires: "desc" },
+    select: { shop: true },
+  });
+  if (!session) {
+    return {
+      ok: false,
+      reason:
+        "No connected store holds the read_orders scope yet. Install or reauthorize the app on a store to begin.",
+      blocking: "NONE",
+    };
+  }
+  return { ok: true, shop: session.shop };
+}
+
+/**
+ * Ask Shopify the question the integration actually depends on.
+ *
+ * Two reads, both authenticated, both cheap: the shop's own identity (the
+ * baseline that proves the session and the token work at all), and ONE order.
+ * The order read is the one that matters — it is the exact call the ingestion
+ * path makes, and it is refused by Protected Customer Data approval rather than
+ * by scopes, so a HEALTHY verdict from it means intake can genuinely work.
+ *
+ * Deliberately `first: 1` and no fields beyond the id. A health check that
+ * pages a merchant's order history to prove it can read orders is a health
+ * check that reads a merchant's order history.
+ */
+async function probeShopifyOrders(): Promise<IntegrationCheckResult> {
+  const store = await probeStore();
+  if (!store.ok) {
+    return { status: "NOT_CONFIGURED", detail: store.reason, error: null };
+  }
+
+  try {
+    const { unauthenticated } = await import("~/shopify.server");
+    const { admin } = await unauthenticated.admin(store.shop);
+    const res = await admin.graphql(
+      `#graphql
+        query MoonVellaOrderProbe {
+          shop { name myshopifyDomain }
+          orders(first: 1) { nodes { id } }
+          webhookSubscriptions(first: 20) { nodes { id topic } }
+        }`,
+    );
+    const json: {
+      data?: {
+        shop?: { name?: string; myshopifyDomain?: string } | null;
+        orders?: { nodes?: { id: string }[] } | null;
+        webhookSubscriptions?: { nodes?: { id: string; topic: string }[] } | null;
+      };
+      errors?: { message: string }[];
+    } = await res.json();
+
+    const errors = json?.errors ?? [];
+    if (errors.length) {
+      const message = errors.map((e) => e.message).join("; ");
+      const pcd = /protected customer data/i.test(message);
+      return {
+        status: pcd ? "BLOCKED" : "FAILED",
+        detail:
+          `Shopify refused the order read for ${store.shop}: ${message}` +
+          (pcd
+            ? " — the app must be approved for Protected Customer Data in the Shopify Partner Dashboard. " +
+              "Until then no order can be read or subscribed to, whatever the granted scopes say."
+            : ""),
+        error: message,
+      };
+    }
+
+    const orderSubscriptions = (json?.data?.webhookSubscriptions?.nodes ?? []).filter((s) =>
+      String(s.topic ?? "").toUpperCase().startsWith("ORDERS_"),
+    );
+    const orderCount = json?.data?.orders?.nodes?.length ?? 0;
+
+    if (orderSubscriptions.length === 0) {
+      /*
+       * Readable orders but no subscriptions is a real and distinct failure:
+       * the app can see orders and will never be told about a new one. It is
+       * reported as FAILED rather than healthy because a store with no
+       * subscription is a store whose orders do not arrive.
+       */
+      return {
+        status: "FAILED",
+        detail:
+          `Orders are readable for ${store.shop}, but no orders/* webhook subscription exists. ` +
+          `New orders will not be delivered until the app's webhook subscriptions are registered.`,
+        error: "No orders/* webhook subscription is registered.",
+      };
+    }
+
+    return {
+      status: "HEALTHY",
+      detail:
+        `Authenticated against ${json?.data?.shop?.myshopifyDomain ?? store.shop} and read the Order object ` +
+        `(${orderCount ? "at least one order" : "the order set, which is empty"}). ` +
+        `${orderSubscriptions.length} order subscription(s) registered: ` +
+        `${orderSubscriptions.map((s) => s.topic).join(", ")}.`,
+      error: null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "order probe failed";
+    const pcd = /protected customer data/i.test(message);
+    return {
+      status: pcd ? "BLOCKED" : "FAILED",
+      detail:
+        `Could not read orders for ${store.shop}: ${message}` +
+        (pcd
+          ? " — Protected Customer Data approval is required in the Shopify Partner Dashboard."
+          : ""),
+      error: message,
+    };
+  }
+}
+
+/**
+ * Whether MoonVella can actually own a shipment, asked rather than assumed.
+ *
+ * Three facts, in the order they matter: the fulfillment services are readable
+ * (which needs the fulfillment scopes), a MoonVella service with a location of
+ * its own exists for the store (which is what stops MoonVella fulfilling out of
+ * the merchant's shelf), and the fulfillment orders are readable (which is what
+ * Protected Customer Data gates).
+ */
+async function probeShopifyFulfillment(): Promise<IntegrationCheckResult> {
+  const store = await probeStore();
+  if (!store.ok) {
+    return { status: "NOT_CONFIGURED", detail: store.reason, error: null };
+  }
+
+  const seller = await prisma.seller.findUnique({
+    where: { shopDomain: store.shop },
+    select: { shopifyFulfillmentLocationId: true, fulfillmentLocationCheckedAt: true },
+  });
+
+  try {
+    const { unauthenticated } = await import("~/shopify.server");
+    const { admin } = await unauthenticated.admin(store.shop);
+    const res = await admin.graphql(
+      `#graphql
+        query MoonVellaFulfillmentProbe {
+          fulfillmentServices(first: 20) { nodes { id serviceName handle location { id name } } }
+        }`,
+    );
+    const json: {
+      data?: {
+        fulfillmentServices?: {
+          nodes?: { id: string; serviceName?: string | null; location?: { id?: string } | null }[];
+        } | null;
+      };
+      errors?: { message: string }[];
+    } = await res.json();
+
+    const errors = json?.errors ?? [];
+    if (errors.length) {
+      const message = errors.map((e) => e.message).join("; ");
+      return {
+        status: /access scope|access denied/i.test(message) ? "BLOCKED" : "FAILED",
+        detail: `Shopify refused the fulfillment-service read for ${store.shop}: ${message}`,
+        error: message,
+      };
+    }
+
+    // Imported dynamically rather than at the top of the file: the fulfillment
+    // service imports this module for `setIntegrationState`, so a static import
+    // here would be a cycle.
+    const { MOONVELLA_FULFILLMENT_SERVICE_NAME: wanted } = await import("./shopifyFulfillment.server");
+
+    const services = json?.data?.fulfillmentServices?.nodes ?? [];
+    const ours = services.find(
+      (s) => String(s.serviceName ?? "").toLowerCase() === wanted.toLowerCase(),
+    );
+    const locationId = ours?.location?.id ?? seller?.shopifyFulfillmentLocationId ?? null;
+
+    if (!locationId) {
+      return {
+        status: "NOT_CONFIGURED",
+        detail:
+          `No ${wanted} fulfillment service exists for ${store.shop}. ` +
+          `It is created on the first product import; until it exists, orders would be routed to the ` +
+          `merchant's own location and MoonVella would be shipping from the merchant's shelf.`,
+        error: null,
+      };
+    }
+
+    return {
+      status: "HEALTHY",
+      detail:
+        `The ${wanted} fulfillment service is present for ${store.shop} ` +
+        `with location ${locationId}. MoonVella's stock belongs there and the fulfillment orders for ` +
+        `MoonVella lines are routed to it.`,
+      error: null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "fulfillment probe failed";
+    return {
+      status: "FAILED",
+      detail: `Could not read fulfillment services for ${store.shop}: ${message}`,
+      error: message,
+    };
+  }
+}
 
 export interface IntegrationStateView {
   key: string;
@@ -214,6 +448,18 @@ export async function checkIntegration(
   }
 
   switch (key) {
+    /*
+     * Both of these were scope checks and both were wrong, for the same reason:
+     * the scope Shopify grants during OAuth and the approval Shopify requires
+     * before an app may touch an order are different gates, and only the second
+     * one decides whether any of this works. See the note on
+     * SHOPIFY_SCOPE_BY_KEY.
+     */
+    case "shopify_orders":
+      return await probeShopifyOrders();
+    case "shopify_fulfillment":
+      return await probeShopifyFulfillment();
+
     case "stripe": {
       // An authenticated call, not a presence check. "A key is present" and "the
       // key works" are different facts, and only the second one may be shown as

@@ -5,6 +5,57 @@ import { setIntegrationState } from "./integrationHealth.server";
 import { resolvePackagesForVariant, toCm, toKg } from "./packaging.server";
 import { addressMateriallyDiffers } from "./addressValidation.server";
 import { invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
+import {
+  cancellationTarget,
+  transitionOrder,
+  MONEY_CLEARED,
+  type OrderState,
+  type StateActor,
+} from "./orderState.server";
+import { enqueueJob, JOB_KIND } from "./jobs.server";
+
+/**
+ * The Shopify topics this deployment acts on.
+ *
+ * Declared here rather than in the route because two things need to agree about
+ * it: the route, which decides whether a delivery is worth recording, and
+ * `shopify.app.toml`, whose subscription list must name the same events. A
+ * topic that is subscribed but not listed here is a delivery the app
+ * acknowledges and drops; one listed here but not subscribed is work that will
+ * never be asked for.
+ *
+ * `orders/paid` is deliberately separate from `orders/create`. A great many
+ * stores take payment asynchronously — a bank transfer, a manual capture, a
+ * gateway callback that lands a minute after the order — and an order that is
+ * created unpaid and paid later produces two events, only the second of which
+ * means the seller's card may be charged.
+ *
+ * `fulfillment_orders/order_routing_complete` is here because Shopify decides
+ * where an order's lines are routed, and it tells the app when it has finished
+ * deciding. Until that event arrives there may be no fulfillment order to act
+ * on, so an app that only listens to orders/paid races Shopify's own routing
+ * and loses on the orders it most needs to win.
+ */
+export const WEBHOOK_TOPICS: ReadonlySet<string> = new Set([
+  "ORDERS_CREATE",
+  "ORDERS_PAID",
+  "ORDERS_UPDATED",
+  "ORDERS_CANCELLED",
+  "REFUNDS_CREATE",
+  "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE",
+]);
+
+/**
+ * Where a delivery came from.
+ *
+ * A REPLAY is an operator asking the system to take in an order Shopify has
+ * already told it about — or, in the case this was written for, never told it
+ * about because the subscription did not exist. The path is the same code
+ * deliberately: a replay that took a different route would be a second
+ * implementation of intake, and the order it produced would be one nobody had
+ * ever tested.
+ */
+export type IntakeSource = "WEBHOOK" | "REPLAY";
 
 interface TaxLine {
   price?: string | null;
@@ -52,6 +103,14 @@ interface ShippingLine {
 
 interface OrderPayload {
   id: number;
+  /**
+   * The order a NON-order event belongs to.
+   *
+   * `refunds/create` and `fulfillment_orders/order_routing_complete` are about
+   * a refund and a fulfillment order respectively, and both name the order in
+   * this field. Their own `id` is a different object's id.
+   */
+  order_id?: number | string;
   name?: string;
   order_number?: number;
   email?: string;
@@ -462,13 +521,65 @@ function addressJson(value: unknown): string | null {
   return value ? JSON.stringify(value) : null;
 }
 
+/**
+ * What is kept of a delivery once it has been processed.
+ *
+ * THE FULL BODY IS NOT KEPT. A Shopify order payload carries the customer's
+ * name, email address, phone number and both addresses, and a `refunds/create`
+ * carries the same again. That is the exact set of fields this app is trusted
+ * with and the exact set that must not be sitting in a table nothing ever
+ * prunes — a webhook log is read by more people than the order it describes,
+ * and it outlives the order.
+ *
+ * What is kept is what an operator actually needs to answer "did we get this,
+ * and what did we do with it": which store, which topic, which order, and the
+ * three facts that say whether the payload was about money and fulfilment. All
+ * of it is identifiers and states — no names, no addresses, no contact details.
+ */
+function redactedSummary(payload: OrderPayload): string {
+  return JSON.stringify({
+    redacted: true,
+    id: payload?.id ?? null,
+    name: payload?.name ?? null,
+    order_number: payload?.order_number ?? null,
+    financial_status: payload?.financial_status ?? null,
+    fulfillment_status: payload?.fulfillment_status ?? null,
+    current_total_price: payload?.total_price ?? null,
+    currency: payload?.currency ?? null,
+    line_item_count: payload?.line_items?.length ?? 0,
+    note:
+      "The full delivery was held only while it was being processed, then replaced by this summary. " +
+      "Customer identity fields are not retained here.",
+  });
+}
+
 async function finishEvent(id: string, status: "SUCCESS" | "FAILED", errorMessage?: string | null) {
+  const current = await prisma.webhookEvent.findUnique({
+    where: { id },
+    select: { payload: true, retryCount: true },
+  });
+  let summary = "{}";
+  try {
+    summary = current ? redactedSummary(JSON.parse(current.payload) as OrderPayload) : "{}";
+  } catch {
+    // A body that will not parse is exactly the body not to keep a copy of.
+    summary = JSON.stringify({ redacted: true, unparseable: true });
+  }
+
   await prisma.webhookEvent.update({
     where: { id },
     data: {
       status,
       processedAt: new Date(),
+      payload: summary,
+      /*
+       * A failure keeps the summary too. The operator needs to know the
+       * delivery arrived and what it was about; they do not need the
+       * customer's address to work out why intake refused it, and an error
+       * message names the reason.
+       */
       ...(errorMessage !== undefined ? { errorMessage } : {}),
+      ...(status === "FAILED" ? { retryCount: (current?.retryCount ?? 0) + 1 } : {}),
     },
   });
 }
@@ -486,15 +597,49 @@ async function finishEvent(id: string, status: "SUCCESS" | "FAILED", errorMessag
  * Dedup is durable per (shop, topic, order, payload version) so redeliveries are
  * ignored while genuine updates still apply.
  */
-export async function intakeOrder(input: { topic: string; shop: string; payload: OrderPayload }): Promise<IntakeResult> {
+export async function intakeOrder(input: {
+  topic: string;
+  shop: string;
+  payload: OrderPayload;
+  /**
+   * Defaults to WEBHOOK. A replay says REPLAY so the audit distinguishes an
+   * order that arrived by itself from one an operator asked for.
+   */
+  source?: IntakeSource;
+  /**
+   * The delivery row the webhook route already wrote, when there is one.
+   *
+   * Passing it means the delivery is marked finished rather than duplicated:
+   * the route records a delivery before it knows whether the payload is one
+   * this app acts on, and intake is what completes that record.
+   */
+  eventId?: string;
+}): Promise<IntakeResult> {
   const { topic, shop, payload } = input;
-  const orderId = payload?.id;
-  if (!orderId) {
-    return { ok: false, reason: "missing order id" };
-  }
+  const source: IntakeSource = input.source ?? "WEBHOOK";
 
   const isCancelled = topic === "ORDERS_CANCELLED";
   const isUpdated = topic === "ORDERS_UPDATED";
+  const isRefund = topic === "REFUNDS_CREATE";
+  const isRouting = topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE";
+
+  /*
+   * WHICH ORDER THIS EVENT IS ABOUT.
+   *
+   * Three of the six topics carry an order as their subject and their `id` IS
+   * the order id. The other three do not: a refund's `id` is the refund, and a
+   * routing event's `id` is the fulfillment order. Both name the order they
+   * belong to in `order_id`.
+   *
+   * Reading `payload.id` unconditionally — which is what this did — meant a
+   * refund or a routing event would be filed against an order whose id was
+   * really a refund id. Nothing would be found, nothing would be written, and
+   * the event would be recorded as a successful no-op.
+   */
+  const orderId = isRefund || isRouting ? payload?.order_id : payload?.id;
+  if (!orderId) {
+    return { ok: false, reason: "missing order id" };
+  }
   const version = payload.updated_at ?? payload.cancelled_at ?? payload.created_at ?? "";
   const idempotencyKey = `${shop}:${topic}:${orderId}:${version}`;
   const already = await prisma.webhookEvent.findUnique({ where: { idempotencyKey } });
@@ -502,15 +647,42 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
     return { ok: true, duplicate: true };
   }
 
-  const event = await prisma.webhookEvent.create({
-    data: {
-      shopDomain: shop,
-      topic,
-      payload: JSON.stringify(payload),
-      status: "PROCESSING",
-      idempotencyKey,
-    },
-  });
+  let event: { id: string };
+  if (input.eventId) {
+    const claimed = await prisma.webhookEvent.findUnique({ where: { id: input.eventId } });
+    /*
+     * The route wrote this row moments ago and enqueued this job. If it is
+     * already SUCCESS it has been processed — by an earlier run of this same
+     * job, most likely — and there is nothing to do.
+     */
+    if (claimed && claimed.status === "SUCCESS") return { ok: true, duplicate: true };
+    event = claimed
+      ? await prisma.webhookEvent.update({
+          where: { id: claimed.id },
+          data: { status: "PROCESSING", source, errorMessage: null },
+        })
+      : await prisma.webhookEvent.create({
+          data: {
+            shopDomain: shop,
+            topic,
+            payload: JSON.stringify(payload),
+            status: "PROCESSING",
+            source,
+            idempotencyKey,
+          },
+        });
+  } else {
+    event = await prisma.webhookEvent.create({
+      data: {
+        shopDomain: shop,
+        topic,
+        payload: JSON.stringify(payload),
+        status: "PROCESSING",
+        source,
+        idempotencyKey,
+      },
+    });
+  }
 
   try {
     const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
@@ -527,6 +699,32 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
 
     if (isCancelled) {
       return await handleCancelled(event.id, shop, existingOrder, payload);
+    }
+
+    /*
+     * A customer refund is not a MoonVella refund.
+     *
+     * Shopify's `refunds/create` says the SELLER gave the CUSTOMER their money
+     * back. MoonVella is not a party to that transaction and has taken nothing
+     * from the customer; what it may have taken is the seller's wholesale
+     * payment. Whether the seller gets that back is MoonVella's decision, made
+     * against its own rule, and it is never inferred from this event. What this
+     * event does is make the question visible: once the seller has been
+     * charged, a refunded order is money that may need to go back, so it is
+     * held in REFUND_REVIEW for a person rather than quietly shipped.
+     */
+    if (isRefund) {
+      return await handleRefund(event.id, shop, existingOrder, payload);
+    }
+
+    /*
+     * Shopify has finished deciding where the order's lines are routed. The
+     * fulfillment order this app needs may only exist from this moment, so a
+     * paid order is handed to the fulfilment queue again rather than trusted to
+     * have been routed when the payment cleared.
+     */
+    if (topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE") {
+      return await handleRoutingComplete(event.id, shop, existingOrder);
     }
 
     /**
@@ -671,6 +869,31 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
       });
 
       await reconcileRefunds(tx, created.id, payload.refunds);
+
+      /*
+       * RECEIVED lasts exactly as long as the transaction that creates the
+       * order, and the reason it exists at all is that "an order row exists"
+       * and "we know what to do with it" are different facts. The order has
+       * been priced, so what it is waiting for is the seller's money.
+       *
+       * The first transition is written here, inside the same transaction, so
+       * an order can never be observed with no history at all — a row whose
+       * state is AWAITING_SELLER_PAYMENT and whose transition table is empty
+       * would be an order nobody could explain.
+       */
+      await transitionOrder(
+        {
+          orderId: created.id,
+          to: "AWAITING_SELLER_PAYMENT",
+          actor: intakeActor(source, shop),
+          reason:
+            source === "REPLAY"
+              ? "Order taken in by an operator replay."
+              : `Received from Shopify (${topic}).`,
+        },
+        tx
+      );
+
       return created;
     });
 
@@ -695,9 +918,32 @@ export async function intakeOrder(input: { topic: string; shop: string; payload:
       prisma as never
     );
 
+    /*
+     * THE SELLER IS CHARGED WITHOUT ANYBODY OPENING A PAGE.
+     *
+     * Queued here rather than in the webhook route because this is the first
+     * moment there is an order to charge for, and queued rather than charged
+     * inline because a Stripe call is a network call to a third party inside
+     * the transaction that just created the order. The key is the order, not
+     * the delivery, so the several events Shopify sends about one order — the
+     * create, the paid, an update — all resolve to a single charge job.
+     *
+     * Queueing is not charging. Whether anything is actually charged is decided
+     * by `chargeSellerForOrder`, which reads the order's state and the seller's
+     * settings; an order that is unpaid queues the same job and the job
+     * declines it.
+     */
+    await enqueueJob({
+      kind: JOB_KIND.SHOPIFY_SELLER_CHARGE,
+      idempotencyKey: `shopify-seller-charge:${order.id}`,
+      sellerId: seller.id,
+      sellerAccessVersion: seller.accessVersion,
+      payload: { orderId: order.id, trigger: "AUTOMATIC" },
+    });
+
     await setIntegrationState("shopify_orders", {
       status: "HEALTHY",
-      detail: "Receiving order webhooks and creating supplier orders.",
+      detail: `Receiving order webhooks; ${built.rows.length} MoonVella line(s) taken in from ${shop}.`,
     });
 
     await finishEvent(event.id, "SUCCESS");
@@ -767,6 +1013,7 @@ async function handleUpdated(
       quantity: number;
     }[];
     financialStatus: string | null;
+    state: OrderState;
     fulfillmentStatus: "PENDING" | "PROCESSING" | "SHIPPED" | "DELIVERED" | "CANCELLED" | "PARTIAL";
     wholesalePaymentStatus: string;
     moonvellaSubtotal: number;
@@ -887,6 +1134,14 @@ async function handleUpdated(
             }
           : {}),
         fulfillmentStatus: mapFulfillmentStatus(payload.fulfillment_status, order.fulfillmentStatus),
+        /*
+         * Shopify's own word for the fulfilment state, kept verbatim beside
+         * MoonVella's view of it. The two disagree constantly and for good
+         * reason — MoonVella's advances when MoonVella ships, and Shopify has a
+         * "restocked" this app has no equivalent for — so the only way to
+         * compare them without inverting a lossy mapping is to keep both.
+         */
+        shopifyFulfillmentState: payload.fulfillment_status ?? null,
         customerEmail: payload.email ?? payload.customer?.email ?? undefined,
         customerName: customerName(payload) ?? undefined,
         customerPhone: payload.customer?.phone ?? undefined,
@@ -1010,23 +1265,84 @@ async function handleUpdated(
     });
   }
 
+  /*
+   * THE CUSTOMER'S MONEY ARRIVING IS WHAT MAKES THE SELLER'S CHARGE DUE.
+   *
+   * An order that was created unpaid and paid later produces this update, not a
+   * second create, and the charge job queued at intake has already run and
+   * declined because nothing had been paid. Re-queueing under the same key
+   * revives that finished row, so the seller is charged the moment the store
+   * has the customer's money — without a second charge job ever existing, and
+   * without anything having to notice that the first run declined.
+   *
+   * Only while the order is still waiting on the seller. An order that has
+   * already been charged, or whose charge failed and is waiting for the
+   * seller's own retry, must not be re-attempted by a routine update.
+   */
+  if (payload.financial_status === "paid" && order.state === "AWAITING_SELLER_PAYMENT") {
+    await enqueueJob({
+      kind: JOB_KIND.SHOPIFY_SELLER_CHARGE,
+      idempotencyKey: `shopify-seller-charge:${order.id}`,
+      sellerId: undefined,
+      payload: { orderId: order.id, trigger: "AUTOMATIC" },
+    });
+  }
+
   await finishEvent(eventId, "SUCCESS");
   return { ok: true, orderId: order.id, updated: true, moonvellaItems: built.rows.length, refunds: refundsCreated };
 }
 
+/** Who a delivery is attributed to. A replay is still Shopify's event, run by a person. */
+function intakeActor(source: IntakeSource, shop: string): StateActor {
+  return source === "REPLAY"
+    ? { actorType: "ADMIN_USER", actorId: "replay", actorName: "Operator replay" }
+    : { actorType: "WEBHOOK", actorId: shop, actorName: shop };
+}
+
+/**
+ * A cancellation, which means two different things depending on the money.
+ *
+ * BEFORE THE CHARGE it is simply the end of the order: the customer withdrew,
+ * MoonVella never took anything from the seller, and there is nothing to give
+ * back. The order is cancelled, the warehouse is told to stop, and that is the
+ * whole of it.
+ *
+ * AFTER THE CHARGE the seller has paid for goods nobody is going to ship, and
+ * MoonVella is holding money for a sale that no longer exists. That is not a
+ * state a webhook may resolve by itself — refunding is MoonVella's decision to
+ * make deliberately, on its own rule — so the order is held in REFUND_REVIEW,
+ * which does nothing except be visible. `cancellationTarget` is what decides
+ * between the two, so the rule lives in one place rather than in a condition
+ * repeated at every caller that can see a cancellation.
+ *
+ * THE CHARGE IS NOT CANCELLED AUTOMATICALLY IN EITHER CASE. A PaymentIntent
+ * that has succeeded cannot be un-succeeded, and cancelling one that is merely
+ * pending is a decision about money that a customer's change of mind does not
+ * make for MoonVella.
+ */
 async function handleCancelled(
   eventId: string,
   shop: string,
   order: {
     id: string;
+    state: OrderState;
     fulfillmentRequest: { id: string; status: string } | null;
   } | null,
   payload: OrderPayload
 ): Promise<IntakeResult> {
   if (!order) {
+    /*
+     * A cancellation for an order this app never took in. That is a real
+     * answer, not a failure: the order was never MoonVella's, so there is
+     * nothing to cancel. It is recorded as a SUCCESS with the reason, because
+     * an operator asking "did we get the cancellation" needs to see that we
+     * did and what we did with it.
+     */
     await finishEvent(eventId, "SUCCESS", "Order not found for cancellation");
     return { ok: true, cancelled: 0 };
   }
+
+  const target = cancellationTarget(order.state);
 
   await prisma.$transaction(async (tx) => {
     await tx.order.update({
@@ -1047,8 +1363,26 @@ async function handleCancelled(
         data: { status: "CANCELLED" },
       });
     }
+
+    await transitionOrder(
+      {
+        orderId: order.id,
+        to: target,
+        actor: { actorType: "WEBHOOK", actorId: shop, actorName: shop },
+        reason:
+          target === "REFUND_REVIEW"
+            ? `Cancelled after the seller was charged (${order.state}); the wholesale payment needs a decision.`
+            : `Cancelled by the customer while still unpaid (${order.state}).`,
+      },
+      tx
+    );
   });
 
+  /*
+   * Nothing more is queued for a cancelled order. A charge job already waiting
+   * will find a CANCELLED order and decline — see `chargeSellerForOrder` — so
+   * the cancellation does not need to hunt down the queue to be safe.
+   */
   await recordAudit(
     {
       actorType: "WEBHOOK",
@@ -1057,11 +1391,107 @@ async function handleCancelled(
       action: "order.cancelled",
       entityType: AUDIT_ENTITY.ORDER,
       entityId: order.id,
-      afterData: { cancelReason: payload.cancel_reason ?? null },
+      afterData: {
+        cancelReason: payload.cancel_reason ?? null,
+        fromState: MONEY_CLEARED.has(order.state) ? "CHARGED" : "UNCHARGED",
+        landedIn: target,
+      },
     },
     prisma as never
   );
 
   await finishEvent(eventId, "SUCCESS");
   return { ok: true, orderId: order.id, cancelled: 1 };
+}
+
+/**
+ * A customer refund, which is the seller's transaction and not MoonVella's.
+ *
+ * The Refund row is written so the order's page shows what the customer got
+ * back, and the order is held in REFUND_REVIEW when — and only when — the
+ * seller's own charge has already cleared. Nothing is sent to Stripe from here
+ * in any case: whether MoonVella gives the seller back the wholesale price of
+ * goods the customer refused is MoonVella's decision, made deliberately, and
+ * `refundSellerCharge` is the only thing that makes it.
+ */
+async function handleRefund(
+  eventId: string,
+  shop: string,
+  order: { id: string; state: OrderState } | null,
+  payload: OrderPayload
+): Promise<IntakeResult> {
+  if (!order) {
+    await finishEvent(eventId, "SUCCESS", "Refund for an order this app does not have");
+    return { ok: true, refunds: 0 };
+  }
+
+  const refundsCreated = await prisma.$transaction((tx) =>
+    reconcileRefunds(tx, order.id, [payload as unknown as RefundPayload])
+  );
+
+  let landedIn: OrderState | null = null;
+  if (MONEY_CLEARED.has(order.state)) {
+    const target = cancellationTarget(order.state);
+    await transitionOrder({
+      orderId: order.id,
+      to: target,
+      actor: { actorType: "WEBHOOK", actorId: shop, actorName: shop },
+      reason: "The customer was refunded after the seller had been charged.",
+    }).catch(() => undefined);
+    landedIn = target;
+  }
+
+  await recordAudit(
+    {
+      actorType: "WEBHOOK",
+      actorId: shop,
+      actorName: shop,
+      action: "order.refund_recorded",
+      entityType: AUDIT_ENTITY.ORDER,
+      entityId: order.id,
+      afterData: {
+        refundsCreated,
+        orderWasCharged: MONEY_CLEARED.has(order.state),
+        landedIn,
+        note:
+          "A customer refund does not move MoonVella money. Whether the seller's wholesale charge " +
+          "is refunded is a separate decision, recorded on the payment when it is made.",
+      },
+    },
+    prisma as never
+  );
+
+  await finishEvent(eventId, "SUCCESS");
+  return { ok: true, orderId: order.id, refunds: refundsCreated };
+}
+
+/**
+ * Shopify has finished routing the order's lines.
+ *
+ * The routing event is the earliest moment a fulfillment order for this order
+ * may exist, so this is where a paid order gets handed to the fulfilment queue.
+ * An unpaid order is left alone — the fulfilment handler refuses it anyway, and
+ * queueing work that is certain to be refused only fills the queue with
+ * failures an operator has to read past.
+ */
+async function handleRoutingComplete(
+  eventId: string,
+  shop: string,
+  order: { id: string; state: OrderState } | null
+): Promise<IntakeResult> {
+  if (!order) {
+    await finishEvent(eventId, "SUCCESS", "Routing completed for an order this app does not have");
+    return { ok: true };
+  }
+
+  if (MONEY_CLEARED.has(order.state)) {
+    await enqueueJob({
+      kind: JOB_KIND.SHOPIFY_FULFILLMENT_SUBMIT,
+      idempotencyKey: `shopify-fulfillment-submit:${order.id}`,
+      payload: { orderId: order.id, reason: "order_routing_complete" },
+    });
+  }
+
+  await finishEvent(eventId, "SUCCESS");
+  return { ok: true, orderId: order.id };
 }
