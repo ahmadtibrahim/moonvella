@@ -13,6 +13,7 @@ import {
   type StateActor,
 } from "./orderState.server";
 import { enqueueJob, JOB_KIND } from "./jobs.server";
+import { numericId } from "./shopifyFulfillment.server";
 
 /**
  * The Shopify topics this deployment acts on.
@@ -343,7 +344,10 @@ async function buildItems(
   byVariant: Map<string, VariantMapping>,
   frozenUnitPrices?: Map<string, number>
 ): Promise<BuiltItems> {
-  const moonvellaItems = items.filter((li) => li.variant_id && byVariant.has(String(li.variant_id)));
+  // Read through the same normaliser the map was keyed with, so a line whose
+  // variant arrives as a GID binds to a mapping stored as a number and the
+  // other way round. See the note in `intakeOrder`.
+  const moonvellaItems = items.filter((li) => li.variant_id && byVariant.has(numericId(li.variant_id)));
   let moonvellaSubtotal = 0;
   let retailTotal = 0;
   let lineDiscountTotal = 0;
@@ -351,7 +355,7 @@ async function buildItems(
   const priceSource = new Map<string, "SNAPSHOT" | "CATALOGUE">();
 
   const rows = await Promise.all(moonvellaItems.map(async (li) => {
-    const mapping = byVariant.get(String(li.variant_id))!;
+    const mapping = byVariant.get(numericId(li.variant_id))!;
     const variant = mapping.productVariant;
     const quantity = Number(li.quantity) || 0;
     const retailUnit = cents(li.price);
@@ -789,10 +793,41 @@ export async function intakeOrder(input: {
       .map((li) => (li.variant_id ? String(li.variant_id) : null))
       .filter((v): v is string => !!v);
 
+    /*
+     * THE SAME VARIANT, AND THE TWO WAYS SHOPIFY WRITES IT.
+     *
+     * A line item's variant arrives here as a number — `51750873071862` — both
+     * from a webhook and from the fetch above, because the webhook says `id` and
+     * the query is reshaped down to the number. The binding stored by the import
+     * is the GID, because every Shopify mutation this app sends back (price,
+     * inventory) needs one and the import reads it straight off GraphQL. So the
+     * lookup compared `51750873071862` against
+     * `gid://shopify/ProductVariant/51750873071862` and matched nothing.
+     *
+     * The cost was total and silent: every line of every real order failed to
+     * bind, `buildItems` returned no rows, and the delivery was closed as the
+     * SUCCESSFUL "No MoonVella items" — the one outcome that means "this order
+     * is not ours", recorded against orders that were entirely ours. No order
+     * was ever created, and nothing anywhere said so. The suite could not see it
+     * because its fixtures wrote the mapping in the same spelling the lookup
+     * used.
+     *
+     * Both spellings are therefore queried for, and the map below is keyed by
+     * the number the two share — so the query and the lookup cannot disagree
+     * again, whichever spelling the payload or the database happens to carry.
+     * `numericId` is the existing normaliser for exactly this; it is imported
+     * rather than reimplemented, because a second copy is how the two spellings
+     * drift apart in the first place.
+     */
+    const numbers = [...new Set(variantIds.map((v) => numericId(v)).filter(Boolean))];
+    const lookupKeys = [
+      ...new Set([...variantIds, ...numbers.map((n) => `gid://shopify/ProductVariant/${n}`)]),
+    ];
+
     const mappings = await prisma.sellerProductVariant.findMany({
       where: {
         sellerProduct: { sellerId: seller.id },
-        shopifyVariantId: { in: variantIds },
+        shopifyVariantId: { in: lookupKeys },
       },
       // Read once, at intake, and copied onto the order line. The relations are
       // included because the snapshot needs the option pairs and the family
@@ -810,9 +845,10 @@ export async function intakeOrder(input: {
         sellerProduct: true,
       },
     });
+    // Keyed by the number both spellings share — see the note above the query.
     const byVariant = new Map<string, VariantMapping>();
     for (const mapping of mappings) {
-      byVariant.set(mapping.shopifyVariantId, mapping);
+      byVariant.set(numericId(mapping.shopifyVariantId), mapping);
     }
 
     if (isUpdated && existingOrder) {

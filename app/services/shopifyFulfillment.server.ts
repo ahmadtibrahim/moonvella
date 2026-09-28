@@ -124,8 +124,15 @@ interface ShopifyFulfillmentOrderNode {
  * strings is the bug this prevents — it never matches, and the failure surfaces
  * as "no MoonVella lines on this order" on an order that is entirely MoonVella
  * lines.
+ *
+ * It takes a number as well as a string because the two spellings are not the
+ * only difference: the webhook's form is genuinely a JSON number, so a caller
+ * that types its payload honestly — as intake does — holds a number and would
+ * otherwise have to stringify it at each call site. Narrowing this to strings
+ * pushed that conversion back out to the callers, which is how one of them
+ * ends up doing it differently from the rest.
  */
-export function numericId(value: string | null | undefined): string {
+export function numericId(value: string | number | null | undefined): string {
   const text = String(value ?? "");
   if (!text) return "";
   const tail = text.startsWith("gid://") ? text.slice(text.lastIndexOf("/") + 1) : text;

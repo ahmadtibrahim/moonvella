@@ -77,16 +77,45 @@ const ORDER_FOUR = ORDER_ID + 3;
 const ORDER_FIVE = ORDER_ID + 4;
 
 /*
- * The sandbox order's own Shopify variant and product ids, verbatim: the
- * binding from a Shopify line to a MoonVella variant is the thing under test,
- * and a fixture that invented ids would be testing a binding nothing produces.
+ * THE VARIANT, IN THE TWO FORMS IT ACTUALLY TRAVELS IN — AND THEY ARE NOT THE
+ * SAME FORM, WHICH IS THE WHOLE POINT OF HAVING BOTH HERE.
  *
- * The SKU carries the run's suffix, and that is not cosmetic — `ProductVariant.sku`
- * is unique across the whole catalogue and the deployed catalogue already holds
- * TEST PILLOW's own row with `MV-DEMO-PIL-STD` on it. A suite that renamed that
- * row to run itself would be editing the data it exists to leave alone.
+ * The binding is what the import writes, and the import reads it off GraphQL,
+ * where every id is a GID: the price and inventory mutations this app sends
+ * back require one. A payload carries the number instead — a webhook says
+ * `"variant_id": 3000000000` and the fetched order is reshaped down to the
+ * number — so the lookup was comparing a number against a GID and matching
+ * nothing. It closed every real order as the successful "No MoonVella items".
+ *
+ * This fixture used one constant for both sides, which is why 109 checks passed
+ * against a binding production could never match. They are two constants now,
+ * so the mismatch is exercised by every check below rather than hidden from all
+ * of them.
+ *
+ * THE SUITE'S IDENTIFIERS HAVE TO BE THE SUITE'S, and this number is why that
+ * is written down twice. It used to be TEST PILLOW's own 51750873071862 — which
+ * is also what the import stored in the catalogue, so the moment this constant
+ * was corrected to the GID spelling production actually holds, every run died
+ * on `Unique constraint failed on the fields: (shopifyVariantId)` before its
+ * first check, against the live seller's row. `SellerProductVariant.shopifyVariantId`
+ * is unique catalogue-wide; the deployed row is not the suite's to take.
+ *
+ * The SKU carries the suffix for exactly the same reason — `ProductVariant.sku`
+ * is unique, and `MV-DEMO-PIL-STD` already belongs to TEST PILLOW. A suite that
+ * renamed that row to run itself would be editing the data it exists to leave
+ * alone. The number is derived from the run suffix rather than fixed so that a
+ * previous run's leftovers cannot collide with this one's.
  */
-const SHOPIFY_VARIANT_ID = "51750873071862";
+const VARIANT_SEED = Array.from(suffix).reduce(
+  (n, ch) => (n * 31 + ch.charCodeAt(0)) % 100_000_000,
+  7
+);
+const SHOPIFY_VARIANT_NUMBER = `30${String(VARIANT_SEED).padStart(8, "0")}`;
+const SHOPIFY_VARIANT_ID = `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_NUMBER}`;
+/*
+ * The product id keeps the real value: no lookup keys on it and no constraint
+ * makes it unique, and the binding under test is the variant's.
+ */
 const SHOPIFY_PRODUCT_ID = "10321109975286";
 const SKU = `MV-DEMO-PIL-STD-${suffix.toUpperCase()}`;
 
@@ -231,7 +260,7 @@ function payloadFor(input: {
 function moonvellaLine(id = 1, quantity = 1): LineItem {
   return {
     id,
-    variant_id: SHOPIFY_VARIANT_ID,
+    variant_id: SHOPIFY_VARIANT_NUMBER,
     title: "TEST PILLOW",
     sku: SKU,
     quantity,
@@ -542,7 +571,7 @@ async function main() {
       lines: [
         moonvellaLine(1),
         { id: 2, variant_id: "99999999999999", title: "Merchant's own pillow", sku: "MERCHANT-OWN", quantity: 3, price: "25.00" },
-        { id: 3, variant_id: SHOPIFY_VARIANT_ID, title: "TEST PILLOW", sku: SKU, quantity: 2, price: money(RETAIL) },
+        { id: 3, variant_id: SHOPIFY_VARIANT_NUMBER, title: "TEST PILLOW", sku: SKU, quantity: 2, price: money(RETAIL) },
       ],
     }),
   );
@@ -844,7 +873,7 @@ async function main() {
                           id: `gid://shopify/LineItem/${lineItemId}`,
                           sku: SKU,
                           name: "TEST PILLOW",
-                          variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_ID}` },
+                          variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_NUMBER}` },
                         },
                       },
                     ],
@@ -964,7 +993,7 @@ async function main() {
                         id: `gid://shopify/LineItem/${item.shopifyLineItemId}`,
                         sku: item.sku,
                         name: item.name,
-                        variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_ID}` },
+                        variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_NUMBER}` },
                       },
                     })),
                   },
