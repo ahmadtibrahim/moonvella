@@ -294,6 +294,12 @@ const CHECKS = [
   // belongs to the seller saving it — needs a real Stripe object and lives in
   // stripe-sandbox instead.
   { name: "checkout-frame", kind: "ts", file: "scripts/verify-checkout-frame.ts" },
+  // The fulfillment-permission gate. Separate from checkout-frame because it
+  // guards a different failure: that suite is about Stripe refusing the frame,
+  // this one is about the app never ASKING for the two scopes it needs — which
+  // is what actually happened when the 14-scope config was deployed and the
+  // merchant saw no permission screen at all.
+  { name: "fulfillment-scopes", kind: "ts", file: "scripts/verify-fulfillment-scopes.ts" },
   // Media is verified inside `product-system` (checks 65-69 cover what a
   // multi-file batch depends on: two files to two assets, per-file variant
   // assignment, the typed duplicate refusal and its two fields, and that a

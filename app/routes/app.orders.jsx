@@ -16,6 +16,12 @@ import {
 import { createSetupSession, getDefaultPaymentMethod } from "../services/sellerBilling.server";
 import { shopifyAdminAppUrl } from "../services/shopifyNavigation.server";
 import { MONEY_CLEARED, IllegalTransitionError } from "../services/orderState.server";
+import { authenticate } from "../shopify.server";
+import {
+  FULFILLMENT_SCOPES,
+  readFulfillmentScopes,
+  forgetFulfillmentScopes,
+} from "../services/shopifyScopes.server";
 
 /**
  * The seller's own orders: what MoonVella is shipping for them, what it is
@@ -333,6 +339,26 @@ export const loader = async ({ request }) =>
           ? "No card was added. You can start again whenever you are ready."
           : null;
 
+    /*
+     * Whether MoonVella is allowed to fulfill, asked of Shopify rather than
+     * remembered. Read here, in the page that feels the absence, and NOT in the
+     * layout: the layout revalidates on a 30-second timer and a revalidation
+     * re-runs this loader too, so anything on this path runs on a schedule for
+     * as long as a merchant leaves the tab open. `readFulfillmentScopes` holds
+     * the answer briefly for that reason.
+     *
+     * This authenticates a second time, and that is a deliberate trade rather
+     * than an oversight: the scopes API only comes from `authenticate.admin`,
+     * and `withMerchantAccess` — which has to run first, because it is what
+     * refuses a blocked store — keeps only the shop. The cost is one extra
+     * session read on a page load. Routing the admin client out through
+     * `SellerContext` to save it would put a live API client into a type that
+     * loaders return as data, which is a worse thing to have in the codebase
+     * than a repeated indexed lookup.
+     */
+    const { scopes } = await authenticate.admin(request);
+    const fulfillmentScopes = await readFulfillmentScopes(context.shop, scopes);
+
     if (!context.seller || !context.canViewOrders) {
       return {
         access: context.access,
@@ -341,6 +367,7 @@ export const loader = async ({ request }) =>
         canAct: false,
         paymentMethod: null,
         setupNotice,
+        fulfillmentScopes,
         orders: [],
       };
     }
@@ -402,6 +429,12 @@ export const loader = async ({ request }) =>
       // are not something a seller is ever shown or sends back.
       paymentMethod: method ? { brand: method.brand, last4: method.last4 } : null,
       setupNotice,
+      /*
+       * Only what the banner draws: which of the two are absent. The full grant
+       * is not sent — a seller has no use for a list of everything the app may
+       * do, and it is one more thing in a payload that a screenshot can carry.
+       */
+      fulfillmentScopes: { missing: fulfillmentScopes.missing },
       orders: rows.map((order) => ({
         id: order.id,
         // Shopify's own name for the order is "#1001"; the number is the
@@ -490,6 +523,64 @@ const REFUSAL_SENTENCE = {
 };
 
 export const action = async ({ request }) => {
+  const form = await request.formData();
+  const intent = String(form.get("intent") || "");
+
+  /*
+   * GRANTING A PERMISSION IS NOT SPENDING MONEY, so it sits above the BUSINESS
+   * gate rather than behind it, with the `VIEW` floor the loader already uses.
+   * The two scopes are what MoonVella needs to ship an order at all; a store
+   * whose orders are read-only still owns the decision about what this app may
+   * do in its Shopify admin, and a store that is blocked is refused here the
+   * same as everywhere else.
+   *
+   * IT IS THE BUTTON THAT ASKS, NEVER A LOADER. That is the whole reason this
+   * is an intent rather than something the page does on render: a page that
+   * requested scopes whenever it noticed they were missing would send a
+   * merchant to the grant screen again on every load — which is the loop this
+   * app has already spent ten hours inside once. Pressing the button is the
+   * only thing that starts this, and `scopes.request` is itself guarded: it
+   * asks Shopify what is granted and returns without redirecting when the
+   * answer is already yes, so a second press is a no-op rather than a second
+   * trip through the grant screen.
+   */
+  if (intent === "grant_fulfillment_scopes") {
+    try {
+      await requireMerchantAccess(request, "VIEW");
+    } catch (error) {
+      if (error instanceof AccessError) {
+        return Response.json({ ok: false, error: error.message });
+      }
+      throw error;
+    }
+
+    const { scopes, session } = await authenticate.admin(request);
+    // Dropped before the ask, because the ask usually ends in a redirect out of
+    // the app: whatever the merchant sees when Shopify sends them back must not
+    // be a cached "still missing" that outlives the approval.
+    forgetFulfillmentScopes(session.shop);
+
+    /*
+     * THROWS ON THE PATH THAT MATTERS. When either scope is absent this throws
+     * a 401 carrying `X-Shopify-API-Request-Failure-Reauthorize-Url` — the App
+     * Bridge reauth signal, which the admin frame answers by navigating the TOP
+     * window to Shopify's grant screen. It is deliberately not a redirect this
+     * app builds: the same 401 path is what `authenticate.admin` uses for its
+     * own reauthorization, so the mechanism is the library's and not a second
+     * one to keep correct.
+     *
+     * When it returns instead, Shopify already holds both and there is nothing
+     * to send anyone to.
+     */
+    await scopes.request([...FULFILLMENT_SCOPES]);
+
+    return Response.json({
+      ok: true,
+      granted: true,
+      message: "Shopify has already granted MoonVella both fulfillment permissions.",
+    });
+  }
+
   let context;
   try {
     /*
@@ -507,9 +598,6 @@ export const action = async ({ request }) => {
     throw error;
   }
   if (!context.seller) return Response.json({ ok: false, error: "No seller account." });
-
-  const form = await request.formData();
-  const intent = String(form.get("intent") || "");
 
   try {
     if (intent === "setup") {
@@ -634,8 +722,16 @@ export const action = async ({ request }) => {
 };
 
 export default function OrdersPage() {
-  const { access, canViewOrders, orders, blockedMessage, canAct, paymentMethod, setupNotice } =
-    useLoaderData();
+  const {
+    access,
+    canViewOrders,
+    orders,
+    blockedMessage,
+    canAct,
+    paymentMethod,
+    setupNotice,
+    fulfillmentScopes,
+  } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
   const { format } = useCurrency();
@@ -743,6 +839,61 @@ export default function OrdersPage() {
     </Form>
   );
 
+  /*
+   * THE ONE PLACE THAT ASKS SHOPIFY FOR THE TWO SCOPES.
+   *
+   * Shown only when the loader has read, from Shopify, that one of them is
+   * absent — and shown as a BUTTON rather than performed when the page loads.
+   * That is the difference between a permission screen the merchant sees once
+   * and the ten-hour loop this app has already been through: a page that asked
+   * whenever it noticed the scopes were missing would send them back to the
+   * grant screen on every single load, and a merchant who declined would be
+   * asked again forever. Nothing else on this page starts this request.
+   *
+   * The scope handles are named because Shopify's own grant screen names them,
+   * and a merchant who is about to read "write_fulfillments" on Shopify's page
+   * should have met the word here first rather than in a list of permissions
+   * they cannot connect to anything.
+   */
+  const missingScopes = fulfillmentScopes?.missing ?? [];
+  const grantPermissions =
+    missingScopes.length > 0 ? (
+      <div
+        className="mv-section-card"
+        style={{ border: "1px solid #fde68a", background: "#fffbeb" }}
+        role="status"
+      >
+        <h3 className="mv-section-title" style={{ color: "#92400e", marginBottom: "0.5rem" }}>
+          MoonVella needs two more Shopify permissions
+        </h3>
+        <p style={{ margin: "0 0 1rem", color: "#92400e" }}>
+          Shopify has not granted MoonVella the{" "}
+          <strong>{missingScopes.join(" and ")}</strong>{" "}
+          {missingScopes.length === 1 ? "permission" : "permissions"}. Until it does, MoonVella
+          cannot create the location its stock ships from or send a fulfillment, so orders cannot be
+          completed. Shopify will ask you to approve them on its own page.
+        </p>
+        <Form method="post">
+          <input type="hidden" name="intent" value="grant_fulfillment_scopes" />
+          <button type="submit" className="mv-btn mv-btn-primary" disabled={busy}>
+            Grant fulfillment permissions
+          </button>
+        </Form>
+      </div>
+    ) : null;
+
+  /*
+   * What the grant action says when it did NOT have to redirect — Shopify
+   * already held both. The redirect path never reaches this page at all: the
+   * merchant leaves for Shopify's grant screen and comes back through the
+   * admin, which is a fresh load of this loader with a fresh read.
+   */
+  const grantNotice = actionData?.message ? (
+    <div className="mv-alert-banner" role="status">
+      <p className="mv-alert-text">{actionData.message}</p>
+    </div>
+  ) : null;
+
   return (
     <s-page heading="Orders">
       <div className="mv-container">
@@ -753,6 +904,11 @@ export default function OrdersPage() {
             their fulfillment and tracking. Standard shipping included.
           </p>
         </div>
+
+        {/* First, because it is the one thing on this page that stops the rest
+            of it from working. */}
+        {grantPermissions}
+        {grantNotice}
 
         {setupNotice ? (
           <div className="mv-alert-banner">
