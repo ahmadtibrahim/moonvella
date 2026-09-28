@@ -116,7 +116,11 @@ api_version = "2026-10"
 redirect_urls = [ "https://app.moonvella.com/auth/callback" ]
 
 [build]
-include_config_on_deploy = true
+# `include_config_on_deploy` used to sit here. CLI 4.8 removed the key — the
+# config is always included on deploy now — and `shopify app deploy` rewrote
+# this file to drop it, which is why it is gone rather than deleted by hand.
+# Re-adding it does nothing.
+#
 # Set false deliberately. When true, running `shopify app dev` locally rewrites
 # the Partner Dashboard URLs to a temporary tunnel address — which would take
 # production down silently the next time anyone ran `npm run dev`. Production
