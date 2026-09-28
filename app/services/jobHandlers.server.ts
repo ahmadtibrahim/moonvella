@@ -23,7 +23,7 @@ import {
   numericId,
   type AdminClient,
 } from "./shopifyFulfillment.server";
-import { ensureOrderWebhookSubscriptions } from "./shopifyWebhooks.server";
+import { ensureOrderWebhookSubscriptions, ensureAppWebhookSubscriptions } from "./shopifyWebhooks.server";
 import { transitionOrder, MONEY_CLEARED } from "./orderState.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
@@ -521,17 +521,44 @@ export const jobHandlers: Record<string, JobHandler> = {
       registered: number;
       alreadyPresent: number;
       refused: string[];
+      /** The app-level topics ensured on the same sweep — `app/scopes_update`. */
+      app: { registered: number; refused: string[]; blockedBy: string | null };
       blockedBy: string | null;
     }[] = [];
 
     for (const seller of sellers) {
       try {
         const outcome = await ensureOrderWebhookSubscriptions(seller.id);
+
+        /*
+         * The app-level topics are ensured on the same sweep, and are caught
+         * separately. They share a schedule but not a fate: the order topics
+         * are the ones a refusal is EXPECTED for until the Protected Customer
+         * Data review lands, and a throw while asking about `app/scopes_update`
+         * must not erase what happened to them — nor the other way round.
+         */
+        let app = { registered: 0, refused: [] as string[], blockedBy: null as string | null };
+        try {
+          const appOutcome = await ensureAppWebhookSubscriptions(seller.id);
+          app = {
+            registered: appOutcome.registered.length,
+            refused: appOutcome.refused.map((r) => r.topic),
+            blockedBy: appOutcome.blockedBy ?? null,
+          };
+        } catch (error) {
+          app = {
+            registered: 0,
+            refused: [],
+            blockedBy: error instanceof Error ? error.message : String(error),
+          };
+        }
+
         results.push({
           shopDomain: seller.shopDomain,
           registered: outcome.registered.length,
           alreadyPresent: outcome.alreadyPresent.length,
           refused: outcome.refused.map((r) => r.topic),
+          app,
           blockedBy: outcome.blockedBy ?? null,
         });
       } catch (error) {
@@ -546,17 +573,24 @@ export const jobHandlers: Record<string, JobHandler> = {
           registered: 0,
           alreadyPresent: 0,
           refused: [],
+          app: { registered: 0, refused: [], blockedBy: null },
           blockedBy: error instanceof Error ? error.message : String(error),
         });
       }
     }
 
     const blocked = results.filter((r) => r.blockedBy).length;
+    const appBlocked = results.filter((r) => r.app.blockedBy).length;
     return {
       summary:
         `${results.length} store(s) checked; ` +
-        `${results.reduce((n, r) => n + r.registered, 0)} topic(s) newly registered, ` +
-        `${blocked} store(s) still blocked.`,
+        `${results.reduce((n, r) => n + r.registered, 0)} order topic(s) and ` +
+        `${results.reduce((n, r) => n + r.app.registered, 0)} app topic(s) newly registered, ` +
+        `${blocked} store(s) still blocked` +
+        // Named only when it happened: a clause that is always present stops
+        // being read, which is how a silently missing subscription survived
+        // being "reported" in the first place.
+        (appBlocked ? `, ${appBlocked} store(s) with an app-level subscription still missing.` : "."),
       detail: { results, jobId: job.id },
     };
   },

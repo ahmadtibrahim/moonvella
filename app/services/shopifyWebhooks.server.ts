@@ -29,15 +29,32 @@
  * app is not approved, that sentence is stored verbatim on the integration row
  * and returned, because it names the one action that unblocks the whole
  * pipeline and paraphrasing it would hide the fix.
+ *
+ * TWO GROUPS, ONE SWEEP. The file also ensures the app-level topic the config
+ * declares but the deploy's sync did not create — see APP_WEBHOOK_TOPICS for
+ * that story. Both groups are the same operation over different topics, so they
+ * share the read-then-create core below rather than being two copies that can
+ * disagree about how "already registered" is decided.
  */
 
 import { prisma } from "~/db.server";
-import { setIntegrationState } from "./integrationHealth.server";
+import { setIntegrationState, type IntegrationKey } from "./integrationHealth.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { classifyRefusal } from "./shopifyFulfillment.server";
 
-/** The route that answers these deliveries. Must match the toml's `uri`. */
+/** The route that answers the order deliveries. Must match the toml's `uri`. */
 export const ORDER_WEBHOOK_PATH = "/webhooks/orders";
+
+/**
+ * The route that answers the app-level deliveries. Must match the toml's `uri`.
+ *
+ * A route file's name IS its path — `app/routes/webhooks.app.scopes_update.jsx`
+ * is served at `/webhooks/app/scopes_update` — so this constant and the toml's
+ * `uri` are two spellings of one address. When they disagree the delivery 404s,
+ * which Shopify answers with a retry and a failed-delivery count rather than
+ * with a message anybody reads.
+ */
+export const APP_WEBHOOK_PATH = "/webhooks/app/scopes_update";
 
 /**
  * The topics, and the same six the toml declares.
@@ -57,6 +74,80 @@ export const ORDER_WEBHOOK_TOPICS = [
 ] as const;
 
 export type OrderWebhookTopic = (typeof ORDER_WEBHOOK_TOPICS)[number];
+
+/**
+ * The app-level topics, and the same one the toml declares.
+ *
+ * WHY THIS LIST EXISTS AT ALL, GIVEN THE TOML ALREADY DECLARES THE TOPIC, and
+ * why it is the same reason as the order topics above.
+ *
+ * `app/scopes_update` has been in `shopify.app.toml` since 2026-09-19 and the
+ * config has been deployed repeatedly, and the store had NO subscription to it.
+ * The toml block is a DECLARATION; a subscription is a separate record, created
+ * by whichever sync runs at deploy. That sync created `app/uninstalled` and
+ * `routing_complete` on this store and never created this one. Reading the
+ * config back proves the declaration was published and proves nothing at all
+ * about whether a subscription exists — they are two different stores, and only
+ * one of them was wrong.
+ *
+ * Nothing in the app could notice, which is the part worth fixing. The six order
+ * topics have the runtime backstop below, so a config sync that drops one of
+ * them is repaired on the next sweep. This topic had no backstop: it was the
+ * only declared topic whose existence depended entirely on a sync that had
+ * already been observed to skip it. A merchant approving the fulfillment scopes
+ * would then have had nothing listening, and the session's scope string would
+ * have kept the old grant — the same silent, total failure the order topics were
+ * given this file for.
+ *
+ * It is also safe to ask for, which was checked before it was written: the
+ * `webhookSubscriptionCreate` call for this topic answers with a subscription id
+ * and no user errors, unlike the order topics, which are refused on Protected
+ * Customer Data until that review completes.
+ */
+export const APP_WEBHOOK_TOPICS = ["APP_SCOPES_UPDATE"] as const;
+
+export type AppWebhookTopic = (typeof APP_WEBHOOK_TOPICS)[number];
+
+/**
+ * One route and the topics it answers.
+ *
+ * Both registrations have to agree about this pairing — the toml's and the
+ * runtime one — so it is written once here and read by both, rather than
+ * repeated per topic in two files that can drift.
+ */
+interface WebhookGroup {
+  /** Named in the audit row, so the two sweeps are told apart when read back. */
+  name: "orders" | "app";
+  /** The route that answers these deliveries. Must match the toml's `uri`. */
+  path: string;
+  /** The topics, and the same set the toml declares for that path. */
+  topics: readonly string[];
+  /**
+   * The integration row this sweep reports its health on, when it has one.
+   *
+   * It is deliberately absent for the app-level group. `shopify_orders` is a
+   * pipeline of its own — Orders and Shipping read it — and letting an
+   * app-level sweep write HEALTHY onto it would make one integration's health
+   * row report another's condition. The app-level outcome is recorded in the
+   * audit log and in the job summary instead; giving the operator a settings row
+   * for a sweep with no credential and no control would be a control that does
+   * nothing.
+   */
+  integrationKey?: IntegrationKey;
+}
+
+const ORDER_GROUP: WebhookGroup = {
+  name: "orders",
+  path: ORDER_WEBHOOK_PATH,
+  topics: ORDER_WEBHOOK_TOPICS,
+  integrationKey: "shopify_orders",
+};
+
+const APP_GROUP: WebhookGroup = {
+  name: "app",
+  path: APP_WEBHOOK_PATH,
+  topics: APP_WEBHOOK_TOPICS,
+};
 
 export interface WebhookSubscriptionOutcome {
   /** Topics Shopify is now delivering. */
@@ -80,9 +171,17 @@ export interface WebhookSubscriptionOutcome {
  * staging deploy registers staging callbacks and doesn't quietly enlist the
  * production host for a test store.
  */
-export function orderWebhookCallbackUrl(): string {
+function callbackUrlFor(path: string): string {
   const base = (process.env.SHOPIFY_APP_URL || "").replace(/\/+$/, "");
-  return `${base}${ORDER_WEBHOOK_PATH}`;
+  return `${base}${path}`;
+}
+
+export function orderWebhookCallbackUrl(): string {
+  return callbackUrlFor(ORDER_WEBHOOK_PATH);
+}
+
+export function appWebhookCallbackUrl(): string {
+  return callbackUrlFor(APP_WEBHOOK_PATH);
 }
 
 interface SubscriptionNode {
@@ -92,7 +191,7 @@ interface SubscriptionNode {
 }
 
 /**
- * Make sure this store is delivering all six order topics to this app.
+ * Make sure this store is delivering every topic in the group to this app.
  *
  * Returns what happened rather than throwing for a refusal, because a refusal
  * here is an expected state until the Partner Dashboard review completes and
@@ -100,10 +199,11 @@ interface SubscriptionNode {
  * recorded — on the integration row and in the audit log — so "we are not
  * receiving orders" is answerable without reading logs.
  */
-export async function ensureOrderWebhookSubscriptions(
-  sellerId: string
+async function ensureWebhookSubscriptions(
+  sellerId: string,
+  group: WebhookGroup
 ): Promise<WebhookSubscriptionOutcome> {
-  const callbackUrl = orderWebhookCallbackUrl();
+  const callbackUrl = callbackUrlFor(group.path);
   const seller = await prisma.seller.findUnique({
     where: { id: sellerId },
     select: { id: true, shopDomain: true },
@@ -145,7 +245,9 @@ export async function ensureOrderWebhookSubscriptions(
   };
 
   const finish = async (status: "HEALTHY" | "DEGRADED" | "FAILED", detail: string) => {
-    await setIntegrationState("shopify_orders", { status, detail });
+    if (group.integrationKey) {
+      await setIntegrationState(group.integrationKey, { status, detail });
+    }
     return outcome;
   };
 
@@ -168,7 +270,7 @@ export async function ensureOrderWebhookSubscriptions(
 
   const present = new Set(existing.map((node) => String(node.topic ?? "").toUpperCase()));
 
-  for (const topic of ORDER_WEBHOOK_TOPICS) {
+  for (const topic of group.topics) {
     if (present.has(topic)) {
       outcome.alreadyPresent.push(topic);
       continue;
@@ -207,9 +309,9 @@ export async function ensureOrderWebhookSubscriptions(
   const detail = outcome.registered.length
     ? `Registered ${outcome.registered.join(", ")}.`
     : outcome.refused.length
-      ? `Could not register ${outcome.refused.length} of ${ORDER_WEBHOOK_TOPICS.length} order topics. ` +
+      ? `Could not register ${outcome.refused.length} of ${group.topics.length} ${group.name} topics. ` +
         `First reason: ${outcome.refused[0].reason}`
-      : `All ${ORDER_WEBHOOK_TOPICS.length} order topics are already registered.`;
+      : `All ${group.topics.length} ${group.name} topics are already registered.`;
 
   await recordAudit({
     actorType: "SYSTEM",
@@ -219,6 +321,7 @@ export async function ensureOrderWebhookSubscriptions(
     entityType: AUDIT_ENTITY.SELLER,
     entityId: sellerId,
     afterData: {
+      group: group.name,
       registered: outcome.registered,
       alreadyPresent: outcome.alreadyPresent.length,
       refused: outcome.refused.map((r) => r.topic),
@@ -231,4 +334,27 @@ export async function ensureOrderWebhookSubscriptions(
     outcome.refused.length === 0 ? "HEALTHY" : outcome.registered.length ? "DEGRADED" : "FAILED",
     detail
   );
+}
+
+/**
+ * The six order topics. This is the sweep that repaired the missing intake
+ * subscriptions, and it reports on the `shopify_orders` integration row.
+ */
+export async function ensureOrderWebhookSubscriptions(
+  sellerId: string
+): Promise<WebhookSubscriptionOutcome> {
+  return ensureWebhookSubscriptions(sellerId, ORDER_GROUP);
+}
+
+/**
+ * The app-level topics — `app/scopes_update` today.
+ *
+ * Reached from the same scheduled sweep as the order topics, so a subscription
+ * the config sync drops is re-created without anybody remembering to re-deploy.
+ * It reports nothing to the integration table; see `WebhookGroup.integrationKey`.
+ */
+export async function ensureAppWebhookSubscriptions(
+  sellerId: string
+): Promise<WebhookSubscriptionOutcome> {
+  return ensureWebhookSubscriptions(sellerId, APP_GROUP);
 }

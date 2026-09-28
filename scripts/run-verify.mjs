@@ -602,6 +602,23 @@ const CHECKS = [
     env: SIMULATED_STRIPE,
     requires: [],
   },
+  // The `app/scopes_update` subscription: declared in the config, absent from
+  // the store, and the reason its absence was silent is that this topic was the
+  // only declared one with no runtime sweep behind it.
+  //
+  // The handler is driven THROUGH THE ROUTE with real signatures — a valid one
+  // and a forged one — because the HMAC check IS the route, and a suite that
+  // called the handler's logic directly would prove the write and nothing about
+  // who is allowed to ask for it. It needs SHOPIFY_API_SECRET, which the verify
+  // run supplies from the deployment environment; without it the delivery
+  // checks are reported SKIPPED and counted as such, rather than passing
+  // vacuously. No Shopify call is made and nothing is charged.
+  {
+    name: "webhook-scopes",
+    kind: "ts",
+    file: "scripts/verify-webhook-scopes.ts",
+    requires: [],
+  },
 ];
 
 async function runAll() {
