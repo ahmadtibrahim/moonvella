@@ -284,6 +284,16 @@ const CHECKS = [
   // session and no fixture, and it can pin a clock to a date in the future or
   // across a daylight-saving transition without waiting for one.
   { name: "pickup", kind: "ts", file: "scripts/verify-pickup.ts" },
+  // Stripe Checkout must never be rendered inside the Shopify admin's frame.
+  // PURE: no database, no session, no provider — it drives the return-URL
+  // builder and reads the routes with comments stripped. It is registered
+  // because of the half that cannot be written as a positive assertion: "no
+  // route navigates the frame to a provider URL" is the check that catches the
+  // NEXT flow being written the way this one was, and the defect it describes
+  // has already shipped once. The other half — that a returned setup intent
+  // belongs to the seller saving it — needs a real Stripe object and lives in
+  // stripe-sandbox instead.
+  { name: "checkout-frame", kind: "ts", file: "scripts/verify-checkout-frame.ts" },
   // Media is verified inside `product-system` (checks 65-69 cover what a
   // multi-file batch depends on: two files to two assets, per-file variant
   // assignment, the typed duplicate refusal and its two fields, and that a

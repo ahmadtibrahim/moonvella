@@ -315,6 +315,35 @@ export async function savePaymentMethodFromSetupIntent(
   // Stripe would answer 404 and it would read like a missing object.
   const intentId = assertProviderId(setupIntentId, "setup intent", "save a payment method");
   const intent = await stripeGet(`setup_intents/${intentId}`);
+
+  /*
+   * THE INTENT MUST BELONG TO THE SELLER WHO IS ASKING FOR IT.
+   *
+   * `sellerId` arrives from the caller — it is whoever is signed in — and the
+   * intent id arrives from the same request, so without this check the two are
+   * unrelated facts that happen to travel together. The row is written keyed on
+   * the CALLER, which sounds like it contains the damage and does not: a seller
+   * who learned another seller's setup-intent id could attach that card to
+   * their own account, make it their default, and have MoonVella charge it for
+   * their wholesale orders. The card's real owner would see charges they never
+   * authorised, from a merchant they never bought from.
+   *
+   * `createSetupSession` writes `metadata[sellerId]` onto both the session and
+   * the intent, so the intent carries the seller it was created for and this is
+   * a comparison between two independently-established facts rather than a
+   * check against something the caller supplied.
+   *
+   * Absent metadata is refused rather than allowed: an intent this app did not
+   * create has no claim to be attached to one of its sellers.
+   */
+  const owner = String(((intent.metadata ?? {}) as Record<string, unknown>).sellerId ?? "");
+  if (!owner) {
+    throw new Error("This setup intent names no seller, so it cannot be saved to one.");
+  }
+  if (owner !== sellerId) {
+    throw new Error("This setup intent belongs to a different seller.");
+  }
+
   const pmId = String(intent.payment_method ?? "");
   if (!pmId) throw new Error("Setup intent has no payment method yet.");
   const pm = await stripeGet(`payment_methods/${pmId}`);

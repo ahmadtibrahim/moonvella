@@ -16,6 +16,7 @@ import {
   removePaymentMethod,
 } from "../services/sellerBilling.server";
 import { isStripeConfigured } from "../services/payments.server";
+import { shopifyAdminAppUrl } from "../services/shopifyNavigation.server";
 import { useCurrency } from "../components/CurrencyDisplay";
 
 export const loader = async ({ request }) =>
@@ -112,13 +113,18 @@ export const action = async ({ request }) => {
   }
   if (!context.seller) return { error: "No seller account." };
 
-  const url = new URL(request.url);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
 
   try {
     if (intent === "setup") {
-      const returnUrl = `${url.origin}/app/billing`;
+      /*
+       * The seller leaves the admin entirely to pay, so the address they come
+       * back to has to put them into it again — see `shopifyAdminAppUrl`. A
+       * return to this origin would be a bare top-level document with no frame
+       * context, which is the dead end this codebase has already fixed once.
+       */
+      const returnUrl = shopifyAdminAppUrl(context.shop, "/app/billing", request);
       const session = await createSetupSession(context.seller.id, returnUrl);
       return { setupUrl: session.url, simulated: session.simulated ?? false };
     }
@@ -179,7 +185,23 @@ export default function BillingPage() {
 
   React.useEffect(() => {
     const url = setupFetcher.data?.setupUrl;
-    if (url && !setupFetcher.data.simulated) window.location.href = url;
+    if (!url || setupFetcher.data?.simulated) return;
+    /*
+     * THE TOP WINDOW, NEVER THIS ONE, AND THAT IS THE WHOLE BUG THIS REPLACES.
+     *
+     * This used to be `window.location.href = url`, which navigates the FRAME.
+     * Stripe refuses to render Checkout in an iframe — "Stripe Checkout is not
+     * able to run in an iFrame. Please redirect to Checkout at the top level."
+     * — so the seller pressed Add payment method and the app's own panel went
+     * blank, with the refusal in a console they had no reason to open.
+     *
+     * `_top` is a named, already-existing browsing context rather than a new
+     * popup, so this is a navigation and not something a popup blocker is
+     * entitled to swallow. It is also the one navigation this app is allowed to
+     * make out of the frame, and it is deliberate: the card is entered on
+     * Stripe's page, never on ours.
+     */
+    window.open(url, "_top");
   }, [setupFetcher.data]);
 
   if (!settings) {

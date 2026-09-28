@@ -34,6 +34,7 @@ import { createHmac } from "node:crypto";
 import {
   stripeUrl,
   createSetupSession,
+  savePaymentMethodFromSetupIntent,
   persistPaymentMethodFromSetupIntent,
   chargeWholesaleOrder,
 } from "../app/services/sellerBilling.server";
@@ -57,6 +58,8 @@ import { action as stripeWebhookAction } from "../app/routes/webhooks.stripe";
 const prisma = new PrismaClient();
 const SHOP = "stripe-sandbox-test.myshopify.com";
 const PAY_SHOP = "stripe-sandbox-pay.myshopify.com";
+/** The seller who must NOT be able to save another seller's setup intent. */
+const OTHER_SHOP = "stripe-sandbox-other.myshopify.com";
 
 let failures = 0;
 let total = 0;
@@ -93,6 +96,10 @@ interface StripeObject {
   enabled_events?: string[];
   data?: StripeObject[];
   error?: { message?: string };
+  /** Where Checkout sends the browser afterwards. Read to prove where it does NOT send it. */
+  success_url?: string;
+  cancel_url?: string;
+  mode?: string;
 }
 
 /**
@@ -375,6 +382,7 @@ async function main() {
   // to do with the code under test.
   await cleanupSeller(SHOP);
   await cleanupSeller(PAY_SHOP);
+  await cleanupSeller(OTHER_SHOP);
   const seller = await prisma.seller.create({
     data: {
       shopDomain: SHOP,
@@ -386,8 +394,18 @@ async function main() {
     },
   });
 
-  // Hosted setup: the session is real, the completion is a human step.
-  const setup = await createSetupSession(seller.id, "https://admin.moonvella.com/billing/return");
+  /*
+   * Hosted setup: the session is real, the completion is a human step.
+   *
+   * The return URL is the shape `shopifyAdminAppUrl` builds for the Billing
+   * page — a Shopify admin address, not an address on this app's own origin.
+   * That shape is the fix for the blank-panel defect: the seller leaves the
+   * admin entirely to type a card, and only a return THROUGH the admin puts them
+   * back in the frame. `verify-checkout-frame.ts` checks the builder; this
+   * checks that the URL it produces is the one Stripe is actually told to use.
+   */
+  const returnUrl = `https://admin.shopify.com/store/stripe-sandbox-test/apps/${process.env.SHOPIFY_API_KEY}/app/billing`;
+  const setup = await createSetupSession(seller.id, returnUrl);
   const setupUrl = "url" in setup ? String(setup.url) : "";
   check(
     "hosted setup is not marked simulated in test mode",
@@ -398,6 +416,28 @@ async function main() {
     "hosted setup returns a real Stripe Checkout session URL",
     /^https:\/\/checkout\.stripe\.com\//.test(setupUrl) && setupUrl.includes("cs_test_"),
     setupUrl ? setupUrl.split("?")[0] : "no url"
+  );
+
+  // Read the session back from Stripe. The returned `url` is what the browser is
+  // sent to; `success_url` and `cancel_url` are where Checkout sends it next,
+  // and they are the ones that decide whether the seller lands back in the
+  // embedded app or on a bare top-level page that cannot open it.
+  const sessionId = "sessionId" in setup ? String(setup.sessionId) : "";
+  const session = sessionId ? await stripe(`checkout/sessions/${sessionId}`) : {};
+  check(
+    "the Checkout Session is a setup session in test mode, and Stripe holds the real object",
+    session.mode === "setup" && session.livemode === false,
+    `mode=${session.mode} livemode=${String(session.livemode)}`
+  );
+  check(
+    "the session returns the seller through the Shopify admin, not to this app's own origin",
+    session.success_url === `${returnUrl}?setup=success` && session.cancel_url === `${returnUrl}?setup=cancelled`,
+    session.success_url ? String(session.success_url) : "no success_url on the session"
+  );
+  check(
+    "the return URL is an admin address, which is what re-establishes the embedded session",
+    /^https:\/\/admin\.shopify\.com\/store\/[^/]+\/apps\//.test(String(session.success_url)),
+    String(session.success_url).split("/apps/")[0]
   );
   console.log("    note: completing that checkout is a browser step and is NOT verified here.");
 
@@ -453,6 +493,79 @@ async function main() {
   });
   const methodRows = await prisma.sellerPaymentMethod.count({ where: { sellerId: seller.id } });
   check("replaying the same setup does not duplicate the saved method", methodRows === 1, `${methodRows} row(s)`);
+
+  /*
+   * A setup intent may only be attached to the seller it was created for.
+   *
+   * This is the server half of the Add-payment-method flow, and it is checked
+   * against REAL objects because that is the only way to make the assertion
+   * mean anything: the check compares the intent's own metadata — written by
+   * `createSetupSession` — with the seller making the request. A stub would be
+   * comparing this suite's fixture with itself.
+   *
+   * The harm being prevented is a card attached to somebody else's account:
+   * `upsertPaymentMethod` keys the row on the CALLER, so a seller who learned
+   * another seller's setup-intent id could make that card their default and have
+   * MoonVella charge it for their own wholesale orders.
+   */
+  const other = await prisma.seller.create({
+    data: {
+      shopDomain: OTHER_SHOP,
+      storeName: "Stripe Sandbox Other Seller",
+      shopDomainFull: OTHER_SHOP,
+      contactEmail: "other@test.example",
+      status: "APPROVED",
+      approvedAt: new Date(),
+    },
+  });
+  let foreignRefusal = "";
+  try {
+    await savePaymentMethodFromSetupIntent(other.id, String(intent.id));
+  } catch (error) {
+    foreignRefusal = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    "a setup intent made for one seller cannot be saved to another",
+    foreignRefusal.includes("different seller"),
+    foreignRefusal || "IT WAS ACCEPTED — the card would have moved accounts"
+  );
+  check(
+    "the refused attempt wrote no payment method for the seller who asked",
+    (await prisma.sellerPaymentMethod.count({ where: { sellerId: other.id } })) === 0,
+    "no row for the wrong seller"
+  );
+
+  // An intent this app did not create carries no seller at all, so there is
+  // nothing to compare and it is refused rather than guestimated from the
+  // caller's fallback.
+  const orphan = await stripe("setup_intents", {
+    customer: String(customer.id),
+    payment_method: "pm_card_visa",
+    confirm: "true",
+    usage: "off_session",
+    "automatic_payment_methods[enabled]": "true",
+    "automatic_payment_methods[allow_redirects]": "never",
+  });
+  let orphanRefusal = "";
+  try {
+    await savePaymentMethodFromSetupIntent(seller.id, String(orphan.id));
+  } catch (error) {
+    orphanRefusal = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    "a setup intent with no seller in its metadata is refused rather than guessed at",
+    orphanRefusal.includes("names no seller"),
+    orphanRefusal || "IT WAS ACCEPTED"
+  );
+
+  // The positive control: the seller's OWN intent still saves, so the two
+  // refusals above are not simply "this function always throws".
+  const own = await savePaymentMethodFromSetupIntent(seller.id, String(intent.id));
+  check(
+    "the seller's own setup intent still saves, so the refusals above are specific",
+    own.sellerId === seller.id,
+    `seller ${own.sellerId === seller.id ? "matches" : "MISMATCH"}`
+  );
 
   // ------------------------------------------------------ E. Signed webhook path
   console.log("\n-- E. Signed webhook delivery to the deployed handler ------------------");
@@ -777,6 +890,7 @@ async function main() {
   );
 
   await cleanupSeller(PAY_SHOP);
+  await cleanupSeller(OTHER_SHOP);
   await cleanupSeller(SHOP);
 
   console.log(`\n=== ${total - failures}/${total} checks passed (${skipped} skipped) ===`);

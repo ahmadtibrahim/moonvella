@@ -1,4 +1,5 @@
-import { Link, Form, useLoaderData, useActionData, useNavigation, redirect } from "react-router";
+import React from "react";
+import { Link, Form, useLoaderData, useActionData, useNavigation } from "react-router";
 import {
   BLOCKED_MESSAGE,
   withMerchantAccess,
@@ -13,6 +14,7 @@ import {
   ChargeRefused,
 } from "../services/sellerCharge.server";
 import { createSetupSession, getDefaultPaymentMethod } from "../services/sellerBilling.server";
+import { shopifyAdminAppUrl } from "../services/shopifyNavigation.server";
 import { MONEY_CLEARED, IllegalTransitionError } from "../services/orderState.server";
 
 /**
@@ -506,26 +508,39 @@ export const action = async ({ request }) => {
   }
   if (!context.seller) return Response.json({ ok: false, error: "No seller account." });
 
-  const url = new URL(request.url);
   const form = await request.formData();
   const intent = String(form.get("intent") || "");
 
   try {
     if (intent === "setup") {
       /*
-       * Back here, not to Billing: a seller who was told their order needs a
-       * card expects to land on the order they were looking at. The return URL
-       * is the only thing the provider is told about this app — the seller's
-       * session, the shop and the order all stay on this side of it.
+       * Back to Orders, not to Billing: a seller who was told their order needs
+       * a card expects to land on the order they were looking at.
+       *
+       * The address is an ADMIN one, so that following it re-enters the embedded
+       * frame rather than landing on a bare top-level document with no session —
+       * see `shopifyAdminAppUrl`. Only the store and this app's own path are in
+       * it: the seller's session and the order stay on this side of the provider.
        */
-      const session = await createSetupSession(context.seller.id, `${url.origin}/app/orders`);
+      const returnUrl = shopifyAdminAppUrl(context.shop, "/app/orders", request);
+      const session = await createSetupSession(context.seller.id, returnUrl);
       if (session.simulated) {
         // No provider session exists to send anyone to, so the honest answer is
         // the deployment fact, in the service's own words, rather than a
         // redirect to a page that would not exist.
         return Response.json({ ok: false, simulated: true, detail: session.detail });
       }
-      return redirect(session.url);
+      /*
+       * RETURNED, NOT REDIRECTED, AND THE DIFFERENCE IS THE WHOLE BUG.
+       *
+       * This was `return redirect(session.url)`. A 302 to Stripe is followed by
+       * whatever asked for it — and what asked for it is the IFRAME, because the
+       * form was submitted from inside the Shopify admin. Stripe will not render
+       * Checkout in a frame ("please redirect to Checkout at the top level"), so
+       * the seller watched the app's own panel empty itself. The URL has to
+       * travel as DATA, so the browser half can hand it to the top window.
+       */
+      return Response.json({ ok: true, setupUrl: session.url });
     }
 
     if (intent === "retry_charge") {
@@ -574,7 +589,14 @@ export const action = async ({ request }) => {
          * priced from the lines on every attempt.
          */
         retry: true,
-        setupReturnUrl: `${url.origin}/app/orders`,
+        /*
+         * An admin address for the same reason the setup action uses one: this
+         * URL ends up on a Stripe session the seller follows out of the frame,
+         * and whatever they come back to has to put them into it again. The
+         * request is passed so the authoritative `host` is preferred where it
+         * is present.
+         */
+        setupReturnUrl: shopifyAdminAppUrl(context.shop, "/app/orders", request),
       });
 
       return Response.json({
@@ -652,6 +674,27 @@ export default function OrdersPage() {
    * that has not been thought about.
    */
   const busy = navigation.state !== "idle";
+
+  /*
+   * THE TOP WINDOW, NEVER THIS ONE. Stripe refuses to render Checkout inside an
+   * iframe — "Stripe Checkout is not able to run in an iFrame. Please redirect
+   * to Checkout at the top level." — so the URL the action returned is handed to
+   * `_top` instead of assigned to this frame's location. Navigating the frame is
+   * what emptied the panel; `_top` is the one hop out of the frame this app
+   * makes, and it is deliberate, because the card is entered on Stripe's page
+   * and never on ours.
+   *
+   * `_top` names a browsing context that already exists, so this is a navigation
+   * rather than a new popup, which is not something a popup blocker swallows.
+   *
+   * Declared above the `canViewOrders` return below because a hook may not sit
+   * behind a conditional — a seller who cannot view orders still renders this
+   * component on the way to the refusal.
+   */
+  React.useEffect(() => {
+    const url = actionData?.setupUrl;
+    if (url) window.open(url, "_top");
+  }, [actionData]);
 
   if (!canViewOrders) {
     return (
