@@ -71,19 +71,52 @@ export interface RateQuote {
 }
 
 export interface BookingResult {
+  /**
+   * `ShippingReply.order.orderId`, kept as the provider typed it — a string.
+   *
+   * The follow-up calls (`GET /api/v2/ship/{orderId}`, `/label`, `/track-order`)
+   * declare that path segment `integer/int64`, so this value is a number in
+   * string's clothing. It is stored verbatim rather than coerced because a
+   * coerced NaN would be indistinguishable from "no id" and would silently
+   * break reconciliation, which is the one path that must not be wrong.
+   */
   providerShipmentId: string;
   carrier: string;
   serviceName: string;
   trackingNumber: string;
   trackingUrl: string | null;
+  /** The provider's own short tracking link, when it issues one. */
+  brandedTrackingUrl?: string | null;
+  /**
+   * The label document returned at booking, inline.
+   *
+   * There is no `labelUrl` in the reply — the document comes back as data, and a
+   * later re-download fetches `GET /api/v2/ship/{orderId}/label`.
+   */
+  label?: { type: string; data: string } | null;
+  /**
+   * The label as an openable href — a `data:` URI for the inline document, or
+   * the provider's URL if that is what it turns out to send. Derived from
+   * `label`, never from a `labelUrl` in the reply, which does not exist.
+   */
   labelUrl: string | null;
+  /**
+   * The saved-quote id this booking was bought from, when it was issued.
+   *
+   * Carried out so the caller can persist it BEFORE the purchase, which is the
+   * only handle that exists if the ship call never returns: the rate uuid is not
+   * an order, and a timed-out booking leaves no order id to look up. It is
+   * transient by nature — it names a draft that becomes an order on success.
+   */
+  savedQuoteId?: number | null;
   bookedCost: number;
   currency: string;
   raw?: unknown;
 }
 
 export interface LabelResult {
-  labelUrl: string;
+  /** Null when the provider answered with an empty document. */
+  labelUrl: string | null;
   format: string;
 }
 
@@ -697,7 +730,7 @@ export function isProviderTimeout(error: unknown): boolean {
  * fresh token; a TIMEOUT IS NOT RETRIED — re-issuing a request that may have
  * been received is exactly the second purchase this file exists to avoid.
  */
-async function eshipperFetch(method: string, path: string, body?: unknown, operation = path) {
+async function eshipperFetch(method: string, path: string, body?: unknown, operation = path, asText = false) {
   const { baseUrl } = await eshipperConfig();
   const attempt = async (): Promise<Response> => {
     // One signal per attempt, kept in scope so a rejection can be attributed:
@@ -747,7 +780,22 @@ async function eshipperFetch(method: string, path: string, body?: unknown, opera
   // Redacted, not raw: this message can be persisted as an integration detail.
   if (!res.ok) throw new Error(`eShipper error ${res.status}: ${redactSecrets(text)}`);
   if (!text) return {};
-  return JSON.parse(text);
+  /*
+   * Some endpoints answer with a document rather than JSON — `/label` returns
+   * the label itself. Parsing those as JSON would turn a perfectly good label
+   * into a syntax error, so the caller says which it is expecting.
+   */
+  if (asText) return text;
+  /*
+   * A JSON endpoint can still answer with a bare string (Spring quotes it), so
+   * a parse failure is reported with the body rather than as a raw SyntaxError
+   * that says nothing about which call produced it.
+   */
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`eShipper ${operation} did not answer with JSON: ${redactSecrets(text).slice(0, 300)}`);
+  }
 }
 
 /**
@@ -1233,11 +1281,54 @@ export function normalizeRates(raw: unknown, quoteId: string | null): RateQuote[
   });
 }
 
-export async function saveQuote(quoteId: string, req: RateRequest): Promise<RateQuote> {
+/**
+ * Save a quote so that it can be booked.
+ *
+ * A rate is NOT bookable. `POST /api/v2/ship/{quoteId}` takes an
+ * `integer/int64` naming a quote the provider has SAVED, and a rate response
+ * contains no such number — its `uuid` identifies the rate TRANSACTION, not a
+ * quote. `PUT /api/v2/quote` is the missing step: "save a quote as a draft
+ * order for review and future action", answered with the `quoteId` to book by.
+ *
+ * Note the verbs, because they invert the obvious reading: on this API **PUT
+ * saves a quote and POST fetches rates**. Posting the uuid to the ship endpoint
+ * (what this app used to do) cannot work at any point — the provider rejects it
+ * with a Java type error before it reads the body.
+ *
+ * The body is the documented `SaveQuoteRequest` — the SAME rate request that
+ * produced the quote, the ONE quote object being bought, and the uuid tying
+ * them together. Because the whole rate request is saved, everything it
+ * carried travels with the draft: the addresses, the parcels, and the
+ * `notifyRecipient` flag that decides whether the carrier tells the customer.
+ */
+export async function saveQuote(input: {
+  /** The rate envelope's `uuid` — the transaction the quote came from. */
+  rateUuid: string;
+  rateRequest: RateRequest;
+  /** The one quote object being bought, as the provider returned it. */
+  quote: Record<string, unknown>;
+}): Promise<number> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("saveQuote");
-  const raw = await eshipperFetch("PUT", `/api/v2/quote/${quoteId}`, buildQuoteRequest(req, new Date()));
-  return normalizeRates([raw], quoteId)[0];
+  const raw = (await eshipperFetch(
+    "PUT",
+    "/api/v2/quote",
+    {
+      quoteRequest: buildQuoteRequest(input.rateRequest, new Date()),
+      quote: input.quote,
+      uuid: input.rateUuid,
+    },
+    "saveQuote"
+  )) as { quoteId?: unknown; message?: unknown; type?: unknown };
+  const quoteId = Number(raw?.quoteId);
+  if (!Number.isFinite(quoteId) || quoteId <= 0) {
+    // Never fall back to the uuid: it is a string the ship endpoint cannot even
+    // deserialize, so "no id" and "wrong id" are the same refusal one call later.
+    throw new Error(
+      `eShipper did not issue a bookable quote id for this rate. It said: ${String(raw?.message ?? "nothing")}`
+    );
+  }
+  return quoteId;
 }
 
 export async function getQuote(quoteId: string): Promise<RateQuote | null> {
@@ -1249,7 +1340,14 @@ export async function getQuote(quoteId: string): Promise<RateQuote | null> {
 }
 
 export async function bookShipment(input: {
-  quote: { carrier: string; serviceCode: string; serviceName: string; providerQuoteId?: string | null };
+  quote: {
+    carrier: string;
+    serviceCode: string;
+    serviceName: string;
+    providerQuoteId?: string | null;
+    /** The provider's own quote object, replayed verbatim into the save. */
+    raw?: unknown;
+  };
   rateRequest: RateRequest;
 }): Promise<BookingResult> {
   if (!(await eshipperConfigured())) {
@@ -1267,47 +1365,106 @@ export async function bookShipment(input: {
     };
   }
   await requireRealMode("bookShipment");
-  // Documented as POST /api/v2/ship/{quoteId}. Without a provider quote id there
-  // is no id to book against, and booking by guessing one would risk a second
-  // label purchase — so refuse and ask for a re-quote instead.
+  /*
+   * Two calls, in the documented order: save the quote, then buy the saved
+   * quote. The save is what turns a rate into something bookable, and it must
+   * happen immediately before the purchase rather than at quote time — a draft
+   * order is created per call, and one per rate the operator merely LOOKED at
+   * would litter the account with drafts nobody asked for.
+   *
+   * The uuid is the rate handle stored on the quote; `raw` is the provider's own
+   * quote object, replayed verbatim so the draft is the quote that was priced.
+   */
   if (!input.quote.providerQuoteId) {
     throw new Error(
-      "This quote has no eShipper quote id. Re-request quotes so the booking can reference the provider quote."
+      "This quote has no eShipper rate id. Re-request quotes so the booking can reference the rate it was priced from."
     );
   }
+  const quoteObject = input.quote.raw as Record<string, unknown> | undefined;
+  if (!quoteObject || typeof quoteObject !== "object" || Array.isArray(quoteObject)) {
+    throw new Error(
+      "This quote did not keep the provider's own quote object, so it cannot be saved for booking. Re-request quotes."
+    );
+  }
+  const savedQuoteId = await saveQuote({
+    rateUuid: input.quote.providerQuoteId,
+    rateRequest: input.rateRequest,
+    quote: quoteObject,
+  });
   /*
-   * The same corrected envelope the quote was priced with, so the label cannot
-   * describe a parcel the price was not based on, plus the service being bought.
+   * No request body: the saved quote already carries the addresses, parcels and
+   * the service being bought — the endpoint's contract is the id in the path.
+   * Sending the rate envelope again (as this used to) would describe a second,
+   * unsaved shipment and could only ever book the wrong thing.
    *
-   * NOTE: the booking contract is NOT yet verified the way the quote contract
-   * is. The quote endpoint was driven to a successful answer and its names are
-   * established; this endpoint has only been reasoned about from the corrected
-   * envelope, and every field here is inherited from that work rather than
-   * proven against a response. It is exercised by the sandbox booking test
-   * before it is relied on.
+   * Named, because this is the one call whose timeout means "you may own a label
+   * you cannot see" rather than "nothing happened".
    */
-  const serviceId = Number(input.quote.serviceCode);
-  const raw = await eshipperFetch(
+  const raw = (await eshipperFetch(
     "POST",
-    `/api/v2/ship/${encodeURIComponent(input.quote.providerQuoteId)}`,
-    {
-      ...buildQuoteRequest(input.rateRequest, new Date()),
-      serviceId: Number.isFinite(serviceId) ? serviceId : input.quote.serviceCode,
-    },
-    // Named, because this is the one call whose timeout means "you may own a
-    // label you cannot see" rather than "nothing happened".
+    `/api/v2/ship/${savedQuoteId}`,
+    undefined,
     "bookShipment"
-  ) as Record<string, unknown>;
+  )) as Record<string, unknown>;
+  return { ...readShippingReply(raw, input.quote), savedQuoteId };
+}
+
+/**
+ * The label as something an operator can click.
+ *
+ * `ShippingReply` describes the label as `{type, data}` and does NOT say whether
+ * `data` is the document or a link to it. Both readings are handled rather than
+ * assumed, because guessing wrong here is invisible: a URL wrapped as base64 and
+ * a base64 blob treated as a URL both produce a broken button and no error. The
+ * first real booking settles which one this account is given. A `data:` URI is
+ * deliberate — it makes `labelUrl` directly openable by the existing links,
+ * without a download route or a new column.
+ */
+export function labelToHref(label: { type: string; data: string } | null | undefined): string | null {
+  if (!label?.data) return null;
+  if (/^https?:\/\//i.test(label.data)) return label.data;
+  const mime = /pdf/i.test(label.type) ? "application/pdf" : "application/octet-stream";
+  return `data:${mime};base64,${label.data}`;
+}
+
+/**
+ * Read the provider's booking answer by its documented names.
+ *
+ * `ShippingReply` nests everything: the ids under `order`, the carrier under
+ * `carrier`, and the money under `quote` — where `quote.totalCharge` is what was
+ * actually BOUGHT, which is not guaranteed to equal what was quoted. The old
+ * reader looked for `shipmentId`, `cost` and `labelUrl` at the top level; none
+ * of those keys exist, so a successful booking would have been recorded as an
+ * empty provider id at zero cost.
+ *
+ * The label arrives inline as `labelData.label[]` of `{type, data}` rather than
+ * as a URL — there is no `labelUrl` anywhere in the reply.
+ */
+function readShippingReply(
+  reply: Record<string, unknown>,
+  fallback: { carrier: string; serviceName: string }
+): BookingResult {
+  const order = (reply.order ?? {}) as Record<string, unknown>;
+  const carrier = (reply.carrier ?? {}) as Record<string, unknown>;
+  const quote = (reply.quote ?? {}) as Record<string, unknown>;
+  const labels = ((reply.labelData ?? {}) as Record<string, unknown>).label;
+  const first = Array.isArray(labels) ? (labels[0] as Record<string, unknown> | undefined) : undefined;
   return {
-    providerShipmentId: String(raw.shipmentId ?? raw.orderId ?? raw.id ?? ""),
-    carrier: String(raw.carrier ?? input.quote.carrier),
-    serviceName: String(raw.serviceName ?? input.quote.serviceName),
-    trackingNumber: String(raw.trackingNumber ?? raw.tracking ?? ""),
-    trackingUrl: raw.trackingUrl ? String(raw.trackingUrl) : null,
-    labelUrl: raw.labelUrl ? String(raw.labelUrl) : null,
-    bookedCost: Math.round(Number(raw.cost ?? raw.total ?? 0) * 100),
-    currency: String(raw.currency ?? "CAD"),
-    raw,
+    // A STRING here, and that is not an oversight: the reply types it as such.
+    // The numeric shipping order id the follow-up GETs want is this value read
+    // as a number, which is why it is kept verbatim rather than coerced.
+    providerShipmentId: String(order.orderId ?? ""),
+    carrier: String(carrier.carrierName ?? fallback.carrier),
+    serviceName: String(carrier.serviceName ?? fallback.serviceName),
+    trackingNumber: String(reply.trackingNumber ?? ""),
+    trackingUrl: reply.trackingUrl ? String(reply.trackingUrl) : null,
+    brandedTrackingUrl: reply.brandedTrackingUrl ? String(reply.brandedTrackingUrl) : null,
+    // Not a URL: the document itself, which the caller must persist.
+    label: first ? { type: String(first.type ?? "PDF"), data: String(first.data ?? "") } : null,
+    labelUrl: labelToHref(first ? { type: String(first.type ?? "PDF"), data: String(first.data ?? "") } : null),
+    bookedCost: Math.round(Number(quote.totalCharge ?? 0) * 100),
+    currency: String(quote.currency ?? "CAD"),
+    raw: reply,
   };
 }
 
@@ -1329,49 +1486,74 @@ export async function updateShipment(data: Record<string, unknown>): Promise<Boo
 }
 
 /**
- * Ask the provider what it holds under this id.
+ * Ask the provider what it holds under a shipping order id.
  *
  * Used to resolve a booking whose call never returned: if the provider has a
- * shipment for the reference we sent, the booking exists and is adopted rather
- * than repeated. `id` is the provider's quote id when that is all we have — the
- * only reference the provider was given before the call went quiet.
+ * shipment under this id, the booking exists and is adopted rather than repeated.
+ *
+ * The id is `ShippingReply.order.orderId` — the SHIPPING ORDER, numeric in a
+ * string's clothing. It is NOT the quote. Until a booking succeeds there is no
+ * such id, which is exactly why a booking that times out cannot be reconciled by
+ * quote: see the note on `bookShipment`'s saved-quote id.
  */
 export async function getShipment(orderId: string): Promise<BookingResult | null> {
   if (!(await eshipperConfigured())) return null;
   await requireRealMode("getShipment");
-  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}`, undefined, "getShipment") as Record<string, unknown>;
+  const raw = (await eshipperFetch("GET", `/api/v2/ship/${orderId}`, undefined, "getShipment")) as Record<
+    string,
+    unknown
+  >;
   if (!raw || Object.keys(raw).length === 0) return null;
-  return {
-    providerShipmentId: String(raw.shipmentId ?? raw.id ?? ""),
-    carrier: String(raw.carrier ?? ""),
-    serviceName: String(raw.serviceName ?? ""),
-    trackingNumber: String(raw.trackingNumber ?? raw.tracking ?? ""),
-    trackingUrl: raw.trackingUrl ? String(raw.trackingUrl) : null,
-    labelUrl: raw.labelUrl ? String(raw.labelUrl) : null,
-    bookedCost: Math.round(Number(raw.cost ?? raw.total ?? 0) * 100),
-    currency: String(raw.currency ?? "CAD"),
-    raw,
-  };
+  return readShippingReply(raw, { carrier: "", serviceName: "" });
 }
 
-export async function cancelShipment(providerShipmentId: string): Promise<{ cancelled: boolean }> {
+/**
+ * Cancel a booked shipment at the provider.
+ *
+ * The body is the documented `ShipmentCancelRequest` — `{order: {trackingId,
+ * orderId}}` — and NOT `{shipmentId}` as this used to send, which matched no
+ * field the provider reads. Either identifier cancels it; if a tracking number
+ * is given the order number is ignored, so the tracking number is preferred as
+ * the narrower of the two.
+ *
+ * `cancelled` is read from the reply naming the orders it cancelled. This is the
+ * safe direction to be strict in: a reply we cannot read leaves the shipment
+ * CANCELLING rather than claiming a refund that may not have happened.
+ */
+export async function cancelShipment(input: {
+  providerShipmentId?: string | null;
+  trackingNumber?: string | null;
+}): Promise<{ cancelled: boolean; raw?: unknown }> {
   if (!(await eshipperConfigured())) return { cancelled: true };
   await requireRealMode("cancelShipment");
-  const raw = await eshipperFetch("DELETE", "/api/v2/ship/cancel", { shipmentId: providerShipmentId }) as Record<string, unknown>;
-  return { cancelled: Boolean(raw.cancelled ?? raw.success ?? true) };
+  const order = input.trackingNumber
+    ? { trackingId: input.trackingNumber }
+    : { orderId: input.providerShipmentId ?? "" };
+  const raw = (await eshipperFetch("DELETE", "/api/v2/ship/cancel", { order }, "cancelShipment")) as {
+    order?: unknown;
+  };
+  return { cancelled: Array.isArray(raw?.order) && raw.order.length > 0, raw };
 }
 
+/**
+ * Re-download the label for a booked shipping order.
+ *
+ * The endpoint answers with the DOCUMENT, typed `string` in the spec — not a
+ * JSON object and not a URL — so it is read as text and wrapped the same way the
+ * booking reply's inline label is.
+ */
 export async function getLabel(orderId: string): Promise<LabelResult> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("getLabel");
-  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}/label`);
-  return { labelUrl: String(raw.labelUrl ?? raw.url ?? ""), format: String(raw.format ?? "PDF") };
+  const text = (await eshipperFetch("GET", `/api/v2/ship/${orderId}/label`, undefined, "getLabel", true)) as string;
+  return { labelUrl: labelToHref({ type: "PDF", data: text }), format: "PDF" };
 }
 
 export async function getOrderDetails(orderId: string): Promise<OrderDetailsResult> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("getOrderDetails");
-  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}/order-details`);
+  // Spec types this 200 as `string`: it is a document, not JSON.
+  const raw = await eshipperFetch("GET", `/api/v2/ship/${orderId}/order-details`, undefined, "getOrderDetails", true);
   return { orderId, details: raw };
 }
 

@@ -753,6 +753,18 @@ export default function AdminOrderDetail() {
   const selectedQuote = order.shippingQuotes.find((q) => q.selected) ?? null;
   const cheapest = order.shippingQuotes[0] ?? null;
   const fastest = order.shippingQuotes.filter((q) => q.transitDays !== null).sort((a, b) => (a.transitDays! - b.transitDays!))[0] ?? null;
+  /*
+   * When the batch on screen was priced.
+   *
+   * Every row here comes from ONE rate call, because a new request replaces the
+   * old batch outright. Naming the time is what lets an operator tell "these are
+   * the prices I just asked for" from "these are yesterday's and the page is
+   * stale" without having to re-quote to find out.
+   */
+  const batchQuotedAt = order.shippingQuotes.reduce<Date | null>((newest, q) => {
+    const at = new Date(q.quotedAt);
+    return newest === null || at > newest ? at : newest;
+  }, null);
   const badge = STRIPE_MODE_BADGE[mode] ?? STRIPE_MODE_BADGE.disabled;
   const deliveryAddress = addressLines(order.shippingAddress);
   const payment = order.wholesalePayment;
@@ -1378,9 +1390,15 @@ export default function AdminOrderDetail() {
         {order.shippingQuotes.length === 0 ? (
           <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No quotes yet.</p>
         ) : (
+          <>
+          <p style={{ fontSize: "0.75rem", color: "#475569", marginBottom: "0.4rem" }}>
+            {order.shippingQuotes.length} price{order.shippingQuotes.length === 1 ? "" : "s"} from the rate request at{" "}
+            <strong>{batchQuotedAt?.toLocaleString() ?? "an unrecorded time"}</strong>. Requesting quotes again
+            replaces this batch and clears any selection made from it.
+          </p>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.8rem" }}>
             <thead>
-              <tr><th style={th}>From dock</th><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Cost</th><th style={th}>Transit</th><th style={th}></th></tr>
+              <tr><th style={th}>From dock</th><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Cost</th><th style={th}>Transit</th><th style={th}>Quoted</th><th style={th}>Expires</th><th style={th}></th></tr>
             </thead>
             <tbody>
               {order.shippingQuotes.map((q) => (
@@ -1406,6 +1424,27 @@ export default function AdminOrderDetail() {
                   </td>
                   <td style={{ padding: "0.4rem" }}>{money(q.totalAmount, q.currency)}</td>
                   <td style={{ padding: "0.4rem" }}>{q.transitDays === null ? "Estimate unavailable" : `${q.transitDays} day(s)`}</td>
+                  {/*
+                    WHEN this price was asked for, and when it stops being a
+                    price. A quote is only good for the rate call that produced
+                    it, so an operator looking at a re-quoted page needs to see
+                    that the row in front of them belongs to the newest batch and
+                    is still live — otherwise the bookable-looking line is the
+                    one thing on the page that cannot be trusted.
+                  */}
+                  <td style={{ padding: "0.4rem" }}>{new Date(q.quotedAt).toLocaleString()}</td>
+                  <td style={{ padding: "0.4rem" }}>
+                    {q.expiresAt ? (
+                      <span style={{ color: new Date(q.expiresAt).getTime() < now ? "#b91c1c" : "#334155" }}>
+                        {new Date(q.expiresAt).getTime() < now ? "expired " : ""}
+                        {new Date(q.expiresAt).toLocaleString()}
+                      </span>
+                    ) : (
+                      // Nullable because the provider does not always say. An
+                      // absent expiry is not an expiry of "now".
+                      <span style={{ color: "#64748b" }}>Not stated</span>
+                    )}
+                  </td>
                   <td style={{ padding: "0.4rem" }}>
                     <Form method="post"><input type="hidden" name="intent" value="select_quote" /><input type="hidden" name="quoteId" value={q.id} /><button type="submit" style={btn("#082a4a")}>Select</button></Form>
                   </td>
@@ -1413,6 +1452,7 @@ export default function AdminOrderDetail() {
               ))}
             </tbody>
           </table>
+          </>
         )}
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
           {/*

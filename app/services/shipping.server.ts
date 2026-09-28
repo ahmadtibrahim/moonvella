@@ -521,10 +521,31 @@ export async function getQuotesForOrder(
   const request = buildRateRequest(order, built.packages, carrierShipFrom(origin.snapshot));
   const rates = await getRates(request);
 
-  // Scoped to this dock: quoting the second dock of a split order must not
-  // withdraw the first dock's prices, which the operator may already have read.
+  /*
+   * The new batch REPLACES the old one, selection included.
+   *
+   * This used to spare the selected row (`selected: false` in the filter), which
+   * left the operator holding a choice made against a batch that no longer
+   * exists: the page showed the new prices, the booking button still named the
+   * old one, and nothing said the two were from different rate calls. Prices are
+   * only valid for the transaction that produced them, so a price from a
+   * superseded batch is not a price at all.
+   *
+   * Deleting the selection is what makes the remaining rules fall out rather
+   * than having to be enforced: an older quote cannot be booked because it is
+   * gone, and a selection can only ever come from the newest batch because it is
+   * the only batch.
+   *
+   * Scoped to this dock, so quoting the second dock of a split order does not
+   * withdraw the first dock's prices.
+   *
+   * Deliberately AFTER the provider call above: a rate request that fails must
+   * leave the operator's existing prices and selection untouched. Withdrawing
+   * them because the provider was unreachable would turn an outage into work
+   * lost, and the operator would have no way to tell the two apart.
+   */
   await prisma.shippingQuote.deleteMany({
-    where: { orderId, originLocationId: origin.location!.id, selected: false, provider: "eshipper" },
+    where: { orderId, originLocationId: origin.location!.id, provider: "eshipper" },
   });
   await prisma.$transaction(
     rates.map((r) =>
@@ -1083,6 +1104,8 @@ async function finalizeBooking(
     providerQuoteId: string | null;
     totalAmount: number;
     originLocationId: string | null;
+    /** The provider's own quote object, replayed verbatim into the booking save. */
+    raw: string | null;
   },
   actor: Actor
 ) {
@@ -1158,7 +1181,13 @@ async function finalizeBooking(
         carrier: quote.carrier,
         serviceCode: quote.serviceCode,
         serviceName: quote.serviceName,
+        // The rate envelope's uuid: the handle the SAVE names, not the booking.
+        // A rate cannot be booked directly — the provider turns it into a draft
+        // order first and issues the numeric id that the ship call consumes.
         providerQuoteId: quote.providerQuoteId,
+        // The provider's own quote object, replayed verbatim into that save so
+        // the draft is the quote that was priced.
+        raw: quote.raw ? (JSON.parse(quote.raw) as unknown) : undefined,
       },
       rateRequest: buildRateRequest(order, parcels.packages, shipFromAddress),
     });
@@ -1175,7 +1204,13 @@ async function finalizeBooking(
         trackingNumber: booking.trackingNumber || null,
         trackingUrl: booking.trackingUrl,
         labelUrl: booking.labelUrl,
-        labelDocumentFormat: booking.labelUrl ? "PDF" : null,
+        // The provider's own word for the document's format, not an assumption
+        // that everything is a PDF.
+        labelDocumentFormat: booking.label ? booking.label.type : null,
+        // The saved quote this booking was bought from. Stored because it is the
+        // ONLY handle that survives a ship call which never returns: the rate
+        // uuid is not an order, and a timed-out booking has no order id yet.
+        providerQuoteId: booking.savedQuoteId == null ? quote.providerQuoteId : String(booking.savedQuoteId),
         bookedCost: booking.bookedCost || quote.totalAmount,
         trackingStatus: TRACKING_STATE.label_created,
         labelCreatedAt: new Date(),
@@ -1343,10 +1378,22 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
         : `Only a shipment awaiting an unknown booking outcome can be reconciled (this is ${shipment.status}).`
     );
   }
-  if (!shipment.providerQuoteId) {
+  /*
+   * Asked by SHIPPING ORDER id, and by nothing else.
+   *
+   * This used to ask by quote id, which cannot work: `GET /api/v2/ship/{orderId}`
+   * is keyed on the shipping order, a different number space from the quote that
+   * was saved to create it. A quote number that happened to collide with some
+   * other order's would have adopted a STRANGER'S shipment onto this row —
+   * someone else's tracking number, someone else's label. Refusing is the only
+   * safe answer when the order id is not known, and the operator is told to
+   * check the provider's portal, which is where the truth actually is.
+   */
+  if (!shipment.providerShipmentId) {
     throw new Error(
-      "No provider quote id was stored for this booking, so the provider cannot be asked what it holds. " +
-        "Check the provider's portal and record the outcome instead."
+      "A booking that never returned leaves no provider shipment id, and the provider cannot be asked what it " +
+        "holds without one — its lookup is keyed on the shipping order, not the saved quote. Check the provider's " +
+        "portal and record the outcome instead."
     );
   }
 
@@ -1358,7 +1405,7 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
     );
   }
 
-  const found = await getShipment(shipment.providerQuoteId);
+  const found = await getShipment(shipment.providerShipmentId);
   await recordAudit({
     actorType: "ADMIN_USER",
     actorId: actor.actorId,
@@ -1366,7 +1413,7 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
     action: "shipping.booking_reconciled",
     entityType: AUDIT_ENTITY.SHIPMENT,
     entityId: shipmentId,
-    afterData: { found: Boolean(found), providerQuoteId: shipment.providerQuoteId },
+    afterData: { found: Boolean(found), providerShipmentId: shipment.providerShipmentId },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
@@ -1376,15 +1423,15 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
       where: { id: shipmentId },
       data: {
         lastBookingError:
-          `Reconciled: the provider returned no shipment for quote ${shipment.providerQuoteId}. ` +
+          `Reconciled: the provider returned no shipment for order ${shipment.providerShipmentId}. ` +
           `This is not proof that no label exists — check the provider's portal.`,
       },
     });
     return {
       adopted: false as const,
-      providerQuoteId: shipment.providerQuoteId,
+      providerShipmentId: shipment.providerShipmentId,
       message:
-        "The provider holds no shipment under this quote id. That is not proof nothing was purchased, " +
+        "The provider holds no shipment under this order id. That is not proof nothing was purchased, " +
         "so this shipment stays unknown until someone checks the provider's portal and records the outcome.",
     };
   }
@@ -1400,7 +1447,7 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
       trackingNumber: found.trackingNumber || shipment.trackingNumber,
       trackingUrl: found.trackingUrl,
       labelUrl: found.labelUrl ?? shipment.labelUrl,
-      labelDocumentFormat: found.labelUrl ? "PDF" : shipment.labelDocumentFormat,
+      labelDocumentFormat: found.label ? found.label.type : shipment.labelDocumentFormat,
       bookedCost: found.bookedCost || shipment.quotedCarrierCost,
       trackingStatus: TRACKING_STATE.label_created,
       labelCreatedAt: shipment.labelCreatedAt ?? new Date(),
@@ -1410,7 +1457,7 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
   });
   await setIntegrationState("eshipper", {
     status: "HEALTHY",
-    detail: `Recovered booking ${found.providerShipmentId} for quote ${shipment.providerQuoteId}.`,
+    detail: `Recovered booking ${found.providerShipmentId}.`,
   });
 
   return {
@@ -1759,7 +1806,13 @@ export async function voidShipment(shipmentId: string, actor: Actor) {
   let cancelled = false;
   let providerMessage: string | null = null;
   try {
-    const result = await cancelShipment(shipment.providerShipmentId);
+    // The tracking number is the narrower identifier, and the provider ignores
+    // the order number when it is present. Both are offered so a shipment whose
+    // order id was never stored can still be cancelled.
+    const result = await cancelShipment({
+      providerShipmentId: shipment.providerShipmentId,
+      trackingNumber: shipment.trackingNumber,
+    });
     cancelled = result.cancelled;
   } catch (error) {
     providerMessage = error instanceof Error ? error.message : "cancel call failed";
