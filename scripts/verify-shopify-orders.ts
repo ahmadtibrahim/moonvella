@@ -1541,19 +1541,35 @@ async function main() {
       const summary = await runDueJobs(handlers, { limit: 20 });
       if (!summary.claimed) break;
     }
-    return prisma.webhookEvent.findUnique({ where: { id: delivery.id } });
+
+    /*
+     * BOTH ROWS COME BACK, because they do not agree about what "finished"
+     * means and the disagreement is load-bearing. `enqueueJob` treats a
+     * SUCCEEDED job as done and will not run it again, but the handler ends
+     * SUCCEEDED whenever it reaches a conclusion — a refusal included — and the
+     * refusal is recorded on the DELIVERY, which ends FAILED. Anything that
+     * decides whether to retry from the delivery alone will re-open a row whose
+     * job can never run again. See the reopen rule in replay-shopify-order.ts.
+     */
+    const jobAfter = await prisma.backgroundJob.findUnique({
+      where: { id: job.id },
+      select: { status: true, result: true },
+    });
+    const event = await prisma.webhookEvent.findUnique({ where: { id: delivery.id } });
+    return { event, job: jobAfter };
   }
 
   const SHOPIFY_REFUSAL =
     "This app is not approved to access the Order object. " +
     "See https://shopify.dev/docs/apps/launch/protected-customer-data for more details.";
 
-  const refused = await runDelivery(
+  const refusedRun = await runDelivery(
     unreadableShop,
     unreadableSeller.id,
     UNREADABLE_ORDER,
     makeAdmin((query) => (query.includes("MoonVellaOrderForEvent") ? { errors: [{ message: SHOPIFY_REFUSAL }] } : { data: null })),
   );
+  const refused = refusedRun.event;
   check(
     "an order the store refused to hand over ends FAILED, not SUCCESS",
     refused?.status === "FAILED",
@@ -1568,6 +1584,25 @@ async function main() {
     "...and it is not filed as an order with no MoonVella lines",
     refused?.errorMessage !== "No MoonVella items",
     refused?.errorMessage ?? "none",
+  );
+  /*
+   * THE ASYMMETRY, PINNED. A refusal is not a crashed handler: the handler
+   * reached a conclusion and said so, so the JOB ends SUCCEEDED while the
+   * DELIVERY ends FAILED. Every retry decision in the system has to know which
+   * of the two it is asking. The replay script read the delivery and re-opened
+   * a row over a job the queue would never run again, which left #1001 sitting
+   * at PENDING with its reason erased. This check is here so that the next
+   * change to either side meets the fact that they disagree on purpose.
+   */
+  check(
+    "...and the job that recorded the refusal still ended SUCCEEDED",
+    refusedRun.job?.status === "SUCCEEDED",
+    `${refusedRun.job?.status ?? "?"} — a refusal is a conclusion, not a crash`,
+  );
+  check(
+    "...and the job kept the refusal in its own result, not only on the delivery",
+    JSON.stringify(refusedRun.job?.result ?? {}).includes("protected-customer-data"),
+    JSON.stringify(refusedRun.job?.result ?? {}).slice(0, 90),
   );
   check(
     "...and no order was invented for it",
@@ -1617,11 +1652,17 @@ async function main() {
             },
           }
         : { data: null });
-  const readable = await runDelivery(unreadableShop, unreadableSeller.id, UNREADABLE_ORDER + 1, readableAdmin);
+  const readableRun = await runDelivery(unreadableShop, unreadableSeller.id, UNREADABLE_ORDER + 1, readableAdmin);
+  const readable = readableRun.event;
   check(
     "a readable order with none of our lines is still the success it is",
     readable?.status === "SUCCESS" && readable?.errorMessage === "No MoonVella items",
     `${readable?.status}${readable?.errorMessage ? ` — ${readable.errorMessage}` : ""}`,
+  );
+  check(
+    "...and that one's job succeeded because the work genuinely succeeded",
+    readableRun.job?.status === "SUCCEEDED",
+    readableRun.job?.status ?? "?",
   );
 
   /*

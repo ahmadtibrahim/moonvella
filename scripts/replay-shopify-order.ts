@@ -166,22 +166,54 @@ async function main() {
      */
     const now = new Date();
     const topic = "ORDERS_PAID";
-    /*
-     * A replay that is run again after a successful one reuses the SAME
-     * delivery rather than making a new one. The intake job below is idempotent
-     * regardless, but keeping one row per order keeps the delivery log a record
-     * of what was replayed rather than of how many times.
-     *
-     * The row is only re-opened when it did not finish. Resetting a delivered
-     * one back to PENDING achieves nothing — the job it belongs to is already
-     * SUCCEEDED, so nothing runs and the row is left claiming work that was done
-     * is outstanding, which is the one reading the delivery log must never give.
-     * A row that failed is a different matter: that one SHOULD be re-opened, and
-     * the enqueue below revives its job in place.
-     */
     const key = `replay:${shopDomain}:${orderId}:${topic}`;
+    const intakeKey = jobKey(JOB_KIND.SHOPIFY_ORDER_INTAKE, seller.id, `replay:${orderId}:${topic}`);
+
+    /*
+     * WHETHER THIS REPLAY CAN ACT, DECIDED FROM BOTH ROWS BEFORE EITHER MOVES.
+     *
+     * The delivery and its job do not agree about what "finished" means, and a
+     * first cut of this read only the delivery. `enqueueJob` treats a SUCCEEDED
+     * job as satisfied and will not run it again — but the handler ends
+     * SUCCEEDED whenever it REACHES A CONCLUSION, including a refusal: a store
+     * this app may not read, a seller MoonVella has not approved, an event with
+     * no order on it. Those are recorded on the DELIVERY, which ends FAILED,
+     * while the job that produced them ends SUCCEEDED. So "delivery not SUCCESS"
+     * does not mean "the queue will try again", and re-opening the delivery on
+     * that alone reset a failed row to PENDING over a job that could never run
+     * again. The run that found this left #1001 sitting at PENDING with its
+     * reason erased and nothing queued to restore it — a delivery log claiming
+     * work is outstanding when the only thing left to do was read the answer
+     * that had just been deleted. The script's own note below says that is the
+     * one reading the log must never give; the rule now matches the note.
+     *
+     * Two combinations, two different things to do:
+     *
+     *   delivery SUCCESS + job SUCCEEDED — the work is done. A replay is a
+     *   no-op, and the rows are left exactly as they are. This is the case the
+     *   `--times 2` idempotency demonstration rests on.
+     *
+     *   anything else — the previous attempt did not take the order in, and
+     *   the reason may have changed since (the owner approves the store, and
+     *   the same replay must then work). A SUCCEEDED job is re-opened so the
+     *   enqueue below revives it in place, rather than depending on a queue
+     *   that has already decided this key is done.
+     */
     const previous = await prisma.webhookEvent.findUnique({ where: { idempotencyKey: key } });
-    const reopen = previous?.status !== "SUCCESS";
+    const previousJob = await prisma.backgroundJob.findUnique({
+      where: { idempotencyKey: intakeKey },
+      select: { id: true, status: true },
+    });
+
+    if (previous?.status === "SUCCESS" && previousJob?.status === "SUCCEEDED") {
+      line("Delivery row", `${previous.id} (already taken in)`);
+      console.log(
+        "  nothing to do                this order was already taken in by an earlier replay; the\n" +
+          "                               rows are left untouched. That is the idempotency, not a gap."
+      );
+      continue;
+    }
+
     const delivery = await prisma.webhookEvent.upsert({
       where: { idempotencyKey: key },
       create: {
@@ -192,15 +224,32 @@ async function main() {
         source: "REPLAY",
         idempotencyKey: key,
       },
-      update: reopen
+      update: previous
         ? { status: "PENDING", processedAt: null, errorMessage: null, retryCount: 0 }
         : {},
     });
     line("Delivery row", delivery.id);
 
+    if (previousJob?.status === "SUCCEEDED") {
+      /*
+       * Re-opened rather than deleted: the first attempt is part of the record
+       * of what this order has been through, and its `result` column carries
+       * the refusal that was given at the time.
+       */
+      await prisma.backgroundJob.update({
+        where: { id: previousJob.id },
+        data: {
+          status: "CANCELLED",
+          lastError:
+            "Re-opened by a replay: the previous attempt ended without taking the order in.",
+        },
+      });
+      line("Re-opened job", previousJob.id);
+    }
+
     const job = await enqueueJob({
       kind: JOB_KIND.SHOPIFY_ORDER_INTAKE,
-      idempotencyKey: jobKey(JOB_KIND.SHOPIFY_ORDER_INTAKE, seller.id, `replay:${orderId}:${topic}`),
+      idempotencyKey: intakeKey,
       sellerId: seller.id,
       payload: { webhookEventId: delivery.id, topic, shop: shopDomain },
       maxAttempts: 3,
