@@ -560,6 +560,24 @@ export const jobHandlers: Record<string, JobHandler> = {
       detail: { results, jobId: job.id },
     };
   },
+
+  /**
+   * Take one Shopify order event in.
+   *
+   * REGISTERED HERE, AND THAT IS THE LINE THAT MATTERS. This handler was once
+   * left out of the map on the reasoning that a factory taking an optional
+   * client is somehow not an entry — and the cost was total: every intake job
+   * the webhook route queued came back with "No handler is registered for job
+   * kind SHOPIFY_ORDER_INTAKE", the delivery stayed pending, and no order was
+   * ever taken in. The suite did not catch it because the replay check built
+   * its own handler map, which is a map the queue never sees. `verify-shopify-orders`
+   * now asserts every kind the pipeline enqueues is registered in THIS object,
+   * and that check is the one that would have failed.
+   *
+   * A factory is a way to BUILD this handler, never a reason to leave it out.
+   * Production calls it with no argument, below.
+   */
+  [JOB_KIND.SHOPIFY_ORDER_INTAKE]: intakeJobHandler(),
 };
 
 /**
@@ -579,15 +597,14 @@ export const jobHandlers: Record<string, JobHandler> = {
  * — see `finishEvent`. That is what keeps a customer's address from living
  * forever in a table nothing prunes.
  *
- * WHY THIS IS A FACTORY AND NOT ANOTHER ENTRY IN THE MAP.
- *
- * The handler above all others needs a live Shopify client: a replay, a refund
- * or a routing event arrives without the order on it, and the order has to be
- * fetched before there is anything to take in. That client is the one thing
- * about this handler a test cannot fake — Shopify's own API client does not go
- * through `globalThis.fetch`, so stubbing the global reaches nothing — and the
- * behaviour most worth pinning is exactly the part that needs it: that a
- * replay run twice creates one order and one payment.
+ * WHY THIS IS A FACTORY. The handler above all others needs a live Shopify
+ * client: a replay, a refund or a routing event arrives without the order on
+ * it, and the order has to be fetched before there is anything to take in.
+ * That client is the one thing about this handler a test cannot fake —
+ * Shopify's own API client does not go through `globalThis.fetch`, so stubbing
+ * the global reaches nothing — and the behaviour most worth pinning is exactly
+ * the part that needs it: that a replay run twice creates one order and one
+ * payment.
  *
  * So the client is a parameter. Production calls this with none and gets the
  * store's own authenticated client, unchanged; a harness passes one that

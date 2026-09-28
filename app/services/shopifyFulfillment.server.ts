@@ -343,7 +343,22 @@ export class FulfillmentSetupBlocked extends Error {
  */
 export function classifyRefusal(message: string): FulfillmentSetupBlocked {
   const text = message.toLowerCase();
-  if (text.includes("protected customer data")) {
+  /*
+   * TWO SPELLINGS, AND THE SECOND IS THE ONE THAT MATTERS HERE.
+   *
+   * Registering a subscription is refused with "...topics containing protected
+   * customer data". READING an object is refused with "This app is not approved
+   * to access the Order object. See https://shopify.dev/docs/apps/launch/
+   * protected-customer-data" — a hyphenated URL, so the phrase with spaces
+   * never appears and the refusal that blocks the whole pipeline was classified
+   * as OTHER. A blocked read and an unclassified error look the same to
+   * whoever has to fix it, and only one of them names the fix.
+   */
+  if (
+    text.includes("protected customer data") ||
+    text.includes("protected-customer-data") ||
+    text.includes("not approved to access")
+  ) {
     return new FulfillmentSetupBlocked(
       `${message} — this app must be approved for Protected Customer Data in the Shopify Partner Dashboard ` +
         `before it can read orders or fulfillment orders.`,

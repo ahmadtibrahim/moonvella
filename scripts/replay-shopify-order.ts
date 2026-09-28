@@ -229,6 +229,22 @@ async function main() {
       if (!summary.claimed) break;
     }
 
+    /*
+     * THE JOB IS READ BACK, NOT ASSUMED.
+     *
+     * A delivery row stays PENDING whether the work is still queued, still
+     * retrying, or has failed for a reason that will never change — and the
+     * reason lives on the job and nowhere else. Printing only the delivery is
+     * how "No handler is registered for job kind SHOPIFY_ORDER_INTAKE" stayed
+     * invisible while the row said PENDING, which reads like work in progress.
+     */
+    const jobAfter = await prisma.backgroundJob.findUnique({
+      where: { id: job.id },
+      select: { status: true, attempts: true, maxAttempts: true, lastError: true },
+    });
+    line("Intake job after", `${jobAfter?.status ?? "?"} (attempt ${jobAfter?.attempts ?? 0}/${jobAfter?.maxAttempts ?? 0})`);
+    if (jobAfter?.lastError) line("Intake job error", jobAfter.lastError);
+
     const after = await prisma.webhookEvent.findUnique({ where: { id: delivery.id } });
     line("Delivery status", `${after?.status ?? "?"}${after?.errorMessage ? ` — ${after.errorMessage}` : ""}`);
   }

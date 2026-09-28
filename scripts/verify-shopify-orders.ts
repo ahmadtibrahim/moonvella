@@ -1430,6 +1430,50 @@ async function main() {
   check("the recorded body says it was redacted", stored?.payload?.includes('"redacted":true') === true);
 
   /* ====================================================================== */
+  console.log("\n--- 23. every job the pipeline queues has a handler -------------");
+  /* ====================================================================== */
+
+  /*
+   * THE CHECK THAT WAS MISSING, AND WHAT ITS ABSENCE COST.
+   *
+   * Section 18 replays an order through a handler map this suite builds, so it
+   * proves the handler. It says nothing about whether production would ever
+   * call it: the queue reads `jobHandlers` and nothing else, and
+   * SHOPIFY_ORDER_INTAKE was absent from that object while every test passed.
+   * On the deployed system each delivery came back "No handler is registered
+   * for job kind SHOPIFY_ORDER_INTAKE" and stayed pending — a total failure of
+   * the pipeline that no amount of handler-level testing can see.
+   *
+   * So this asks the question the queue asks, of the object the queue uses:
+   * every kind the system can enqueue has something to run it. It is written
+   * over the whole enum rather than a list of the order kinds, because the next
+   * job kind added is the one that would otherwise be forgotten.
+   */
+  const kinds = Object.values(JOB_KIND) as string[];
+  const unregistered = kinds.filter((kind) => typeof jobHandlers[kind] !== "function");
+  check(
+    `every one of the ${kinds.length} job kinds is registered in the real handler map`,
+    unregistered.length === 0,
+    unregistered.length ? `missing: ${unregistered.join(", ")}` : `${kinds.length}/${kinds.length}`,
+  );
+  check(
+    "the order intake handler production will actually run is registered",
+    typeof jobHandlers[JOB_KIND.SHOPIFY_ORDER_INTAKE] === "function",
+    typeof jobHandlers[JOB_KIND.SHOPIFY_ORDER_INTAKE],
+  );
+  for (const kind of [
+    JOB_KIND.SHOPIFY_SELLER_CHARGE,
+    JOB_KIND.SHOPIFY_FULFILLMENT_SUBMIT,
+    JOB_KIND.SHOPIFY_WEBHOOK_SUBSCRIBE,
+  ]) {
+    check(
+      `${kind} — queued by the pipeline — is registered`,
+      typeof jobHandlers[kind] === "function",
+      typeof jobHandlers[kind],
+    );
+  }
+
+  /* ====================================================================== */
   /* Done                                                                    */
   /* ====================================================================== */
 
