@@ -45,6 +45,7 @@
  *
  *   --times N   replay N times (default 1) to demonstrate idempotency
  *   --no-drain  record the delivery and stop; do not run the queue
+ *   --force     re-run even though the previous attempt ended SUCCESS/SUCCEEDED
  */
 
 import { PrismaClient } from "@prisma/client";
@@ -89,6 +90,7 @@ async function main() {
   const orderId = numericId(gid);
   const times = Math.max(1, Number(arg("times") || "1") || 1);
   const drain = !flag("no-drain");
+  const force = flag("force");
 
   const database = (process.env.DATABASE_URL ?? "").split("/").pop()?.split("?")[0] ?? "(unset)";
 
@@ -198,6 +200,22 @@ async function main() {
      *   the same replay must then work). A SUCCEEDED job is re-opened so the
      *   enqueue below revives it in place, rather than depending on a queue
      *   that has already decided this key is done.
+     *
+     * AND THAT RULE IS NOT ENOUGH ON ITS OWN, which is what `--force` is for.
+     * A conclusion can be reached IN ERROR, and the pair above cannot tell a
+     * right one from a wrong one: both rows only record that some answer was
+     * produced. #1001 is the worked example — its job ended SUCCEEDED with
+     * `{"ok":true,"moonvellaItems":0}`, a confident statement that the order
+     * holds none of our lines, which was false and was produced by an id
+     * lookup that compared a GID against a number. Under the rule above a
+     * replay after the fix would print "already taken in" and change nothing,
+     * and the delivery log would go on saying the order was handled.
+     *
+     * The script cannot re-derive that conclusion without re-running the work,
+     * and re-running the work is what a replay is. So the operator says so:
+     * `--force` re-opens both rows whatever they recorded. It is deliberately
+     * not automatic — a replay that always re-ran would make `--times 2` prove
+     * nothing.
      */
     const previous = await prisma.webhookEvent.findUnique({ where: { idempotencyKey: key } });
     const previousJob = await prisma.backgroundJob.findUnique({
@@ -205,11 +223,12 @@ async function main() {
       select: { id: true, status: true },
     });
 
-    if (previous?.status === "SUCCESS" && previousJob?.status === "SUCCEEDED") {
+    if (!force && previous?.status === "SUCCESS" && previousJob?.status === "SUCCEEDED") {
       line("Delivery row", `${previous.id} (already taken in)`);
       console.log(
         "  nothing to do                this order was already taken in by an earlier replay; the\n" +
-          "                               rows are left untouched. That is the idempotency, not a gap."
+          "                               rows are left untouched. That is the idempotency, not a gap.\n" +
+          "                               Pass --force to re-run it anyway."
       );
       continue;
     }
