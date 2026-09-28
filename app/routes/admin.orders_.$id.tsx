@@ -27,7 +27,7 @@ import {
   syncShipmentTracking,
 } from "~/services/shipping.server";
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
-import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
+import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import {
   addManualShipment,
   addOrderPackage,
@@ -273,6 +273,22 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     packages: order.packages,
   });
 
+  /*
+   * WHICH PROVIDER AN OPERATOR IS ABOUT TO SPEND AGAINST.
+   *
+   * This used to be `eshipperMode()`, whose "real" means only "a credential is
+   * configured" — so a deployment pointed at the account's TEST host told the
+   * operator it was real, which is the one word they would read as "live". The
+   * question the button below raises is which HOST a call reaches, and that is
+   * what is carried now.
+   *
+   * The SENTENCE is built here rather than in the component on purpose: the
+   * values come from a `.server` module, which React Router strips from the
+   * client bundle, so a component that called the formatter itself would fail
+   * the build. Resolved once — it reads the credential store.
+   */
+  const eshipper = await eshipperStatus();
+
   return {
     order,
     collection: {
@@ -314,7 +330,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     },
     chargeBlock,
     timeline,
-    eshipper: { mode: await eshipperMode(), account: await maskedEshipperAccount() },
+    eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
     billing: {
       mode: billing.mode,
       autoPayEnabled: billing.autoPayEnabled,
@@ -748,20 +764,61 @@ export default function AdminOrderDetail() {
    */
   const chargeIsRetry = machine.current === "PAYMENT_FAILED" || payment?.status === "FAILED";
   /*
-   * The address gate, as the booking asks it.
+   * The address gate is NO LONGER ONE OF THEM.
    *
-   * `bookShipmentForOrder` refuses on `assertBookingAddressesBookable`, and that
-   * check is the same closed-by-default gate drawn in the card above: both ends
-   * of the label, each needing a current ACCEPTED verdict or a recorded owner
-   * override. Drawing an enabled Book button beside two red address cards asks
-   * an operator to discover the rule by being refused, which is how the same
-   * refusal gets read as a bug. A dock with no gate at all is closed too — an
-   * address that could not be resolved cannot have been checked.
+   * A Google verdict used to be able to hold this button shut, and the button
+   * was right to obey it only because `bookShipmentForOrder` refused on the same
+   * gate. That refusal is gone: booking now checks the fields a carrier needs
+   * (`assertCarrierAddressesReady`) and takes the customer's address as the
+   * seller supplied it. Keeping a verdict-powered term here would disable a
+   * booking the service would now accept — the same disagreement as before,
+   * pointing the other way. The address cards below still draw those verdicts;
+   * they are advice now.
+   *
+   * What remains is the half that still refuses: an order whose parcels cannot
+   * be described is refused by the quote path itself, and `blockers` is that
+   * list.
    */
-  const bookingGatesOpen =
-    collection.blockers.length === 0 &&
-    collection.deliveryGate.allowed &&
-    collection.groups.every((group) => group.addressGate?.allowed === true);
+  const bookingGatesOpen = collection.blockers.length === 0;
+
+  /*
+   * The quote the booking would buy, decided the way `bookShipmentForOrder`
+   * decides it.
+   *
+   * THE SAME THREE QUESTIONS, because a button is a promise about what the
+   * service will do: a quote is SELECTED, it has not EXPIRED, and it is priced
+   * for a dock this order actually collects from. The service refuses on all
+   * three (`where: { orderId, selected: true, originLocationId: origin.location.id }`
+   * then the expiry check), so a page that drew the button without them would be
+   * selling a booking it already knows will be refused.
+   *
+   * The expiry half matters more than it looks: `expiresAt` is nullable because
+   * the provider does not always issue one, and a quote with no expiry never
+   * expires here — which is the same reading the service takes.
+   */
+  const now = Date.now();
+  const quoteExpired = selectedQuote?.expiresAt != null && new Date(selectedQuote.expiresAt).getTime() < now;
+  const orderDockIds = collection.groups.map((group) => group.locationId).filter((id): id is string => id !== null);
+  const quoteDockMatches =
+    selectedQuote?.originLocationId != null && orderDockIds.includes(selectedQuote.originLocationId);
+  const quoteBookable = selectedQuote !== null && !quoteExpired && quoteDockMatches;
+
+  /*
+   * Said once, and in the words of the thing that is missing. "Select a service"
+   * and "the price you chose has expired" send an operator to two different
+   * buttons, and the second one is the reason the first would fail again.
+   */
+  const quoteBlock = !selectedQuote
+    ? order.shippingQuotes.length > 0
+      ? "Select a shipping service before booking."
+      : "Request shipping quotes, then select a service, before booking."
+    : quoteExpired
+      ? "The selected quote has expired. Request quotes again and select a fresh one."
+      : !quoteDockMatches
+        ? `The selected quote was priced from a different pickup location than ${orderDockIds.length > 1 ? "the docks this order collects from" : "this order's dock"}. Select a quote priced from ${collection.groups[0]?.code ?? "the order's dock"}.`
+        : null;
+
+  const bookingReady = bookingGatesOpen && quoteBookable;
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -1247,13 +1304,18 @@ export default function AdminOrderDetail() {
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Addresses on this label</h2>
         {/*
           * Every dock this order ships from, then the destination. Both ends,
-          * because the booking refuses on either: a page that showed only the
-          * customer's address would leave an operator reading "Pickup address —
-          * Validation unavailable" with nothing on the screen to press.
+          * because both are printed on the label and either can be wrong.
+          *
+          * INFORMATIONAL. These verdicts used to be booking gates — a Google
+          * result of CONFIRMATION_REQUIRED or no record at all held the Book
+          * button shut. They no longer do, and the heading says so, because a
+          * card that looks like a gate invites an operator to go and satisfy a
+          * validator the carrier never asked about.
           */}
         <p style={{ fontSize: "0.72rem", color: "#64748b", margin: "0 0 0.2rem" }}>
-          Booking needs every address below accepted. A check that could not be performed is not an
-          acceptance: it blocks the booking the same way a rejected address does.
+          For reference — these checks do not block booking. The carrier needs a recipient name, street,
+          city, province, postal code and country on both ends; those are what a booking is refused for.
+          A check here is advice, and a check that could not be performed is only that.
         </p>
         {collection.groups.map((group) =>
           group.addressGate && group.locationId ? (
@@ -1270,7 +1332,8 @@ export default function AdminOrderDetail() {
           ) : (
             <p key={group.key} style={{ fontSize: "0.78rem", color: "#b45309", marginTop: "0.8rem" }}>
               A pickup address could not be resolved for this order&apos;s lines, so there is nothing to
-              check and booking is blocked until the origin mapping is complete.
+              check — and nothing to print on a label. Booking is blocked until the origin mapping is
+              complete.
             </p>
           )
         )}
@@ -1285,8 +1348,20 @@ export default function AdminOrderDetail() {
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipping quotes</h2>
-        <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.5rem" }}>
-          eShipper: {eshipper.mode}{eshipper.account ? ` · account ${eshipper.account}` : ""}
+        {/*
+          The environment, not just "configured". A test host and a live one are
+          both "real" to `eshipperMode()`, and the difference is the whole of what
+          somebody needs to know before booking a label against it.
+
+          The sentence is built in the loader and arrives as a string, because
+          `describeEshipperStatus` lives in a `.server` module: React Router
+          strips those from the client bundle, and calling one from a component
+          fails the build rather than the request.
+        */}
+        <p
+          style={{ fontSize: "0.75rem", color: eshipper.environment === "production" ? "#b91c1c" : "#64748b", marginBottom: "0.5rem" }}
+        >
+          eShipper: {eshipper.description}
         </p>
         <Form method="post" style={{ marginBottom: "0.75rem" }}>
           <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")}>Get shipping quotes</button>
@@ -1340,14 +1415,23 @@ export default function AdminOrderDetail() {
           </table>
         )}
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-          <Form method="post"><button type="submit" name="intent" value="book_shipment" disabled={!paid || !bookingGatesOpen} style={btn(paid && bookingGatesOpen ? "#059669" : "#94a3b8")}>Book shipment{selectedQuote ? ` (${selectedQuote.carrier})` : ""}</button></Form>
+          {/*
+            Disabled unless a valid, unexpired, correctly-priced quote is
+            selected. An empty or failed quote response leaves no selected
+            quote, so it cannot open this. Address verdicts are not part of
+            `bookingReady` any more — see `bookingGatesOpen` above.
+          */}
+          <Form method="post"><button type="submit" name="intent" value="book_shipment" disabled={!paid || !bookingReady} style={btn(paid && bookingReady ? "#059669" : "#94a3b8")}>Book shipment{quoteBookable ? ` (${selectedQuote.carrier})` : ""}</button></Form>
         </div>
         {!paid && <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>Booking is blocked until the wholesale payment succeeds.</p>}
+        {paid && quoteBlock ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>{quoteBlock}</p>
+        ) : null}
         {paid && !bookingGatesOpen ? (
           <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>
-            Booking is blocked until every address on the label is accepted — see{" "}
-            <em>Addresses on this label</em> above. Checking an address or recording an owner override is what clears it;
-            quotes can be requested meanwhile, because pricing a parcel does not commit to collecting it.
+            Booking is blocked until every dock this order ships from is mapped — see{" "}
+            <em>Addresses on this label</em> above. Mapping the origin is what clears it; quotes can be
+            requested meanwhile, because pricing a parcel does not commit to collecting it.
           </p>
         ) : null}
       </div>

@@ -308,19 +308,87 @@ async function main() {
   );
 
   /* ---------------------------------------------------------------- */
-  /* 4. Booking is not offered while a gate it would be refused by is  */
+  /* 4. An address verdict is not what holds the button                */
   /* ---------------------------------------------------------------- */
-  // The payment half is satisfied on this fixture, so what is read here is the
-  // address half. Booking refuses on `assertBookingAddressesBookable`; a page
-  // that drew an enabled button beside a shut gate would be asking the operator
-  // to learn the rule from the refusal.
+  /*
+   * WHAT THIS USED TO SAY. This section asserted the opposite: that the button
+   * was disabled while an address verdict was outstanding, and that the page
+   * said so in the words "Booking is blocked until every address on the label is
+   * accepted". The owner has withdrawn that rule — booking takes the seller's
+   * address as supplied and refuses only for the fields a carrier needs — so the
+   * assertion is inverted rather than dropped, and the fixture is unchanged:
+   * this order has NO verdicts recorded for either end, which is the state every
+   * Shopify order arrives in.
+   *
+   * The button IS disabled here, and the page IS saying why — but the reason it
+   * gives is the quote, not an address. That distinction is the check: an
+   * operator reading an address-shaped excuse on a page whose addresses are
+   * perfectly sendable has been taught to go and satisfy a validator the carrier
+   * never asked about.
+   */
   const button = bookButton(page.html);
   check("the Book shipment button is on the page", button.length > 0, button.slice(0, 120));
-  check("and it is disabled while the order's dock does not resolve", button.includes("disabled"));
+  check("and it is disabled, because no service has been selected", button.includes("disabled"));
   check(
-    "and the page says why, rather than leaving a dead control",
-    page.html.includes("Booking is blocked until every address on the label is accepted"),
+    "and the reason the page gives is the quote",
+    page.html.includes("Request shipping quotes, then select a service, before booking."),
   );
+  check(
+    "and the address card says in as many words that it does not block booking",
+    page.html.includes("these checks do not block booking"),
+  );
+  check(
+    "and no address verdict is described as holding the button",
+    !page.html.includes("Booking is blocked until every address on the label is accepted") &&
+      !page.html.includes("Booking needs every address below accepted"),
+  );
+
+  /* ---------------------------------------------------------------- */
+  /* 5. A booking needs a live quote, and the page says so             */
+  /* ---------------------------------------------------------------- */
+  /*
+   * The same rule `bookShipmentForOrder` applies, drawn from the same facts.
+   * This order has never been quoted, so there is nothing selected to buy — the
+   * state a failed or empty quote response also leaves behind, which is why the
+   * button must not be offered for it.
+   */
+  check(
+    "an unquoted order is told a service has to be chosen",
+    page.html.includes("Request shipping quotes, then select a service, before booking"),
+  );
+
+  // The twin: a quote that is selected but past its expiry. The page has to
+  // change its answer, because "select a service" is the wrong instruction for
+  // an operator who has already selected one.
+  await prisma.shippingQuote.create({
+    data: {
+      orderId: goodOrder.id,
+      originLocationId: null,
+      provider: "eshipper",
+      carrier: "Canada Post",
+      serviceCode: "5000026",
+      serviceName: "Expedited",
+      providerQuoteId: `verify-op-quote-${SUFFIX}`,
+      totalAmount: 1474,
+      currency: "CAD",
+      selected: true,
+      expiresAt: new Date(Date.now() - 60_000),
+    },
+  });
+  const expiredPage = await get(`/admin/orders/${goodOrder.id}`, cookie);
+  check("the expired-quote page renders", expiredPage.status === 200, `HTTP ${expiredPage.status}`);
+  check(
+    "and the page asks for a re-quote rather than for a selection",
+    expiredPage.html.includes("The selected quote has expired. Request quotes again and select a fresh one."),
+  );
+  /*
+   * The button's DISABLED state is deliberately not asserted in this section.
+   * This fixture's seller is mapped to no dock, so `bookingGatesOpen` is false
+   * and the button is disabled whatever the quote says — a check written here
+   * would pass for a reason that has nothing to do with the quote. The quote
+   * gate is pinned where it can be isolated: `verify-booking.ts` books with no
+   * selection and with an expired one and asserts the carrier is never called.
+   */
 
   console.log(`\n${total - failures}/${total} checks passed.`);
   if (failures > 0) process.exitCode = 1;

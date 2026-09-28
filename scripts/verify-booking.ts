@@ -706,6 +706,149 @@ async function bookingOutcomeChecks() {
 
   const seller = await createSeller("bo");
 
+  /* --- nothing is bought without a selected, live quote ------------------ */
+  /*
+   * A BOOKING MUST HAVE A QUOTE, and the state this pins is the one a failed or
+   * empty quote response leaves behind: quotes were asked for, the provider
+   * answered nothing usable, and the order is left with no SELECTED price. The
+   * assertion that matters is not the refusal message — it is that no provider
+   * call happened and nothing was recorded as bought, because a purchased label
+   * cannot be un-purchased by fixing a later screen.
+   */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "noquote");
+    await prisma.shippingQuote.update({ where: { id: quote.id }, data: { selected: false } });
+    responder = () => ({ status: 200, body: BOOKED_BODY("NOQUOTE") });
+    providerCalls = [];
+
+    let message = "";
+    try {
+      // No quote named, so the service looks for the order's SELECTED one — the
+      // lookup an operator's "Book shipment" press performs.
+      await bookPreparedShipment(shipment.id, undefined, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("an order with no SELECTED quote cannot be booked", /Select a shipping service/.test(message), message.slice(0, 110));
+    check("...and the provider is never asked", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check(
+      "...and nothing is recorded as bought",
+      (await prisma.shipment.count({ where: { orderId: order.id, providerShipmentId: { not: null } } })) === 0
+    );
+  }
+
+  /* --- and not with one that has expired --------------------------------- */
+  {
+    const { shipment, quote } = await createBookableOrder(seller.id, "expiredquote");
+    await prisma.shippingQuote.update({ where: { id: quote.id }, data: { expiresAt: new Date(Date.now() - 60_000) } });
+    responder = () => ({ status: 200, body: BOOKED_BODY("EXPIRED") });
+    providerCalls = [];
+
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("a quote past its expiry cannot be booked", /expired/i.test(message), message.slice(0, 110));
+    check("...and the provider is never asked", apiCalls().length === 0, `calls=${apiCalls().length}`);
+  }
+
+  /* --- the country on a booking's own wire request ----------------------- */
+  /*
+   * The defect was in the DATA, not the schema: Shopify's address JSON carries
+   * `country` as a display name and `country_code` as the code, and the caller
+   * read the name. Every other fixture in this file writes `country: "CA"`, so
+   * not one of them could see it — this block is the only place in the suite
+   * where an address arrives in the shape the live orders actually have.
+   */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "country");
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        shippingAddress: JSON.stringify({
+          name: "Verify Customer",
+          address1: "1 Test Street",
+          city: "Ottawa",
+          province: "ON",
+          province_code: "ON",
+          zip: "K1P 1J1",
+          country: "Canada",
+          country_code: "CA",
+        }),
+      },
+    });
+    /*
+     * No verdict is re-recorded here any more. Moving the destination invalidates
+     * the accepted one, and this booking goes through anyway — which is the
+     * owner's rule, and the check below would have failed under the old gate.
+     */
+    responder = () => ({ status: 200, body: BOOKED_BODY("country") });
+    providerCalls = [];
+    await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+
+    const body = apiCalls()[0]?.body as
+      | { to?: { country?: string; province?: string }; from?: { country?: string; province?: string } }
+      | undefined;
+    check(
+      "the country NAME Shopify sends is converted on the booking's wire request",
+      body?.to?.country === "CA",
+      `to.country=${JSON.stringify(body?.to?.country)}`
+    );
+    check("...and the pickup end is a code too", body?.from?.country === "CA", `from.country=${JSON.stringify(body?.from?.country)}`);
+    check(
+      "...and the province arrives as a subdivision code, not a name",
+      body?.to?.province === "ON",
+      `to.province=${JSON.stringify(body?.to?.province)}`
+    );
+  }
+
+  /* --- the fields a carrier actually needs ------------------------------- */
+  /*
+   * The half of the old rule that SURVIVES. Google is gone from this path, but
+   * a carrier still cannot deliver to a street with no postal code, and the
+   * refusal has to name the field — "invalid address" sends an operator to look
+   * at all six of them.
+   */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "nofields");
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        shippingAddress: JSON.stringify({
+          name: "Verify Customer",
+          address1: "1 Test Street",
+          city: "Ottawa",
+          province: "ON",
+          zip: "",
+          country: "Canada",
+          country_code: "CA",
+        }),
+      },
+    });
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("NOFIELDS") });
+    providerCalls = [];
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "a destination with no postal code cannot be booked",
+      /postal or ZIP code on the delivery address/i.test(message),
+      message.slice(0, 200)
+    );
+    check("...and the refusal names the side it is about", /delivery address/i.test(message), message.slice(0, 200));
+    check("...and the carrier is never called for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check(
+      "...and nothing is recorded as bought",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === null
+    );
+  }
+
   /* --- the provider refuses outright ------------------------------------- */
   {
     const { order, shipment, quote } = await createBookableOrder(seller.id, "fail");
@@ -1509,19 +1652,28 @@ async function originGateChecks() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* The booking address gate                                                   */
+/* The address verdicts, as advice                                            */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Booking must refuse an address that is not accepted, and an unavailable
- * validator is not an acceptance.
+ * Verdicts are recorded, shown and audited — and they do not hold a booking.
  *
- * THE DEFECT THIS EXISTS FOR. `addressGate` was written long before this suite
- * and rendered on the Pickup locations page, but nothing that books ever called
- * it: an operator could check a dock, watch Google refuse it, and then book
- * from it anyway, because the check was advice. The checks below are the
- * requirement stated as behaviour — a refusal, with a reason, before any money
- * or any carrier call — on the code path the routes call.
+ * THE REQUIREMENT THIS NOW PINS, AND WHAT IT REPLACED. These checks were
+ * written when `addressGate` was wired into booking: an operator could watch
+ * Google refuse a dock and then book from it anyway, and the fix was a refusal
+ * on the code path the routes call. The owner has since withdrawn that rule —
+ * booking must take the seller's address as supplied and refuse only for the
+ * fields a carrier needs — so the refusal assertions are inverted here rather
+ * than deleted. What is still pinned is that the verdicts themselves are
+ * honest: an unchecked address says so, an unreachable validator says so, an
+ * edited address loses its standing, an owner's override is recorded with a
+ * reason and never described as a Google validation, and a suggestion is only
+ * ever applied when somebody presses the button that says so.
+ *
+ * THE INVERSION IS THE POINT. If someone re-wires a Google verdict into the
+ * booking path, these checks fail — a booking that goes through today would be
+ * refused tomorrow. That is a stronger pin than a comment, and it is the same
+ * test either way.
  *
  * Every provider call is stubbed and every address here is a fixture. Nothing
  * was checked against Google, no label was bought, and no real address is
@@ -1530,7 +1682,7 @@ async function originGateChecks() {
  * real one.
  */
 async function addressGateChecks() {
-  console.log("\n-- the booking address gate --");
+  console.log("\n-- address verdicts (advice, not gates) --");
   /*
    * The stub is installed for the whole group, including the checks that expect
    * a refusal. Most of them assert the carrier was never called, which needs a
@@ -1547,35 +1699,50 @@ async function addressGateChecks() {
     const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "agate-never");
     if (!origin) throw new Error("fixture expected an origin");
     // The fixture seeds accepted verdicts so the OTHER checks exercise booking.
-    // This one is about the unvalidated case, so it removes them.
+    // This one is about the unvalidated case, so it removes them — and the
+    // booking below must not care, because a verdict is no longer a gate. If
+    // the fixture's seed were left in place this check would pass for the wrong
+    // reason, which is why it is deleted rather than ignored.
     await prisma.addressValidation.deleteMany({
       where: { subjectId: { in: [order.id, origin.location.id] } },
     });
 
+    const gateBefore = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
+    check(
+      "with no verdicts at all, both ends read as unchecked",
+      gateBefore.allowed === false && gateBefore.pickup?.allowed === false && gateBefore.delivery.allowed === false,
+      `pickup=${gateBefore.pickup?.allowed} delivery=${gateBefore.delivery.allowed}`
+    );
+
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-NEVER") });
     providerCalls = [];
     let message = "";
+    let booked = false;
     try {
       await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
     const after = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    /*
+     * The withdrawal, stated as behaviour. An address nobody has run through
+     * Google is exactly the state every Shopify order arrives in, so refusing
+     * here would refuse most of the queue.
+     */
+    check("booking does NOT require an address to have been checked", booked, message.slice(0, 200));
+    check("...so the carrier IS called for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("...and the label is recorded as bought", after.providerShipmentId === `S-ADDR-NEVER-${suffix}`, after.providerShipmentId ?? "(null)");
+    check("...and the shipment reaches BOOKED", after.status === "BOOKED", after.status);
+    check("...and a label time is stamped", after.labelCreatedAt !== null);
+    // Still advice, and still true after the booking: the record did not become
+    // an acceptance just because a label was bought against it.
+    const gateAfter = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
     check(
-      "booking refuses an address that has never been checked",
-      /never been checked/i.test(message),
-      message.slice(0, 180)
+      "...and the verdicts still say unchecked afterwards",
+      gateAfter.allowed === false,
+      gateAfter.blockers.join(" | ").slice(0, 160)
     );
-    check(
-      "...and says which address it means",
-      /pickup address/i.test(message) && /delivery address/i.test(message),
-      message.slice(0, 180)
-    );
-    check("...and the refusal offers a way out", /override|accept/i.test(message), message.slice(0, 200));
-    check("...and the carrier is never called", apiCalls().length === 0, `calls=${apiCalls().length}`);
-    check("...and the shipment is left exactly where it was", after.status === "PENDING", after.status);
-    check("...and nothing is recorded as purchased", after.providerShipmentId === null);
-    check("...and no label time is stamped", after.labelCreatedAt === null);
   }
 
   /* --- the validator could not be reached -------------------------------- */
@@ -1602,25 +1769,27 @@ async function addressGateChecks() {
       /could not be checked|no verdict|unavailable/i.test(gate.blockers.join(" ")),
       gate.blockers.join(" ").slice(0, 160)
     );
-    check("...and an override is offered as the way through", gate.canOverride === true);
+    check("...and an override is still offered as a way to record a human decision", gate.canOverride === true);
 
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-UNAVAIL") });
     providerCalls = [];
     let message = "";
+    let booked = false;
     try {
       await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
+    /*
+     * Google being down is the case this rule was withdrawn for. An outage is
+     * not evidence about an address, and treating it as a refusal stopped
+     * shipments the carrier would have taken without comment.
+     */
+    check("an unreachable validator does not stop the booking", booked, message.slice(0, 200));
     check(
-      "an unavailable validator does not silently permit booking",
-      /pickup address/i.test(message) && /unavailable/i.test(message),
-      message.slice(0, 200)
-    );
-    check("...and the carrier is never called for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
-    check(
-      "...and the shipment is untouched",
-      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "PENDING"
+      "...and the shipment is not left behind as a result",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "BOOKED"
     );
   }
 
@@ -1653,21 +1822,28 @@ async function addressGateChecks() {
     );
     check("...and the gate will not vouch for it", gate.googleValidated === false);
 
-    // And the booking path agrees with the gate, rather than having its own idea.
+    /*
+     * The stale verdict does not follow the address to the carrier, and it does
+     * not stop the booking either. Both halves matter: the first is what stops
+     * the card from saying "accepted" about an address that changed, and the
+     * second is the rule as it now stands.
+     */
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-EDITED") });
     providerCalls = [];
     let message = "";
+    let booked = false;
     try {
       await bookPreparedShipment(
         (await prisma.shipment.findFirstOrThrow({ where: { orderId: order.id } })).id,
         quote.id,
         ACTOR
       );
+      booked = true;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    check("...and booking is refused", /changed since it was last checked/i.test(message), message.slice(0, 180));
-    check("...with no carrier call", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check("a stale verdict does not refuse the booking", booked, message.slice(0, 200));
+    check("...with the carrier called exactly once", apiCalls().length === 1, `calls=${apiCalls().length}`);
   }
 
   /* --- the two verdicts that ask for a person ---------------------------- */
@@ -1681,44 +1857,58 @@ async function addressGateChecks() {
     check(`${verdict} does not pass the gate`, gate.allowed === false, gate.label);
     check(`...and ${verdict} is distinguishable from never having checked`, gate.verdict === verdict, gate.verdict);
 
+    /*
+     * The two verdicts that mean "a person should look at this". They are the
+     * strongest case for a refusal, and they are still not one: a label bought
+     * against an address the carrier accepted is not made wrong by Google
+     * wanting a second opinion. The card says so; the operator books or does not.
+     */
     responder = () => ({ status: 200, body: BOOKED_BODY(`ADDR-${verdict}`) });
     providerCalls = [];
     let message = "";
+    let booked = false;
     try {
       await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    check(`booking is refused while the pickup address is ${verdict}`, message.length > 0, message.slice(0, 140));
-    check(`...and the carrier is not called for ${verdict}`, apiCalls().length === 0);
+    check(`${verdict} on the pickup address does not refuse the booking`, booked, message.slice(0, 180));
+    check(`...and the carrier is called once for ${verdict}`, apiCalls().length === 1, `calls=${apiCalls().length}`);
   }
 
-  /* --- the destination is gated too, not just the dock ------------------- */
+  /* --- the destination is reported too, not just the dock ---------------- */
   {
     const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "agate-delivery");
     if (!origin) throw new Error("fixture expected an origin");
     await prisma.addressValidation.deleteMany({ where: { subjectId: order.id } });
 
-    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-DELIVERY") });
-    providerCalls = [];
-    let message = "";
-    try {
-      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
-    } catch (error) {
-      message = error instanceof Error ? error.message : String(error);
-    }
-    check(
-      "a dock that is accepted does not carry an unchecked destination",
-      /delivery address/i.test(message) && /never been checked/i.test(message),
-      message.slice(0, 200)
-    );
-    check("...and no label is bought for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    /*
+     * A dock that IS accepted, and a destination that is not. The card has to
+     * be able to say which end is which — that is what makes it usable as
+     * advice rather than as a wall of red — and the booking has to go through
+     * for the reason the owner gave: the destination is the seller's, taken as
+     * supplied.
+     */
     const gate = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
     check(
-      "...and the gate is shut on one end only",
+      "the verdicts are shut on one end only, and say which",
       gate.allowed === false && gate.pickup?.allowed === true && gate.delivery.allowed === false,
       `pickup=${gate.pickup?.allowed} delivery=${gate.delivery.allowed}`
     );
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-DELIVERY") });
+    providerCalls = [];
+    let message = "";
+    let booked = false;
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("an unchecked destination does not refuse the booking", booked, message.slice(0, 200));
+    check("...and a label is bought for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
   }
 
   /* --- an owner's override, on the record -------------------------------- */
@@ -1788,8 +1978,12 @@ async function addressGateChecks() {
       gate.label
     );
 
-    // And the money moves only once the gate is open — the same booking that was
-    // refused a moment ago now goes through, with the override carrying it.
+    /*
+     * The override's effect on the record, not on the booking. It used to be
+     * the thing that let a refused booking through; now it is a way for an
+     * owner to put a human decision on the record, in their own name, with
+     * their reason — which is worth keeping even though nothing is blocked.
+     */
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-OVERRIDE") });
     providerCalls = [];
     let message = "";
@@ -1800,8 +1994,8 @@ async function addressGateChecks() {
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    check("the booking proceeds on an owner's override", booked, message.slice(0, 180));
-    check("...and the carrier IS called once it is open", apiCalls().length > 0, `calls=${apiCalls().length}`);
+    check("the booking still proceeds, override or not", booked, message.slice(0, 180));
+    check("...and the carrier is called for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
 
     // The entry is keyed on the validation row it created (`entityId`), and the
     // address it is about is in `afterData` — stored as a JSON string, so it is
@@ -1848,13 +2042,14 @@ async function addressGateChecks() {
      * field, and a postal code Google would change.
      *
      * Three things are asserted. That a disagreement is FLAGGED — the
-     * difference is stored, shown, and blocks a booking. That nothing is
-     * APPLIED BY ITSELF: until somebody acts, the unit stays in street2, the
-     * postal code stays as the customer entered it, and no code path copies
-     * Google's answer over either. And that the one path which does apply it
-     * applies only the field that actually differs, only when asked, and leaves
-     * the record checked rather than assumed — which is what the owner's
-     * "Apply Google suggestion and save" button does, exercised below.
+     * difference is stored and shown to the person deciding, and it is NOT
+     * applied and does NOT hold the booking. That nothing is APPLIED BY ITSELF:
+     * until somebody acts, the unit stays in street2, the postal code stays as
+     * the customer entered it, and no code path copies Google's answer over
+     * either. And that the one path which does apply it applies only the field
+     * that actually differs, only when asked, and leaves the record checked
+     * rather than assumed — which is what the owner's "Apply Google suggestion
+     * and save" button does, exercised below.
      */
     const seller7a = await createSeller("agate-7a");
     const { order, origin } = await createBookableOrder(seller7a.id, "agate-7a");
@@ -1957,7 +2152,7 @@ async function addressGateChecks() {
       status.differences.some((d) => d.component === "postalCode"),
       status.differences.map((d) => d.component).join(",") || "(none)"
     );
-    check("...and the gate is shut on it", status.allowed === false, status.label);
+    check("...and the verdict is shut on it", status.allowed === false, status.label);
 
     /*
      * ── Applying the suggestion ────────────────────────────────────────────
@@ -2031,12 +2226,12 @@ async function addressGateChecks() {
         appliedGate.googleValidated === false,
       `${appliedGate.verdict}: ${appliedGate.blockers.join(" ")}`
     );
-    const bookedAfterApply = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
+    const afterApply = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
     check(
-      "...so a corrected address is not a way past the gate",
-      bookedAfterApply.allowed === false &&
-        bookedAfterApply.blockers.some((line) => line.includes("Delivery address")),
-      bookedAfterApply.blockers.join(" | ")
+      "...so the corrected destination reads as unchecked under its own name",
+      afterApply.allowed === false &&
+        afterApply.blockers.some((line) => line.includes("Delivery address")),
+      afterApply.blockers.join(" | ")
     );
 
     const secondAttempt = await applySuggestedAddress({
@@ -2055,18 +2250,55 @@ async function addressGateChecks() {
       secondAttempt.ok ? JSON.stringify(secondAttempt.applied) : secondAttempt.error
     );
 
+    /*
+     * The disputed postal code, on the wire. Google wanted M5V 3A8 and the
+     * customer typed M5V 2T6; the label must carry what the customer typed,
+     * because the owner ruled that the seller's address is used as supplied and
+     * a suggestion is applied only when a person says so. This is the check
+     * that would have caught the old behaviour in the other direction: booking
+     * that quietly sent Google's value would be the same defect as one that
+     * refused on it.
+     */
     const shipment = await prisma.shipment.findFirstOrThrow({ where: { orderId: order.id } });
     const quote = await prisma.shippingQuote.findFirstOrThrow({ where: { orderId: order.id } });
     responder = () => ({ status: 200, body: BOOKED_BODY("ADDR-7A") });
     providerCalls = [];
     let message = "";
+    let booked = false;
     try {
       await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+      booked = true;
     } catch (error) {
       message = error instanceof Error ? error.message : String(error);
     }
-    check("booking is refused while the postal code is disputed", message.length > 0, message.slice(0, 160));
-    check("...and nothing is bought", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check("a disputed postal code does not refuse the booking", booked, message.slice(0, 200));
+    /*
+     * Read by the WIRE's names, not the app's: the adapter renames `postalCode`
+     * to `zip` and the street to `address1`, and an assertion written against
+     * the app's vocabulary would read `undefined` and call it a pass-by-absence.
+     *
+     * Asserted against the STORED address rather than against either literal,
+     * because by this point in the block an operator has pressed "Apply Google
+     * suggestion and save" — so M5V 3A8 is now what the order holds, and the
+     * question is not which value wins but where the wire's value came from.
+     * The label must carry the record, and the record must only ever have
+     * changed because somebody said so. A literal here would pass whether the
+     * adapter copied the blob or re-derived it from Google's stored answer.
+     */
+    const wire = apiCalls()[0]?.body as { to?: { zip?: string; address1?: string } } | undefined;
+    const storedAfterApply = JSON.parse(
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress ?? "{}"
+    ) as { zip?: string; address2?: string };
+    check(
+      "...and the label carries the address the order holds, not a re-derived one",
+      wire?.to?.zip === storedAfterApply.zip,
+      `to.zip=${JSON.stringify(wire?.to?.zip)} stored=${JSON.stringify(storedAfterApply.zip)}`
+    );
+    check(
+      "...and the unit the customer typed is still on the street line",
+      wire?.to?.address1 === "500 Queen St W, Unit 7A",
+      `to.address1=${JSON.stringify(wire?.to?.address1)}`
+    );
 
     // The source of the last write is checked too: no code path copies a
     // suggestion onto a stored address without somebody pressing the button

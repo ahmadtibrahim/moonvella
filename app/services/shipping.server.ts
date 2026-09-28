@@ -5,7 +5,9 @@ import {
   getRates,
   bookShipment,
   cancelShipment,
+  carrierAddressProblems,
   eshipperMode,
+  eshipperStatus,
   trackByOrderId,
   trackByTrackingNumber,
   bulkTrack,
@@ -50,7 +52,6 @@ import {
   type LocationSchedule,
 } from "./holidays";
 import { resolveFulfillmentOrders, type AdminClient } from "./shopifyFulfillment.server";
-import { assertBookingAddressesBookable, assertDeliveryAddressBookable } from "./addressValidation.server";
 
 /**
  * The states from which a booking may be attempted.
@@ -136,6 +137,78 @@ function configuredReturnAddress() {
 }
 
 /**
+ * The destination, as it is handed to a carrier.
+ *
+ * THE CUSTOMER'S ADDRESS IS USED AS SUPPLIED. It is copied out of the order the
+ * seller's store captured and nothing here rewrites it — no Google suggestion is
+ * applied to it, and no field is corrected on the strength of one. What the
+ * carrier receives is what the customer typed, converted only into the tokens a
+ * carrier reads (an ISO country code, a subdivision code); the conversions
+ * happen at the provider boundary and never touch the stored address.
+ *
+ * `countryCode` is read after `country` because both keys are present in a
+ * Shopify address — `country` as a display name ("Canada"), `country_code` as
+ * the code. Whichever arrives, the boundary normalises it; this order is just
+ * which one the app would prefer to carry.
+ *
+ * The unit is joined onto the street rather than dropped, which is what a dock
+ * address gets (`carrierShipFrom`) and what the carrier's single address line
+ * requires. Reading only `address1` lost it: a customer in a multi-unit
+ * building had "Unit 7A" on their order and no unit on their label, silently,
+ * which is the same defect as a country name sent where a code belongs.
+ */
+function deliveryAddressFor(order: { shippingAddress: string | null }): RateRequest["shipTo"] {
+  const to = parseAddress(order.shippingAddress);
+  const street = [to.address1 || to.address, to.address2].map((part) => part?.trim()).filter(Boolean);
+  return {
+    name: to.name,
+    address: street.join(", "),
+    city: to.city,
+    province: to.province || to.provinceCode || to.province_code,
+    postalCode: to.zip || to.postalCode || "",
+    country: to.countryCode || to.country || "",
+    residential: to.residential === undefined ? true : to.residential !== "false",
+    // Only when the stored address carries them: a destination that has no
+    // phone number is still a destination, and inventing one puts a wrong
+    // number on a label.
+    phone: to.phone || to.phoneNumber || null,
+    email: to.email || null,
+  };
+}
+
+/**
+ * Both ends of the label, checked for the fields a carrier cannot work without.
+ *
+ * THIS REPLACES A GOOGLE GATE, AND THE DIFFERENCE IS THE POINT. Booking used to
+ * refuse unless Google had accepted both addresses — which meant an outage, an
+ * unvalidated dock, or a customer address nobody had run through the validator
+ * stopped a shipment that the carrier would have taken without comment. What a
+ * carrier actually refuses is a missing street, city, postal code or country,
+ * and that is what is enforced now.
+ *
+ * Validation is not gone: the screens still offer it, it still records verdicts,
+ * and its opinions are still shown. They are advice, and a booking no longer
+ * hangs on them.
+ *
+ * Called BEFORE the shipment row is created in both booking paths, so an address
+ * that cannot be sent is refused while nothing exists to clean up — and before
+ * the provider is claimed, so a refusal never leaves a shipment that looks like
+ * a call is out.
+ */
+function assertCarrierAddressesReady(from: CarrierShipFrom, order: { shippingAddress: string | null }) {
+  const problems = [
+    ...carrierAddressProblems(from, "pickup"),
+    ...carrierAddressProblems(deliveryAddressFor(order), "delivery"),
+  ];
+  if (problems.length > 0) {
+    throw new Error(
+      `The carrier cannot be given this shipment's addresses: ${problems.join("; ")}. ` +
+        `Correct the address on the record, then try again.`
+    );
+  }
+}
+
+/**
  * The ships-from address is a PARAMETER, never a default.
  *
  * It used to be assembled from environment variables with plausible stand-ins
@@ -149,7 +222,6 @@ function buildRateRequest(
   packages: { count: number; length: number; width: number; height: number; weight: number; units: string }[],
   from: CarrierShipFrom
 ): RateRequest {
-  const to = parseAddress(order.shippingAddress);
   return {
     shipFrom: {
       name: from.name,
@@ -161,20 +233,7 @@ function buildRateRequest(
       phone: from.phone,
       email: from.email,
     },
-    shipTo: {
-      name: to.name,
-      address: to.address1 || to.address || "",
-      city: to.city,
-      province: to.province || to.provinceCode,
-      postalCode: to.zip || to.postalCode || "",
-      country: to.country || to.countryCode || "CA",
-      residential: to.residential === undefined ? true : to.residential !== "false",
-      // Only when the stored address carries them: a destination that has no
-      // phone number is still a destination, and inventing one puts a wrong
-      // number on a label.
-      phone: to.phone || to.phoneNumber || null,
-      email: to.email || null,
-    },
+    shipTo: deliveryAddressFor(order),
     packages,
     declaredValue: order.moonvellaTotal,
     insurance: false,
@@ -489,6 +548,9 @@ export async function getQuotesForOrder(
     )
   );
 
+  // Resolved once: this reads the credential store, and asking twice could in
+  // principle straddle a change made between the two calls.
+  const provider = await eshipperStatus();
   await recordAudit({
     actorType: "ADMIN_USER",
     actorId: actor.actorId,
@@ -499,6 +561,13 @@ export async function getQuotesForOrder(
     afterData: {
       count: rates.length,
       mode: await eshipperMode(),
+      /*
+       * WHICH HOST priced this. `mode` alone says "a credential exists", which
+       * cannot be read back later to tell a staging price from a live one — and
+       * the whole question an audit trail for a spend exists to answer.
+       */
+      environment: provider.environment,
+      host: provider.host,
       originLocationId: origin.location!.id,
       originCode: origin.snapshot.code,
     },
@@ -836,21 +905,17 @@ export async function bookShipmentForOrder(
       .filter((i) => toShipLineIds.has(i.id))
       .map((i) => ({ orderItemId: i.id, variantId: i.variantId, sku: i.sku, quantity: i.quantity })),
   );
-  if (!origin.ready || !origin.location) {
+  if (!origin.ready || !origin.location || !origin.snapshot) {
     throw new Error(origin.reason ?? "Pickup location required before booking.");
   }
 
   /*
-   * The addresses, before the money. Both ends of the label are checked here —
-   * this is the enforcement the booking flow was missing: `addressGate` existed
-   * and was rendered on the origins page, but nothing that books ever consulted
-   * it, so an address Google had refused (or had never managed to check at all)
-   * still produced a label and a charge. It runs before the quote lookup for a
-   * blunt reason: a refusal that says "this address has never been checked"
-   * tells the operator what to do, and a refusal that says "re-quote" sends them
-   * to re-quote an address that will refuse again.
+   * The addresses, before the money — and before the quote lookup, so a refusal
+   * names the address rather than sending the operator to re-quote one that will
+   * refuse again. Both ends of the label, for the fields the carrier needs; see
+   * assertCarrierAddressesReady for why this is no longer a Google gate.
    */
-  await assertBookingAddressesBookable({ originLocationId: origin.location.id, orderId });
+  assertCarrierAddressesReady(carrierShipFrom(origin.snapshot), order);
 
   const quote = opts.quoteId
     ? await prisma.shippingQuote.findUnique({ where: { id: opts.quoteId } })
@@ -946,14 +1011,15 @@ export async function bookPreparedShipment(shipmentId: string, quoteId: string |
    * ends up travelling on a price quoted from an address it never visited.
    */
   const origin = await resolveShipmentOrigin(shipment, order.items);
-  if (!origin.ready || !origin.location) {
+  if (!origin.ready || !origin.location || !origin.snapshot) {
     throw new Error(origin.reason ?? "Pickup location required before booking.");
   }
 
   // The same address precondition as bookShipmentForOrder, on the same two
-  // ends. Booking a prepared parcel is still booking, and it still prints a
+  // ends — and the same rule: the fields a carrier needs, not a Google verdict.
+  // Booking a prepared parcel is still booking, and it still prints a
   // destination the customer typed.
-  await assertBookingAddressesBookable({ originLocationId: origin.location.id, orderId: order.id });
+  assertCarrierAddressesReady(carrierShipFrom(origin.snapshot), order);
 
   const quote = quoteId
     ? await prisma.shippingQuote.findUnique({ where: { id: quoteId } })
@@ -2258,12 +2324,11 @@ export async function bookReturnForOrder(
 
   // The return label's destination is the customer's address, which is the
   // order's shipping address — the same address, under the same subject, as the
-  // outbound delivery. It is gated for the same reason the outbound one is: a
-  // label is a label, and a return to an address nobody checked is the same
-  // risk pointing the other way. Only this end: the ship-from is the configured
-  // return address, which has no record to validate (see
-  // assertDeliveryAddressBookable).
-  await assertDeliveryAddressBookable(orderId, "Return booking");
+  // outbound delivery, so it passes the same carrier-field check. A label is a
+  // label, and a return to an address no carrier could deliver to is the same
+  // defect pointing the other way. Both ends here: this endpoint carries a third
+  // address (the configured return address) that no other check sees.
+  assertCarrierAddressesReady(configuredReturnAddress(), order);
 
   const built = await buildQuotePackagesForOrder({
     items: order.items.map((i) => ({ sku: i.sku, quantity: i.quantity, variantId: i.variantId })),

@@ -26,6 +26,7 @@
 
 import { createHash } from "node:crypto";
 import { getCredentials, redactSecrets } from "./credentials.server";
+import { COUNTRIES } from "~/utils/countries";
 
 export interface RateRequest {
   shipFrom: {
@@ -288,6 +289,57 @@ export async function eshipperConfigured(): Promise<boolean> {
 
 export async function eshipperMode(): Promise<"real" | "simulated"> {
   return (await eshipperConfigured()) ? "real" : "simulated";
+}
+
+export interface EshipperStatus {
+  /** Which host a call would actually go to, in the app's own terms. */
+  environment: EshipperEnvironment;
+  /** That host's name. Not a secret — it is the fact an operator needs. */
+  host: string | null;
+  /** Masked account identifier, or null when there is no credential at all. */
+  account: string | null;
+}
+
+/**
+ * The provider as an admin screen should state it.
+ *
+ * `eshipperMode()` answers a DIFFERENT question — "is a credential configured?" —
+ * and its two words are not an environment. Collapsing "test host" and
+ * "production host" into `real` is how a page came to report `eShipper: real`
+ * above a deployment that was pointed at the account's TEST host, which reads as
+ * "live" to the one person who has to decide whether pressing a button spends
+ * money. Both statements are true about different things; only one of them is
+ * worth the space.
+ */
+export async function eshipperStatus(): Promise<EshipperStatus> {
+  const config = await eshipperConfig();
+  let host: string | null = null;
+  try {
+    host = config.baseUrl ? new URL(config.baseUrl).hostname.toLowerCase() : null;
+  } catch {
+    host = null; // Not a URL, so not a host. `classify` will refuse it anyway.
+  }
+  return {
+    environment: classifyEshipperEnvironment(config),
+    host,
+    account: await maskedEshipperAccount(),
+  };
+}
+
+/**
+ * The one sentence every admin screen uses, so two pages cannot describe the
+ * same provider differently.
+ */
+export function describeEshipperStatus(status: EshipperStatus): string {
+  const account = status.account ? ` · account ${status.account}` : "";
+  switch (status.environment) {
+    case "production":
+      return `LIVE — calls reach the production host ${status.host ?? "(host unrecorded)"}${account}`;
+    case "test":
+      return `TEST environment — calls reach the account's test host ${status.host ?? "(host unrecorded)"}${account}`;
+    default:
+      return "not configured — quotes and bookings are simulated and no label is bought";
+  }
 }
 
 /** Masked identifier safe to display in admin screens. Never a secret. */
@@ -774,22 +826,265 @@ function wireShipDate(when: Date): string {
   return when.toISOString().slice(0, 16).replace("T", " ");
 }
 
-function toWireAddress(source: RateRequest["shipFrom"] | RateRequest["shipTo"]): WireAddress {
+/**
+ * Names a caller produces that the platform's own ISO 3166 data does not.
+ *
+ * Kept deliberately short and justified: an alias earns its line by being a
+ * shape something real sends, not by being a spelling somebody might use. The
+ * three-letter ISO codes are NOT accepted — "CAN" is a different standard and a
+ * half-filled alpha-3 table would rot; a 2-letter code or a name is what this
+ * app stores and what a caller here produces.
+ */
+const COUNTRY_ALIASES: Record<string, string> = {
+  "united states of america": "US",
+  "u.s.a.": "US",
+  "u.s.a": "US",
+  "u.s.": "US",
+  usa: "US",
+  "great britain": "GB",
+  "united kingdom of great britain and northern ireland": "GB",
+  "u.k.": "GB",
+  uk: "GB",
+  holland: "NL",
+};
+
+/**
+ * Subdivision codes for the two countries in this market that define them.
+ *
+ * A province reaches the wire as a NAME — "Ontario", "British Columbia" — under
+ * exactly the same conditions as a country name did, and the provider is silent
+ * about it in exactly the same way: an unrecognised value is dropped and a
+ * default takes its place, so the rate is priced for a subdivision nobody chose.
+ *
+ * The table stops at CA and US because those are the codes that exist. Every-
+ * where else a province is free text or absent, and inventing a code for
+ * "Bavaria" would be worse than passing the name through — which is what
+ * `toCarrierProvince` does, and why it does not throw the way the country does.
+ */
+const SUBDIVISIONS: Record<string, string> = {
+  // Canada
+  alberta: "AB", "british columbia": "BC", manitoba: "MB", "new brunswick": "NB",
+  "newfoundland and labrador": "NL", "nova scotia": "NS", "northwest territories": "NT",
+  nunavut: "NU", ontario: "ON", "prince edward island": "PE", quebec: "QC", "québec": "QC",
+  saskatchewan: "SK", yukon: "YT",
+  // United States
+  alabama: "AL", alaska: "AK", arizona: "AZ", arkansas: "AR", california: "CA",
+  colorado: "CO", connecticut: "CT", delaware: "DE", "district of columbia": "DC",
+  florida: "FL", georgia: "GA", hawaii: "HI", idaho: "ID", illinois: "IL", indiana: "IN",
+  iowa: "IA", kansas: "KS", kentucky: "KY", louisiana: "LA", maine: "ME", maryland: "MD",
+  massachusetts: "MA", michigan: "MI", minnesota: "MN", mississippi: "MS", missouri: "MO",
+  montana: "MT", nebraska: "NE", nevada: "NV", "new hampshire": "NH", "new jersey": "NJ",
+  "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND",
+  ohio: "OH", oklahoma: "OK", oregon: "OR", pennsylvania: "PA", "rhode island": "RI",
+  "south carolina": "SC", "south dakota": "SD", tennessee: "TN", texas: "TX", utah: "UT",
+  vermont: "VT", virginia: "VA", washington: "WA", "west virginia": "WV",
+  wisconsin: "WI", wyoming: "WY",
+};
+
+const SUBDIVISION_CODES = new Set(Object.values(SUBDIVISIONS));
+
+/**
+ * The subdivision as the carrier wants it: a code where one is defined.
+ *
+ * NOT a refusal, unlike the country, and the difference is deliberate. A country
+ * has a code in every case, so a value that is not one is always wrong. A
+ * province has a code in two countries and not in the rest, so an unrecognised
+ * value is either a misspelling to pass through or a real subdivision this table
+ * has no business inventing — and refusing it would block shipments to most of
+ * the world to catch a problem that only exists in the two countries the code
+ * was defined for.
+ */
+export function toCarrierProvince(value: string | null | undefined): string | undefined {
+  const raw = (value ?? "").trim();
+  if (!raw) return undefined;
+  const upper = raw.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper) && SUBDIVISION_CODES.has(upper)) return upper;
+  return SUBDIVISIONS[raw.toLowerCase().replace(/\s+/g, " ")] ?? raw;
+}
+
+/**
+ * The fields a carrier needs before it can price a parcel or print a label.
+ *
+ * THESE ARE ENFORCED; GOOGLE IS NOT. What a carrier will actually refuse is a
+ * missing street or postal code, and that is what this checks — not whether an
+ * address matches a postal database, which is a different question with a
+ * different (and non-blocking) answer.
+ *
+ * `phone` is deliberately absent. Carriers require it for some services and not
+ * others, and this layer has no per-service rule to consult — so a blanket
+ * requirement would refuse shipments that are perfectly bookable, and a blanket
+ * pass would be no check at all. It is sent whenever an address carries one, and
+ * a carrier that needs it says so in its own words, which the operator sees.
+ */
+export interface CarrierAddress {
+  name?: string | null;
+  address?: string | null;
+  city?: string | null;
+  province?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
+}
+
+const filled = (value: string | null | undefined) => Boolean(value && String(value).trim());
+
+export function carrierAddressProblems(
+  address: CarrierAddress,
+  side: "pickup" | "delivery" | "return"
+): string[] {
+  const problems: string[] = [];
+  if (!filled(address.name)) problems.push(`no recipient name on the ${side} address`);
+  if (!filled(address.address)) problems.push(`no street on the ${side} address`);
+  if (!filled(address.city)) problems.push(`no city on the ${side} address`);
+  if (!filled(address.province)) problems.push(`no province or state on the ${side} address`);
+  if (!filled(address.postalCode)) problems.push(`no postal or ZIP code on the ${side} address`);
+  if (!filled(address.country)) problems.push(`no country on the ${side} address`);
+  return problems;
+}
+
+let isoRegions: { codes: Set<string>; byName: Map<string, string> } | null = null;
+
+/**
+ * ISO 3166-1 alpha-2, from the platform's own CLDR data rather than a table
+ * maintained here.
+ *
+ * Enumerating the two-letter space and asking what each one is called gives a
+ * complete, correct code set and its English names for free — including the ones
+ * no curated list would have ("Nigeria", "Côte d'Ivoire"). A hand-written map
+ * would be 249 rows that rot quietly; this cannot disagree with the standard.
+ */
+function isoRegionTables(): { codes: Set<string>; byName: Map<string, string> } {
+  if (isoRegions) return isoRegions;
+  const codes = new Set<string>();
+  const byName = new Map<string, string>();
+  try {
+    const display = new Intl.DisplayNames(["en"], { type: "region" });
+    for (let first = 65; first <= 90; first += 1) {
+      for (let second = 65; second <= 90; second += 1) {
+        const code = String.fromCharCode(first, second);
+        const name = display.of(code);
+        if (name && name !== code && !/unknown/i.test(name)) {
+          codes.add(code);
+          byName.set(name.trim().toLowerCase(), code);
+        }
+      }
+    }
+  } catch {
+    // No ICU on this host. The app's own list and the aliases above still cover
+    // the operating market; see the permissive branch in the caller.
+  }
+  isoRegions = { codes, byName };
+  return isoRegions;
+}
+
+/**
+ * The country a carrier is given: ISO 3166-1 alpha-2, upper case.
+ *
+ * WHY THIS LIVES AT THE ADAPTER AND NOT AT THE CALLER. A country reached the
+ * wire as a NAME — "Canada", straight out of Shopify's address JSON, where
+ * `country` is a display name and `country_code` is the code — while every other
+ * field on the address was correct. The provider does not reject that: Jackson
+ * drops a value it cannot bind, so the quote came back for a shipment that
+ * cannot exist, and nothing anywhere said so. Three callers build an address
+ * from here (the quote/booking envelope, a return, a pickup) and each is a
+ * separate place to forget, so the conversion happens at the one boundary they
+ * all cross.
+ *
+ * ALPHA-2 IN, ALPHA-2 OUT, and anything else REFUSES. That is the same rule the
+ * parcels get three screens up, for the same reason: the provider prices what it
+ * is given rather than refusing it, so an unrecognised country would become a
+ * real quote against a silent default. The refusal names the value AND the side
+ * of the shipment it was on, because "CA" being wrong at the pickup end and at
+ * the delivery end are two different records to go and fix.
+ */
+export function toIsoCountryCode(value: string | null | undefined, side: "pickup" | "delivery" | "return"): string {
+  const raw = (value ?? "").trim();
+  if (!raw) {
+    throw new Error(
+      `The ${side} address has no country, and a carrier cannot be asked to price or collect a shipment ` +
+        `whose ${side} country is blank. Set the country on that address.`
+    );
+  }
+  const { codes, byName } = isoRegionTables();
+  if (/^[A-Za-z]{2}$/.test(raw)) {
+    const code = raw.toUpperCase();
+    // A two-letter string is not automatically a country — "ZZ" is the classic
+    // placeholder, and the provider would price it. Without ICU there is no set
+    // to check against, and a right-shaped code is then worth more than a
+    // refusal: the shape is the part the provider needs.
+    if (codes.size === 0 || codes.has(code)) return code;
+    throw new Error(
+      `"${raw}" is not an ISO 3166-1 alpha-2 country code, so it cannot be sent as the ${side} country. ` +
+        `Correct the country on that address.`
+    );
+  }
+  const key = raw.toLowerCase();
+  const fromApp = COUNTRIES.find((country) => country.name.trim().toLowerCase() === key)?.code;
+  const resolved = fromApp ?? COUNTRY_ALIASES[key] ?? byName.get(key);
+  if (resolved) return resolved;
+  throw new Error(
+    `"${raw}" is not a country this app can send: eShipper takes an ISO 3166-1 alpha-2 code, and the ` +
+      `${side} address carries a value that is not one and is not a recognised country name. ` +
+      `Correct the country on that address.`
+  );
+}
+
+/**
+ * The two conversions every address on this wire needs, plus the field check.
+ *
+ * A function rather than two lines in `toWireAddress` because two endpoints —
+ * the return booking and the pickup — build their payload by hand and would
+ * otherwise each have to remember. Forgetting looks like success: the provider
+ * takes the address, drops what it does not recognise, and returns a price for a
+ * shipment nobody described.
+ */
+function checkedDispatchAddress<
+  T extends {
+    name?: string | null;
+    address?: string | null;
+    city?: string | null;
+    province?: string | null;
+    postalCode?: string | null;
+    country?: string | null;
+  },
+>(address: T, side: "pickup" | "delivery" | "return"): T {
+  const problems = carrierAddressProblems(address, side);
+  if (problems.length > 0) {
+    throw new Error(
+      `This address cannot be sent to eShipper: ${problems.join(", ")}. ` +
+        `Correct the ${side} address before quoting or booking.`
+    );
+  }
+  return {
+    ...address,
+    // The conversion that does not survive being left to the caller: see
+    // toIsoCountryCode.
+    country: toIsoCountryCode(address.country, side),
+    // A subdivision NAME becomes a code where one exists, and is passed through
+    // where none does. See toCarrierProvince.
+    province: toCarrierProvince(address.province) ?? address.province,
+  };
+}
+
+function toWireAddress(
+  source: RateRequest["shipFrom"] | RateRequest["shipTo"],
+  side: "pickup" | "delivery"
+): WireAddress {
+  const checked = checkedDispatchAddress(source, side);
   const address: WireAddress = {
-    address1: source.address,
-    city: source.city,
-    province: source.province,
-    zip: source.postalCode,
-    country: source.country,
+    address1: checked.address,
+    city: checked.city,
+    province: checked.province,
+    zip: checked.postalCode,
+    country: checked.country,
     // `attention`, not `name`: the Address type has no `name` property, so a
     // recipient sent under that key is dropped and the label prints with nobody
     // to deliver to. Whether `attention` renders as the recipient is confirmed
     // on a label, not by a quote -- recorded as open.
-    attention: source.name,
-    residential: "residential" in source ? source.residential : undefined,
+    attention: checked.name,
+    residential: "residential" in checked ? checked.residential : undefined,
   };
-  if (source.phone) address.phone = source.phone;
-  if (source.email) address.email = source.email;
+  if (checked.phone) address.phone = checked.phone;
+  if (checked.email) address.email = checked.email;
   return address;
 }
 
@@ -850,8 +1145,8 @@ export function buildQuoteRequest(req: RateRequest, when: Date): WireQuoteReques
     throw new Error("A quote needs at least one parcel; none were supplied.");
   }
   return {
-    from: toWireAddress(req.shipFrom),
-    to: toWireAddress(req.shipTo),
+    from: toWireAddress(req.shipFrom, "pickup"),
+    to: toWireAddress(req.shipTo, "delivery"),
     scheduledShipDate: wireShipDate(when),
     packagingUnit: WIRE_PACKAGING_UNIT,
     packages: { type: "Package", packages: parcels },
@@ -1279,7 +1574,11 @@ export async function bookReturn(input: {
       ? Number(input.quote.serviceCode)
       : input.quote.serviceCode,
     returnItems: input.returnItems,
-    returnAddress: input.returnAddress,
+    // A third address on this endpoint, and it does NOT travel through
+    // `toWireAddress` — so it needs the same treatment by hand. Leaving it out
+    // is how the outbound envelope would be fixed and the return label still
+    // sent a country name.
+    returnAddress: checkedDispatchAddress(input.returnAddress, "return"),
   }) as Record<string, unknown>;
   return {
     providerReturnId: String(raw.returnId ?? raw.id ?? ""),
@@ -1346,7 +1645,10 @@ export async function schedulePickup(data: {
     };
   }
   await requireRealMode("schedulePickup");
-  const raw = await eshipperFetch("POST", "/api/v2/pickup", data) as Record<string, unknown>;
+  // `data` IS the payload on this endpoint, so the ship-from address is not
+  // built by `toWireAddress` and gets the same treatment by hand.
+  const payload = { ...data, shipFrom: checkedDispatchAddress(data.shipFrom, "pickup") };
+  const raw = await eshipperFetch("POST", "/api/v2/pickup", payload) as Record<string, unknown>;
   return {
     pickupId: String(raw.pickupId ?? raw.id ?? ""),
     scheduledDate: String(raw.scheduledDate ?? data.pickupDate),

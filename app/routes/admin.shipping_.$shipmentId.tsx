@@ -54,7 +54,7 @@ import {
   removeOrderPackage,
   type ShipmentAdvanceEvent,
 } from "~/services/fulfillment.server";
-import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
+import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
 import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
@@ -257,6 +257,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   ]);
 
   /*
+   * The environment eShipper calls actually reach, resolved once.
+   *
+   * A host, not a boolean: `eshipperMode()` collapses a test host and a live one
+   * into the same word when a credential is present, and this deployment reads
+   * its settings from an encrypted store that can point anywhere.
+   */
+  const status = await eshipperStatus();
+
+  /*
    * Which dock this booking will actually use — resolved the same way
    * `bookPreparedShipment` resolves it, deliberately, rather than read from
    * `shipment.originLocationId`. The column can be empty on a parcel whose dock
@@ -350,8 +359,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     selectedQuote,
     billing,
     eshipper: {
-      mode: await eshipperMode(),
-      account: await maskedEshipperAccount(),
+      /*
+       * The host, not the boolean: see eshipperStatus. The sentence is built
+       * here and travels as a string, because `describeEshipperStatus` lives in
+       * a `.server` module and React Router strips those from the client bundle
+       * — calling one from the component fails the build, not the request.
+       */
+      ...status,
+      description: describeEshipperStatus(status),
       state: eshipper.status,
       detail: eshipper.detail,
     },
@@ -1014,7 +1029,7 @@ export default function AdminShipmentDetail() {
       <div style={card}>
         <h2 style={h2}>Rate comparison</h2>
         <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
-          eShipper: {eshipper.mode === "real" ? `configured (${eshipper.account ?? "account"})` : "not configured — quotes are simulated"} · {eshipper.detail}
+          eShipper: {eshipper.description} · {eshipper.detail}
         </p>
         <Form method="post" style={{ marginBottom: "0.6rem" }}>
           <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")} disabled={packages.length === 0}>Get quotes</button>

@@ -20,7 +20,13 @@
  *
  * Nothing is booked. Nothing is purchased.
  */
-import { buildQuoteRequest, normalizeRates, type RateRequest } from "~/services/eshipper.server";
+import {
+  buildQuoteRequest,
+  normalizeRates,
+  toCarrierProvince,
+  toIsoCountryCode,
+  type RateRequest,
+} from "~/services/eshipper.server";
 
 const WAREHOUSE = {
   name: "MoonVella Warehouse",
@@ -172,6 +178,131 @@ function main() {
     emptyRefusal = error instanceof Error ? error.message : String(error);
   }
   check(/at least one parcel/.test(emptyRefusal), "an empty parcel list is refused", emptyRefusal.slice(0, 80));
+
+  /*
+   * THE COUNTRY, AT BOTH ENDS.
+   *
+   * This is the same class of defect as the field names above and it was found
+   * the same way — a real quote for a real order — but it came from the DATA
+   * rather than the schema. Shopify's address JSON carries `country` as a
+   * display name ("Canada") and `country_code` as the code, the caller read the
+   * name first, and the provider priced it without complaint. A test that only
+   * ever built addresses with `country: "CA"` could not see it, which is why
+   * every fixture below starts from the shape the caller actually holds.
+   */
+  console.log("\n=== the country is an ISO alpha-2 code at both ends ===");
+  const withCountries = (from: string, to: string) =>
+    buildQuoteRequest(
+      {
+        ...request([parcel(30, 20, 20, 5)]),
+        shipFrom: { ...WAREHOUSE, country: from },
+        shipTo: { ...CONSIGNEE, country: to },
+      },
+      new Date()
+    );
+
+  check(
+    withCountries("Canada", "Canada").to.country === "CA",
+    "a delivery address carrying the NAME is sent as its code",
+    `"Canada" -> "${withCountries("Canada", "Canada").to.country}"`
+  );
+  check(
+    withCountries("Canada", "Canada").from.country === "CA",
+    "and so is the pickup address",
+    `"Canada" -> "${withCountries("Canada", "Canada").from.country}"`
+  );
+  check(
+    withCountries("United States", "United States").to.country === "US",
+    "the same for a name that is not Canadian",
+    `"United States" -> "${withCountries("United States", "United States").to.country}"`
+  );
+  check(withCountries("USA", "usa").from.country === "US", "and for the short forms a caller writes");
+  check(withCountries("  Canada  ", "ca").to.country === "CA", "case and surrounding space are not the provider's problem");
+  check(withCountries("CA", "CA").from.country === "CA", "a code already in the right shape is passed through unchanged");
+  check(
+    withCountries("Nigeria", "Nigeria").to.country === "NG",
+    "a country outside the app's own short list still resolves",
+    "the platform's ISO 3166 data is the table, so it cannot fall behind the standard"
+  );
+
+  let badName = "";
+  try {
+    withCountries("CA", "Wakanda");
+  } catch (error) {
+    badName = error instanceof Error ? error.message : String(error);
+  }
+  check(
+    /Wakanda/.test(badName) && /delivery/.test(badName),
+    "an unrecognised country is refused, naming the value and which address it is on",
+    badName.slice(0, 120)
+  );
+
+  let badCode = "";
+  try {
+    buildQuoteRequest({ ...request([parcel(30, 20, 20, 5)]), shipTo: { ...CONSIGNEE, country: "ZZ" } }, new Date());
+  } catch (error) {
+    badCode = error instanceof Error ? error.message : String(error);
+  }
+  check(/ZZ/.test(badCode), "a two-letter placeholder is not accepted just for being two letters", badCode.slice(0, 90));
+
+  let blank = "";
+  try {
+    buildQuoteRequest({ ...request([parcel(30, 20, 20, 5)]), shipFrom: { ...WAREHOUSE, country: "" } }, new Date());
+  } catch (error) {
+    blank = error instanceof Error ? error.message : String(error);
+  }
+  check(/pickup/.test(blank) && /no country/.test(blank), "a blank pickup country is refused as a pickup problem", blank.slice(0, 90));
+
+  check(
+    toIsoCountryCode("canada", "pickup") === "CA" && toIsoCountryCode("US", "delivery") === "US",
+    "the conversion is available to test on its own",
+    "this is what a caller fixing a stored record should be able to reach"
+  );
+
+  /*
+   * ── the province, converted the same way ────────────────────────────────
+   *
+   * THE SECOND HALF OF THE SAME DEFECT, and the half that is easy to miss
+   * because it fails more quietly. Shopify sends `province` as a name and
+   * `province_code` as the code; carriers want the code. A name has no ISO
+   * standard behind it the way a country does — subdivisions are per-country
+   * (CA provinces and territories, US states) — so this is a curated table and
+   * NOT a refusal: a dock in a country this table does not cover must still be
+   * quotable, because the carrier's own answer is the only authority on what it
+   * will accept, and inventing a code would be worse than passing the name.
+   */
+  console.log("\n=== province names become the codes the carriers read ===");
+  const withProvinces = (province: string) =>
+    buildQuoteRequest(
+      { ...request([parcel(30, 20, 20, 5)]), shipTo: { ...CONSIGNEE, province } },
+      new Date()
+    ).to.province;
+
+  check(withProvinces("Ontario") === "ON", `a province NAME is sent as a code: "Ontario" -> ON`, `got "${withProvinces("Ontario")}"`);
+  check(withProvinces("Quebec") === "QC", `"Quebec" -> QC`, `got "${withProvinces("Quebec")}"`);
+  check(
+    withProvinces("British Columbia") === "BC",
+    `"British Columbia" -> BC, a name of more than one word`,
+    `got "${withProvinces("British Columbia")}"`
+  );
+  check(
+    withProvinces("California") === "CA",
+    `"California" -> CA, so the same table serves both countries`,
+    `got "${withProvinces("California")}"`
+  );
+  check(withProvinces("ontario") === "ON", `"ontario" -> ON, because case is not the provider's problem`, `got "${withProvinces("ontario")}"`);
+  check(withProvinces("ON") === "ON", "a code already in the right shape is passed through unchanged");
+  check(
+    withProvinces("  Ontario  ") === "ON",
+    "surrounding space is trimmed rather than sent",
+    `got "${withProvinces("  Ontario  ")}"`
+  );
+  check(
+    withProvinces("Bavaria") === "Bavaria",
+    "a subdivision this table does not cover is passed through, not refused",
+    "a carrier that will not take it says so in its own words; guessing a code would be worse"
+  );
+  check(toCarrierProvince(null) === undefined, "and an absent province stays absent rather than becoming a code");
 
   console.log("\n=== the response is read by its real names ===");
   const quotes = normalizeRates(CAPTURED_RESPONSE, CAPTURED_RESPONSE.uuid);

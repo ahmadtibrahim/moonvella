@@ -18,7 +18,7 @@ import {
   TRACKING_DISPLAY_ORDER,
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
-import { maskedEshipperAccount, eshipperMode } from "~/services/eshipper.server";
+import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 
 /**
  * Every state a shipment can be in, in the order an operator meets them.
@@ -189,7 +189,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   }
   const where = and.length ? { AND: and } : {};
 
-  const [shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep] = await Promise.all([
+  const [shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, eshipper] = await Promise.all([
     prisma.shipment.findMany({
       where,
       orderBy: { createdAt: "desc" },
@@ -297,6 +297,8 @@ export async function loader({ request }: LoaderFunctionArgs) {
     // the one somebody is looking for.
     prisma.pickupLocation.findMany({ select: { id: true, code: true, name: true }, orderBy: { code: "asc" } }),
     prisma.order.count({ where: { wholesalePaymentStatus: "SUCCEEDED", fulfillmentStatus: { in: ["PENDING", "PROCESSING", "PARTIAL"] } } }),
+    // The host, not the boolean: see eshipperStatus.
+    eshipperStatus(),
   ]);
 
   return {
@@ -308,8 +310,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
     sellers,
     origins,
     awaitingPrep,
-    mode: await eshipperMode(),
-    account: await maskedEshipperAccount(),
+    /*
+     * The host, not the boolean: see eshipperStatus.
+     *
+     * The sentence is built HERE and travels as a string. `describeEshipperStatus`
+     * lives in a `.server` module, and React Router strips those from the client
+     * bundle — a component that calls one fails the build rather than the
+     * request, which is how this was found.
+     */
+    eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
     filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from, to, origin: originId, destination, tracking, pickup, syncErrors: syncErrors ? "1" : "" },
     page,
     pageCount: Math.max(1, Math.ceil(total / PAGE_SIZE)),
@@ -449,7 +458,7 @@ function shopifySync(shipment: {
 }
 
 export default function AdminShipping() {
-  const { shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, mode, account, filters, page, pageCount } =
+  const { shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, eshipper, filters, page, pageCount } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
@@ -583,8 +592,19 @@ export default function AdminShipping() {
         </label>
         <button type="submit" style={{ ...input, background: "#082a4a", color: "white", border: "none", fontWeight: 600, cursor: "pointer" }}>Filter</button>
         <Link to="/admin/shipping" style={{ fontSize: "0.75rem", color: "#082a4a", paddingBottom: "0.4rem" }}>Reset</Link>
-        <span style={{ fontSize: "0.68rem", color: mode === "real" ? "#64748b" : "#b45309", marginLeft: "auto", paddingBottom: "0.4rem" }}>
-          eShipper: {mode === "real" ? account ?? "configured" : "not configured (simulated)"}
+        {/*
+          A test host and a live host both used to render as "configured" here.
+          The environment and its hostname are the fact; see eshipperStatus.
+        */}
+        <span
+          style={{
+            fontSize: "0.68rem",
+            color: eshipper.environment === "production" ? "#b91c1c" : eshipper.environment === "test" ? "#b45309" : "#64748b",
+            marginLeft: "auto",
+            paddingBottom: "0.4rem",
+          }}
+        >
+          eShipper: {eshipper.description}
         </span>
       </Form>
 

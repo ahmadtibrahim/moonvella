@@ -99,9 +99,17 @@ function installFetch(respond: (url: string) => { status?: number; body?: unknow
 }
 const lastCall = () => calls[calls.length - 1];
 
+/*
+ * `name` on both ends is not decoration: the carrier adapter now refuses an
+ * address it cannot put a recipient on, because the label prints one and a
+ * parcel with nobody to hand it to is a delivery nobody can make. Production
+ * never has to invent one — `carrierShipFrom` reads the dock's contact, falling
+ * back to the location's own name — but this fixture builds its request by hand
+ * and so has to carry what the real caller always does.
+ */
 const rateRequest = {
-  shipFrom: { address: "1 Warehouse Way", city: "Toronto", province: "ON", postalCode: "M5H2N2", country: "CA" },
-  shipTo: { address: "9 Buyer Rd", city: "Ottawa", province: "ON", postalCode: "K1A0A1", country: "CA", residential: true },
+  shipFrom: { name: "Warehouse Receiver", address: "1 Warehouse Way", city: "Toronto", province: "ON", postalCode: "M5H2N2", country: "CA" },
+  shipTo: { name: "Buyer", address: "9 Buyer Rd", city: "Ottawa", province: "ON", postalCode: "K1A0A1", country: "CA", residential: true },
   packages: [{ count: 1, length: 30, width: 20, height: 10, weight: 2, units: "cm_kg" }],
 };
 
