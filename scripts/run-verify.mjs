@@ -619,6 +619,25 @@ const CHECKS = [
     file: "scripts/verify-webhook-scopes.ts",
     requires: [],
   },
+  // The order page's Packages card, over HTTP.
+  //
+  // `verify-packaging` proves the resolver and cannot see a screen; the defect
+  // this covers was a screen deciding what to say from the wrong fact — it read
+  // the order's own parcel rows, found none, and asked the operator to type
+  // dimensions the quote path was already able to resolve from the item. Every
+  // service agreed the order was quotable and the page said it was not, which is
+  // the shape of failure that only a rendered page can catch.
+  //
+  // It needs a session, so it is skipped without one and run through
+  // `deployment/mv-verify-http.sh` against the isolated test deployment. It
+  // builds its own seller, products and orders and removes them. No eShipper,
+  // Shopify or Odoo call is made.
+  {
+    name: "order-page",
+    kind: "ts",
+    file: "scripts/verify-order-page.ts",
+    requires: ["OWNER_EMAIL", "OWNER_PASSWORD"],
+  },
 ];
 
 async function runAll() {

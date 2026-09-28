@@ -42,6 +42,7 @@ import {
 } from "~/services/fulfillmentRequest.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { groupOrderLinesByOrigin } from "~/services/origins.server";
+import { buildQuotePackagesForOrder } from "~/services/packaging.server";
 import {
   addressStatus,
   loadSubjectAddress,
@@ -251,6 +252,27 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   else if (order.paymentStatus !== "PAID")
     chargeBlock = "The store has not been paid for this order yet, so there is nothing to charge. The charge is made when the customer's payment clears.";
 
+  /*
+   * THE PARCELS THIS ORDER WILL BE QUOTED AND BOOKED WITH, resolved for display.
+   *
+   * This is the same call `getQuotesForOrder` and `bookShipmentForOrder` make,
+   * against the same two inputs, so the card below cannot describe a different
+   * set of boxes from the one the carrier is asked about. That matters because
+   * the order-level parcel rows are OPTIONAL: the resolver falls back to the
+   * packaging stored on the variant — or on the product, for a product with no
+   * choices — and a page that reported "no parcels" for an order the quote path
+   * prices happily would be asking an operator to retype dimensions the system
+   * already holds.
+   *
+   * `missing` is the resolver's own list of lines it could not describe, in the
+   * same words the refusal uses, so the screen and the refusal name the same
+   * line the same way.
+   */
+  const parcels = await buildQuotePackagesForOrder({
+    items: order.items.map((item) => ({ sku: item.sku, quantity: item.quantity, variantId: item.variantId })),
+    packages: order.packages,
+  });
+
   return {
     order,
     collection: {
@@ -259,6 +281,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       groups: collectionGroups,
       deliveryGate: await addressStatus("DELIVERY", order.id),
     },
+    parcels,
     mode,
     shopifyFulfillment,
     /*
@@ -606,6 +629,19 @@ const STRIPE_MODE_BADGE: Record<string, { text: string; background: string; bord
   disabled: { text: "DISCONNECTED", background: "#e2e8f0", border: "#cbd5e1", color: "#334155" },
 };
 
+/**
+ * Where the parcels on this order come from, said the way the card has to say it.
+ *
+ * `manual` is not "entered by hand" but "recorded against this order", and the
+ * distinction is the one an operator needs: those rows override the items'
+ * packaging, and the other two are read from the catalogue and follow it.
+ */
+const PARCEL_SOURCE: Record<"manual" | "variant" | "product", string> = {
+  manual: "from the parcel rows recorded on this order",
+  variant: "from the packaging stored on the ordered items",
+  product: "from the packaging stored on the products, which these items have none of their own",
+};
+
 /** Where the order is in the pipeline, coloured the way the orders list colours it. */
 const STATE_COLOR: Record<string, string> = {
   RECEIVED: "#64748b",
@@ -694,7 +730,7 @@ function auditDetails(raw: string | null): string[] {
 }
 
 export default function AdminOrderDetail() {
-  const { order, collection, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline } =
+  const { order, collection, parcels, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -711,6 +747,21 @@ export default function AdminOrderDetail() {
    * and the retry is what changes the provider's idempotency key.
    */
   const chargeIsRetry = machine.current === "PAYMENT_FAILED" || payment?.status === "FAILED";
+  /*
+   * The address gate, as the booking asks it.
+   *
+   * `bookShipmentForOrder` refuses on `assertBookingAddressesBookable`, and that
+   * check is the same closed-by-default gate drawn in the card above: both ends
+   * of the label, each needing a current ACCEPTED verdict or a recorded owner
+   * override. Drawing an enabled Book button beside two red address cards asks
+   * an operator to discover the rule by being refused, which is how the same
+   * refusal gets read as a bug. A dock with no gate at all is closed too — an
+   * address that could not be resolved cannot have been checked.
+   */
+  const bookingGatesOpen =
+    collection.blockers.length === 0 &&
+    collection.deliveryGate.allowed &&
+    collection.groups.every((group) => group.addressGate?.allowed === true);
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -1072,15 +1123,59 @@ export default function AdminOrderDetail() {
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Packages</h2>
-        {order.packages.length === 0 ? (
-          <p style={{ fontSize: "0.82rem", color: "#64748b" }}>Add package dimensions and weight before quoting.</p>
+        {/*
+          WHAT WILL ACTUALLY BE SENT, NOT WHAT HAS BEEN TYPED HERE.
+          The order-level rows below are an override, not a prerequisite: when
+          there are none the resolver reads the packaging stored on the items, so
+          quoting and booking are already possible. Telling an operator to enter
+          dimensions for a parcel the system can already describe is asking for
+          work that nothing downstream reads — and the numbers they type by hand
+          are the ones a carrier would later be billed against.
+        */}
+        {parcels.packages.length === 0 ? (
+          <p style={{ fontSize: "0.82rem", color: "#b45309" }}>
+            No packaging could be resolved for this order, so a quote would be refused
+            {parcels.missing.length > 0 ? `: ${parcels.missing.join(", ")}` : "."} Record parcel dimensions below, or complete the
+            packaging on the item.
+          </p>
         ) : (
-          <ul style={{ fontSize: "0.8rem", marginBottom: "0.5rem" }}>
-            {order.packages.map((p) => (
-              <li key={p.id}>{p.count} × {p.length}×{p.width}×{p.height} cm, {p.weight} kg</li>
-            ))}
-          </ul>
+          <>
+            <p style={{ fontSize: "0.78rem", color: "#334155", marginBottom: "0.35rem" }}>
+              Quoting and booking will use{" "}
+              <strong>
+                {parcels.packages.reduce((n, p) => n + p.count, 0)} parcel
+                {parcels.packages.reduce((n, p) => n + p.count, 0) === 1 ? "" : "s"}
+              </strong>
+              , {PARCEL_SOURCE[parcels.source]}.
+            </p>
+            <ul style={{ fontSize: "0.8rem", marginBottom: "0.5rem" }}>
+              {parcels.packages.map((p, index) => (
+                <li key={index}>
+                  {p.count} × {p.length}×{p.width}×{p.height} cm, {p.weight} kg
+                </li>
+              ))}
+            </ul>
+          </>
         )}
+        {parcels.missing.length > 0 && parcels.packages.length > 0 ? (
+          <p style={{ fontSize: "0.78rem", color: "#b45309", marginBottom: "0.5rem" }}>
+            These lines have no packaging and would be refused at quoting: {parcels.missing.join(", ")}.
+          </p>
+        ) : null}
+        {order.packages.length > 0 ? (
+          <>
+            <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.35rem" }}>
+              Parcels recorded on this order, which replace the items&apos; own packaging in the set above:
+            </p>
+            <ul style={{ fontSize: "0.8rem", marginBottom: "0.5rem" }}>
+              {order.packages.map((p) => (
+                <li key={p.id}>
+                  {p.count} × {p.length}×{p.width}×{p.height} cm, {p.weight} kg
+                </li>
+              ))}
+            </ul>
+          </>
+        ) : null}
         <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
           <input type="hidden" name="intent" value="add_package" />
           <label style={{ fontSize: "0.7rem", color: "#64748b" }}>Count<br /><input style={input} name="count" type="number" defaultValue={1} min={1} /></label>
@@ -1088,8 +1183,12 @@ export default function AdminOrderDetail() {
           <label style={{ fontSize: "0.7rem", color: "#64748b" }}>W (cm)<br /><input style={input} name="width" type="number" required /></label>
           <label style={{ fontSize: "0.7rem", color: "#64748b" }}>H (cm)<br /><input style={input} name="height" type="number" required /></label>
           <label style={{ fontSize: "0.7rem", color: "#64748b" }}>Weight (kg)<br /><input style={input} name="weight" type="number" step="0.01" required /></label>
-          <button type="submit" style={btn("#0369a1")}>Add package</button>
+          <button type="submit" style={btn("#0369a1")}>Override with a parcel</button>
         </Form>
+        <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.4rem" }}>
+          Only needed when this order&apos;s boxes differ from the packaging stored on the items. Adding one
+          replaces the stored packaging for the whole order, and withdraws any quotes already asked for.
+        </p>
       </div>
 
       <div style={card}>
@@ -1241,9 +1340,16 @@ export default function AdminOrderDetail() {
           </table>
         )}
         <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-          <Form method="post"><button type="submit" name="intent" value="book_shipment" disabled={!paid} style={btn(paid ? "#059669" : "#94a3b8")}>Book shipment{selectedQuote ? ` (${selectedQuote.carrier})` : ""}</button></Form>
+          <Form method="post"><button type="submit" name="intent" value="book_shipment" disabled={!paid || !bookingGatesOpen} style={btn(paid && bookingGatesOpen ? "#059669" : "#94a3b8")}>Book shipment{selectedQuote ? ` (${selectedQuote.carrier})` : ""}</button></Form>
         </div>
         {!paid && <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>Booking is blocked until the wholesale payment succeeds.</p>}
+        {paid && !bookingGatesOpen ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>
+            Booking is blocked until every address on the label is accepted — see{" "}
+            <em>Addresses on this label</em> above. Checking an address or recording an owner override is what clears it;
+            quotes can be requested meanwhile, because pricing a parcel does not commit to collecting it.
+          </p>
+        ) : null}
       </div>
 
       <div style={card}>
