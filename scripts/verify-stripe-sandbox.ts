@@ -87,6 +87,9 @@ interface StripeObject {
   customer?: string;
   url?: string;
   livemode?: boolean;
+  /** Minor units, as Stripe returns it. The number the card network is asked for. */
+  amount?: number;
+  metadata?: Record<string, string>;
   enabled_events?: string[];
   data?: StripeObject[];
   error?: { message?: string };
@@ -150,7 +153,7 @@ let seq = 0;
  */
 const RUN = Date.now().toString(36);
 
-async function makeOrder(sellerId: string, total = 2598) {
+async function makeOrder(sellerId: string, total = 5999) {
   seq++;
   return prisma.order.create({
     data: {
@@ -614,6 +617,39 @@ async function main() {
     "the attempt records Stripe's PaymentIntent id, not a fabricated one",
     String(attempt?.providerPaymentIntentId ?? "").startsWith("pi_") && !isSimulatedId(attempt?.providerPaymentIntentId),
     String(attempt?.providerPaymentIntentId)
+  );
+
+  /*
+   * THE AMOUNT IS READ BACK FROM STRIPE, NOT FROM OUR OWN ROW.
+   *
+   * Everything above this line was computed by the application and stored by
+   * the application; agreeing with itself proves nothing about what the card
+   * network was actually asked for. This fetches the PaymentIntent Stripe says
+   * it holds and compares the number on it with the seller's bill.
+   *
+   * The fixture is built so the two candidate numbers are different: the
+   * customer paid 5999 retail and the line snapshot is 2 x 1299 = 2598, so a
+   * charge that had picked up the wrong total would be visible here rather than
+   * hidden behind two figures that happened to match. This is the closest a
+   * sandbox can come to the work order's "confirm the test charge equals the
+   * seller-price snapshot, not the retail price".
+   */
+  const bill = await prisma.wholesalePayment.findUnique({ where: { orderId: okOrder.id } });
+  const liveIntent = await stripe(`payment_intents/${String(attempt?.providerPaymentIntentId)}`);
+  check(
+    "Stripe's own record of the charge is in test mode",
+    liveIntent.livemode === false,
+    String(liveIntent.livemode),
+  );
+  check(
+    "the amount on Stripe's PaymentIntent is the wholesale snapshot, not the retail total",
+    liveIntent.amount === bill?.amount && liveIntent.amount === 2598 && liveIntent.amount !== okOrder.totalPrice,
+    `stripe=${String(liveIntent.amount)} bill=${String(bill?.amount)} retail=${okOrder.totalPrice}`,
+  );
+  check(
+    "Stripe's PaymentIntent carries the MoonVella order id, so a late event can still find it",
+    String((liveIntent.metadata ?? {})["moonvellaOrderId"] ?? "") === okOrder.id,
+    JSON.stringify(liveIntent.metadata ?? {}),
   );
 
   const orderAfterCharge = await prisma.order.findUnique({ where: { id: okOrder.id } });

@@ -671,10 +671,17 @@ export function intakeJobHandler(adminOverride?: AdminClient): JobHandler {
      * not inside `intakeOrder`: intake stays a pure function of its payload,
      * and the one thing that needs a network call happens once, above it.
      */
+    const hydrated = await hydrateOrderPayload({ topic, shop, payload: body, adminOverride });
     const result = await intakeOrder({
       topic,
       shop,
-      payload: (await hydrateOrderPayload({ topic, shop, payload: body, adminOverride })) as never,
+      payload: hydrated.payload as never,
+      /*
+       * The reason the order could not be read travels with it, so intake can
+       * end the delivery honestly instead of filing an unreadable order as one
+       * with nothing on it. See `hydrateOrderPayload`.
+       */
+      orderUnavailable: hydrated.failure,
       source: delivery.source === "REPLAY" ? "REPLAY" : "WEBHOOK",
       eventId: delivery.id,
     });
@@ -705,9 +712,22 @@ export function intakeJobHandler(adminOverride?: AdminClient): JobHandler {
  * in — so the order is fetched here, once, with an authenticated client, rather
  * than teaching every branch of intake to accept three payload shapes.
  *
- * A fetch that fails returns the original payload unchanged. Intake then treats
- * it as an order it does not have, which is the correct degradation: the
- * delivery is recorded, the reason is on it, and nothing is invented.
+ * A FETCH THAT FAILS COMES BACK WITH ITS REASON, AND THAT IS NOT THE SAME AS AN
+ * EMPTY ORDER. The first version of this returned the original payload and let
+ * intake decide what to do with it — and what intake decided was "No MoonVella
+ * items", because a payload with no line items is indistinguishable from an
+ * order with no MoonVella lines. So a delivery the app was not permitted to
+ * read was recorded as SUCCESS, was never retried, and read to an operator as
+ * a fact about the order rather than a fact about the app's access to it.
+ *
+ * That is exactly what happened on the first live replay: the store refuses to
+ * let this app read the Order object until it is approved for protected
+ * customer data, and the delivery log said the order had no MoonVella items.
+ * Both statements describe the same run; only one of them names the fix.
+ *
+ * So the failure travels with the payload. The caller records it against the
+ * delivery and the delivery ends FAILED — the truth, and a state that does not
+ * claim work is outstanding.
  */
 async function hydrateOrderPayload(input: {
   topic: string;
@@ -715,7 +735,7 @@ async function hydrateOrderPayload(input: {
   payload: Record<string, unknown>;
   /** The store's client, when the caller already has one. See `intakeJobHandler`. */
   adminOverride?: AdminClient;
-}): Promise<unknown> {
+}): Promise<{ payload: Record<string, unknown>; failure: string | null }> {
   const { topic, shop, payload } = input;
   /*
    * TWO REASONS TO GO AND FETCH THE ORDER.
@@ -736,14 +756,14 @@ async function hydrateOrderPayload(input: {
   const isRefundOrRouting =
     topic === "REFUNDS_CREATE" || topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE";
   const carriesTheOrder = Array.isArray(payload.line_items);
-  if (!isRefundOrRouting && carriesTheOrder) return payload;
+  if (!isRefundOrRouting && carriesTheOrder) return { payload, failure: null };
 
   const orderId = isRefundOrRouting ? payload.order_id : (payload.id ?? payload.order_id);
-  if (orderId === undefined || orderId === null) return payload;
+  if (orderId === undefined || orderId === null) return { payload, failure: null };
 
   try {
     const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
-    if (!seller) return payload;
+    if (!seller) return { payload, failure: null };
     const admin =
       input.adminOverride ??
       (await (async () => {
@@ -800,10 +820,14 @@ async function hydrateOrderPayload(input: {
       data?: { order?: Record<string, unknown> | null };
       errors?: { message: string }[];
     } = await res.json();
-    if (Array.isArray(json?.errors) && json.errors.length) return payload;
+    if (Array.isArray(json?.errors) && json.errors.length) {
+      return { payload, failure: json.errors.map((e) => e.message).join("; ") };
+    }
 
     const order = json?.data?.order;
-    if (!order) return payload;
+    if (!order) {
+      return { payload, failure: `Shopify returned no order for id ${orderId}.` };
+    }
 
     // Reshaped into the same field names the webhook payload uses, so intake
     // has exactly one payload shape to understand.
@@ -811,6 +835,7 @@ async function hydrateOrderPayload(input: {
       (set as { shopMoney?: { amount?: string } } | null)?.shopMoney?.amount ?? null;
 
     return {
+      payload: {
       ...payload,
       id: numericId(String(order.id)),
       order_id: numericId(String(order.id)),
@@ -865,9 +890,16 @@ async function hydrateOrderPayload(input: {
           price: money(li.originalUnitPriceSet) ?? "0",
         }),
       ),
+      },
+      failure: null,
     };
-  } catch {
-    return payload;
+  } catch (error) {
+    /*
+     * The client itself failed — no session, a revoked token, a network error.
+     * That is a different reason from a refusal and it is reported as itself
+     * rather than folded into "no items".
+     */
+    return { payload, failure: error instanceof Error ? error.message : String(error) };
   }
 }
 

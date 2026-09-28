@@ -614,6 +614,18 @@ export async function intakeOrder(input: {
    * this app acts on, and intake is what completes that record.
    */
   eventId?: string;
+  /**
+   * Why the order this event is about could not be read, when it had to be
+   * fetched and the fetch did not produce one.
+   *
+   * It is passed in rather than discovered here because intake is a pure
+   * function of its payload and has no client to fetch with — the fetch
+   * belongs to the caller, and so does the obligation to say when it failed.
+   * Given a reason, intake ends the delivery FAILED carrying it, rather than
+   * reading an empty payload as an order with no MoonVella lines and closing
+   * the delivery as a success. See `hydrateOrderPayload`.
+   */
+  orderUnavailable?: string | null;
 }): Promise<IntakeResult> {
   const { topic, shop, payload } = input;
   const source: IntakeSource = input.source ?? "WEBHOOK";
@@ -638,6 +650,15 @@ export async function intakeOrder(input: {
    */
   const orderId = isRefund || isRouting ? payload?.order_id : payload?.id;
   if (!orderId) {
+    /*
+     * The delivery row was written by the route before it knew what it had, so
+     * an event that names no order leaves that row behind. Ending it here is
+     * the difference between a delivery that says it was refused and one that
+     * sits at PENDING forever looking like work still to do.
+     */
+    if (input.eventId) {
+      await finishEvent(input.eventId, "FAILED", "The event names no order.");
+    }
     return { ok: false, reason: "missing order id" };
   }
   const version = payload.updated_at ?? payload.cancelled_at ?? payload.created_at ?? "";
@@ -685,6 +706,16 @@ export async function intakeOrder(input: {
   }
 
   try {
+    /*
+     * THE ORDER WAS NEVER OBTAINED. Checked before anything is created, because
+     * every branch below reads the payload as though it were an order, and an
+     * empty one would be taken as an order with nothing on it.
+     */
+    if (input.orderUnavailable) {
+      await finishEvent(event.id, "FAILED", input.orderUnavailable);
+      return { ok: false, reason: input.orderUnavailable };
+    }
+
     const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
     if (!seller) {
       await finishEvent(event.id, "FAILED", "No seller for shop");

@@ -1474,6 +1474,161 @@ async function main() {
   }
 
   /* ====================================================================== */
+  console.log("\n--- 24. an order we cannot read is not an order with nothing on it --");
+  /* ====================================================================== */
+
+  /*
+   * THE LIVE RUN FOUND THIS, AND THE SUITE HAD NOT.
+   *
+   * The first replay against the deployed system came back `SUCCESS — No
+   * MoonVella items`. The store refuses to let this app read the Order object
+   * until it is approved for protected customer data, so the fetch returned
+   * nothing — and an empty payload is indistinguishable from an order with no
+   * MoonVella lines. The delivery was written off as a success, would never be
+   * retried, and told an operator a fact about the order when the fact was
+   * about the app's access to it. A refund event lost that way is money nobody
+   * ever looks for again.
+   *
+   * Two runs, identical in every respect except what the store answers, and the
+   * point is that they must NOT be recorded the same way.
+   */
+  const unreadableShop = `mv-orders-unreadable-${suffix}.myshopify.com`;
+  const unreadableSeller = await makeSeller(unreadableShop);
+  const UNREADABLE_ORDER = ORDER_ID + 30;
+  await prisma.session.create({
+    data: {
+      id: `offline_${unreadableShop}`,
+      shop: unreadableShop,
+      state: "",
+      isOnline: false,
+      scope: process.env.SCOPES || "",
+      accessToken: "mvverify-not-a-real-token",
+      expires: new Date(Date.now() + 60 * 60 * 1000),
+    },
+  });
+
+  /** Run one delivery all the way through the queue, as the cron entry point would. */
+  async function runDelivery(shop: string, sellerId: string, orderId: number, admin: AdminClient) {
+    const key = `unreadable:${shop}:${orderId}:ORDERS_PAID`;
+    const delivery = await prisma.webhookEvent.upsert({
+      where: { idempotencyKey: key },
+      create: {
+        shopDomain: shop,
+        topic: "ORDERS_PAID",
+        // No line items, so the handler has to go and ask the store — the same
+        // shape a replay has, and the shape whose failure used to be swallowed.
+        payload: JSON.stringify({ id: orderId, admin_graphql_api_id: `gid://shopify/Order/${orderId}` }),
+        status: "PENDING",
+        source: "REPLAY",
+        idempotencyKey: key,
+      },
+      update: { status: "PENDING", processedAt: null, errorMessage: null, retryCount: 0 },
+    });
+    created.deliveryIds.push(delivery.id);
+
+    const job = await enqueueJob({
+      kind: JOB_KIND.SHOPIFY_ORDER_INTAKE,
+      idempotencyKey: jobKey(JOB_KIND.SHOPIFY_ORDER_INTAKE, sellerId, `unreadable:${orderId}`),
+      sellerId,
+      payload: { webhookEventId: delivery.id, topic: "ORDERS_PAID", shop },
+      maxAttempts: 2,
+    });
+    created.jobIds.push(job.id);
+
+    const handlers = { ...jobHandlers, [JOB_KIND.SHOPIFY_ORDER_INTAKE]: intakeJobHandler(admin) };
+    await prisma.backgroundJob.deleteMany({ where: { sellerId, id: { not: job.id } } });
+    for (let drain = 0; drain < 3; drain++) {
+      const summary = await runDueJobs(handlers, { limit: 20 });
+      if (!summary.claimed) break;
+    }
+    return prisma.webhookEvent.findUnique({ where: { id: delivery.id } });
+  }
+
+  const SHOPIFY_REFUSAL =
+    "This app is not approved to access the Order object. " +
+    "See https://shopify.dev/docs/apps/launch/protected-customer-data for more details.";
+
+  const refused = await runDelivery(
+    unreadableShop,
+    unreadableSeller.id,
+    UNREADABLE_ORDER,
+    makeAdmin((query) => (query.includes("MoonVellaOrderForEvent") ? { errors: [{ message: SHOPIFY_REFUSAL }] } : { data: null })),
+  );
+  check(
+    "an order the store refused to hand over ends FAILED, not SUCCESS",
+    refused?.status === "FAILED",
+    `${refused?.status}${refused?.errorMessage ? ` — ${refused.errorMessage}` : ""}`,
+  );
+  check(
+    "...and the delivery carries Shopify's own sentence, not our guess at it",
+    refused?.errorMessage === SHOPIFY_REFUSAL,
+    refused?.errorMessage ?? "none",
+  );
+  check(
+    "...and it is not filed as an order with no MoonVella lines",
+    refused?.errorMessage !== "No MoonVella items",
+    refused?.errorMessage ?? "none",
+  );
+  check(
+    "...and no order was invented for it",
+    (await prisma.order.count({ where: { supplierReference: `${unreadableShop}#${UNREADABLE_ORDER}` } })) === 0,
+  );
+
+  /*
+   * THE CONTROL, WITHOUT WHICH THE THREE CHECKS ABOVE WOULD PASS ON A SUITE THAT
+   * SIMPLY FAILS EVERYTHING. The store answers with a real order whose only
+   * line is a variant this seller does not list. That is genuinely "no MoonVella
+   * items", and it must still be recorded as the success it is.
+   */
+  const readable = await runDelivery(
+    unreadableShop,
+    unreadableSeller.id,
+    UNREADABLE_ORDER + 1,
+    makeAdmin((query) =>
+      query.includes("MoonVellaOrderForEvent")
+        ? {
+            data: {
+              order: {
+                id: `gid://shopify/Order/${UNREADABLE_ORDER + 1}`,
+                name: "#1002",
+                orderNumber: 1002,
+                email: null,
+                currencyCode: "CAD",
+                displayFinancialStatus: "PAID",
+                displayFulfillmentStatus: "UNFULFILLED",
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+                cancelledAt: null,
+                totalTaxSet: { shopMoney: { amount: "0.00" } },
+                totalDiscountsSet: { shopMoney: { amount: "0.00" } },
+                subtotalPriceSet: { shopMoney: { amount: "10.00" } },
+                totalPriceSet: { shopMoney: { amount: "10.00" } },
+                totalShippingPriceSet: { shopMoney: { amount: "0.00" } },
+                shippingAddress: null,
+                lineItems: {
+                  nodes: [
+                    {
+                      id: "gid://shopify/LineItem/7777777",
+                      sku: "NOT-OURS-AT-ALL",
+                      name: "Somebody else's thing",
+                      quantity: 1,
+                      variant: { id: "gid://shopify/ProductVariant/55555555555555" },
+                      originalUnitPriceSet: { shopMoney: { amount: "10.00" } },
+                    },
+                  ],
+                },
+              },
+            },
+          }
+        : { data: null }),
+  );
+  check(
+    "a readable order with none of our lines is still the success it is",
+    readable?.status === "SUCCESS" && readable?.errorMessage === "No MoonVella items",
+    `${readable?.status}${readable?.errorMessage ? ` — ${readable.errorMessage}` : ""}`,
+  );
+
+  /* ====================================================================== */
   /* Done                                                                    */
   /* ====================================================================== */
 
