@@ -552,7 +552,11 @@ export async function getQuotesForOrder(
   // principle straddle a change made between the two calls.
   const provider = await eshipperStatus();
   await recordAudit({
-    actorType: "ADMIN_USER",
+    // The caller's own kind, like every other entry this file writes. Hard-coded
+    // to ADMIN_USER here, which would have recorded a SYSTEM or WEBHOOK caller
+    // as a person who was not there — on the one row that says who asked for a
+    // price and against which host.
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.quotes_requested",
