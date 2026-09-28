@@ -21,6 +21,7 @@ import {
   FULFILLMENT_SCOPES,
   readFulfillmentScopes,
   forgetFulfillmentScopes,
+  reauthorizeUrl,
 } from "../services/shopifyScopes.server";
 
 /**
@@ -561,18 +562,59 @@ export const action = async ({ request }) => {
     forgetFulfillmentScopes(session.shop);
 
     /*
-     * THROWS ON THE PATH THAT MATTERS. When either scope is absent this throws
-     * a 401 carrying `X-Shopify-API-Request-Failure-Reauthorize-Url` — the App
-     * Bridge reauth signal, which the admin frame answers by navigating the TOP
-     * window to Shopify's grant screen. It is deliberately not a redirect this
-     * app builds: the same 401 path is what `authenticate.admin` uses for its
-     * own reauthorization, so the mechanism is the library's and not a second
-     * one to keep correct.
+     * `scopes.request` THROWS WHEN EITHER SCOPE IS ABSENT — a 401 carrying
+     * `X-Shopify-API-Request-Failure-Reauthorize-Url`, the url of Shopify's
+     * grant screen. That throw is the library's mechanism and it is kept; what
+     * is added is the transport, because the throw alone only works for a
+     * request that App Bridge's patched `fetch` is on the path of.
      *
-     * When it returns instead, Shopify already holds both and there is nothing
-     * to send anyone to.
+     * IT WAS NOT ON THE PATH OF THE MERCHANT'S, and the failure was silent in
+     * the worst way: the 401 came back to React Router instead of to App
+     * Bridge, React Router did the only thing it can with an error response,
+     * and the iframe printed "401 Unauthorized" where the merchant expected
+     * Shopify's consent screen. Nothing logged an error, because nothing went
+     * wrong — the response simply reached the wrong consumer.
+     *
+     * So the url is taken out of the throw and handed back as a value the page
+     * can act on. The route answers with the url, and the page opens it in the
+     * TOP window. A 401 cannot be rendered, because none is ever returned.
+     *
+     * THERE IS DELIBERATELY ONLY ONE PATH HERE, and the second one was tried and
+     * removed. The library's own answer for a document submission is
+     * `redirect(grantUrl, { target: "_top" })`, which for an embedded request
+     * returns the App Bridge bounce document — an HTML page that loads App
+     * Bridge and calls `window.open(<grant url>, "_top")`. That is a 200 whose
+     * body is HTML, and React Router 7 does not have a "return this document
+     * verbatim" case for an action: a thrown Response that is not a redirect is
+     * an ERROR, so React Router routed it to the error boundary and rendered the
+     * bounce document's script source as text inside an error card. The merchant
+     * would have seen `<script>window.open(...)</script>` printed on the page.
+     * It reached the grant screen anyway — the script still ran — but that is
+     * luck, not design.
+     *
+     * The one path covers both transports better than the two did. A submission
+     * from the running page is a fetch to `/app/orders.data` and gets this JSON
+     * directly. A submission the browser posted itself (scripts not yet running,
+     * e.g. a click before hydration) gets the app's document rendered with this
+     * same JSON as its action data, and the page's effect opens the grant screen
+     * as soon as that document hydrates — same destination, no error card, and
+     * no dependence on a bounce document this framework will not serve.
      */
-    await scopes.request([...FULFILLMENT_SCOPES]);
+    try {
+      await scopes.request([...FULFILLMENT_SCOPES]);
+    } catch (thrown) {
+      const grantUrl = reauthorizeUrl(thrown);
+      if (!grantUrl) throw thrown;
+
+      return Response.json({
+        ok: false,
+        grantUrl,
+        // See the effect in the component: the url alone cannot tell one press
+        // from the next, and this is what the page opens the grant screen on.
+        grantAsk: Date.now(),
+        message: "Shopify needs your approval for two permissions before MoonVella can ship orders.",
+      });
+    }
 
     return Response.json({
       ok: true,
@@ -791,6 +833,32 @@ export default function OrdersPage() {
     const url = actionData?.setupUrl;
     if (url) window.open(url, "_top");
   }, [actionData]);
+
+  /*
+   * SHOPIFY'S GRANT SCREEN, BY THE SAME HOP AND FOR THE SAME REASON.
+   *
+   * The grant action cannot answer a script with the 401 that App Bridge reads,
+   * because that response is only interpreted by App Bridge's patched `fetch` —
+   * and when it is not on the path, React Router renders the 401 into the frame
+   * instead of anyone being asked for anything. So the action returns the url
+   * and this opens it in the top window: the same navigation the library's own
+   * bounce document performs, without depending on a page load to perform it.
+   *
+   * KEYED ON THE ASK, NOT ON THE URL. The url is the same string every time —
+   * same client id, same scopes — so an effect that depended on it would fire
+   * once and never again: a merchant who declined and pressed the button a
+   * second time would get nothing, which is a worse bug than the one being
+   * fixed. Depending on `actionData` instead is the same trap from the other
+   * side, because action data outlives a revalidation and the layout polls
+   * every thirty seconds. So the action stamps each ask and this fires on the
+   * stamp: exactly once per press, never on a poll.
+   */
+  const grantAsk = actionData?.grantAsk;
+  const grantUrl = actionData?.grantUrl;
+  React.useEffect(() => {
+    if (!grantAsk || !grantUrl) return;
+    window.open(grantUrl, "_top");
+  }, [grantAsk, grantUrl]);
 
   if (!canViewOrders) {
     return (

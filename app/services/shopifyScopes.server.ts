@@ -103,3 +103,42 @@ export async function readFulfillmentScopes(
 export function forgetFulfillmentScopes(shop: string): void {
   cache.delete(shop);
 }
+
+/**
+ * The header `scopes.request` throws, and the reason it is not enough on its own.
+ *
+ * The library's grant path is `throw new Response(undefined, {status: 401,
+ * headers: {"X-Shopify-API-Request-Failure-Reauthorize-Url": <grant url>}})`,
+ * and the merchant's admin frame is supposed to answer it by navigating the TOP
+ * window to that URL. That only happens inside App Bridge's patched `fetch`:
+ * the CDN bundle reads this header and forwards it to the host frame, guarded by
+ * a same-origin test. A submission that does not travel through that patched
+ * fetch — a document POST, or a fetch in a page where App Bridge is not running
+ * — gets the 401 handed straight back to React Router, which renders it. That is
+ * what the merchant saw: the iframe stayed on /app/orders and printed "401
+ * Unauthorized", with no consent screen anywhere.
+ *
+ * So the header is treated here as a VALUE to be carried, not as the mechanism.
+ * The url it names is what both transports need, and the route decides which
+ * transport the request can actually use.
+ */
+export const REAUTHORIZE_URL_HEADER = "X-Shopify-API-Request-Failure-Reauthorize-Url";
+
+/** The grant url out of a thrown reauth response, or null if it is anything else. */
+export function reauthorizeUrl(thrown: unknown): string | null {
+  if (!(thrown instanceof Response)) return null;
+  return thrown.headers.get(REAUTHORIZE_URL_HEADER);
+}
+
+/*
+ * THERE IS NO `isDocumentNavigation` HELPER HERE, and it existed. It was used to
+ * split the grant answer into "bounce document for a form post, JSON for a
+ * fetch", on the reasoning that the two transports need different bodies. The
+ * bounce-document half was then driven in a browser and turned out to render
+ * `<script>window.open(...)</script>` as visible text: the library's bounce is a
+ * 200 whose body is HTML, React Router 7 treats a thrown non-redirect Response
+ * as an error, and the error boundary printed the document's source. One path
+ * answers both transports correctly — see the grant action — so the split, and
+ * the `Sec-Fetch-Dest` read that decided it, are gone rather than left as a
+ * branch nothing reaches.
+ */

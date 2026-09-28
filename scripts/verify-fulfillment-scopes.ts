@@ -393,6 +393,172 @@ function main() {
     "literal survived"
   );
 
+  /* ------------------------------------------------------------------ *
+   * F. The transport. A 401 must not be able to reach a script.
+   *
+   * The merchant's failure was not that the ask was wrong — the action asked,
+   * and answered 401 + `X-Shopify-API-Request-Failure-Reauthorize-Url` exactly
+   * as the library intends. It was that the response reached React Router
+   * instead of App Bridge's patched fetch, and React Router rendered it. These
+   * checks hold the property that fixes it: the url is taken OUT of the throw
+   * and returned as data, so that no response the route can produce is one React
+   * Router is able to render as an error.
+   * ------------------------------------------------------------------ */
+
+  check(
+    21,
+    "The action catches the reauth throw rather than letting it reach the router",
+    /catch \(thrown\)[\s\S]{0,400}?reauthorizeUrl\(thrown\)/.test(orders),
+    "catch + reauthorizeUrl"
+  );
+
+  /*
+   * ONE ANSWER, NOT TWO — and this check used to assert the opposite.
+   *
+   * It required a document submission to be handed to the library's own
+   * `redirect(grantUrl, { target: "_top" })`, on the reasoning that
+   * `redirectFactory` knows what an embedded document request needs. Driving
+   * that branch in a browser showed what the library's answer actually is here:
+   * the App Bridge bounce document, a 200 whose body is HTML. React Router 7 has
+   * no "return this document verbatim" case for an action — a thrown Response
+   * that is not a redirect is an ERROR — so the error boundary rendered the
+   * bounce's `<script>window.open(...)</script>` as visible text on the page.
+   * The merchant reached the grant screen anyway, because the script still ran,
+   * which is luck rather than design.
+   *
+   * So the branch is gone, and this check now fails if it returns. One path is
+   * the property that matters: a JSON answer that both transports can carry, and
+   * no response shape that React Router can turn into an error page.
+   */
+  check(
+    22,
+    "The grant has exactly one answer — the url as JSON — and no document branch",
+    !/isDocumentNavigation/.test(orders) &&
+      !/throw redirect\(grantUrl/.test(orders) &&
+      /return Response\.json\(\{[\s\S]{0,200}?grantUrl,/.test(orders),
+    "no document branch, url returned as JSON"
+  );
+
+  check(
+    23,
+    "A script is given the url to open, never the thrown 401",
+    /return Response\.json\(\{[\s\S]{0,200}?grantUrl,/.test(orders) &&
+      !/return thrown;/.test(orders),
+    "grantUrl returned, raw throw not returned"
+  );
+
+  /*
+   * The page opens it, and opens it ONCE PER ASK. Both halves matter: an effect
+   * keyed on the url fires only on the first press (the url is the same string
+   * every time), and one keyed on `actionData` fires again on every layout
+   * revalidation. Either mistake turns the consent screen into a loop of its
+   * own, which is the failure this whole feature exists to avoid.
+   */
+  check(
+    24,
+    "The page opens the grant url in the top window",
+    /window\.open\(grantUrl, "_top"\)/.test(orders),
+    "window.open(grantUrl, _top)"
+  );
+
+  check(
+    25,
+    "That effect is keyed on the ask, so a second press opens it again and a poll does not",
+    /const grantAsk = actionData\?\.grantAsk/.test(orders) &&
+      /\}, \[grantAsk, grantUrl\]\)/.test(orders) &&
+      /grantAsk: Date\.now\(\)/.test(orders),
+    "stamped by the action, depended on by the effect"
+  );
+
+  /*
+   * THE SPLIT IS GONE FROM BOTH FILES, and the signal it keyed on with it.
+   *
+   * `Sec-Fetch-Dest` was the right signal for the wrong question — it correctly
+   * distinguishes a form post from a fetch, and the answer to "which transport
+   * is this?" turned out not to change what the route should send. Leaving the
+   * helper behind would leave a reader to wonder which branch is live. `redirect`
+   * is checked here too: it was destructured from `authenticate.admin` only to
+   * build the bounce document, so its disappearance is the same fact.
+   */
+  check(
+    26,
+    "The removed document/fetch split left nothing behind — no signal, no unused redirect",
+    !/sec-fetch-dest/i.test(scopesService) &&
+      !/isDocumentNavigation/.test(scopesService) &&
+      /const \{ scopes, session \} = await authenticate\.admin\(request\)/.test(orders),
+    "no Sec-Fetch-Dest read, no isDocumentNavigation, no unused redirect"
+  );
+
+  /* ------------------------------------------------------------------ *
+   * G. The configuration that makes the ask legal.
+   *
+   * A scope requested at runtime through the Scopes API must be declared as an
+   * OPTIONAL scope in the app config. Required scopes are granted once, by the
+   * install screen; asking for one at runtime is asking Shopify to grant, on
+   * demand, something it believes it already granted. Both of these lived in
+   * `scopes` while the app asked for them at runtime — a second defect behind
+   * the 401, and invisible until the 401 stopped hiding it.
+   * ------------------------------------------------------------------ */
+
+  const toml = readFileSync(join(process.cwd(), "shopify.app.toml"), "utf8");
+  const requiredLines = [...toml.matchAll(/^scopes\s*=\s*"([^"]*)"/gm)];
+  const optionalLines = [...toml.matchAll(/^optional_scopes\s*=\s*\[([^\]]*)\]/gm)];
+  /*
+   * Read EVERY occurrence, and refuse a duplicate. A defect injection proved
+   * this matters: a second `scopes =` line left the first one intact, the
+   * check below read the first, and it passed while the file declared the two
+   * as required in a second key that TOML would resolve differently than this
+   * test did. A config that says two things about the same key is a config
+   * error whether or not the parser complains, so it fails here first.
+   */
+  const required = (requiredLines[0]?.[1] ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+  const optional = (optionalLines[0]?.[1] ?? "")
+    .split(",")
+    .map((s) => s.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean);
+
+  check(
+    27,
+    "The config declares `scopes` and `optional_scopes` once each",
+    requiredLines.length === 1 && optionalLines.length === 1,
+    `scopes x${requiredLines.length}, optional_scopes x${optionalLines.length}`
+  );
+
+  check(
+    28,
+    "Both scopes are declared as optional_scopes in the app configuration",
+    FULFILLMENT_SCOPES.every((scope) => optional.includes(scope)),
+    `optional_scopes = ${optional.join(", ") || "(absent)"}`
+  );
+
+  check(
+    29,
+    "Neither is still declared as a required scope",
+    !FULFILLMENT_SCOPES.some((scope) => required.includes(scope)),
+    `${required.length} required scope(s)`
+  );
+
+  /*
+   * The read half stays required and that is not an oversight: `read_locations`
+   * is granted, the catalog uses it to know where stock is, and only the WRITE
+   * half is being asked for. Shopify also refuses an optional scope that is an
+   * implicit required one, so this pair is the shape that deploys.
+   */
+  check(
+    30,
+    "read_locations stays required — only the write half became optional",
+    required.includes("read_locations"),
+    required.includes("read_locations") ? "read_locations required" : "read_locations MISSING"
+  );
+
+  check(
+    31,
+    "The reauth header name is written once, in the service",
+    scopesService.includes("REAUTHORIZE_URL_HEADER = \"X-Shopify-API-Request-Failure-Reauthorize-Url\"") &&
+      !/X-Shopify-API-Request-Failure-Reauthorize-Url/.test(orders),
+    "one definition, no literals in the route"
+  );
+
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   process.exit(failures ? 1 : 0);
 }
