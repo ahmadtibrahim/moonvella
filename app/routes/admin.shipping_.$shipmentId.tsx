@@ -34,9 +34,12 @@ import {
   recordValidation,
   validateAddress,
 } from "~/services/addressValidation.server";
+import { orderProgress } from "~/services/orderProgress.server";
+import type { ProgressStage } from "~/services/orderProgress.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
 import { BookingConfirmation } from "~/components/BookingConfirmation";
 import type { BookingEnvironment } from "~/components/BookingConfirmation";
+import { OrderProgress, stageByKey } from "~/components/OrderProgress";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
 import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 // The window form's rule, from the client-safe module: both ends or neither,
@@ -471,7 +474,28 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     // shipping-management permission, so the control is shown only to an owner
     // and the action re-checks the role rather than trusting this flag.
     isOwner: user.role === "OWNER",
+    /*
+     * THE SAME PROGRESSION THE ORDER PAGE DRAWS, from the same rows and the same
+     * function — this page is where the label and the dispatch control live, so
+     * it is where an operator comes back to ask why a stage has not moved. Two
+     * screens reading one builder cannot disagree about where a parcel is.
+     *
+     * It is the ORDER's progression because that is what the audit rows and the
+     * selected quote belong to; a shipment page shows the strip for its own
+     * parcel and ignores the others, which is also what the order page does when
+     * it draws one per box.
+     */
+    progress: shipmentProgressFor(await orderProgress(shipment.orderId), shipment.id),
   };
+}
+
+/** This parcel's strip out of the order's, falling back to the first — which is
+ *  what exists when the order page is drawing an order with no shipment at all. */
+function shipmentProgressFor(
+  entries: { shipmentId: string | null; stages: ProgressStage[] }[],
+  shipmentId: string
+): ProgressStage[] {
+  return (entries.find((entry) => entry.shipmentId === shipmentId) ?? entries[0])?.stages ?? [];
 }
 
 export async function action({ request, params }: ActionFunctionArgs) {
@@ -1014,7 +1038,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, isOwner } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, isOwner, progress } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1031,6 +1055,11 @@ export default function AdminShipmentDetail() {
    */
   const [standingOpen, standingClose] = (pickupPlan.suggestedWindow ?? "").split("-");
   const standingWindow = { open: standingOpen || "", close: standingClose || "" };
+  /*
+   * The Shopify stage's own words, rather than a second copy of the rule that
+   * decides them. See `stageByKey`.
+   */
+  const trackingStage = stageByKey(progress, "tracking_sent");
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -1043,6 +1072,17 @@ export default function AdminShipmentDetail() {
       <p style={{ color: "#64748b", fontSize: "0.8rem", marginBottom: "1.25rem" }}>
         {order.shopifyOrderName} · {order.seller.storeName} · {order.supplierReference} · {trackingLabel(shipment.trackingStatus)} ({shipment.status})
       </p>
+
+      {/*
+        The same six stages the order page draws, from the same rows. This is
+        where an operator comes back to ask why a parcel has not moved, so the
+        answer belongs above the controls that move it.
+      */}
+      {progress.length > 0 ? (
+        <div style={card}>
+          <OrderProgress title="Progress" stages={progress} />
+        </div>
+      ) : null}
 
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>{actionData.error}</div>
@@ -1212,7 +1252,9 @@ export default function AdminShipmentDetail() {
       </div>
 
       <div style={card}>
-        <h2 style={h2}>Rate comparison</h2>
+        {/* The progression links here so a booking retry reaches the one
+            confirmation panel rather than a second form. */}
+        <h2 id="book-shipment" style={h2}>Rate comparison</h2>
         <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
           eShipper: {eshipper.description} · {eshipper.detail}
         </p>
@@ -1463,6 +1505,25 @@ export default function AdminShipmentDetail() {
           {shipment.trackingNumber || "no tracking number"} · {trackingLabel(shipment.trackingStatus)} ({shipment.status})
           {shipment.trackingUrl ? <> · <a href={shipment.trackingUrl} target="_blank" rel="noreferrer" style={{ color: "#0369a1" }}>carrier tracking</a></> : null}
         </p>
+        {/*
+          THE NUMBER IS OURS THE MOMENT THE LABEL IS BOUGHT, and Shopify's is
+          not told until the parcel is handed over — because creating the
+          fulfillment is what marks the items fulfilled. The two moments are far
+          apart and the gap is deliberate, so it is stated here rather than left
+          to look like a sync that has not run.
+        */}
+        {trackingStage && trackingStage.state !== "done" && !shipment.shopifySyncError ? (
+          <p
+            style={{
+              fontSize: "0.72rem",
+              fontWeight: 600,
+              marginBottom: "0.4rem",
+              color: trackingStage.state === "unknown" ? "#b45309" : "#92400e",
+            }}
+          >
+            {trackingStage.detail}
+          </p>
+        ) : null}
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginBottom: "0.6rem" }}>
           Last successful update: {shipment.lastTrackingSyncAt ? new Date(shipment.lastTrackingSyncAt).toLocaleString() : "never"}
           {shipment.trackingSyncFailures > 0
@@ -1786,7 +1847,8 @@ export default function AdminShipmentDetail() {
       </div>
 
       <div style={card}>
-        <h2 style={h2}>Order and Shopify links</h2>
+        {/* Where the tracking push is retried from. */}
+        <h2 id="shipments" style={h2}>Order and Shopify links</h2>
         <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
           <div>Shopify fulfillment order: {order.id ? "see order" : "—"}</div>
           <div>Shopify fulfillment id: {shipment.shopifyFulfillmentId || "not pushed"}</div>

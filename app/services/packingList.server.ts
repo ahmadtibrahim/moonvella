@@ -22,7 +22,20 @@
  * store name in the brand's colour is used instead.
  */
 
+import PDFDocument from "pdfkit";
 import { prisma } from "~/db.server";
+
+/**
+ * The sentence both renderers end with, written once.
+ *
+ * It is on the document because a packing list found in a carton is the kind of
+ * paper somebody tries to file as an invoice or present to a customs officer.
+ * Two renderers meant two copies of it, and a copy that drifted would be one
+ * that made a claim the other did not.
+ */
+const PACKING_LIST_NOTE =
+  "This is a packing list. It is not a carrier document, not an invoice, and not a customs declaration, and it states " +
+  "no prices. Retail pricing is on the customer's receipt; carrier charges are on the carrier's own invoice.";
 
 export interface PackingListLine {
   name: string;
@@ -345,11 +358,205 @@ export function renderPackingList(list: PackingList): string {
       : ""
   }
 
-  <div class="note">
-    This is a packing list. It is not a carrier document, not an invoice, and not a customs declaration, and it states no
-    prices. Retail pricing is on the customer's receipt; carrier charges are on the carrier's own invoice.
-  </div>
+  <div class="note">${PACKING_LIST_NOTE}</div>
 
 </body>
 </html>`;
+}
+
+/**
+ * The same document as a real file.
+ *
+ * WHY TWO RENDERERS AND NOT TWO FORMATS OF ONE. The two actions have different
+ * jobs. PRINT opens a page the warehouse can read and send to a printer from
+ * whatever machine is in front of them, and HTML does that with no dependency at
+ * all — the print rules are inline so it works with the internet down. DOWNLOAD
+ * produces a file that leaves this system and is opened somewhere else, possibly
+ * on a machine that has never heard of this app, and §4 asks for a genuine PDF
+ * with a .pdf name. Those are different requirements and they are met by
+ * different code; the content is held identical by both reading the same
+ * `PackingList` and by the checks in verify-booking that assert it of both.
+ *
+ * PDFKIT, AND WHY THAT LIBRARY. It runs here — no network call, no external
+ * document service, no headless browser — and it draws with the standard 14
+ * fonts, whose metrics ship inside the package, so nothing has to be uploaded or
+ * licensed and the file is self-contained. Its dependencies are pure JavaScript
+ * (fontkit, fflate, png-js), so it installs on the musl image the same way it
+ * installs anywhere, with no native build step.
+ */
+export function renderPackingSlipPdf(list: PackingList): Promise<Buffer> {
+  const doc = new PDFDocument({
+    size: "LETTER",
+    margin: 54,
+    // Named for what it is. This string is what a PDF reader shows in its title
+    // bar and what a "Save as" dialog offers, and it is the customer's document,
+    // so it names the order and never a row in our database.
+    info: { Title: `Packing list — ${list.orderName}`, Creator: list.brandName, Producer: list.brandName },
+  });
+
+  const chunks: Buffer[] = [];
+  doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const finished = new Promise<Buffer>((resolve, reject) => {
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+  });
+
+  const left = doc.page.margins.left;
+  const right = doc.page.width - doc.page.margins.right;
+  const width = right - left;
+
+  const options = (raw: string | null): string => {
+    if (!raw) return "";
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return "";
+      return parsed
+        .map((entry) =>
+          typeof entry === "string"
+            ? entry
+            : `${(entry as Record<string, unknown>).name ?? ""}: ${(entry as Record<string, unknown>).value ?? ""}`
+        )
+        .filter(Boolean)
+        .join(", ");
+    } catch {
+      return "";
+    }
+  };
+
+  /* --- the heading: the seller's brand, then what the sheet is ------------ */
+  doc.font("Helvetica-Bold").fontSize(20).fillColor(list.brandColour).text(list.brandName, left, doc.y, { width: width * 0.6 });
+  doc.font("Helvetica").fontSize(11).fillColor("#64748b").text("Packing list", { width: width * 0.6 });
+
+  const headingBottom = doc.y;
+  doc.font("Helvetica-Bold").fontSize(12).fillColor("#0f172a").text(list.orderName, left, headingBottom - 34, {
+    width,
+    align: "right",
+  });
+  doc.font("Helvetica").fontSize(9).fillColor("#64748b").text(`Packed ${new Date().toLocaleDateString()}`, {
+    width,
+    align: "right",
+  });
+
+  doc.moveTo(left, doc.y + 10).lineTo(right, doc.y + 10).lineWidth(2).strokeColor(list.brandColour).stroke();
+  doc.y += 22;
+
+  /* --- both ends ---------------------------------------------------------- */
+  const halfWidth = (width - 24) / 2;
+  const blockTop = doc.y;
+  const sectionLabel = (text: string, x: number, y: number) => {
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b").text(text.toUpperCase(), x, y, { width: halfWidth });
+  };
+
+  sectionLabel("Ship to", left, blockTop);
+  doc.font("Helvetica").fontSize(10).fillColor("#0f172a");
+  const toLines = list.shipTo.length ? list.shipTo : ["—"];
+  toLines.forEach((line, index) => {
+    doc.text(line, left, blockTop + 14 + index * 13, { width: halfWidth });
+  });
+
+  sectionLabel("Ship from", left + halfWidth + 24, blockTop);
+  doc.font("Helvetica").fontSize(10).fillColor("#0f172a").text(list.brandName, left + halfWidth + 24, blockTop + 14, {
+    width: halfWidth,
+  });
+
+  doc.y = blockTop + 14 + toLines.length * 13 + 18;
+
+  /* --- the contents ------------------------------------------------------- */
+  const columns = [left, left + 24, right - 120, right - 58];
+  const rowTop = () => doc.y;
+
+  const header = (top: number) => {
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b");
+    doc.text("CONTENTS", left, top);
+    doc.y = top + 14;
+  };
+  header(doc.y);
+
+  doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b");
+  const columnHead = rowTop();
+  doc.text("#", columns[0], columnHead, { width: 20, align: "right" });
+  doc.text("ITEM", columns[1], columnHead, { width: columns[2] - columns[1] - 8 });
+  doc.text("SKU", columns[2], columnHead, { width: columns[3] - columns[2] - 8 });
+  doc.text("QTY", columns[3], columnHead, { width: right - columns[3], align: "right" });
+  doc.y = columnHead + 12;
+  doc.moveTo(left, doc.y).lineTo(right, doc.y).lineWidth(0.5).strokeColor("#cbd5e1").stroke();
+  doc.y += 6;
+
+  if (list.lines.length === 0) {
+    doc.font("Helvetica").fontSize(10).fillColor("#0f172a").text("No items recorded on this shipment.", left, doc.y);
+  }
+  list.lines.forEach((line, index) => {
+    const top = doc.y;
+    const label = options(line.options);
+    doc.font("Helvetica").fontSize(10).fillColor("#0f172a");
+    doc.text(String(index + 1), columns[0], top, { width: 20, align: "right" });
+    doc.text(line.name, columns[1], top, { width: columns[2] - columns[1] - 8 });
+    const afterName = doc.y;
+    if (label) {
+      doc.font("Helvetica").fontSize(8).fillColor("#64748b").text(label, columns[1], afterName, {
+        width: columns[2] - columns[1] - 8,
+      });
+    }
+    doc.font("Helvetica").fontSize(9).fillColor("#0f172a").text(line.sku, columns[2], top, {
+      width: columns[3] - columns[2] - 8,
+    });
+    doc.font("Helvetica-Bold").fontSize(11).text(String(line.quantity), columns[3], top, {
+      width: right - columns[3],
+      align: "right",
+    });
+    doc.y = Math.max(doc.y, top + 13) + 5;
+    doc.moveTo(left, doc.y - 3).lineTo(right, doc.y - 3).lineWidth(0.5).strokeColor("#e2e8f0").stroke();
+  });
+
+  doc.font("Helvetica-Bold").fontSize(10).fillColor("#0f172a").text(
+    `${list.totalUnits} unit${list.totalUnits === 1 ? "" : "s"} in ${list.packageCount || 1} parcel(s)`,
+    left,
+    doc.y + 4,
+    { width, align: "right" }
+  );
+  doc.y += 16;
+
+  /* --- the parcels -------------------------------------------------------- */
+  if (list.packages.length > 0) {
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b").text("PARCELS", left, doc.y + 8);
+    doc.y += 20;
+    const parcelColumns = [left, left + 60, left + 220, right - 110];
+    const head = doc.y;
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b");
+    doc.text("COUNT", parcelColumns[0], head);
+    doc.text("DIMENSIONS", parcelColumns[1], head);
+    doc.text("GROSS WEIGHT", parcelColumns[2], head);
+    doc.text("TOTAL WEIGHT", parcelColumns[3], head, { width: right - parcelColumns[3], align: "right" });
+    doc.y = head + 12;
+    doc.moveTo(left, doc.y).lineTo(right, doc.y).lineWidth(0.5).strokeColor("#cbd5e1").stroke();
+    doc.y += 6;
+    list.packages.forEach((pkg) => {
+      const top = doc.y;
+      doc.font("Helvetica").fontSize(10).fillColor("#0f172a");
+      doc.text(String(pkg.count), parcelColumns[0], top);
+      doc.text(`${pkg.length} × ${pkg.width} × ${pkg.height} cm`, parcelColumns[1], top);
+      doc.text(`${pkg.weight} kg`, parcelColumns[2], top);
+      doc.text(`${(pkg.weight * pkg.count).toFixed(3)} kg`, parcelColumns[3], top, {
+        width: right - parcelColumns[3],
+        align: "right",
+      });
+      doc.y = top + 18;
+    });
+  }
+
+  /* --- the operator's own words, verbatim and only when there are some ---- */
+  if (list.message) {
+    doc.y += 12;
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#64748b").text("MESSAGE", left, doc.y);
+    doc.y += 12;
+    doc.font("Helvetica").fontSize(10).fillColor("#0f172a").text(list.message, left, doc.y, { width });
+  }
+
+  /* --- and what the sheet is not ------------------------------------------ */
+  doc.y += 22;
+  doc.moveTo(left, doc.y).lineTo(right, doc.y).lineWidth(0.5).strokeColor("#e2e8f0").stroke();
+  doc.font("Helvetica").fontSize(8).fillColor("#64748b").text(PACKING_LIST_NOTE, left, doc.y + 8, { width });
+
+  doc.end();
+  return finished;
 }

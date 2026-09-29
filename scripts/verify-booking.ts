@@ -27,6 +27,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { inflateSync } from "node:zlib";
 import { PrismaClient } from "@prisma/client";
 import {
   QUOTE_INVALIDATION,
@@ -55,7 +56,9 @@ import {
 } from "../app/services/addressValidation.server";
 import { acceptBookingAddresses, recordVerdict } from "./verify-address-fixtures";
 import { intakeOrder } from "../app/services/orderIntake.server";
-import { packingListFor, parseAddressLines, renderPackingList } from "../app/services/packingList.server";
+import { packingListFor, parseAddressLines, renderPackingList, renderPackingSlipPdf } from "../app/services/packingList.server";
+import { orderProgress, shipmentProgress } from "../app/services/orderProgress.server";
+import type { ProgressInput, ProgressShipment, ProgressStage } from "../app/services/orderProgress.server";
 import { eshipperMode } from "../app/services/eshipper.server";
 import { JOB_KIND } from "../app/services/jobs.server";
 
@@ -65,6 +68,88 @@ function check(name: string, pass: boolean, detail = "") {
   total++;
   if (!pass) failures++;
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
+}
+
+/**
+ * The text a PDF reader would draw, extracted the way a reader extracts it.
+ *
+ * pdfkit writes each page's operators into a Flate-compressed stream, so the
+ * words are in the file but not in the bytes as written. Inflating the streams
+ * gives back the page's instructions — and those instructions are NOT the page:
+ * they are full of the numbers that position each word, and a check for "no
+ * price appears" run against them would find "25.00" in a coordinate and fail on
+ * a correct document.
+ *
+ * So the literal strings are pulled out of the operators, which is what a text
+ * extractor does and what a reader sees. Escapes are resolved because pdfkit
+ * escapes the parentheses and backslashes in the operator's message, and a word
+ * containing one would otherwise not be found even though it is plainly printed.
+ *
+ * A stream that will not inflate is kept as it was rather than dropped: an
+ * uncompressed or differently-encoded stream would otherwise turn a document
+ * nobody can read into a silent PASS.
+ */
+function inflatePdfStreams(pdf: Buffer): string {
+  const raw = pdf.toString("latin1");
+  let operators = "";
+  const streams = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  for (let match = streams.exec(raw); match; match = streams.exec(raw)) {
+    const bytes = Buffer.from(match[1], "latin1");
+    try {
+      operators += `${inflateSync(bytes).toString("latin1")}\n`;
+    } catch {
+      operators += `${match[1]}\n`;
+    }
+  }
+
+  /*
+   * ONLY INSIDE BT…ET. Those two operators bracket every text object, so
+   * harvesting there skips the parts of the file that are not text at all — an
+   * embedded font program, a colour profile — where a `<...>` would otherwise be
+   * read as words.
+   */
+  const lines: string[] = [];
+  const textObjects = /BT([\s\S]*?)ET/g;
+  for (let object = textObjects.exec(operators); object; object = textObjects.exec(operators)) {
+    /*
+     * A `Tm` places the cursor, so each run between two of them is one line on
+     * the page. The runs are joined with a space because that is where the
+     * wrapping happened — a sentence that wrapped is still one sentence to a
+     * reader — while within a run the pieces are joined with NOTHING, because
+     * pdfkit cuts a run at its kerning boundaries and the cut lands in the
+     * middle of words ("...20706163" + "6b696e67206c6973742e" is "packing
+     * list.", one word and a half apart from nothing).
+     */
+    for (const run of object[1].split(/\bTm\b/)) {
+      let line = "";
+      // Both spellings pdfkit can use: `<hex> Tj`/`TJ` for the standard fonts,
+      // and a literal `(string)` when a string needs no encoding.
+      const tokens = run.match(/<[0-9A-Fa-f\s]*>|\((?:\\.|[^\\()])*\)/g);
+      if (!tokens) continue;
+      for (const token of tokens) {
+        if (token.startsWith("<")) {
+          const hex = token.slice(1, -1).replace(/\s+/g, "");
+          for (let index = 0; index + 1 < hex.length; index += 2) {
+            // WinAnsi bytes for everything this document prints, which is ASCII.
+            line += String.fromCharCode(parseInt(hex.slice(index, index + 2), 16));
+          }
+        } else {
+          line += token
+            .slice(1, -1)
+            .replace(/\\([nrtbf()\\])/g, (_all, escaped: string) => ({ n: "\n", r: "\r", t: "\t", b: "\b", f: "\f" })[escaped] ?? escaped)
+            .replace(/\\([0-7]{1,3})/g, (_all, octal: string) => String.fromCharCode(parseInt(octal, 8)));
+        }
+      }
+      if (line) lines.push(line);
+    }
+  }
+  /*
+   * Collapsed, because a wrap leaves the space it broke at in the run before it
+   * and the join adds another. A reader sees one space, so a check for a phrase
+   * that wrapped has to see one too — otherwise the document could say exactly
+   * the right thing and fail for a reason nobody can see on the page.
+   */
+  return lines.join(" ").replace(/\s+/g, " ").trim();
 }
 
 const prisma = new PrismaClient();
@@ -1556,6 +1641,75 @@ async function packingListChecks() {
     "...and the message cannot inject markup into the page",
     messageHtml.includes("&lt;seller&gt;") && !messageHtml.includes("<seller>")
   );
+
+  /* --- the downloadable PDF --------------------------------------------- */
+  /*
+   * §5's download button is a real PDF, and it is the copy that LEAVES this
+   * system — saved to a warehouse desktop, attached to an email, handed to a
+   * driver. So it is checked as bytes rather than as a promise: the file is a
+   * PDF, it carries the document, and §5's forbidden list is asserted against
+   * the text actually drawn on the page rather than against the object it was
+   * built from.
+   *
+   * THE TEXT IS EXTRACTED THE WAY A READER WOULD. pdfkit compresses its content
+   * streams, so the strings are not lying in the file in plain sight; inflating
+   * them is what turns "the buffer is not empty" into "the words on the page are
+   * these". A check that only measured the byte length would pass on a blank
+   * page.
+   */
+  if (withMessage) {
+    let pdf: Buffer | null = null;
+    let pdfError = "";
+    try {
+      pdf = await renderPackingSlipPdf(withMessage);
+    } catch (error) {
+      pdfError = error instanceof Error ? error.message : String(error);
+    }
+    check("the packing slip renders a PDF", pdf !== null && pdf.byteLength > 0, pdfError || `${pdf?.byteLength ?? 0} bytes`);
+    check("...that is a PDF by its own header and trailer", Boolean(pdf && pdf.subarray(0, 5).toString("latin1") === "%PDF-" && pdf.toString("latin1").includes("%%EOF")));
+
+    const pdfText = pdf ? inflatePdfStreams(pdf) : "";
+    check("...whose page carries the order it belongs to", pdfText.includes(withMessage.orderName), withMessage.orderName);
+    check("...and the recipient it is going to", withMessage.shipTo.length > 0 && pdfText.includes(withMessage.shipTo[0]), withMessage.shipTo[0] ?? "(no address)");
+    check("...and the operator's message, on the box it was written for", pdfText.includes("Packed with care"));
+    check("...and the item and its quantity", withMessage.lines.length > 0 && pdfText.includes(withMessage.lines[0].name) && pdfText.includes(String(withMessage.lines[0].quantity)));
+    /*
+     * THE SAME FOOTER SENTENCE AS THE PRINTABLE COPY, which is the point of
+     * having written it once: a sentence that exists twice drifts, and the copy
+     * that drifted would be the one making a claim the other does not. Checked
+     * by a phrase long enough to be that sentence and short enough not to be
+     * broken by a line wrap.
+     */
+    check(
+      "...and the footer that says what this document is not",
+      pdfText.includes("carrier document") && pdfText.includes("customs declaration")
+    );
+
+    /*
+     * §6, against the drawn page: the same forbidden list the HTML is checked
+     * against, plus the same supplier and internal-id words. A leak here is
+     * worse than on the print copy, because this is the file that gets saved,
+     * attached to an email and kept.
+     */
+    const pdfTold = [...forbidden, ...forbiddenWords].filter((needle) => pdfText.includes(needle));
+    check("no price, internal id or supplier appears on the PDF", pdfTold.length === 0, pdfTold.join(" "));
+  }
+
+  /*
+   * THE DOWNLOAD ANSWERS WITH A FILE, THE PRINT WITH A PAGE. Both routes build
+   * the same document and differ only in what they set on the response, so what
+   * is checked here is the two headers that decide which of the two an operator
+   * gets. This is a check on the source of the routes rather than a request
+   * through them: reaching the loaders needs an authenticated admin session,
+   * which this suite deliberately does not have.
+   */
+  for (const route of ["app/routes/admin.packing-list.$shipmentId.tsx", "app/routes/app.packing-list.$shipmentId.tsx"]) {
+    const source = readFileSync(join(process.cwd(), route), "utf8");
+    check(`${route.split("/").pop()} answers a download with application/pdf`, source.includes('"Content-Type": "application/pdf"'));
+    check(`...and names the file .pdf`, /filename="packing-slip-\$\{safeName\}\.pdf"/.test(source));
+    check(`...and keeps the printable copy for print`, source.includes('"Content-Type": "text/html; charset=utf-8"'));
+    check(`...and never names the file after an internal id`, !source.includes("packing-slip-${shipment") && !source.includes('filename="packing-list-'));
+  }
   /*
    * THE MESSAGE BELONGS TO ONE BOX. A split order has one slip per carton, so a
    * note written for the pillows must not appear in the carton of towels — which
@@ -2012,6 +2166,255 @@ async function originGateChecks() {
       String(charged.sellerShippingCharge)
     );
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* The progression on the order                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The six stages, exercised at every branch that has one.
+ *
+ * THIS IS THE ONE SECTION THAT NEEDS NO DATABASE. `shipmentProgress` is pure —
+ * it takes rows and returns stages — so each rule below is called with the rows
+ * that make it true and no fixture at all. That matters here more than usual,
+ * because the cases that decide whether this screen is trustworthy are the ones
+ * a working system never reaches: a refused booking, an unanswered one, a push
+ * that failed, a parcel handed over that Shopify was never told about.
+ *
+ * The last check is the exception and goes through the database on purpose:
+ * `orderProgress` is what the two pages actually call, and its job is reading
+ * the ACTOR out of the audit log — so one shipment is driven through a real
+ * booking and the strip is asked who did it.
+ */
+async function progressionChecks() {
+  console.log("\n-- progression --");
+
+  const base: ProgressShipment = {
+    id: "ship-1",
+    status: "PENDING",
+    trackingNumber: null,
+    carrier: null,
+    serviceName: null,
+    labelCreatedAt: null,
+    packedAt: null,
+    handedToCarrierAt: null,
+    shippedAt: null,
+    deliveredAt: null,
+    shopifySyncedAt: null,
+    shopifyFulfillmentId: null,
+    shopifySyncError: null,
+    lastBookingError: null,
+    bookingOutcomeUnknownAt: null,
+  };
+  const at = new Date("2026-09-28T12:00:00Z");
+  /*
+   * Every fixture below describes a parcel whose rate was chosen, because that
+   * is true of every parcel that has a shipment at all — and it is not a
+   * decoration: the strip's cursor sits on the FIRST stage that has not
+   * happened, so a fixture that forgot the rate would put the cursor on the rate
+   * and every assertion about where the parcel is would be asserting about the
+   * fixture instead. The order with nothing chosen is checked on its own above.
+   */
+  const chosenQuote = { carrier: "eShipper", serviceName: "Standard" };
+  const run = (over: Partial<ProgressShipment>, extra: Partial<ProgressInput> = {}) =>
+    shipmentProgress({ shipment: { ...base, ...over }, selectedQuote: chosenQuote, hasFulfillmentOrder: true, events: [], ...extra });
+  const stage = (stages: ProgressStage[], key: string) => stages.find((s) => s.key === key)!;
+
+  /* --- the shape --------------------------------------------------------- */
+  const empty = shipmentProgress({ shipment: null, selectedQuote: null, hasFulfillmentOrder: true, events: [] });
+  check(
+    "the progression is the six stages in the order they happen",
+    empty.map((s) => s.label).join(" -> ") ===
+      "Rate selected -> Label booked -> Packed -> Handed to carrier -> Tracking sent to Shopify -> Delivered",
+    empty.map((s) => s.label).join(" -> ")
+  );
+  check(
+    "an order nothing has happened to claims nothing",
+    empty.every((s) => s.at === null && s.actor === null && s.detail === null),
+    JSON.stringify(empty.map((s) => [s.key, s.state]))
+  );
+  check("...and it points at the first thing to do, not the last", empty[0].state === "current" && empty.slice(1).every((s) => s.state === "pending"));
+
+  /* --- the rate ---------------------------------------------------------- */
+  const rated = run({});
+  check("a chosen rate completes the first stage", stage(rated, "rate_selected").state === "done");
+  check("...and names the carrier and service it was", stage(rated, "rate_selected").detail === "eShipper Standard");
+  check("...and the cursor moves to the label", stage(rated, "label_booked").state === "current");
+
+  /* --- the booking ------------------------------------------------------- */
+  const booked = run({ status: "BOOKED", labelCreatedAt: at, trackingNumber: "TRK1", carrier: "eShipper", serviceName: "Standard" });
+  check("a booked label completes the second stage", stage(booked, "label_booked").state === "done");
+  check("...dated by the label, not by the cursor", stage(booked, "label_booked").at === at.toISOString());
+
+  /*
+   * §2, IN THE WORDS THE OPERATOR READS. The tracking number is known the moment
+   * the label is bought; Shopify is told at dispatch; the stage has to say which
+   * of the two it is waiting for rather than showing an empty gap.
+   */
+  const waiting = stage(booked, "tracking_sent");
+  check("a parcel not yet dispatched says it is waiting for dispatch", waiting.detail?.startsWith("Waiting for dispatch.") === true, String(waiting.detail));
+  check("...while the strip points at PACKING, which comes first", stage(booked, "packed").state === "current" && waiting.state === "pending");
+  check("...and states the tracking number it already holds", waiting.detail?.includes("TRK1") === true);
+  check("...and promises no notification that has not been sent", waiting.detail?.includes("will be sent to Shopify when this parcel is handed") === true);
+
+  /*
+   * AND THE SAME STAGE AFTER THE HANDOVER, which is a different fact. A parcel
+   * that has left is not waiting for anything; saying "waiting for dispatch"
+   * about it sends an operator to the dock instead of to the sync.
+   */
+  const handedOver = run({ status: "IN_TRANSIT", labelCreatedAt: at, trackingNumber: "TRK1", handedToCarrierAt: at });
+  const afterHandover = stage(handedOver, "tracking_sent");
+  check("a parcel already handed over is not described as waiting for dispatch", afterHandover.detail?.startsWith("Waiting for dispatch.") === false, String(afterHandover.detail));
+  check("...it says Shopify has not been told, and offers the push", afterHandover.retry?.kind === "shopify_sync", String(afterHandover.retry?.kind));
+  check("...and the tracking push never offers to buy a label", afterHandover.retry?.note.includes("does not buy another label") === true);
+
+  /* --- the two ways a booking does not land ------------------------------ */
+  const refused = run({ status: "BOOKING_FAILED", lastBookingError: "Postal code not serviceable" });
+  const refusedStage = stage(refused, "label_booked");
+  check("a refused booking fails the label stage", refusedStage.state === "failed");
+  check("...showing the carrier's own reason", refusedStage.detail === "Postal code not serviceable", String(refusedStage.detail));
+  check("...and offering a retry", refusedStage.retry?.kind === "booking");
+  check("...that says why retrying is safe", refusedStage.retry?.note.includes("nothing was purchased") === true);
+  check(
+    "...and nothing after it claims to be current",
+    refused.slice(2).every((s) => s.state === "pending"),
+    refused.map((s) => `${s.key}:${s.state}`).join(" ")
+  );
+
+  const unanswered = run({ status: "BOOKING_UNKNOWN", bookingOutcomeUnknownAt: at });
+  const unknownStage = stage(unanswered, "label_booked");
+  check("an unanswered booking is unknown rather than failed", unknownStage.state === "unknown");
+  check("...dated by when it went unanswered", unknownStage.at === at.toISOString());
+  check("...and it is NOT offered as a retry", unknownStage.retry?.kind === "reconcile");
+  check("...because a second booking may buy a second label", unknownStage.retry?.note.includes("may already have been purchased") === true);
+
+  /* --- packing and handover ---------------------------------------------- */
+  const packed = run({ status: "PACKED", labelCreatedAt: at, packedAt: at });
+  check("packing completes its own stage", stage(packed, "packed").state === "done" && stage(packed, "packed").at === at.toISOString());
+  check(
+    "a parcel may be recorded shipped without the handover word",
+    stage(run({ labelCreatedAt: at, shippedAt: at }), "handed_to_carrier").state === "done"
+  );
+  check(
+    "...and the two words date the same stage",
+    stage(run({ labelCreatedAt: at, shippedAt: at }), "handed_to_carrier").at === at.toISOString()
+  );
+
+  /* --- the push ---------------------------------------------------------- */
+  const pushed = run({
+    labelCreatedAt: at,
+    packedAt: at,
+    handedToCarrierAt: at,
+    trackingNumber: "TRK1",
+    shopifyFulfillmentId: "gid://shopify/Fulfillment/5",
+    shopifySyncedAt: at,
+  });
+  check("a fulfillment in Shopify completes the push stage", stage(pushed, "tracking_sent").state === "done");
+  check("...dated by when it was pushed", stage(pushed, "tracking_sent").at === at.toISOString());
+  check("...and a parcel that is packed, dispatched and pushed is waiting only on delivery", stage(pushed, "delivered").state === "current");
+
+  const failedPush = run({ labelCreatedAt: at, handedToCarrierAt: at, shopifySyncError: "Shopify refused: fulfillment order closed" });
+  check("a failed push fails its stage", stage(failedPush, "tracking_sent").state === "failed");
+  check("...quoting what Shopify said", stage(failedPush, "tracking_sent").detail === "Shopify refused: fulfillment order closed");
+  check("...and offering the push again, not a booking", stage(failedPush, "tracking_sent").retry?.kind === "shopify_sync");
+
+  /*
+   * AN ORDER THAT CAN NEVER BE PUSHED TO. "Waiting" would be a lie with a
+   * deadline: it will not happen, and an operator checking the page every
+   * morning is the cost of saying it will.
+   */
+  const noFulfillmentOrder = run(
+    { labelCreatedAt: at, trackingNumber: "TRK1" },
+    { hasFulfillmentOrder: false }
+  );
+  const unpushable = stage(noFulfillmentOrder, "tracking_sent");
+  check("an order with no fulfillment order says the push cannot happen", unpushable.state === "unknown", unpushable.state);
+  check("...rather than waiting for something that never will", unpushable.detail?.includes("cannot be pushed") === true, String(unpushable.detail));
+  check("...and offers no retry that would fail the same way", unpushable.retry === null);
+
+  /* --- delivery ----------------------------------------------------------- */
+  const delivered = run({
+    status: "DELIVERED",
+    labelCreatedAt: at,
+    packedAt: at,
+    handedToCarrierAt: at,
+    deliveredAt: at,
+    trackingNumber: "TRK1",
+    shopifyFulfillmentId: "gid://shopify/Fulfillment/5",
+    shopifySyncedAt: at,
+  });
+  check(
+    "a delivered parcel has every stage done",
+    delivered.every((s) => s.state === "done"),
+    delivered.filter((s) => s.state !== "done").map((s) => `${s.key}:${s.state}`).join(" ") || "all done"
+  );
+
+  /* --- who did it --------------------------------------------------------- */
+  /*
+   * THE ACTOR COMES FROM THE LOG OR NOT AT ALL. A stage performed by a
+   * background job has no audit row with a name on it, and filling that gap with
+   * "system" would be inventing a fact about who did something.
+   */
+  const audited = run(
+    { labelCreatedAt: at },
+    {
+      events: [
+        { action: "shipping.booked", at: new Date("2026-09-28T11:00:00Z"), actorName: "Dana Reyes", entityId: "ship-1" },
+        { action: "shipping.booked", at: new Date("2026-09-28T10:00:00Z"), actorName: "Older Attempt", entityId: "ship-1" },
+        { action: "shipping.booked", at: new Date("2026-09-28T13:00:00Z"), actorName: "Another Shipment", entityId: "ship-OTHER" },
+      ],
+    }
+  );
+  check("a stage names the person who did it", stage(audited, "label_booked").actor === "Dana Reyes", String(stage(audited, "label_booked").actor));
+  check("...from the newest row, not the oldest", stage(audited, "label_booked").actor !== "Older Attempt");
+  check("...and not from another shipment's row", stage(audited, "label_booked").actor !== "Another Shipment");
+  check("a stage with no audit row claims no actor", stage(audited, "packed").actor === null);
+
+  /* --- the reader the pages call ----------------------------------------- */
+  const seller = await createSeller("prog");
+  const { order, shipment } = await createBookableOrder(seller.id, "prog");
+  await prisma.auditLog.create({
+    data: {
+      actorType: "ADMIN_USER",
+      actorId: "test-actor",
+      actorName: "Priya Raman",
+      action: "shipping.quote_selected",
+      entityType: "ORDER",
+      entityId: order.id,
+      createdAt: new Date(),
+    },
+  });
+  const secondBox = await prisma.shipment.create({
+    data: { orderId: order.id, status: "PENDING", provider: "eshipper", carrier: "eShipper", packageCount: 1 },
+  });
+  const read = await orderProgress(order.id);
+  check("the reader returns one progression per parcel", read.length === 2, String(read.length));
+  check("...keyed by the shipment they belong to", read.every((entry) => entry.shipmentId !== null));
+  check(
+    "...and each of them carries the six stages",
+    read.every((entry) => entry.stages.length === 6),
+    read.map((entry) => entry.stages.length).join(",")
+  );
+  check(
+    "...with the actor the audit log names",
+    read.some((entry) => entry.stages.find((s) => s.key === "rate_selected")?.actor === "Priya Raman"),
+    JSON.stringify(read[0].stages.find((s) => s.key === "rate_selected")?.actor)
+  );
+  check("the second box is read as its own parcel", read.some((entry) => entry.shipmentId === secondBox.id) && read.some((entry) => entry.shipmentId === shipment.id));
+
+  /*
+   * AN ORDER WITH NOTHING BOOKED YET. That is most of an order's life, and the
+   * strip is still drawn — from the chosen rate — because "no parcels" is a
+   * worse answer than showing how far the order has got.
+   */
+  const { order: bareOrder } = await createBookableOrder(seller.id, "prog-bare");
+  await prisma.shipment.deleteMany({ where: { orderId: bareOrder.id } });
+  const bare = await orderProgress(bareOrder.id);
+  check("an order with no shipment still gets one progression", bare.length === 1 && bare[0].shipmentId === null, String(bare.length));
+  check("...carrying all six stages", bare[0]?.stages.length === 6);
+  check("...and claiming no parcel has moved", bare[0]?.stages.every((s) => s.key === "rate_selected" || s.at === null) === true);
+  check("an order that does not exist gets none", (await orderProgress("no-such-order")).length === 0);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2773,6 +3176,7 @@ async function main() {
   await addressGateChecks();
   await pickupChecks();
   await packingListChecks();
+  await progressionChecks();
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   return failures;

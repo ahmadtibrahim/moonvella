@@ -1,6 +1,6 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { withMerchantAccess } from "../services/seller.server";
-import { packingListFor, renderPackingList } from "../services/packingList.server";
+import { packingListFor, renderPackingList, renderPackingSlipPdf } from "../services/packingList.server";
 
 /**
  * The packing list, from the seller's side.
@@ -28,6 +28,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) =>
     const list = await packingListFor(String(params.shipmentId), { sellerId: context.seller.id });
     if (!list) throw new Response("Shipment not found", { status: 404 });
 
+    /*
+     * Download answers with a real PDF and Print with the page, the same two
+     * answers the admin route gives — a seller and an operator must not get
+     * different documents for the same button, and this is the copy that ends up
+     * in the customer's hands.
+     */
     const download = new URL(request.url).searchParams.get("download") === "1";
     /*
      * The ORDER's name and not the shipment's reference: this string becomes the
@@ -35,12 +41,21 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) =>
      * reason the document itself no longer prints one.
      */
     const safeName = list.orderName.replace(/[^A-Za-z0-9._-]+/g, "-");
+    const cacheControl = { "Cache-Control": "no-store" };
+
+    if (download) {
+      const pdf = await renderPackingSlipPdf(list);
+      return new Response(new Uint8Array(pdf), {
+        headers: {
+          "Content-Type": "application/pdf",
+          "Content-Length": String(pdf.byteLength),
+          "Content-Disposition": `attachment; filename="packing-slip-${safeName}.pdf"`,
+          ...cacheControl,
+        },
+      });
+    }
 
     return new Response(renderPackingList(list), {
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store",
-        ...(download ? { "Content-Disposition": `attachment; filename="packing-list-${safeName}.html"` } : {}),
-      },
+      headers: { "Content-Type": "text/html; charset=utf-8", ...cacheControl },
     });
   });

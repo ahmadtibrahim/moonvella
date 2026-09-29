@@ -53,8 +53,10 @@ import {
   recordValidation,
   validateAddress,
 } from "~/services/addressValidation.server";
+import { orderProgress } from "~/services/orderProgress.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
 import { BookingConfirmation } from "~/components/BookingConfirmation";
+import { OrderProgress, stageByKey } from "~/components/OrderProgress";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
 import { unitsView } from "~/utils/measurementUnits";
@@ -363,6 +365,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     },
     chargeBlock,
     timeline,
+    /*
+     * WHERE THE PARCELS ARE. One progression per shipment, or one about the
+     * order alone when nothing has been booked yet. Read here rather than in the
+     * component because it spans three tables — the shipments, the selected
+     * quote and the audit log that supplies the actor — and the audit rows are
+     * read once for the whole order instead of once per stage.
+     */
+    progress: await orderProgress(order.id),
     eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
     billing: {
       mode: billing.mode,
@@ -803,7 +813,7 @@ function auditDetails(raw: string | null): string[] {
 }
 
 export default function AdminOrderDetail() {
-  const { order, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline } =
+  const { order, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline, progress } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -932,6 +942,26 @@ export default function AdminOrderDetail() {
           Pack order
         </Link>
       </p>
+
+      {/*
+        THE PROGRESSION, above everything else on the page, because "where has
+        this got to" is the question an operator arrives with. A split order
+        draws one strip per parcel — a single bar would have to pick one of two
+        journeys and be wrong about the other — and an order with nothing booked
+        still draws one strip, from the rate that was chosen.
+      */}
+      {progress.map((entry, index) => (
+        <div style={card} key={entry.shipmentId ?? "order"}>
+          <OrderProgress
+            title={
+              progress.length > 1 && entry.shipmentId
+                ? `Shipment ${index + 1} of ${progress.length}`
+                : "Progress"
+            }
+            stages={entry.stages}
+          />
+        </div>
+      ))}
 
       {actionData?.error ? <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>{actionData.error}</div> : null}
 
@@ -1464,7 +1494,9 @@ export default function AdminOrderDetail() {
       </div>
 
       <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipping quotes</h2>
+        {/* The progression links here for a booking retry, so that a retry
+            reaches the one confirmation panel rather than a second form. */}
+        <h2 id="book-shipment" style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipping quotes</h2>
         {/*
           The environment, not just "configured". A test host and a live one are
           both "real" to `eshipperMode()`, and the difference is the whole of what
@@ -1623,7 +1655,8 @@ export default function AdminOrderDetail() {
       </div>
 
       <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipments &amp; tracking</h2>
+        {/* Where the tracking push is retried from. Same reason as above. */}
+        <h2 id="shipments" style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Shipments &amp; tracking</h2>
         <p style={{ fontSize: "0.75rem", color: "#64748b", marginBottom: "0.25rem" }}>
           Shopify fulfillment order: {order.shopifyFulfillmentOrderId || "not resolved"}
         </p>
@@ -1661,7 +1694,38 @@ export default function AdminOrderDetail() {
         ) : (
           order.shipments.map((s) => (
             <div key={s.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.6rem", marginBottom: "0.5rem", fontSize: "0.8rem" }}>
-              <div><strong>{s.carrier}</strong> {s.serviceName} · {s.status} · {s.trackingNumber || "no tracking"}</div>
+              <div><strong>{s.carrier}</strong> {s.serviceName} · {s.status}</div>
+              {/*
+                THE TRACKING NUMBER, IMMEDIATELY (§2). It is known the moment the
+                label is bought — before packing, before the carrier has the box
+                — and an operator answering a customer's phone call needs it in
+                the first line, not spelled out of a status sentence.
+              */}
+              {s.trackingNumber ? (
+                <div>
+                  Tracking <strong style={{ fontFamily: "ui-monospace, monospace", fontSize: "0.82rem" }}>{s.trackingNumber}</strong>
+                </div>
+              ) : (
+                <div style={{ color: "#64748b" }}>No tracking number recorded yet.</div>
+              )}
+              {/*
+                AND THE FACT THAT SHOPIFY HAS NOT BEEN TOLD YET, said plainly.
+                A booked label is not a collected parcel: the fulfillment is
+                created at the dispatch milestone because that is what marks the
+                items fulfilled, so between the two the order is deliberately
+                half-done and the screen has to say so or it reads as a fault.
+              */}
+              {(() => {
+                // The stage's own words, so this card and the strip above it
+                // cannot say different things about the same parcel.
+                const stage = stageByKey(progress.find((p) => p.shipmentId === s.id)?.stages ?? [], "tracking_sent");
+                if (!stage || stage.state === "done" || s.shopifySyncError) return null;
+                return (
+                  <div style={{ color: stage.state === "unknown" ? "#b45309" : "#92400e", fontWeight: 600, marginTop: "0.1rem" }}>
+                    {stage.detail}
+                  </div>
+                );
+              })()}
               <div style={{ color: "#64748b" }}>
                 {s.originLocation ? `from ${s.originLocation.code}` : "dock not recorded"} · booked cost {s.bookedCost != null ? money(s.bookedCost) : "—"}
                 {s.shopifyFulfillmentId ? ` · Shopify fulfillment ${s.shopifyFulfillmentId}` : ""}
@@ -1669,7 +1733,6 @@ export default function AdminOrderDetail() {
               <div style={{ color: "#64748b" }}>
                 pickup {s.pickupMode ?? "not recorded"}
                 {s.pickupStatus ? ` · ${s.pickupStatus}` : ""}
-                {s.status === "BOOKED" && !s.shopifyFulfillmentId ? " · Shopify push waits for dispatch" : ""}
               </div>
               <div style={{ color: "#94a3b8", fontSize: "0.7rem" }}>
                 packed {s.packedAt ? new Date(s.packedAt).toLocaleDateString() : "—"} · shipped {s.shippedAt ? new Date(s.shippedAt).toLocaleDateString() : "—"} · in transit {s.inTransitAt ? new Date(s.inTransitAt).toLocaleDateString() : "—"} · delivered {s.deliveredAt ? new Date(s.deliveredAt).toLocaleDateString() : "—"}

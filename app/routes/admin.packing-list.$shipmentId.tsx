@@ -1,6 +1,6 @@
 import type { LoaderFunctionArgs } from "react-router";
 import { requirePermission } from "~/utils/adminAuth.server";
-import { packingListFor, renderPackingList } from "~/services/packingList.server";
+import { packingListFor, renderPackingList, renderPackingSlipPdf } from "~/services/packingList.server";
 
 /**
  * The printable packing list for one shipment.
@@ -24,9 +24,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   const list = await packingListFor(String(params.shipmentId));
   if (!list) throw new Response("Shipment not found", { status: 404 });
 
-  // ?download=1 asks the browser to save the file rather than display it. Both
-  // actions are offered on the document itself so the choice is made where the
-  // operator is looking, not somewhere else that has to be remembered.
+  /*
+   * TWO ACTIONS, TWO DOCUMENTS. Download is a real PDF with a .pdf name, because
+   * it is the one that leaves this system and is opened somewhere else. Print is
+   * the page itself, which needs no library and no network to render — the
+   * warehouse's printer is not this server's problem. The content is the same
+   * document either way: both are built from this one `PackingList`.
+   */
   const download = new URL(request.url).searchParams.get("download") === "1";
   /*
    * The ORDER's name, and not the shipment's reference. This string becomes the
@@ -34,15 +38,24 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
    * reason the document itself no longer prints one.
    */
   const safeName = list.orderName.replace(/[^A-Za-z0-9._-]+/g, "-");
+  // Generated from live order data, so it is never cached: an intermediate copy
+  // of a customer's name and address is not something to leave lying around, and
+  // a stale packing list is worse than none.
+  const cacheControl = { "Cache-Control": "no-store" };
+
+  if (download) {
+    const pdf = await renderPackingSlipPdf(list);
+    return new Response(new Uint8Array(pdf), {
+      headers: {
+        "Content-Type": "application/pdf",
+        "Content-Length": String(pdf.byteLength),
+        "Content-Disposition": `attachment; filename="packing-slip-${safeName}.pdf"`,
+        ...cacheControl,
+      },
+    });
+  }
 
   return new Response(renderPackingList(list), {
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      // Generated from live order data, so it is never cached: an intermediate
-      // copy of a customer's name and address is not something to leave lying
-      // around, and a stale packing list is worse than none.
-      "Cache-Control": "no-store",
-      ...(download ? { "Content-Disposition": `attachment; filename="packing-list-${safeName}.html"` } : {}),
-    },
+    headers: { "Content-Type": "text/html; charset=utf-8", ...cacheControl },
   });
 }
