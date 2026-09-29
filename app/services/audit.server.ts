@@ -10,6 +10,8 @@ export const AUDIT_ENTITY = {
   SELLER_PRODUCT: "SellerProduct",
   ORDER: "Order",
   SHIPMENT: "Shipment",
+  RETURN_REQUEST: "ReturnRequest",
+  SHIPPING_CLAIM: "ShippingClaim",
   PAYMENT: "WholesalePayment",
   SETTINGS: "SellerSettings",
   PICKUP_LOCATION: "PickupLocation",

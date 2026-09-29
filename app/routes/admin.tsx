@@ -46,11 +46,14 @@ const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permi
   // under Shipping because it is a work list over orders — the shipping section
   // begins later, at the parcel.
   { href: "/admin/fulfillment", label: "Fulfillment", icon: "F", permission: "orders.view" },
-  { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view" },
+  { href: "/admin/shipping", label: "Shipments", icon: "H", permission: "shipping.view" },
+  { href: "/admin/pickups", label: "Pickups", icon: "K", permission: "shipping.view" },
+  { href: "/admin/returns", label: "Returns", icon: "T", permission: "shipping.view" },
+  { href: "/admin/claims", label: "Claims", icon: "M", permission: "shipping.view" },
   // The docks goods are collected from. It sits next to Shipping rather than
   // under Settings because it is the record a shipping decision is made from:
   // the booking gate reads the address verdict on each of these rows.
-  { href: "/admin/origins", label: "Pickup Locations", icon: "K", permission: "shipping.view" },
+  { href: "/admin/origins", label: "Pickup Locations", icon: "L", permission: "shipping.view" },
   { href: "/admin/users", label: "Users", icon: "U", permission: "users.view" },
   // Settings has no permission gate: every signed-in user needs it to change
   // their own password. The sections inside it are gated individually.
