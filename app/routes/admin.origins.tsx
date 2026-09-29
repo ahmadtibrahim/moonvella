@@ -52,6 +52,7 @@ import type { PickedAddress } from "~/utils/placesAddress";
 // The address verdict panel, shared with the booking screens rather than redrawn
 // here. See the note where it is rendered.
 import { AddressGateCard } from "~/components/AddressGateCard";
+import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 import {
   INK,
   MUTED,
@@ -701,6 +702,7 @@ export default function AdminOrigins() {
 
   return (
     <div style={{ padding: "2rem", maxWidth: 1100 }}>
+      <ShippingOperationsNav />
       <h1 style={{ fontSize: "1.4rem", color: INK, marginBottom: "0.35rem" }}>Pickup locations</h1>
       <p style={{ ...sectionNote, maxWidth: 800 }}>
         Each dock, warehouse or supplier counter that goods are collected from. Products and

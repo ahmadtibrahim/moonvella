@@ -19,6 +19,7 @@ import {
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
+import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 
 /**
  * Every state a shipment can be in, in the order an operator meets them.
@@ -466,7 +467,8 @@ export default function AdminShipping() {
 
   return (
     <div style={{ maxWidth: 1400, margin: "0 auto" }}>
-      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>Shipping</h1>
+      <ShippingOperationsNav />
+      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>Shipments</h1>
       <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1rem" }}>
         One row per shipment, so a split order shows each parcel. Parsing, quoting and booking begin from a parcel.
       </p>

@@ -38,6 +38,7 @@ import { orderProgress } from "~/services/orderProgress.server";
 import type { ProgressStage } from "~/services/orderProgress.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
 import { BookingConfirmation } from "~/components/BookingConfirmation";
+import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 import type { BookingEnvironment } from "~/components/BookingConfirmation";
 import { OrderProgress, stageByKey } from "~/components/OrderProgress";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
@@ -73,6 +74,11 @@ import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
 import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
 import { MAX_PROPOSAL_SCAN } from "~/services/holidays";
+import {
+  createReturnRequest,
+  createShippingClaim,
+} from "~/services/shippingOperations.server";
+import type { ReturnShippingPayer, ShippingClaimType } from "@prisma/client";
 
 const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
   "packed",
@@ -210,6 +216,9 @@ const PICKUP_MODE_LABEL: Record<string, string> = {
   DROPOFF: "Drop-off at the carrier",
 };
 
+const RETURN_PAYERS: ReturnShippingPayer[] = ["UNDECIDED", "MOONVELLA", "SELLER", "CUSTOMER", "CARRIER"];
+const CLAIM_TYPES: ShippingClaimType[] = ["LOST", "DAMAGED", "SHORTAGE", "DELIVERY_ISSUE", "OTHER"];
+
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const user = await requirePermission(request, "shipping.view");
   const shipmentId = String(params.shipmentId);
@@ -218,6 +227,11 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     include: {
       items: { include: { orderItem: true } },
       trackingEvents: { orderBy: { eventAt: "desc" }, take: 50 },
+      returnRequests: {
+        orderBy: { createdAt: "desc" },
+        include: { items: { include: { orderItem: true } } },
+      },
+      shippingClaims: { orderBy: { createdAt: "desc" } },
       // The dock, for the Ship from card. The shipment's own snapshot is read
       // from a scalar column; this is the fallback for a parcel that has not
       // been quoted or booked yet.
@@ -448,6 +462,8 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
      * and costs nothing — so only the purchase is drawn as closed.
      */
     returnPurchasing: { enabled: RETURN_PURCHASING_ENABLED, reason: RETURN_PURCHASING_DISABLED_REASON },
+    returnRequests: shipment.returnRequests,
+    shippingClaims: shipment.shippingClaims,
     pickupPlan,
     /*
      * Both addresses this booking will print, with their verdicts, read here
@@ -665,6 +681,25 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await advanceShipment(shipmentId, event as ShipmentAdvanceEvent, actor, {
         notifyCustomer: form.get("notifyCustomer") === "on",
       });
+    } else if (intent === "create_return_request") {
+      const returnItems: { orderItemId: string; quantity: number }[] = [];
+      for (const [key, value] of form.entries()) {
+        if (!key.startsWith("ret_")) continue;
+        const quantity = Number(value);
+        if (Number.isInteger(quantity) && quantity > 0) returnItems.push({ orderItemId: key.slice(4), quantity });
+      }
+      const payer = String(form.get("shippingPayer") || "UNDECIDED") as ReturnShippingPayer;
+      if (!RETURN_PAYERS.includes(payer)) throw new Error("Choose who is expected to pay return shipping.");
+      await createReturnRequest({ shipmentId, reason: String(form.get("reason") || ""), notes: String(form.get("notes") || ""), shippingPayer: payer, items: returnItems }, actor);
+      return redirect(`${back}?notice=return-opened#return`);
+    } else if (intent === "create_claim") {
+      const type = String(form.get("claimType") || "") as ShippingClaimType;
+      if (!CLAIM_TYPES.includes(type)) throw new Error("Choose a claim type.");
+      const amountText = String(form.get("amount") || "").trim();
+      const amount = amountText ? Math.round(Number(amountText) * 100) : null;
+      if (amountText && !Number.isFinite(amount)) throw new Error("Claim amount must be a number.");
+      await createShippingClaim({ shipmentId, type, description: String(form.get("description") || ""), amount, currency: String(form.get("currency") || "CAD"), evidenceNotes: String(form.get("evidenceNotes") || "") }, actor);
+      return redirect(`${back}?notice=claim-opened#claim`);
     } else if (intent === "return_quotes") {
       await getReturnQuotesForOrder(orderId, actor);
     } else if (intent === "book_return") {
@@ -1038,7 +1073,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, isOwner, progress } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1063,6 +1098,7 @@ export default function AdminShipmentDetail() {
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+      <ShippingOperationsNav />
       <p style={{ fontSize: "0.75rem", marginBottom: "0.5rem" }}>
         <Link to="/admin/shipping" style={{ color: "#082a4a" }}>&larr; All shipments</Link>
       </p>
@@ -1587,7 +1623,7 @@ export default function AdminShipmentDetail() {
         )}
       </div>
 
-      <div style={card}>
+      <div id="pickup" style={card}>
         <h2 style={h2}>Pickup</h2>
         {/*
           The current pickup state, stated before the form that changes it. "A
@@ -1742,11 +1778,42 @@ export default function AdminShipmentDetail() {
       </div>
 
       {!shipment.returnOfShipmentId ? (
-        <div style={card}>
-          <h2 style={h2}>Return</h2>
+        <div id="return" style={card}>
+          <h2 style={h2}>Return authorization</h2>
           <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
-            A return is a new shipment linked to this one. It does not refund, restock, mark received, or charge the seller.
+            Open and approve the RMA first. This record does not buy a label, refund, restock, mark received, or update Shopify.
           </p>
+          {returnRequests.length > 0 ? (
+            <div style={{ display: "grid", gap: "0.4rem", marginBottom: "0.75rem" }}>
+              {returnRequests.map((request) => (
+                <div key={request.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.55rem", fontSize: "0.73rem" }}>
+                  <strong>{request.rmaNumber}</strong> · {request.status.replaceAll("_", " ")} · payer {request.shippingPayer.replaceAll("_", " ")}
+                  <br /><span style={{ color: "#64748b" }}>{request.items.map((line) => `${line.quantity} × ${line.orderItem.sku}`).join(" · ")} · {request.reason}</span>
+                </div>
+              ))}
+              <Link to="/admin/returns" style={{ fontSize: "0.72rem", color: "#0369a1" }}>Manage return statuses</Link>
+            </div>
+          ) : null}
+          <Form method="post" style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.65rem", marginBottom: "0.8rem" }}>
+            <input type="hidden" name="intent" value="create_return_request" />
+            <div style={{ marginBottom: "0.5rem" }}>
+              <span style={{ ...label, marginBottom: "0.3rem" }}>Items requested</span>
+              {items.map((item) => (
+                <label key={item.id} style={{ fontSize: "0.72rem", display: "block", marginBottom: "0.2rem" }}>
+                  <input type="number" name={`ret_${item.id}`} min={0} max={item.inThisShipment || item.ordered} defaultValue={0} style={{ ...input, width: 60, marginRight: "0.4rem" }} />
+                  {item.name} ({item.sku})
+                </label>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
+              <label style={label}>Reason<br /><input name="reason" style={{ ...input, width: 260 }} required /></label>
+              <label style={label}>Expected return-shipping payer<br /><select name="shippingPayer" defaultValue="UNDECIDED" style={input}>{RETURN_PAYERS.map((payer) => <option key={payer}>{payer}</option>)}</select></label>
+              <label style={label}>Internal notes<br /><input name="notes" style={{ ...input, width: 260 }} /></label>
+              <button type="submit" style={btn("#082a4a")}>Open return request</button>
+            </div>
+          </Form>
+          <h3 style={{ fontSize: "0.85rem", color: "#082a4a", margin: "0 0 0.35rem" }}>Return shipping rates</h3>
+          <p style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: "0.5rem" }}>Rate shopping is read-only. Label purchase remains disabled until the provider return contract is proven.</p>
           <Form method="post" style={{ marginBottom: "0.6rem" }}>
             <button type="submit" name="intent" value="return_quotes" style={btn("#0369a1")}>Get return rates</button>
           </Form>
@@ -1796,6 +1863,24 @@ export default function AdminShipmentDetail() {
           ) : null}
         </div>
       ) : null}
+
+      <div id="claim" style={card}>
+        <h2 style={h2}>Carrier claim</h2>
+        <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.6rem" }}>
+          Open an internal case for loss, damage, shortage, or a delivery problem. MoonVella does not tell the carrier it was submitted until you record the carrier&apos;s claim number.
+        </p>
+        {shippingClaims.length > 0 ? <div style={{ display: "grid", gap: "0.4rem", marginBottom: "0.75rem" }}>{shippingClaims.map((claim) => <div key={claim.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.55rem", fontSize: "0.73rem" }}><strong>{claim.claimNumber}</strong> · {claim.type.replaceAll("_", " ")} · {claim.status.replaceAll("_", " ")}{claim.carrierClaimNumber ? ` · carrier ${claim.carrierClaimNumber}` : ""}<br /><span style={{ color: "#64748b" }}>{claim.description}</span></div>)}<Link to="/admin/claims" style={{ fontSize: "0.72rem", color: "#0369a1" }}>Manage claim statuses</Link></div> : null}
+        <Form method="post" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.5rem", alignItems: "end" }}>
+          <input type="hidden" name="intent" value="create_claim" />
+          <label style={label}>Problem<br /><select name="claimType" style={{ ...input, width: "100%" }}>{CLAIM_TYPES.map((type) => <option key={type}>{type.replaceAll("_", " ")}</option>)}</select></label>
+          <label style={label}>Requested amount (optional)<br /><input name="amount" type="number" min="0" step="0.01" style={{ ...input, width: "100%" }} /></label>
+          <label style={label}>Currency<br /><input name="currency" defaultValue={order.currency} maxLength={3} style={{ ...input, width: "100%" }} /></label>
+          <label style={{ ...label, gridColumn: "1 / -1" }}>What happened<br /><textarea name="description" required rows={3} style={{ ...input, width: "100%", resize: "vertical" }} /></label>
+          <label style={{ ...label, gridColumn: "1 / -1" }}>Evidence checklist / links (internal)<br /><textarea name="evidenceNotes" rows={2} style={{ ...input, width: "100%", resize: "vertical" }} /></label>
+          <button type="submit" style={btn("#082a4a")} disabled={!shipment.providerShipmentId}>Open claim draft</button>
+          {!shipment.providerShipmentId ? <span style={{ fontSize: "0.68rem", color: "#b45309" }}>A claim needs a booked provider shipment.</span> : null}
+        </Form>
+      </div>
 
       <div style={card}>
         <h2 style={h2}>Carrier billing and reconciliation</h2>
