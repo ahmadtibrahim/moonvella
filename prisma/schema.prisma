@@ -925,6 +925,7 @@ model Order {
   fulfillmentRequest        FulfillmentRequest?
   shippingQuotes            ShippingQuote[]
   packages                  OrderPackage[]
+  returnRequests            ReturnRequest[]
   stateTransitions          OrderStateTransition[]
   /// When the order's quotes stopped describing it, and why.
   ///
@@ -1066,6 +1067,7 @@ model OrderItem {
   createdAt          DateTime        @default(now())
   refundItems        RefundItem[]
   shipmentItems      ShipmentItem[]
+  returnRequestItems ReturnRequestItem[]
 
   @@unique([orderId, shopifyLineItemId])
 
@@ -1346,6 +1348,8 @@ model Shipment {
   packages                OrderPackage[]          @relation("ShipmentPackages")
   items                   ShipmentItem[]
   trackingEvents          ShipmentTrackingEvent[]
+  returnRequests          ReturnRequest[]          @relation("OriginalShipmentReturns")
+  shippingClaims          ShippingClaim[]
   createdAt               DateTime                @default(now())
   updatedAt               DateTime                @updatedAt
 
@@ -1355,6 +1359,126 @@ model Shipment {
   @@index([returnOfShipmentId])
   @@index([originLocationId])
 }
+
+/// A manual authorization to bring goods back from a customer.
+///
+/// This is deliberately separate from Shipment. Approving a return does not
+/// buy a label, refund money, restock inventory, or tell Shopify anything. An
+/// operator must advance each of those actions explicitly after checking the
+/// goods and the seller's instructions.
+model ReturnRequest {
+  id                 String              @id @default(cuid())
+  rmaNumber          String              @unique
+  orderId            String
+  order              Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  originalShipmentId String
+  originalShipment   Shipment            @relation("OriginalShipmentReturns", fields: [originalShipmentId], references: [id], onDelete: Cascade)
+  returnShipmentId   String?             @unique
+  status             ReturnRequestStatus @default(REQUESTED)
+  reason             String
+  notes              String?
+  shippingPayer      ReturnShippingPayer @default(UNDECIDED)
+  approvedAt         DateTime?
+  receivedAt         DateTime?
+  resolvedAt         DateTime?
+  createdById        String
+  createdByName      String?
+  items              ReturnRequestItem[]
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  @@index([orderId, createdAt])
+  @@index([originalShipmentId])
+  @@index([status, createdAt])
+}
+
+model ReturnRequestItem {
+  id              String        @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest @relation(fields: [returnRequestId], references: [id], onDelete: Cascade)
+  orderItemId     String
+  orderItem       OrderItem     @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  quantity        Int
+  condition       String?
+  resolution      String?
+  createdAt       DateTime      @default(now())
+
+  @@unique([returnRequestId, orderItemId])
+  @@index([orderItemId])
+}
+
+enum ReturnRequestStatus {
+  REQUESTED
+  UNDER_REVIEW
+  APPROVED
+  LABEL_PENDING
+  IN_TRANSIT
+  RECEIVED
+  INSPECTED
+  RESOLVED
+  REJECTED
+  CANCELLED
+}
+
+enum ReturnShippingPayer {
+  UNDECIDED
+  MOONVELLA
+  SELLER
+  CUSTOMER
+  CARRIER
+}
+
+/// MoonVella's case file for a carrier problem.
+///
+/// Provider submission is intentionally not automatic. The carrier claim id
+/// is recorded only after an operator submits through the provider-supported
+/// channel, so an internal DRAFT can never be mistaken for a filed claim.
+model ShippingClaim {
+  id                 String              @id @default(cuid())
+  claimNumber        String              @unique
+  shipmentId         String
+  shipment           Shipment            @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  type               ShippingClaimType
+  status             ShippingClaimStatus @default(DRAFT)
+  description        String
+  amount             Int?
+  currency           String              @default("CAD")
+  carrierClaimNumber String?
+  evidenceNotes      String?
+  resolutionNotes    String?
+  submittedAt        DateTime?
+  resolvedAt         DateTime?
+  paidAt             DateTime?
+  createdById        String
+  createdByName      String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  @@index([shipmentId, createdAt])
+  @@index([status, createdAt])
+}
+
+enum ShippingClaimType {
+  LOST
+  DAMAGED
+  SHORTAGE
+  DELIVERY_ISSUE
+  OTHER
+}
+
+enum ShippingClaimStatus {
+  DRAFT
+  EVIDENCE_REQUIRED
+  READY_TO_SUBMIT
+  SUBMITTED
+  CARRIER_REVIEW
+  APPROVED
+  DENIED
+  PAID
+  CLOSED
+  CANCELLED
+}
+
 
 /// Every raw carrier event a provider returns, stored append-only so the UI can
 /// show provider detail while still normalizing into a friendly status. Events
