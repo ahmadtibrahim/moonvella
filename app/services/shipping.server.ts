@@ -19,6 +19,8 @@ import {
   getReturn,
   getShipment,
   isProviderTimeout,
+  RETURN_PURCHASING_ENABLED,
+  RETURN_PURCHASING_DISABLED_REASON,
   schedulePickup,
   cancelPickup,
   type RateRequest,
@@ -157,7 +159,11 @@ function configuredReturnAddress() {
  * building had "Unit 7A" on their order and no unit on their label, silently,
  * which is the same defect as a country name sent where a code belongs.
  */
-function deliveryAddressFor(order: { shippingAddress: string | null }): RateRequest["shipTo"] {
+function deliveryAddressFor(order: {
+  shippingAddress: string | null;
+  customerPhone?: string | null;
+  customerEmail?: string | null;
+}): RateRequest["shipTo"] {
   const to = parseAddress(order.shippingAddress);
   const street = [to.address1 || to.address, to.address2].map((part) => part?.trim()).filter(Boolean);
   return {
@@ -168,12 +174,83 @@ function deliveryAddressFor(order: { shippingAddress: string | null }): RateRequ
     postalCode: to.zip || to.postalCode || "",
     country: to.countryCode || to.country || "",
     residential: to.residential === undefined ? true : to.residential !== "false",
-    // Only when the stored address carries them: a destination that has no
-    // phone number is still a destination, and inventing one puts a wrong
-    // number on a label.
-    phone: to.phone || to.phoneNumber || null,
-    email: to.email || null,
+    /*
+     * The phone is taken from wherever it genuinely exists, and from nowhere
+     * else. Two places hold one and neither is authoritative over the other:
+     * the address block the store captured, and the order's own `customerPhone`
+     * (which is what Shopify's order payload fills). Reading only the address
+     * dropped a number the order actually had, which made a bookable shipment
+     * look unbookable.
+     *
+     * There is no third source and no default. A placeholder — "0000000000",
+     * the dock's number, the store's number — would put a stranger's phone on a
+     * carrier label and a customer's delivery notice. Absent means absent, and
+     * `assertRecipientPhoneReady` refuses the booking and says so.
+     */
+    phone: recipientPhoneFor(order),
+    email: to.email || order.customerEmail || null,
   };
+}
+
+/**
+ * The recipient's phone number, or null. Never a substitute.
+ *
+ * Trimmed, and a value that is only whitespace counts as absent — a field of
+ * spaces is not a phone number, and passing it through would satisfy the
+ * carrier's "required" check on the way to printing a label with no number on
+ * it.
+ *
+ * Exported because the order page has to answer the same question: a page that
+ * read the address blob itself would miss a number recorded in `customerPhone`
+ * and tell an operator a booking was impossible while the booking path was
+ * perfectly happy with it — two answers to one question, disagreeing.
+ */
+export function recipientPhoneFor(order: {
+  shippingAddress: string | null;
+  customerPhone?: string | null;
+}): string | null {
+  const to = parseAddress(order.shippingAddress);
+  const candidates = [to.phone, to.phoneNumber, order.customerPhone];
+  for (const candidate of candidates) {
+    const trimmed = (candidate ?? "").trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+/**
+ * Refuse a booking whose recipient has no phone number.
+ *
+ * WHY THIS IS A PREREQUISITE AND NOT A PROVIDER ERROR. The rate call does not
+ * need a phone — a quote for #1002 priced fine without one. The SAVE call does:
+ * `PUT /api/v2/quote` validates against `ShipToAddress`, whose required list is
+ * `[address1, attention, city, company, country, email, phone, zip]`, and it
+ * refuses the whole booking with a `fieldErrors` entry naming `phone`.
+ *
+ * Left to the provider, that arrives as an HTTP 400 after the operator has
+ * already confirmed a purchase — the worst possible moment to learn a field is
+ * missing. Checked here, it is a stated prerequisite with a place to fix it, and
+ * the operator never reaches the confirmation at all.
+ *
+ * Deliberately NOT part of `carrierAddressProblems`: that function decides what
+ * a carrier needs to PRINT a label, and a phone is not required to print one.
+ * This decides what eShipper's SAVE endpoint will accept, which is a different
+ * question with a different answer, and conflating them would misstate both.
+ */
+function assertRecipientPhoneReady(order: {
+  shippingAddress: string | null;
+  customerPhone?: string | null;
+  shopifyOrderName?: string | null;
+}): void {
+  if (recipientPhoneFor(order)) return;
+  throw new Error(
+    `A delivery phone number is required before this shipment can be booked, and ${
+      order.shopifyOrderName ?? "this order"
+    } has none. ` +
+      `eShipper's save step rejects a booking whose recipient address has no phone, so nothing was purchased and nothing was sent. ` +
+      `Record the customer's own number on the order, then book. ` +
+      `Do not use the dock's number or a placeholder — the carrier puts this number on the label and uses it for delivery.`
+  );
 }
 
 /**
@@ -195,7 +272,15 @@ function deliveryAddressFor(order: { shippingAddress: string | null }): RateRequ
  * the provider is claimed, so a refusal never leaves a shipment that looks like
  * a call is out.
  */
-function assertCarrierAddressesReady(from: CarrierShipFrom, order: { shippingAddress: string | null }) {
+function assertCarrierAddressesReady(
+  from: CarrierShipFrom,
+  order: { shippingAddress: string | null; customerPhone?: string | null; shopifyOrderName?: string | null }
+) {
+  // First, because its refusal is the one with a fix the operator may not know
+  // about, and because a provider 400 naming `phone` is unreadable next to a
+  // sentence that says which number is missing and where to put it.
+  assertRecipientPhoneReady(order);
+
   const problems = [
     ...carrierAddressProblems(from, "pickup"),
     ...carrierAddressProblems(deliveryAddressFor(order), "delivery"),
@@ -843,7 +928,7 @@ const BOOKING_ERROR = "Booking failed after payment";
  */
 export async function bookShipmentForOrder(
   orderId: string,
-  opts: { quoteId?: string; quantities?: Record<string, number> },
+  opts: { quoteId?: string; quantities?: Record<string, number>; notifyCustomerOnPush?: boolean },
   actor: Actor
 ) {
   const order = await prisma.order.findUnique({
@@ -999,7 +1084,9 @@ export async function bookShipmentForOrder(
     throw new Error("Could not create shipment booking record.");
   }
 
-  return finalizeBooking(shipment.id, orderId, quote, actor);
+  return finalizeBooking(shipment.id, orderId, quote, actor, {
+    notifyCustomerOnPush: opts.notifyCustomerOnPush,
+  });
 }
 
 /**
@@ -1007,7 +1094,21 @@ export async function bookShipmentForOrder(
  * rules as bookShipmentForOrder, but the parcel was already prepared and its
  * allocations already decided, so nothing is re-derived.
  */
-export async function bookPreparedShipment(shipmentId: string, quoteId: string | undefined, actor: Actor) {
+/**
+ * Book a prepared shipment.
+ *
+ * `opts.notifyCustomerOnPush` is the answer given on the booking confirmation
+ * screen to "will Shopify notify the customer". It is STORED, not acted on: the
+ * push happens at dispatch, and this is the choice it will use as its default
+ * unless whoever dispatches says otherwise. Omitted means "no answer given",
+ * which is not the same as "no" and does not overwrite a stored answer.
+ */
+export async function bookPreparedShipment(
+  shipmentId: string,
+  quoteId: string | undefined,
+  actor: Actor,
+  opts?: { notifyCustomerOnPush?: boolean }
+) {
   const shipment = await prisma.shipment.findUnique({
     where: { id: shipmentId },
     include: { order: { include: { items: true, packages: true } }, items: true },
@@ -1091,7 +1192,9 @@ export async function bookPreparedShipment(shipmentId: string, quoteId: string |
     },
   });
 
-  return finalizeBooking(shipmentId, order.id, quote, actor);
+  return finalizeBooking(shipmentId, order.id, quote, actor, {
+    notifyCustomerOnPush: opts?.notifyCustomerOnPush,
+  });
 }
 
 async function finalizeBooking(
@@ -1107,7 +1210,15 @@ async function finalizeBooking(
     /** The provider's own quote object, replayed verbatim into the booking save. */
     raw: string | null;
   },
-  actor: Actor
+  actor: Actor,
+  /**
+   * Carried through from whoever asked for the booking, and written below only
+   * when it was actually said. Both entry points — booking an order's remaining
+   * lines and booking a prepared parcel — reach the provider through here, so
+   * the answer given on the confirmation screen has exactly one place to land
+   * and no path can quietly drop it.
+   */
+  opts?: { notifyCustomerOnPush?: boolean }
 ) {
   const shipment = await prisma.shipment.findUniqueOrThrow({
     where: { id: shipmentId },
@@ -1241,6 +1352,15 @@ async function finalizeBooking(
         // the page stops reporting a problem that is no longer true.
         lastBookingError: null,
         bookingOutcomeUnknownAt: null,
+        /*
+         * What the operator chose on the confirmation screen, kept until the
+         * push actually happens. Written ONLY when the caller said something:
+         * an unspecified choice leaves the column alone, so a caller that has no
+         * opinion cannot silently reset a decision somebody made.
+         */
+        ...(opts?.notifyCustomerOnPush === undefined
+          ? {}
+          : { notifyCustomerOnPush: opts.notifyCustomerOnPush }),
       },
     });
 
@@ -1653,7 +1773,18 @@ export async function syncShipmentTracking(
     return { pushed: false, reason: "orphan_lines", message };
   }
 
-  const notifyCustomer = Boolean(opts?.notifyCustomer) && !shipment.shopifyNotifiedAt;
+  /*
+   * The choice made on the booking confirmation screen, unless the caller is
+   * saying something else right now. The two are the same rule as
+   * `advanceShipment` and `addManualShipment`: the question is asked once, where
+   * the operator is looking at what they are buying, and a later caller that has
+   * no opinion does not silently overturn it.
+   *
+   * `shopifyNotifiedAt` still wins over both. Shopify sends the e-mail on the
+   * call, and an operator who retries a push must not write to the customer a
+   * second time.
+   */
+  const notifyCustomer = (opts?.notifyCustomer ?? shipment.notifyCustomerOnPush) && !shipment.shopifyNotifiedAt;
 
   try {
     const admin =
@@ -1715,7 +1846,16 @@ export async function syncShipmentTracking(
           fulfillment: {
             lineItemsByFulfillmentOrder: [
               {
-                fulfillmentOrderId: shipment.order.shopifyFulfillmentOrderId,
+                /*
+                 * THE GROUP'S OWN ID, not the order's stored one. The lines above
+                 * were chosen from `group`, and naming a different fulfillment
+                 * order here is how a parcel fulfills something it was not
+                 * matched against: the fallback to `groups[0]` exists precisely
+                 * for the case where the stored id matched nothing, so sending
+                 * the stored id would mean the quantities and the destination
+                 * came from two different objects.
+                 */
+                fulfillmentOrderId: group.fulfillmentOrderId,
                 fulfillmentOrderLineItems: match.lines,
               },
             ],
@@ -2352,6 +2492,55 @@ export async function getReturnQuotesForOrder(orderId: string, actor: Actor) {
 }
 
 /**
+ * Record the recipient's own phone number on an order, so it can be booked.
+ *
+ * EXISTS BECAUSE THE PREREQUISITE WOULD OTHERWISE BE A DEAD END. Booking is
+ * refused when the recipient has no phone (see `assertRecipientPhoneReady`), and
+ * the number has to come from the customer — so there must be somewhere an
+ * operator can put it without a developer. This is that place.
+ *
+ * It writes `customerPhone`, which `recipientPhoneFor` already reads, and it is
+ * audited because it is customer contact data being entered by hand: who typed
+ * it, and what it replaced, is exactly what someone will need to know if a
+ * carrier calls the wrong person.
+ *
+ * `previous` is recorded in the audit rather than silently overwritten. The
+ * number is NOT validated for correctness beyond containing digits — this app
+ * cannot know a number is reachable, and a stricter rule would reject valid
+ * international formats to catch a typo it cannot actually detect.
+ */
+export async function recordRecipientPhone(orderId: string, phone: string, actor: Actor) {
+  const trimmed = phone.trim();
+  const digits = trimmed.replace(/\D/g, "");
+  if (digits.length < 7) {
+    throw new Error(
+      "That does not look like a phone number — a deliverable number needs at least 7 digits. " +
+        "Enter the customer's own number as they gave it, including the country code if it is not Canadian."
+    );
+  }
+
+  const order = await prisma.order.findUnique({ where: { id: orderId } });
+  if (!order) throw new Error("Order not found.");
+
+  const updated = await prisma.order.update({ where: { id: orderId }, data: { customerPhone: trimmed } });
+
+  await recordAudit({
+    actorType: actor.actorType ?? "ADMIN_USER",
+    actorId: actor.actorId,
+    actorName: actor.actorName,
+    action: "order.recipient_phone_recorded",
+    entityType: AUDIT_ENTITY.ORDER,
+    entityId: orderId,
+    beforeData: { customerPhone: order.customerPhone },
+    afterData: { customerPhone: trimmed },
+    ipAddress: actor.ipAddress,
+    userAgent: actor.userAgent,
+  });
+
+  return updated;
+}
+
+/**
  * Create a return as its OWN shipment linked to the original. Returns are not
  * refunds: this creates a label and tracking and stops there. Nothing is
  * refunded, restocked, marked received, or charged to the seller.
@@ -2366,6 +2555,14 @@ export async function bookReturnForOrder(
   },
   actor: Actor
 ): Promise<ReturnBookingResult> {
+  /*
+   * Refused before anything is read or created. The adapter refuses this too, on
+   * the principle that a gate belongs where the purchase happens — but the
+   * operator should be told before they have filled in a form, not after, so
+   * the same condition is stated here in the same words.
+   */
+  if (!RETURN_PURCHASING_ENABLED) throw new Error(RETURN_PURCHASING_DISABLED_REASON);
+
   const order = await prisma.order.findUnique({
     where: { id: orderId },
     include: { items: true, packages: true },
@@ -2392,40 +2589,99 @@ export async function bookReturnForOrder(
     packages: order.packages,
   });
 
-  const returnItems = opts.returnItems
-    .map((ri) => {
-      const item = order.items.find((i) => i.id === ri.orderItemId);
-      return { sku: item?.sku ?? "", quantity: ri.quantity };
-    })
-    .filter((i) => i.sku);
+  /*
+   * The lines being returned, RESOLVED RATHER THAN FILTERED.
+   *
+   * This used to map each selection to a SKU and then quietly drop the ones it
+   * could not resolve, so a return naming a line that is not on the order — or
+   * naming a quantity of zero — produced a label and a shipment for fewer items
+   * than the operator selected, with nothing anywhere saying so. It is the same
+   * silent omission the parcel resolution refuses to make: a return that does
+   * not itemise what is coming back is a return nobody can check.
+   *
+   * The provider is not told any of this (see the note on `bookReturn`); it is
+   * our own record, and it is written to ShipmentItem below.
+   */
+  const returnItems = opts.returnItems.map((ri) => {
+    const item = order.items.find((i) => i.id === ri.orderItemId);
+    if (!item) {
+      throw new Error(
+        "A selected return line is not on this order, so the return cannot be created. Reload the page and select again."
+      );
+    }
+    if (!Number.isFinite(ri.quantity) || ri.quantity <= 0) {
+      throw new Error(`Select a quantity of at least 1 to return for ${item.sku || item.name}.`);
+    }
+    if (ri.quantity > item.quantity) {
+      throw new Error(
+        `Cannot return ${ri.quantity} of ${item.sku || item.name}: the order only has ${item.quantity}.`
+      );
+    }
+    return { orderItemId: item.id, sku: item.sku, quantity: ri.quantity };
+  });
+  if (returnItems.length === 0) {
+    throw new Error("Select at least one item to return.");
+  }
 
+  /*
+   * The return is booked by the documented save-then-create pair, which needs
+   * the same two things an outbound booking does: the rate ENVELOPE's uuid and
+   * the provider's own quote object. Both are on the stored quote row.
+   *
+   * `returnItems` is deliberately NOT passed to the provider. It has no place in
+   * the API — no schema in the spec names it — and sending it is what the old
+   * implementation did, where Jackson dropped it silently. What is being
+   * returned is our record, written to ShipmentItem below.
+   */
   const booking = await bookReturn({
-    quote: { carrier: quote.carrier, serviceCode: quote.serviceCode, serviceName: quote.serviceName },
+    quote: {
+      carrier: quote.carrier,
+      serviceCode: quote.serviceCode,
+      serviceName: quote.serviceName,
+      providerQuoteId: quote.providerQuoteId,
+      raw: quote.raw ? (JSON.parse(quote.raw) as unknown) : undefined,
+    },
     rateRequest: buildRateRequest(order, built.packages, configuredReturnAddress()),
-    returnItems,
-    returnAddress: configuredReturnAddress(),
   });
 
+  /*
+   * BOOKED, not PENDING — the provider has answered and the label exists, which
+   * is the same fact the outbound path records with the same word.
+   *
+   * The provider's own id is kept for the same reason: every follow-up call is
+   * keyed on it (`GET /api/v2/returns/{orderId}`, tracking, cancellation). This
+   * row used to be written without one, so a return label the account had
+   * genuinely bought was a record nothing could look up, track or cancel — it
+   * read as an unbooked parcel carrying a label. `providerQuoteId` keeps the
+   * SAVED quote id, which is the only handle that exists if a later call has to
+   * reconcile what was created.
+   */
   const shipment = await prisma.shipment.create({
     data: {
       orderId,
-      status: "PENDING",
+      status: "BOOKED",
       provider: "eshipper",
+      providerShipmentId: booking.providerReturnId || null,
+      providerQuoteId: booking.savedQuoteId == null ? quote.providerQuoteId : String(booking.savedQuoteId),
       carrier: booking.carrier,
       serviceCode: quote.serviceCode,
       serviceName: booking.serviceName,
-      trackingNumber: booking.trackingNumber,
+      trackingNumber: booking.trackingNumber || null,
       trackingUrl: booking.trackingUrl,
       labelUrl: booking.labelUrl,
-      labelDocumentFormat: booking.labelUrl ? "PDF" : null,
-      bookedCost: booking.bookedCost,
+      // The provider's own word for the document's format, not an assumption
+      // that everything is a PDF.
+      labelDocumentFormat: booking.label ? booking.label.type : null,
+      bookedCost: booking.bookedCost || quote.totalAmount,
       quotedCarrierCost: quote.totalAmount,
       packageCount: 1,
       trackingStatus: TRACKING_STATE.label_created,
       labelCreatedAt: new Date(),
+      bookingAttemptedAt: new Date(),
+      billingStatus: "PENDING",
       returnOfShipmentId: originalShipmentId,
       returnReason: opts.reason,
-      items: { create: opts.returnItems.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
+      items: { create: returnItems.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
     },
   });
 

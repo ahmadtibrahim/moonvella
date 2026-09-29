@@ -25,6 +25,8 @@ import {
   bookShipmentForOrder,
   voidShipment,
   syncShipmentTracking,
+  recipientPhoneFor,
+  recordRecipientPhone,
 } from "~/services/shipping.server";
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
@@ -52,7 +54,10 @@ import {
   validateAddress,
 } from "~/services/addressValidation.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
+import { BookingConfirmation } from "~/components/BookingConfirmation";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
+import { getUnitsPreference } from "~/services/adminPreferences.server";
+import { unitsView } from "~/utils/measurementUnits";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   const user = await requirePermission(request, "orders.view");
@@ -204,6 +209,19 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       skus: [...new Set(group.lines.map((line) => line.sku))],
       locationId: group.location?.id ?? null,
       addressGate: group.location ? await addressStatus("PICKUP", group.location.id) : null,
+      /*
+       * The dock's address, as the confirmation screen prints it. Carried here
+       * rather than looked up again there so the panel and the card above it
+       * name the same place — this is the address the label will carry.
+       */
+      pickupAddress: group.location
+        ? ([
+            [group.location.street1, group.location.street2].filter(Boolean).join(", "),
+            [group.location.city, group.location.province, group.location.postalCode].filter(Boolean).join(", "),
+            group.location.country,
+            [group.location.contactName, group.location.contactPhone].filter(Boolean).join(" · "),
+          ].filter(Boolean) as string[])
+        : [],
     }))
   );
 
@@ -291,6 +309,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
 
   return {
     order,
+    /*
+     * THE NUMBER THE LABEL WILL CARRY, or null. Read through the same function
+     * the booking gate uses, so the card below and the refusal agree: it is the
+     * address's own phone, or the one recorded on the order, and never a
+     * substitute for either.
+     */
+    recipientPhone: recipientPhoneFor(order),
     collection: {
       split: grouping.split,
       blockers: grouping.blockers,
@@ -298,6 +323,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       deliveryGate: await addressStatus("DELIVERY", order.id),
     },
     parcels,
+    /*
+     * The admin's unit preference, read for the same reason the shipment page
+     * reads it: the stored parcel columns are centimetres and kilograms and do
+     * not move, and a confirmation that showed an operator working in inches a
+     * box measured in centimetres would be showing them a parcel they did not
+     * pack.
+     */
+    units: unitsView(await getUnitsPreference()),
     mode,
     shopifyFulfillment,
     /*
@@ -557,7 +590,31 @@ export async function action({ request, params }: ActionFunctionArgs) {
       });
       if (!result.ok) return { error: result.error };
     } else if (intent === "book_shipment") {
-      await bookShipmentForOrder(orderId, { quoteId: String(form.get("quoteId") || "") || undefined }, actor);
+      /*
+       * The confirmation screen's answer to "will Shopify notify the customer",
+       * carried into the booking and stored on the shipment. Read as a VALUE
+       * rather than as the presence of a tick: the modal always posts it, and
+       * "not asked" (a caller that sends nothing) must stay distinguishable from
+       * "asked, and the answer was no".
+       */
+      const notifyAnswer = form.get("notifyCustomer");
+      await bookShipmentForOrder(
+        orderId,
+        {
+          quoteId: String(form.get("quoteId") || "") || undefined,
+          ...(notifyAnswer === null ? {} : { notifyCustomerOnPush: notifyAnswer === "on" }),
+        },
+        actor
+      );
+    } else if (intent === "record_phone") {
+      /*
+       * The one remedy for the booking prerequisite stated on this page. The
+       * service validates the shape and audits the change against the account
+       * that made it; this branch does not re-check the role, because any
+       * operator who can see the order is the one the carrier has to be given a
+       * number by, and refusing here would leave the order unbookable.
+       */
+      await recordRecipientPhone(orderId, String(form.get("phone") || ""), actor);
     } else if (intent === "void_shipment") {
       await voidShipment(String(form.get("shipmentId")), actor);
     } else if (intent === "retry_sync") {
@@ -746,7 +803,7 @@ function auditDetails(raw: string | null): string[] {
 }
 
 export default function AdminOrderDetail() {
-  const { order, collection, parcels, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline } =
+  const { order, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, isOwner, canFulfill, machine, refund, chargeBlock, timeline } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -767,6 +824,13 @@ export default function AdminOrderDetail() {
   }, null);
   const badge = STRIPE_MODE_BADGE[mode] ?? STRIPE_MODE_BADGE.disabled;
   const deliveryAddress = addressLines(order.shippingAddress);
+  /*
+   * The same address, split the way the confirmation screen wants it: the
+   * recipient's name on its own line, then the address. `addressLines` leads
+   * with the name because that is how the card above renders it; the panel has
+   * a labelled slot for the name and a block of lines for everything else.
+   */
+  const shipTo = { name: deliveryAddress[0] ?? order.customerName ?? "—", lines: deliveryAddress.slice(1) };
   const payment = order.wholesalePayment;
   /*
    * The same rule the `charge` action applies, so the button's words and the
@@ -993,6 +1057,47 @@ export default function AdminOrderDetail() {
             treats that as a refusal rather than as an empty address.
           </p>
         )}
+
+        {/*
+          THE CARRIER'S ONE MISSING FIELD, AND THE PLACE TO FIX IT.
+
+          Booking is refused when the recipient has no phone, and the refusal
+          says to record the customer's own number — so the page that states the
+          prerequisite has to be the page where it can be met, or the message is
+          an instruction to go somewhere that does not exist.
+
+          Nothing is prefilled and nothing is suggested. The dock's number, the
+          store's and a placeholder are all accepted by the carrier and all
+          belong to somebody who is not receiving this parcel.
+        */}
+        <div style={{ marginTop: "0.6rem", paddingTop: "0.6rem", borderTop: "1px solid #f1f5f9", fontSize: "0.82rem" }}>
+          {recipientPhone ? (
+            <div>
+              Delivery phone: <strong>{recipientPhone}</strong>
+            </div>
+          ) : (
+            <>
+              <p style={{ color: "#b45309", marginBottom: "0.4rem" }}>
+                No delivery phone number is recorded. A carrier will not take this booking without one — the number is
+                printed on the label and used to reach the recipient — so nothing is filled in on their behalf.
+              </p>
+              <Form method="post" style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", alignItems: "flex-end" }}>
+                <input type="hidden" name="intent" value="record_phone" />
+                <input
+                  style={input}
+                  name="phone"
+                  placeholder="Customer's own number"
+                  required
+                  inputMode="tel"
+                  aria-label="Delivery phone number"
+                />
+                <button type="submit" style={btn("#0369a1")}>
+                  Save phone number
+                </button>
+              </Form>
+            </>
+          )}
+        </div>
       </div>
 
       <div style={card}>
@@ -1461,7 +1566,48 @@ export default function AdminOrderDetail() {
             quote, so it cannot open this. Address verdicts are not part of
             `bookingReady` any more — see `bookingGatesOpen` above.
           */}
-          <Form method="post"><button type="submit" name="intent" value="book_shipment" disabled={!paid || !bookingReady} style={btn(paid && bookingReady ? "#059669" : "#94a3b8")}>Book shipment{quoteBookable ? ` (${selectedQuote.carrier})` : ""}</button></Form>
+          {/*
+            The confirmation screen, not a second booking path. This button used
+            to post `book_shipment` directly, which meant the page with the least
+            context was the one that spent the money without asking.
+          */}
+          {selectedQuote ? (
+            <BookingConfirmation
+              environment={eshipper.environment}
+              environmentDetail={eshipper.description}
+              environmentHost={eshipper.host}
+              orderName={order.shopifyOrderName}
+              carrier={selectedQuote.carrier}
+              serviceName={selectedQuote.serviceName}
+              totalCharge={selectedQuote.totalAmount}
+              currency={selectedQuote.currency}
+              transitDays={selectedQuote.transitDays}
+              quotedAt={selectedQuote.quotedAt}
+              expiresAt={selectedQuote.expiresAt}
+              shipFrom={(() => {
+                // The dock the SELECTED QUOTE was priced from, which is the dock
+                // this booking would leave. Falling back to the first group
+                // would name a dock the price did not come from.
+                const group =
+                  collection.groups.find((g) => g.locationId === selectedQuote.originLocationId) ?? collection.groups[0];
+                return group ? { name: `${group.name ?? "Pickup location"} (${group.code ?? "—"})`, lines: group.pickupAddress } : null;
+              })()}
+              shipTo={shipTo}
+              shipToPhone={recipientPhone}
+              parcels={parcels.packages}
+              units={{ dimensionUnit: units.dimensionUnit, weightUnit: units.weightUnit }}
+              hasFulfillmentOrder={Boolean(order.shopifyFulfillmentOrderId)}
+              quoteId={selectedQuote.id}
+              canBook={paid && bookingReady}
+              // A retry is a shipment whose attempt failed and bought nothing.
+              // Anything else is a first booking, and the screen says so.
+              retrying={order.shipments.some((s) => s.status === "BOOKING_FAILED")}
+            />
+          ) : (
+            <button type="button" disabled style={btn("#94a3b8")}>
+              Book shipment
+            </button>
+          )}
         </div>
         {!paid && <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>Booking is blocked until the wholesale payment succeeds.</p>}
         {paid && quoteBlock ? (

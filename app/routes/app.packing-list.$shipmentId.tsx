@@ -29,7 +29,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) =>
     if (!list) throw new Response("Shipment not found", { status: 404 });
 
     const download = new URL(request.url).searchParams.get("download") === "1";
-    const safeName = `${list.orderName}-${list.reference}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+    /*
+     * The ORDER's name and not the shipment's reference: this string becomes the
+     * customer's own filename, and the reference is an internal id — the same
+     * reason the document itself no longer prints one.
+     */
+    const safeName = list.orderName.replace(/[^A-Za-z0-9._-]+/g, "-");
 
     return new Response(renderPackingList(list), {
       headers: {

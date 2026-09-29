@@ -189,18 +189,36 @@ export interface ReturnQuote {
   transitDays: number | null;
   estimatedDelivery: Date | null;
   expiresAt: Date | null;
-  /** The provider's quote id for the return, when it issues one. */
+  /**
+   * The rate envelope's `uuid` — the TRANSACTION handle, not a bookable quote.
+   *
+   * Same meaning as on an outbound quote, because the returns API answers with
+   * the same `QuoteResponse` envelope. A return is booked by saving this quote
+   * (`PUT /api/v2/returns/quote`) and creating the shipment from the numeric id
+   * that comes back — never by spending the uuid directly.
+   */
   providerQuoteId?: string | null;
   raw?: unknown;
 }
 
 export interface ReturnBookingResult {
+  /**
+   * `ShippingReply.order.orderId` — the SHIPPING ORDER, shared with outbound.
+   *
+   * `POST /api/v2/returns/create/{quoteId}` answers with the same
+   * `ShippingReply` an outbound booking does, so this is the same id space and
+   * the same follow-up calls (`GET /api/v2/returns/{orderId}`).
+   */
   providerReturnId: string;
   carrier: string;
   serviceName: string;
   trackingNumber: string;
   trackingUrl: string | null;
+  brandedTrackingUrl?: string | null;
+  label?: { type: string; data: string } | null;
   labelUrl: string | null;
+  /** The saved return-quote id this was created from, when one was issued. */
+  savedQuoteId?: number | null;
   bookedCost: number;
   currency: string;
   raw?: unknown;
@@ -1689,46 +1707,138 @@ function normalizeTracking(raw: unknown): TrackingResult {
   };
 }
 
+/**
+ * Whether a return LABEL may be purchased. Off, deliberately, and off here.
+ *
+ * The returns workflow was rewritten against the documented contract (save the
+ * return quote, then create from the numeric id) after the previous
+ * implementation was found to be calling an endpoint that cannot work. The
+ * rewrite is correct as far as the spec goes, but NO RETURN HAS EVER COMPLETED
+ * AGAINST THE PROVIDER — not in test, not in production. A booking path that has
+ * never once succeeded is not one to leave a button on.
+ *
+ * So quoting stays open (it is read-only and costs nothing) and the PURCHASE is
+ * closed. The gate lives in the adapter rather than only in the screen, because
+ * a hidden button is not a control: the action, a job, or a future caller would
+ * each have to remember, and the one that forgets buys a label.
+ *
+ * Flip this to `true` only when a sandbox return has been created end to end and
+ * the reply recorded — then remove this comment and its gate.
+ */
+export const RETURN_PURCHASING_ENABLED = false;
+
+/** The refusal, in the operator's words, whenever the gate above is closed. */
+export const RETURN_PURCHASING_DISABLED_REASON =
+  "Return label purchasing is switched off until a return has been created successfully against " +
+  "eShipper's sandbox. Return rates can still be requested; no return label can be bought yet.";
+
+function assertReturnPurchasingEnabled() {
+  if (!RETURN_PURCHASING_ENABLED) throw new Error(RETURN_PURCHASING_DISABLED_REASON);
+}
+
 export async function getReturnQuote(req: RateRequest): Promise<ReturnQuote[]> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("getReturnQuote");
-  const raw = await eshipperFetch("POST", "/api/v2/returns/quote", req);
-  const list = Array.isArray(raw) ? raw : (raw as { rates?: unknown[] })?.rates ?? [];
-  return list.map((r) => {
-    const rate = r as Record<string, unknown>;
-    const transit = rate.transitDays ?? rate.transit_days ?? null;
-    const delivery = rate.estimatedDelivery ?? rate.deliveryDate ?? null;
-    // A return quote is booked by id like any other, so it carries the provider's
-    // quote id too — the shipment record persists it under "eshipper-return".
-    const quoteId = rate.quoteId ?? rate.quote_id ?? rate.id ?? null;
-    return {
-      carrier: String(rate.carrier ?? rate.carrierName ?? "Unknown"),
-      serviceCode: String(rate.serviceCode ?? rate.service_code ?? ""),
-      serviceName: String(rate.serviceName ?? rate.service_name ?? ""),
-      totalAmount: Math.round(Number(rate.total ?? rate.cost ?? 0) * 100),
-      currency: String(rate.currency ?? "CAD"),
-      transitDays: transit === null ? null : Number(transit),
-      estimatedDelivery: delivery ? new Date(String(delivery)) : null,
-      expiresAt: rate.expiresAt ? new Date(String(rate.expiresAt)) : null,
-      providerQuoteId: quoteId === null ? null : String(quoteId),
-      raw: rate,
-    };
-  });
+  /*
+   * The SAME wire request as an outbound rate call, and that is not a
+   * coincidence: `ReturnQuoteRequest_APIv2UserView` is `QuoteRequest_APIv2UserView`
+   * plus three return-only flags (`boxFreeLabelFree`, `qrCodePackaged`,
+   * `returnLabelPackaged`), all optional and all defaulting to the outbound
+   * behaviour. Everything this app sends is therefore already valid here.
+   *
+   * The answer is the same `QuoteResponse` envelope too, which is why it is read
+   * with `normalizeRates` rather than by hand. Reading it by hand is what was
+   * wrong before: the reader looked for `rates` (the key is `quotes`), for
+   * `total`/`cost` (the key is `totalCharge`) and for `carrier`/`serviceCode`
+   * (they are `carrierName`/`serviceId`), so every return rate came back absent
+   * or priced at zero — the exact defect the outbound reader had already been
+   * fixed for, still live on this side of the copy.
+   */
+  const raw = await eshipperFetch("POST", "/api/v2/returns/quote", buildQuoteRequest(req, new Date()));
+  const envelope = raw as { uuid?: unknown; warnings?: unknown[] } | null;
+  const quotes = normalizeRates(raw, envelope?.uuid == null ? null : String(envelope.uuid)) as ReturnQuote[];
+  if (quotes.length === 0) {
+    // The same rule as getRates: an empty list is the provider declining to
+    // price, and it says why in `warnings`. Returning [] discards the reason and
+    // makes a malformed envelope look like "no coverage".
+    const reasons = (envelope?.warnings ?? []).map((w) => String(w).trim()).filter(Boolean);
+    throw new Error(
+      reasons.length
+        ? `eShipper returned no return rates. ${reasons.length} carrier(s) declined: ${reasons.join(" | ")}`
+        : "eShipper returned no return rates and offered no reason."
+    );
+  }
+  return quotes;
 }
 
-export async function saveReturnQuote(quoteId: string, req: RateRequest): Promise<ReturnQuote> {
+/**
+ * Save a return quote so that it can be created.
+ *
+ * THE SAME THREE-STEP SHAPE AS AN OUTBOUND BOOKING, on a parallel set of paths:
+ *
+ *     POST /api/v2/returns/quote      rates
+ *     PUT  /api/v2/returns/quote      SAVE  -> SaveQuoteResponse.quoteId
+ *     POST /api/v2/returns/create/{id} CREATE -> ShippingReply
+ *
+ * Note the body key: `returnQuoteRequest`, NOT `quoteRequest`. The two save
+ * endpoints differ in exactly that one word, and Jackson ignores a property it
+ * does not recognise — so sending the outbound name would not be rejected, it
+ * would be saved as an empty request.
+ *
+ * This replaces a `PUT /api/v2/returns/quote/{quoteId}` that does not exist:
+ * the save path takes no path segment at all, and the value being passed as one
+ * was a service code.
+ */
+export async function saveReturnQuote(input: {
+  /** The rate envelope's `uuid` — the transaction the return quote came from. */
+  rateUuid: string;
+  rateRequest: RateRequest;
+  /** The one quote object being bought, as the provider returned it. */
+  quote: Record<string, unknown>;
+}): Promise<number> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("saveReturnQuote");
-  const raw = await eshipperFetch("PUT", `/api/v2/returns/quote/${quoteId}`, buildQuoteRequest(req, new Date()));
-  return normalizeRates([raw], quoteId)[0] as ReturnQuote;
+  const raw = (await eshipperFetch(
+    "PUT",
+    "/api/v2/returns/quote",
+    {
+      returnQuoteRequest: buildQuoteRequest(input.rateRequest, new Date()),
+      quote: input.quote,
+      uuid: input.rateUuid,
+    },
+    "saveReturnQuote"
+  )) as { quoteId?: unknown; message?: unknown; type?: unknown };
+  const quoteId = Number(raw?.quoteId);
+  if (!Number.isFinite(quoteId) || quoteId <= 0) {
+    // Never fall back to the uuid — see saveQuote. The create endpoint declares
+    // `integer/int64`, so "no id" and "wrong id" are the same refusal one call
+    // later, and the second one has no message to explain itself.
+    throw new Error(
+      `eShipper did not issue a creatable return quote id. It said: ${String(raw?.message ?? "nothing")}`
+    );
+  }
+  return quoteId;
 }
 
 export async function bookReturn(input: {
-  quote: { carrier: string; serviceCode: string; serviceName: string };
+  quote: {
+    carrier: string;
+    serviceCode: string;
+    serviceName: string;
+    /** The rate envelope's uuid; the handle the SAVE names. */
+    providerQuoteId?: string | null;
+    /** The provider's own quote object, replayed verbatim into the save. */
+    raw?: unknown;
+  };
   rateRequest: RateRequest;
-  returnItems: { sku: string; quantity: number }[];
-  returnAddress: { name: string; address: string; city: string; province: string; postalCode: string; country: string };
 }): Promise<ReturnBookingResult> {
+  /*
+   * Checked FIRST, before the simulated branch. A simulated return is still a
+   * return that reports success, and reporting success is the thing this gate
+   * exists to stop: an operator who saw one would reasonably conclude the flow
+   * works, which is exactly what nobody knows yet.
+   */
+  assertReturnPurchasingEnabled();
   if (!(await eshipperConfigured())) {
     const id = `sim_ret_${Math.random().toString(36).slice(2, 10)}`;
     const tracking = `SIMR${Math.floor(Math.random() * 1e10).toString().padStart(10, "0")}`;
@@ -1745,51 +1855,80 @@ export async function bookReturn(input: {
   }
   await requireRealMode("bookReturn");
   /*
-   * The corrected envelope, plus the two fields that are this endpoint's own.
-   * Like the outbound booking, the returns contract is inherited from the
-   * verified quote envelope rather than proven against this endpoint's
-   * response, and it is exercised by a sandbox return before it is relied on.
+   * SAVE, THEN CREATE — the returns equivalent of the outbound two-call booking,
+   * and it replaces a call that could never have worked.
+   *
+   * The old body was `POST /api/v2/returns/create/{serviceCode}` carrying the
+   * rate envelope plus `returnItems` and `returnAddress`. Three things were
+   * wrong with it, and the last one is the instructive one:
+   *
+   *   1. `/returns/create/{id}` takes `integer/int64` — a SAVED QUOTE id. A
+   *      service code is neither numeric nor a quote.
+   *   2. The create-by-quote endpoint takes NO request body: everything it needs
+   *      travels in the save that precedes it.
+   *   3. `returnItems` and `returnAddress` DO NOT EXIST in this API. Neither
+   *      name appears anywhere in the 278 schemas. Jackson ignores unknown
+   *      properties, so they were not rejected — they were silently dropped,
+   *      which is why the call looked plausible and bought nothing.
+   *
+   * The lesson generalises and is why this is written against the spec rather
+   * than against the previous implementation: on this API an unrecognised field
+   * is not an error, so a wrong body is indistinguishable from a right one until
+   * something is actually purchased.
+   *
+   * What is being returned is OUR record, not the provider's: the API creates a
+   * label from the return address to the destination and does not itemise it.
+   * The line items are stored on the local Shipment (ShipmentItem) by the
+   * caller, which is where an operator reads them.
    */
-  const raw = await eshipperFetch("POST", `/api/v2/returns/create/${input.quote.serviceCode}`, {
-    ...buildQuoteRequest(input.rateRequest, new Date()),
-    serviceId: Number.isFinite(Number(input.quote.serviceCode))
-      ? Number(input.quote.serviceCode)
-      : input.quote.serviceCode,
-    returnItems: input.returnItems,
-    // A third address on this endpoint, and it does NOT travel through
-    // `toWireAddress` — so it needs the same treatment by hand. Leaving it out
-    // is how the outbound envelope would be fixed and the return label still
-    // sent a country name.
-    returnAddress: checkedDispatchAddress(input.returnAddress, "return"),
-  }) as Record<string, unknown>;
-  return {
-    providerReturnId: String(raw.returnId ?? raw.id ?? ""),
-    carrier: String(raw.carrier ?? input.quote.carrier),
-    serviceName: String(raw.serviceName ?? input.quote.serviceName),
-    trackingNumber: String(raw.trackingNumber ?? raw.tracking ?? ""),
-    trackingUrl: raw.trackingUrl ? String(raw.trackingUrl) : null,
-    labelUrl: raw.labelUrl ? String(raw.labelUrl) : null,
-    bookedCost: Math.round(Number(raw.cost ?? raw.total ?? 0) * 100),
-    currency: String(raw.currency ?? "CAD"),
-    raw,
-  };
+  if (!input.quote.providerQuoteId) {
+    throw new Error(
+      "This return quote has no eShipper rate id. Re-request return rates so the booking can reference the rate it was priced from."
+    );
+  }
+  const quoteObject = input.quote.raw as Record<string, unknown> | undefined;
+  if (!quoteObject || typeof quoteObject !== "object" || Array.isArray(quoteObject)) {
+    throw new Error(
+      "This return quote did not keep the provider's own quote object, so it cannot be saved. Re-request return rates."
+    );
+  }
+  const savedQuoteId = await saveReturnQuote({
+    rateUuid: input.quote.providerQuoteId,
+    rateRequest: input.rateRequest,
+    quote: quoteObject,
+  });
+  const raw = (await eshipperFetch(
+    "POST",
+    `/api/v2/returns/create/${savedQuoteId}`,
+    undefined,
+    "bookReturn"
+  )) as Record<string, unknown>;
+  // The create answers with the SAME `ShippingReply` an outbound booking does,
+  // so it is read by the same reader — one place that knows the reply's shape
+  // rather than two that can drift.
+  const reply = readShippingReply(raw, input.quote);
+  return { ...reply, providerReturnId: reply.providerShipmentId, savedQuoteId };
 }
 
+/**
+ * Create a return from a full request, with no saved quote.
+ *
+ * `PUT /api/v2/returns/create` is real and documented, but it is a DIFFERENT
+ * operation from the saved-quote path this module books through: it takes the
+ * whole `ReturnShippingRequest` (`ReturnQuoteRequest` plus `forwardShippingOrderId`
+ * and `warehouse`), obtains quotes itself and books the best one. It is kept for
+ * completeness and is not on the operator's path.
+ *
+ * Its answer is a `ShippingReply`, so it is read by the same reader — the old
+ * body looked for `returnId`/`id`/`status`/`items`, none of which this reply
+ * carries, and would have recorded an empty return at zero cost.
+ */
 export async function updateReturn(data: Record<string, unknown>): Promise<ReturnBookingResult> {
   if (!(await eshipperConfigured())) throw new Error("eShipper not configured.");
   await requireRealMode("updateReturn");
   const raw = await eshipperFetch("PUT", "/api/v2/returns/create", data) as Record<string, unknown>;
-  return {
-    providerReturnId: String(raw.returnId ?? raw.id ?? ""),
-    carrier: String(raw.carrier ?? ""),
-    serviceName: String(raw.serviceName ?? ""),
-    trackingNumber: String(raw.trackingNumber ?? raw.tracking ?? ""),
-    trackingUrl: raw.trackingUrl ? String(raw.trackingUrl) : null,
-    labelUrl: raw.labelUrl ? String(raw.labelUrl) : null,
-    bookedCost: Math.round(Number(raw.cost ?? raw.total ?? 0) * 100),
-    currency: String(raw.currency ?? "CAD"),
-    raw,
-  };
+  const reply = readShippingReply(raw, { carrier: "", serviceName: "" });
+  return { ...reply, providerReturnId: reply.providerShipmentId };
 }
 
 export async function getReturn(returnId: string): Promise<ReturnDetails | null> {
@@ -1797,16 +1936,22 @@ export async function getReturn(returnId: string): Promise<ReturnDetails | null>
   await requireRealMode("getReturn");
   const raw = await eshipperFetch("GET", `/api/v2/returns/${returnId}`) as Record<string, unknown>;
   if (!raw || Object.keys(raw).length === 0) return null;
+  /*
+   * Read as the `ShippingReply` it is, under the same names `readShippingReply`
+   * uses. `status` and `items` have no counterpart in the reply at all — the
+   * provider describes a shipment, not our return record — so they are reported
+   * as absent rather than filled from keys that do not exist. The itemised lines
+   * the operator reads come from our own ShipmentItem rows.
+   */
+  const reply = readShippingReply(raw, { carrier: "", serviceName: "" });
+  const order = (raw.order ?? {}) as Record<string, unknown>;
   return {
-    returnId: String(raw.returnId ?? raw.id ?? ""),
-    status: String(raw.status ?? ""),
-    trackingNumber: raw.trackingNumber ? String(raw.trackingNumber) : null,
-    trackingUrl: raw.trackingUrl ? String(raw.trackingUrl) : null,
-    labelUrl: raw.labelUrl ? String(raw.labelUrl) : null,
-    items: Array.isArray(raw.items) ? raw.items.map((i: unknown) => {
-      const it = i as Record<string, unknown>;
-      return { sku: String(it.sku ?? ""), quantity: Number(it.quantity ?? 0) };
-    }) : [],
+    returnId: reply.providerShipmentId,
+    status: order.message ? String(order.message) : "",
+    trackingNumber: reply.trackingNumber || null,
+    trackingUrl: reply.trackingUrl,
+    labelUrl: reply.labelUrl,
+    items: [],
     raw,
   };
 }

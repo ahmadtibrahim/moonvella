@@ -135,7 +135,12 @@ async function ensureDock() {
   const variant = await prisma.productVariant.create({
     data: {
       productId: product.id,
-      sku: "MV-HP-001",
+      // Unique per run, like the product code above. `sku` is unique in the
+      // schema, so a fixed one made this suite single-shot: a run that died
+      // before its cleanup left the variant behind and every later run failed
+      // on the unique constraint instead of on anything it was testing. Nothing
+      // asserts the value — it is fixture data.
+      sku: `WS-V-${Date.now()}-${seq}`,
       name: "Hotel Pillow",
       wholesalePrice: 1299,
       suggestedRetailPrice: 4900,
@@ -160,7 +165,10 @@ async function makeOrder(sellerId: string, total = 2598) {
       shopifyOrderNumber: seq,
       currency: "CAD",
       customerName: "Retail Customer",
-      shippingAddress: JSON.stringify({ name: "Retail Customer", address1: "500 Queen St W", city: "Toronto", province: "ON", zip: "M5V 2T6", country: "CA", residential: true }),
+      // The phone is a prerequisite of eShipper's save step, not decoration:
+      // this order is BOOKED below, and a fixture without one is refused on the
+      // prerequisite before the check it was written for is reached.
+      shippingAddress: JSON.stringify({ name: "Retail Customer", phone: "(416) 555-0142", address1: "500 Queen St W", city: "Toronto", province: "ON", zip: "M5V 2T6", country: "CA", residential: true }),
       subtotal: total,
       totalTax: 0,
       totalShipping: 0,
@@ -256,12 +264,17 @@ async function main() {
 
   // Booking blocked before payment
   let blocked = false;
+  let blockMessage = "";
   try {
     await bookShipmentForOrder(order1.id, { quoteId: cheapest.id }, actor);
   } catch (error) {
-    blocked = error instanceof Error && error.message.includes("not SUCCEEDED");
+    // The message is carried into the check rather than reduced to a boolean:
+    // a refusal for the WRONG reason is the failure this is guarding against,
+    // and "false" alone cannot tell the two apart.
+    blockMessage = error instanceof Error ? error.message : String(error);
+    blocked = blockMessage.includes("not SUCCEEDED");
   }
-  check("booking blocked before payment", blocked);
+  check("booking blocked before payment", blocked, blockMessage.slice(0, 180) || "no refusal at all");
 
   // Manual charge (simulated) then verified confirmation
   const charge = await chargeWholesaleOrder(order1.id, { trigger: "MANUAL", actor });

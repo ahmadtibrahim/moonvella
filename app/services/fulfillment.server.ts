@@ -105,7 +105,11 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
    * unlike a booking.
    */
   const shopify = await syncShipmentTracking(shipment.id, actor, {
-    notifyCustomer: input.notifyCustomer ?? false,
+    // The choice made on the booking confirmation screen is the DEFAULT, and a
+    // caller that says nothing here does not override it. This is the same rule
+    // as advanceShipment: the question is asked once, where the operator is
+    // looking at what they are buying, and answered again only deliberately.
+    notifyCustomer: input.notifyCustomer ?? shipment.notifyCustomerOnPush,
   });
   if (!shopify.pushed && shopify.reason !== "no_fulfillment_order_id") {
     await enqueueJob({
@@ -173,7 +177,11 @@ export async function advanceShipment(
    */
   if (isFulfillmentMilestone(event)) {
     const sync = await syncShipmentTracking(shipmentId, actor, {
-      notifyCustomer: opts?.notifyCustomer ?? false,
+      // The booking confirmation screen asked this question and its answer was
+      // stored on the shipment; this is where it takes effect. An explicit
+      // `opts.notifyCustomer` still wins, because whoever marks the parcel
+      // dispatched is looking at the real thing and may know better.
+      notifyCustomer: opts?.notifyCustomer ?? shipment.notifyCustomerOnPush,
     });
     // Queued only when there is something to retry, and keyed per shipment so a
     // second dispatch of the same parcel collapses into the same job. A

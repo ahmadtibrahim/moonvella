@@ -1,0 +1,20 @@
+-- The customer-notification choice made on the booking confirmation screen.
+--
+-- WHY A COLUMN. The choice is made when the label is bought and the push to
+-- Shopify happens when the parcel is marked dispatched — two different moments,
+-- possibly days apart and by two different people. Without somewhere to keep it,
+-- the answer given at the confirmation would be lost the moment the request
+-- finished, and the operator would be asked the same question again at dispatch
+-- with no memory of what they had already decided.
+--
+-- WHY DEFAULT false. Shopify sends the customer e-mail ON the fulfillment call
+-- and there is no undo for a duplicate, and a shipment in the test environment
+-- is still a real order with a real customer behind it. A default of "notify"
+-- would mean the safe path is the one that requires an action, and the harmful
+-- one is what happens when nobody acts. This is only a DEFAULT: the dispatch
+-- screen reads it and whoever marks the parcel dispatched can still change it.
+--
+-- Additive and defaulted, so the deployment's existing rows stay valid and the
+-- migration applies while the app is running. An existing shipment has not been
+-- asked the question and has not notified anyone — false is the truth for it.
+ALTER TABLE "Shipment" ADD COLUMN "notifyCustomerOnPush" BOOLEAN NOT NULL DEFAULT false;

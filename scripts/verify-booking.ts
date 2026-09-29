@@ -35,7 +35,9 @@ import {
   cancelPickupForShipment,
   invalidateQuotes,
   packagesForShipment,
+  recipientPhoneFor,
   reconcileBookingOutcome,
+  recordRecipientPhone,
   resolveUnknownBooking,
   schedulePickupForShipment,
 } from "../app/services/shipping.server";
@@ -97,6 +99,49 @@ function apiCalls() {
   return providerCalls.filter((c) => !/\/api\/v2\/(authenticate|refresh-token)$/.test(c.url));
 }
 
+/**
+ * The calls that actually BUY a label.
+ *
+ * Booking is three calls, and only the last one is a purchase: the rate is a
+ * price, `PUT /api/v2/quote` is the draft that makes the price bookable, and
+ * `POST /api/v2/ship/{quoteId}` is the money. "The provider was asked once" has
+ * always meant "one label was bought", so it is counted here rather than across
+ * every call — otherwise the save would make every one of those checks read 2
+ * and the count would stop being about purchases at all.
+ */
+function purchaseCalls() {
+  return apiCalls().filter((c) => c.method === "POST" && /\/api\/v2\/ship\//.test(c.url));
+}
+
+/**
+ * The body of the request that describes the shipment to the carrier.
+ *
+ * The parcels and addresses travel in the SAVE — the purchase carries no body,
+ * only the id of the draft it is buying. So "what did we tell the carrier" is a
+ * question about the save now, and it used to be a question about the ship.
+ */
+function savedRequest() {
+  const call = apiCalls().find((c) => c.method === "PUT" && /\/api\/v2\/quote$/.test(c.url));
+  return (call?.body as { quoteRequest?: Record<string, unknown> } | undefined)?.quoteRequest;
+}
+
+/**
+ * The numeric id the provider issues when a booking's draft is saved.
+ *
+ * Numeric because `POST /api/v2/ship/{id}` is typed `integer/int64` and refuses
+ * anything else before it reads the body — a rate's `uuid` cannot be booked at
+ * any point, which is the whole reason the save exists.
+ */
+let savedQuoteSeq = 0;
+/** Every id the save has issued, in order, so a check can ask what was bought. */
+const savedQuoteIds: string[] = [];
+function savedQuoteId(): string {
+  const id = String(8000000029700 + ++savedQuoteSeq);
+  savedQuoteIds.push(id);
+  return id;
+}
+const lastSavedQuoteId = () => savedQuoteIds[savedQuoteIds.length - 1];
+
 let allowedHostCache: string | null = null;
 async function allowedHost(): Promise<string> {
   if (allowedHostCache) return allowedHostCache;
@@ -146,6 +191,29 @@ function installStub() {
     if (/\/(authenticate|refresh-token)$/.test(url)) {
       return new Response(
         JSON.stringify({ token: `verify-token-${suffix}`, expires_in: "3600", token_type: "Bearer" }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    /*
+     * The SAVE step of a booking, answered here rather than by each block.
+     *
+     * Booking a label is three calls — rate, SAVE, buy — and the save is the one
+     * that turns a rate into a bookable id. No check in this file is about the
+     * save: every block sets a responder to say what happens to the PURCHASE.
+     * Left to a blanket responder, the save gets answered with the purchase's
+     * reply, which carries no `quoteId` — so the booking fails one call early
+     * with "did not issue a bookable quote id", and every check below asserts on
+     * a refusal about a call it was not asking about. That is exactly what this
+     * suite did when the contract changed under it.
+     *
+     * Answering it here is not a convenience: it is the only reading under which
+     * a block's responder still means what the block says it means. The save
+     * FAILING is a case in its own right, and is pinned in verify-shipping.
+     */
+    if (method === "PUT" && /\/api\/v2\/quote$/.test(url)) {
+      return new Response(
+        JSON.stringify({ quoteId: savedQuoteId(), type: "Success", message: "Quote saved successfully" }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
     }
@@ -295,8 +363,15 @@ async function createBookableOrder(
       // The scalar the Shopify push reads. A store with no fulfillment order id
       // has nothing to push to, which is a case the booking path handles.
       shopifyFulfillmentOrderId: fulfillmentOrderId,
+      // The phone is NOT decoration: eShipper's SAVE step validates the
+      // recipient against ShipToAddress, whose required list includes `phone`,
+      // and refuses the whole booking without one. A fixture that reaches a
+      // booking therefore has to carry what a real order carries, or the check
+      // below fails on the prerequisite instead of on its subject. The
+      // missing-phone case is pinned on its own, separately.
       shippingAddress: JSON.stringify({
         name: "Verify Customer",
+        phone: "(416) 555-0142",
         address1: "1 Test Street",
         city: "Toronto",
         province: "ON",
@@ -379,15 +454,44 @@ async function createBookableOrder(
   return { order, quote, shipment, origin };
 }
 
+/**
+ * The shipping order id the provider puts on a booked shipment.
+ *
+ * Derived from the tag rather than random so a block can name it twice — once
+ * when it answers and once when it asserts — and get the same value, and
+ * NUMERIC because the provider types it that way: `order.orderId` is an integer
+ * in a string's clothing, and the follow-up GETs read it as a number.
+ */
+const orderIdFor = (tag: string) =>
+  String(
+    8000000000000 +
+      [...`${tag}-${suffix}`].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1000000, 7)
+  );
+
+/*
+ * What the provider answers when a label is bought, in the shape the documented
+ * `ShippingReply` actually has.
+ *
+ * EVERY id used to sit at the TOP level here — `shipmentId`, `cost`,
+ * `labelUrl` — and not one of those keys exists in the reply. The provider
+ * nests the ids under `order`, the carrier under `carrier`, the money under
+ * `quote`, and the label under `labelData.label[]`. So this fixture and the
+ * reader that consumed it were the same invention agreeing with itself: a real
+ * booking would have been recorded as an empty provider id at zero cost, and
+ * the suite would have passed. The nesting below is the documented one, and it
+ * is what the adapter's own contract suite pins.
+ *
+ * There is no `labelUrl` anywhere in `ShippingReply`: the label arrives as the
+ * document itself, `{type, data}`.
+ */
 const BOOKED_BODY = (tag: string) => ({
-  shipmentId: `S-${tag}-${suffix}`,
-  carrier: "Purolator",
-  serviceName: "Purolator Express",
+  order: { orderId: orderIdFor(tag) },
+  carrier: { carrierName: "Purolator", serviceName: "Purolator Express" },
   trackingNumber: `TRK-${tag}-${suffix}`,
   trackingUrl: "https://example.invalid/track",
-  labelUrl: "https://example.invalid/label.pdf",
-  cost: 33.5,
-  currency: "CAD",
+  brandedTrackingUrl: "https://example.invalid/branded",
+  labelData: { label: [{ type: "PDF", data: "JVBERi0xLjQK" }] },
+  quote: { totalCharge: 33.5, currency: "CAD" },
 });
 
 async function cleanup() {
@@ -769,6 +873,10 @@ async function bookingOutcomeChecks() {
       data: {
         shippingAddress: JSON.stringify({
           name: "Verify Customer",
+          // Carried because the override replaces the whole blob, and this
+          // order is BOOKED below — without it the refusal would be about the
+          // phone and the country conversion would go unchecked.
+          phone: "(416) 555-0142",
           address1: "1 Test Street",
           city: "Ottawa",
           province: "ON",
@@ -788,7 +896,12 @@ async function bookingOutcomeChecks() {
     providerCalls = [];
     await bookPreparedShipment(shipment.id, quote.id, ACTOR);
 
-    const body = apiCalls()[0]?.body as
+    /*
+     * Read from the SAVE, where the request is restated. The purchase carries
+     * no body at all, so reading the first api call used to be reading the
+     * request we sent and is now reading the draft that carries it.
+     */
+    const body = savedRequest() as
       | { to?: { country?: string; province?: string }; from?: { country?: string; province?: string } }
       | undefined;
     check(
@@ -818,6 +931,9 @@ async function bookingOutcomeChecks() {
       data: {
         shippingAddress: JSON.stringify({
           name: "Verify Customer",
+          // Only the postal code is withheld: the phone is present so the
+          // postal-code refusal is the one this block actually reaches.
+          phone: "(416) 555-0142",
           address1: "1 Test Street",
           city: "Ottawa",
           province: "ON",
@@ -849,6 +965,125 @@ async function bookingOutcomeChecks() {
     );
   }
 
+  /* --- a recipient with no phone number ---------------------------------- */
+  /*
+   * The phone is a prerequisite of the SAVE, not of the rate, which is why a
+   * quote for an order with no phone prices perfectly well and the booking is
+   * the first place it can be noticed. Left to the provider that notice arrives
+   * as an HTTP 400 after the operator has confirmed a purchase; checked here it
+   * is a named prerequisite with a place to fix it, and the confirmation is
+   * never reached.
+   *
+   * BOTH HALVES ARE PINNED, because the interesting failure is not the refusal
+   * — it is refusing an order that COULD have been booked. The order's own
+   * `customerPhone` is a legitimate source (Shopify's payload fills it), and a
+   * reader that only looked at the address blob made a bookable shipment look
+   * unbookable. The second half books the same order after recording the number
+   * the customer typed and proves it reaches the wire.
+   */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "nophone");
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        // The override replaces the whole blob, so the phone is gone from both
+        // places it could have been read.
+        shippingAddress: JSON.stringify({
+          name: "Verify Customer",
+          address1: "1 Test Street",
+          city: "Ottawa",
+          province: "ON",
+          zip: "K1P 1J1",
+          country: "CA",
+        }),
+        customerPhone: null,
+      },
+    });
+    responder = () => ({ status: 200, body: BOOKED_BODY("NOPHONE") });
+    providerCalls = [];
+
+    let message = "";
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("a recipient with no phone number cannot be booked", /phone number is required/i.test(message), message.slice(0, 200));
+    check("...and the refusal says nothing was bought", /nothing was purchased/i.test(message), message.slice(0, 220));
+    check(
+      "...and it forbids a placeholder, which would print a stranger's number on the label",
+      /placeholder/i.test(message),
+      message.slice(0, 260)
+    );
+    check("...and the carrier is never called for it", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check(
+      "...and nothing is recorded as bought",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === null
+    );
+
+    /*
+     * THE REMEDY, NOT A COLUMN WRITE. This is the function the order page's
+     * "Save phone number" button calls, so the second half of this check proves
+     * the whole path an operator takes out of the refusal — the refusal names a
+     * prerequisite, the page offers the one field that answers it, and the number
+     * then reaches the carrier. A test that wrote the column itself would pass
+     * while the button it stands for was broken.
+     */
+    let junk = "";
+    try {
+      await recordRecipientPhone(order.id, "call the shop", ACTOR);
+    } catch (error) {
+      junk = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "a value that is not a phone number is refused rather than stored",
+      /at least 7 digits/i.test(junk),
+      junk.slice(0, 160)
+    );
+    check(
+      "...and it does not land on the order",
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).customerPhone === null
+    );
+
+    // The other half: the number is on the ORDER, not in the address blob.
+    const recorded = await recordRecipientPhone(order.id, "  +1 416 555 0188  ", ACTOR);
+    check("the number an operator records is stored trimmed", recorded.customerPhone === "+1 416 555 0188", JSON.stringify(recorded.customerPhone));
+    /*
+     * "NEVER A SUBSTITUTE" is a property of the reader, and these are the four
+     * ways it could quietly become one: falling back to the dock, the store, or
+     * a default; treating whitespace as a number; letting the order's column
+     * override the address the customer actually gave; or throwing on a blob it
+     * cannot parse instead of reporting no number.
+     */
+    check(
+      "the recipient's number is read from the address when the address has one",
+      recipientPhoneFor({
+        shippingAddress: JSON.stringify({ phone: "+1 905 555 0100" }),
+        customerPhone: "+1 416 555 0188",
+      }) === "+1 905 555 0100"
+    );
+    check(
+      "an address field of spaces is not a phone number",
+      recipientPhoneFor({ shippingAddress: JSON.stringify({ phone: "   " }), customerPhone: null }) === null
+    );
+    check(
+      "an address that will not parse yields no number rather than a guess",
+      recipientPhoneFor({ shippingAddress: "{not json", customerPhone: null }) === null
+    );
+    providerCalls = [];
+    await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    const wire = savedRequest() as { to?: { phone?: string } } | undefined;
+    check(
+      "an order whose own customerPhone is recorded is bookable, and the number reaches the wire",
+      wire?.to?.phone === "+1 416 555 0188",
+      `to.phone=${JSON.stringify(wire?.to?.phone)}`
+    );
+    check(
+      "...and the label is bought",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === orderIdFor("NOPHONE")
+    );
+  }
+
   /* --- the provider refuses outright ------------------------------------- */
   {
     const { order, shipment, quote } = await createBookableOrder(seller.id, "fail");
@@ -867,7 +1102,22 @@ async function bookingOutcomeChecks() {
     check("...and is not recorded as an exception", after.status !== "EXCEPTION");
     check("...and stores the provider's reason", Boolean(after.lastBookingError), after.lastBookingError ?? "(none)");
     check("...and tells the operator nothing was purchased", /nothing was purchased/i.test(message), message.slice(0, 120));
-    check("the provider was asked exactly once", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("the provider was asked exactly once", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
+    /*
+     * §7, read as a list of what must NOT exist afterwards: no label, no
+     * provider shipment, no tracking number, and nothing pushed to Shopify.
+     * A refusal that left any of these would be a purchase the operator was
+     * told had not happened.
+     */
+    check("...and buys no label", after.labelUrl === null, after.labelUrl ?? "(null)");
+    check("...and holds no provider shipment id", after.providerShipmentId === null, after.providerShipmentId ?? "(null)");
+    check("...and records no tracking number", after.trackingNumber === null, after.trackingNumber ?? "(null)");
+    check("...and creates no Shopify fulfillment", after.shopifyFulfillmentId === null, after.shopifyFulfillmentId ?? "(null)");
+    check(
+      "...and leaves the order unfulfilled",
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).fulfillmentStatus === "PENDING",
+      (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).fulfillmentStatus
+    );
     check(
       "the order's payment is untouched by a failed booking",
       (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).wholesalePaymentStatus === "SUCCEEDED"
@@ -879,12 +1129,12 @@ async function bookingOutcomeChecks() {
     await bookPreparedShipment(shipment.id, quote.id, ACTOR);
     const booked = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
     check("a retry after a refusal succeeds", booked.status === "BOOKED", booked.status);
-    check("...and keeps the provider shipment id", booked.providerShipmentId === `S-RETRY-${suffix}`, booked.providerShipmentId ?? "(null)");
+    check("...and keeps the provider shipment id", booked.providerShipmentId === orderIdFor("RETRY"), booked.providerShipmentId ?? "(null)");
     check("...and keeps the tracking number", booked.trackingNumber === `TRK-RETRY-${suffix}`, booked.trackingNumber ?? "(null)");
     check("...and clears the previous failure reason", booked.lastBookingError === null, booked.lastBookingError ?? "(null)");
     check("...and stamps the label time", booked.labelCreatedAt !== null);
     check("...and leaves the seller's charge alone", booked.sellerShippingCharge === 2500, String(booked.sellerShippingCharge));
-    check("...and does not re-ask the provider for a booked shipment", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("...and does not re-ask the provider for a booked shipment", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
 
     // Re-booking an already-booked shipment returns what exists; it does not buy.
     providerCalls = [];
@@ -909,7 +1159,7 @@ async function bookingOutcomeChecks() {
     check("...and records when the outcome became unknown", after.bookingOutcomeUnknownAt !== null);
     check("...and says the outcome is unknown", /outcome unknown/i.test(message), message.slice(0, 140));
     check("...and does not claim nothing was purchased", !/nothing was purchased/i.test(message));
-    check("the provider was asked exactly once for the timed-out attempt", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("the provider was asked exactly once for the timed-out attempt", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
 
     /*
      * The check this whole state exists for. A second attempt here is how an
@@ -930,24 +1180,53 @@ async function bookingOutcomeChecks() {
       (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "BOOKING_UNKNOWN"
     );
 
-    // Reconciling against a provider that holds nothing.
-    responder = () => ({ status: 200, body: {} });
-    const notFound = await reconcileBookingOutcome(shipment.id, ACTOR);
-    check("reconciling with an empty provider answer adopts nothing", notFound.adopted === false);
-    check("...and says an empty answer is not proof", /not proof/i.test(notFound.message), notFound.message.slice(0, 120));
+    /*
+     * RECONCILING CANNOT RUN HERE, AND REFUSING IS THE CORRECT ANSWER.
+     *
+     * This block used to reconcile a timed-out booking by asking the provider
+     * what it held under the QUOTE id, and to assert that an existing shipment
+     * was adopted from the answer. That lookup cannot work: `GET
+     * /api/v2/ship/{orderId}` is keyed on the SHIPPING ORDER, a different
+     * number space from the quote — and a booking that times out on the
+     * purchase never produces one, because the shipping order is IN the reply
+     * that went missing. Asking by quote id means a quote number that happened
+     * to collide with another order's would adopt a STRANGER'S shipment onto
+     * this row: someone else's tracking number, someone else's label.
+     *
+     * So the assertion that survives is the refusal, which is what protects the
+     * order. The way out of this state is a person reading the provider's
+     * portal and recording what they find — the next block, and the only path
+     * the provider's own endpoints leave open.
+     *
+     * NOTE for whoever reads this next: `reconcileBookingOutcome`'s lookup
+     * branch is now unreachable — a shipment only reaches BOOKING_UNKNOWN from
+     * a timed-out purchase, which by definition has no shipping order id. It is
+     * kept because it is the only place that knows what to do with an id if one
+     * ever exists, but it has no coverage here and cannot be given any until
+     * the provider offers a lookup by quote.
+     */
+    responder = () => ({ status: 200, body: BOOKED_BODY("RECOVERED") });
+    providerCalls = [];
+    let reconcileRefusal = "";
+    try {
+      await reconcileBookingOutcome(shipment.id, ACTOR);
+    } catch (error) {
+      reconcileRefusal = error instanceof Error ? error.message : String(error);
+    }
     check(
-      "...and leaves the shipment for a person to decide",
+      "reconciling a booking that never returned is refused rather than guessed",
+      /check the provider's portal/i.test(reconcileRefusal),
+      reconcileRefusal.slice(0, 200)
+    );
+    check("...and the provider is not asked anything it cannot answer", apiCalls().length === 0, `calls=${apiCalls().length}`);
+    check(
+      "...and the shipment is still waiting for a person",
       (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).status === "BOOKING_UNKNOWN"
     );
-
-    // Reconciling against a provider that already holds the booking.
-    responder = () => ({ status: 200, body: BOOKED_BODY("RECOVERED") });
-    const recovered = await reconcileBookingOutcome(shipment.id, ACTOR);
-    const recoveredRow = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
-    check("reconciling adopts a booking the provider already holds", recovered.adopted === true);
-    check("...and does not buy a second label", recoveredRow.status === "BOOKED", recoveredRow.status);
-    check("...and records the provider's shipment id", recoveredRow.providerShipmentId === `S-RECOVERED-${suffix}`);
-    check("...and clears the unknown marker", recoveredRow.bookingOutcomeUnknownAt === null);
+    check(
+      "...and no provider shipment id was invented for it",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === null
+    );
   }
 
   /* --- a person resolves what reconcile could not ------------------------ */
@@ -1017,9 +1296,9 @@ async function bookingOutcomeChecks() {
     // The loser may either be refused (it saw BOOKING) or handed the shipment
     // the winner created (it saw BOOKED) — both are correct, and which one
     // happens is a race. What must hold either way is one purchase.
-    check("two simultaneous bookings make one provider call", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("two simultaneous bookings make one provider call", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
     const raced = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
-    check("...and one provider shipment id", raced.providerShipmentId === `S-RACE-${suffix}`, raced.providerShipmentId ?? "(null)");
+    check("...and one provider shipment id", raced.providerShipmentId === orderIdFor("RACE"), raced.providerShipmentId ?? "(null)");
     check("...and one shipment for the order", (await prisma.shipment.count({ where: { orderId: raced.orderId } })) === 1);
   }
 
@@ -1241,6 +1520,72 @@ async function packingListChecks() {
   check("another seller reading the same shipment gets nothing", asOther === null);
   check("a shipment that does not exist is not invented", (await packingListFor("not-a-shipment")) === null);
 
+  /*
+   * §5's forbidden list, checked against the DOCUMENT rather than against the
+   * query. Two of those items were on this slip until the rendered output was
+   * read: the shipment's own cuid, and a line naming the supplier. Both are
+   * assertions about a string a customer receives, so both are made against the
+   * string.
+   */
+  const internalId = shipment.id.slice(0, 8);
+  const forbiddenWords = [internalId, shipment.id, "MoonVella", "Fulfilled by", "wholesale"];
+  const told = forbiddenWords.filter((needle) => html.includes(needle));
+  check("no internal id and no supplier appears in the document", told.length === 0, told.join(" "));
+
+  /* --- the operator's optional message ---------------------------------- */
+  /*
+   * Absent by default, and absent MEANS absent: §5 asks for an optional
+   * message, and a heading printed over an empty space would be the document
+   * claiming somebody had something to say.
+   */
+  check("a shipment with no message carries none", list.message === null, String(list.message));
+  check("...and the document prints no message block", !/class="msg"/.test(html));
+
+  await prisma.shipment.update({
+    where: { id: shipment.id },
+    // Newlines and angle brackets on purpose: the first must survive as a line
+    // break, and the second must not survive at all.
+    data: { packingSlipMessage: "  Packed with care.\nThanks — the <seller>  " },
+  });
+  const withMessage = await packingListFor(shipment.id);
+  check("the operator's message is read back trimmed", withMessage?.message === "Packed with care.\nThanks — the <seller>", JSON.stringify(withMessage?.message));
+  const messageHtml = withMessage ? renderPackingList(withMessage) : "";
+  check("the message is printed", messageHtml.includes("Packed with care."));
+  check("a newline in the message becomes a line break", messageHtml.includes("Packed with care.<br />Thanks"));
+  check(
+    "...and the message cannot inject markup into the page",
+    messageHtml.includes("&lt;seller&gt;") && !messageHtml.includes("<seller>")
+  );
+  /*
+   * THE MESSAGE BELONGS TO ONE BOX. A split order has one slip per carton, so a
+   * note written for the pillows must not appear in the carton of towels — which
+   * is why the column is on Shipment and not on Order. A second shipment on the
+   * same order is the only way to ask that.
+   */
+  const secondBox = await prisma.shipment.create({
+    data: {
+      orderId: order.id,
+      status: "PENDING",
+      provider: "eshipper",
+      carrier: quote.carrier,
+      serviceCode: quote.serviceCode,
+      serviceName: quote.serviceName,
+      packageCount: 1,
+      items: { create: order.items.map((i) => ({ orderItemId: i.id, quantity: 1 })) },
+    },
+  });
+  const secondList = await packingListFor(secondBox.id);
+  check("a message written for one box is not printed in the other", secondList?.message === null, String(secondList?.message));
+  check("...and the box it was written for still has it", withMessage?.message?.startsWith("Packed with care.") === true);
+
+  // Whitespace only is the same as nothing: the operator who cleared the box
+  // meant to clear it, and a blank block reads as a rendering fault.
+  await prisma.shipment.update({ where: { id: shipment.id }, data: { packingSlipMessage: "   " } });
+  const blanked = await packingListFor(shipment.id);
+  check("a message of spaces prints nothing at all", blanked?.message === null, JSON.stringify(blanked?.message));
+  check("...and its document has no message block", blanked ? !/class="msg"/.test(renderPackingList(blanked)) : false);
+  await prisma.shipment.update({ where: { id: shipment.id }, data: { packingSlipMessage: null } });
+
   const lines = parseAddressLines(
     JSON.stringify({ name: "A", address1: "1 St", city: "Toronto", province: "ON", zip: "M5H 2N2", country: "CA" })
   );
@@ -1361,8 +1706,15 @@ async function multiLineBookingChecks() {
       wholesalePaymentStatus: "SUCCEEDED",
       shopifyCreatedAt: new Date(),
       shopifyUpdatedAt: new Date(),
+      // The phone is NOT decoration: eShipper's SAVE step validates the
+      // recipient against ShipToAddress, whose required list includes `phone`,
+      // and refuses the whole booking without one. A fixture that reaches a
+      // booking therefore has to carry what a real order carries, or the check
+      // below fails on the prerequisite instead of on its subject. The
+      // missing-phone case is pinned on its own, separately.
       shippingAddress: JSON.stringify({
         name: "Verify Customer",
+        phone: "(416) 555-0142",
         address1: "1 Test Street",
         city: "Toronto",
         province: "ON",
@@ -1471,14 +1823,25 @@ async function multiLineBookingChecks() {
     booked?.items.length === 2,
     `${booked?.items.length ?? 0} line(s) on the shipment`
   );
-  check("...bought with one provider call", apiCalls().length === 1, `calls=${apiCalls().length}`);
-  const shipCall = apiCalls()[0];
+  check("...bought with one provider call", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
+  const shipCall = purchaseCalls()[0];
+  /*
+   * The id in the URL is the one the SAVE issued, not the rate's uuid.
+   *
+   * This is the assertion that would have caught the defect this contract was
+   * rewritten for: `quote.providerQuoteId` is a rate envelope's uuid — a string
+   * — and `/api/v2/ship/{id}` is typed `integer/int64`, so posting the uuid
+   * there is refused by the provider's deserializer before it reads anything.
+   * A booking is only bookable after the save has named it.
+   */
   check(
-    "...to the quote that was selected",
-    Boolean(shipCall?.url.endsWith(`/api/v2/ship/${quote.providerQuoteId}`)),
-    shipCall?.url ?? "(no call)"
+    "...to the quote the save made bookable, not the rate's uuid",
+    Boolean(shipCall?.url.endsWith(`/api/v2/ship/${lastSavedQuoteId()}`)) && shipCall?.body === null,
+    `${shipCall?.url ?? "(no call)"} body=${JSON.stringify(shipCall?.body)}`
   );
-  const wire = shipCall?.body as { packages?: { type?: string; packages?: unknown[] }; packagingUnit?: string } | undefined;
+  const wire = savedRequest() as
+    | { packages?: { type?: string; packages?: unknown[] }; packagingUnit?: string }
+    | undefined;
   check(
     "...whose own request carried both cartons, in one package block",
     wire?.packages?.type === "Package" && wire?.packages?.packages?.length === 2,
@@ -1731,8 +2094,8 @@ async function addressGateChecks() {
      * here would refuse most of the queue.
      */
     check("booking does NOT require an address to have been checked", booked, message.slice(0, 200));
-    check("...so the carrier IS called for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
-    check("...and the label is recorded as bought", after.providerShipmentId === `S-ADDR-NEVER-${suffix}`, after.providerShipmentId ?? "(null)");
+    check("...so the carrier IS called for it", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
+    check("...and the label is recorded as bought", after.providerShipmentId === orderIdFor("ADDR-NEVER"), after.providerShipmentId ?? "(null)");
     check("...and the shipment reaches BOOKED", after.status === "BOOKED", after.status);
     check("...and a label time is stamped", after.labelCreatedAt !== null);
     // Still advice, and still true after the booking: the record did not become
@@ -1843,7 +2206,7 @@ async function addressGateChecks() {
       message = error instanceof Error ? error.message : String(error);
     }
     check("a stale verdict does not refuse the booking", booked, message.slice(0, 200));
-    check("...with the carrier called exactly once", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("...with the carrier called exactly once", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
   }
 
   /* --- the two verdicts that ask for a person ---------------------------- */
@@ -1874,7 +2237,7 @@ async function addressGateChecks() {
       message = error instanceof Error ? error.message : String(error);
     }
     check(`${verdict} on the pickup address does not refuse the booking`, booked, message.slice(0, 180));
-    check(`...and the carrier is called once for ${verdict}`, apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check(`...and the carrier is called once for ${verdict}`, purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
   }
 
   /* --- the destination is reported too, not just the dock ---------------- */
@@ -1908,7 +2271,7 @@ async function addressGateChecks() {
       message = error instanceof Error ? error.message : String(error);
     }
     check("an unchecked destination does not refuse the booking", booked, message.slice(0, 200));
-    check("...and a label is bought for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("...and a label is bought for it", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
   }
 
   /* --- an owner's override, on the record -------------------------------- */
@@ -1995,7 +2358,7 @@ async function addressGateChecks() {
       message = error instanceof Error ? error.message : String(error);
     }
     check("the booking still proceeds, override or not", booked, message.slice(0, 180));
-    check("...and the carrier is called for it", apiCalls().length === 1, `calls=${apiCalls().length}`);
+    check("...and the carrier is called for it", purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
 
     // The entry is keyed on the validation row it created (`entityId`), and the
     // address it is about is in `afterData` — stored as a JSON string, so it is
@@ -2285,7 +2648,7 @@ async function addressGateChecks() {
      * changed because somebody said so. A literal here would pass whether the
      * adapter copied the blob or re-derived it from Google's stored answer.
      */
-    const wire = apiCalls()[0]?.body as { to?: { zip?: string; address1?: string } } | undefined;
+    const wire = savedRequest() as { to?: { zip?: string; address1?: string } } | undefined;
     const storedAfterApply = JSON.parse(
       (await prisma.order.findUniqueOrThrow({ where: { id: order.id } })).shippingAddress ?? "{}"
     ) as { zip?: string; address2?: string };

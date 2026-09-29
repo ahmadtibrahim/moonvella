@@ -37,6 +37,10 @@ import {
   trackByTrackingNumber,
   bulkTrack,
   getReturnQuote,
+  saveReturnQuote,
+  bookReturn,
+  labelToHref,
+  RETURN_PURCHASING_ENABLED,
   schedulePickup,
   classifyEshipperEnvironment,
   isRecognizedTestHost,
@@ -79,7 +83,7 @@ function tracking(partial: Partial<TrackingResult>): TrackingResult {
 // --- a fetch stub that records every call -----------------------------------
 type Call = { url: string; method: string; body: Record<string, unknown> | null };
 const calls: Call[] = [];
-function installFetch(respond: (url: string) => { status?: number; body?: unknown }) {
+function installFetch(respond: (url: string, method: string) => { status?: number; body?: unknown }) {
   (globalThis as unknown as { fetch: unknown }).fetch = async (input: unknown, init?: { method?: string; body?: string }) => {
     const url = String(input);
     const method = init?.method ?? "GET";
@@ -90,7 +94,11 @@ function installFetch(respond: (url: string) => { status?: number; body?: unknow
       body = null;
     }
     calls.push({ url, method, body });
-    const r = respond(url);
+    // The METHOD is passed through because on this API the verb carries the
+    // meaning: `PUT /api/v2/quote` saves a quote and `POST /api/v2/quote` fetches
+    // rates, on the same path. A stub that branches on the URL alone cannot tell
+    // the two apart and would answer the save with a rate envelope.
+    const r = respond(url, method);
     return new Response(JSON.stringify(r.body ?? {}), {
       status: r.status ?? 200,
       headers: { "content-type": "application/json" },
@@ -233,17 +241,55 @@ async function main() {
   process.env.ESHIPPER_ENV = "sandbox";
 
   // 7. Provider request mapping (MOCKED) -------------------------------------
-  installFetch((url) => {
+  /*
+   * The provider's answer to a CREATE, in the shape the spec defines.
+   *
+   * Reproduced rather than invented: `ShippingReply` nests the ids under
+   * `order`, the carrier under `carrier`, and the money under `quote`; the label
+   * arrives INLINE as `labelData.label[]` of `{type, data}` and there is no
+   * `labelUrl` anywhere in the reply. The previous stub answered with a flat
+   * `{shipmentId, carrier, labelUrl, cost}` object that resembles nothing the
+   * provider sends, which is why a reader looking for those names passed here
+   * and recorded an empty shipment at zero cost in production.
+   */
+  const shippingReply = {
+    order: { orderId: "8000000029608", trackingId: "TRK1", message: null },
+    carrier: { carrierName: "Canada Post", serviceName: "Expedited Parcel", carrierLogoPath: "/logo.png" },
+    trackingNumber: "TRK1",
+    trackingUrl: "https://track/TRK1",
+    brandedTrackingUrl: "https://branded/TRK1",
+    labelData: { label: [{ type: "PDF", data: "JVBERi0xLjQK" }] },
+    // Deliberately NOT the quoted 15.5: what was bought is not guaranteed to
+    // equal what was quoted, and the reader must take the reply's figure.
+    quote: { totalCharge: 16.25, currency: "CAD", serviceId: 5000026, serviceName: "Expedited Parcel", carrierName: "Canada Post", transitDays: "3" },
+    packages: [{ trackingNumber: "TRK1", reference: "1" }],
+    message: null,
+  };
+
+  installFetch((url, method) => {
     if (url.includes("/authenticate")) return { body: { token: "test-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-1", refresh_expires_in: "7200" } };
     if (url.includes("/refresh-token")) return { body: { token: "refreshed-token", expires_in: "3600", token_type: "Bearer", refresh_token: "refresh-2", refresh_expires_in: "7200" } };
+    /*
+     * The SAVE and the RATE call share a path and differ only by verb. Answering
+     * them from one branch was how the suite kept passing while the adapter's
+     * booking flow was wrong.
+     */
+    if (url.endsWith("/api/v2/quote") && method === "PUT") return { body: { quoteId: 8000000029607, type: "Success", message: "Quote saved successfully" } };
     if (url.includes("/api/v2/quote")) return { body: { quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 15.5, currency: "CAD", transitDays: "3" }], uuid: "Q-1", warnings: [] } };
+    // Before the generic /ship/ branch below, which would otherwise swallow it.
+    if (url.includes("/api/v2/ship/cancel")) return { body: { order: [{ orderId: "8000000029608" }] } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/label")) return { body: { url: "https://labels.example/L.pdf", format: "PDF" } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/order-details")) return { body: { orderId: "O", details: { weight: 2 } } };
     if (url.includes("/api/v2/ship/") && url.endsWith("/customs-invoice")) return { body: { url: "https://labels.example/C.pdf" } };
-    if (url.includes("/api/v2/ship/")) return { body: { shipmentId: "SHIP-1", carrier: "Canada Post", serviceName: "Expedited", trackingNumber: "TRK1", trackingUrl: "https://track/TRK1", labelUrl: "https://labels/L.pdf", cost: 15.5, currency: "CAD" } };
+    if (url.includes("/api/v2/ship/")) return { body: shippingReply };
     if (url.includes("/api/v2/track/tracking-number/bulk")) return { body: { results: [] } };
     if (url.includes("/api/v2/track/tracking-number/")) return { body: { trackingUrl: "https://track/TN", trackingDetails: [{ dateTime: "2026-01-01T00:00:00Z", location: "Toronto", description: "In transit", carrierEventCode: "IT", statusText: "inTransit" }], inTransit: true } };
-    if (url.includes("/api/v2/returns/quote")) return { body: { carrierName: "UPS", serviceId: 5000200, serviceName: "Return", totalCharge: 9.25, currency: "CAD", transitDays: "5" } };
+    // Returns mirror the outbound flow: rates are the same envelope (uuid +
+    // quotes), the save answers SaveQuoteResponse, and the create answers the
+    // same ShippingReply.
+    if (url.endsWith("/api/v2/returns/quote") && method === "PUT") return { body: { quoteId: 8000000029610, type: "Success", message: "Return quote saved successfully" } };
+    if (url.includes("/api/v2/returns/quote")) return { body: { quotes: [{ carrierName: "UPS", serviceId: 5000200, serviceName: "Return", totalCharge: 9.25, currency: "CAD", transitDays: "5" }], uuid: "RQ-1", warnings: [] } };
+    if (url.includes("/api/v2/returns/create/")) return { body: shippingReply };
     if (url.includes("/api/v2/pickup")) return { body: { pickupId: "PK-1", scheduledDate: "2026-02-01", status: "SCHEDULED" } };
     return { status: 500, body: { error: "unexpected url" } };
   });
@@ -317,12 +363,80 @@ async function main() {
     JSON.stringify(Object.keys(authBody).sort())
   );
 
+  /*
+   * BOOKING IS THREE CALLS, NOT TWO, AND THIS IS WHERE THAT IS PINNED.
+   *
+   * A rate is not bookable: `POST /api/v2/ship/{id}` wants an `integer/int64`
+   * naming a quote the provider has SAVED, and a rate response carries no such
+   * number — only a `uuid` identifying the rate transaction. The adapter was
+   * posting that uuid into the numeric slot, which the provider refused with a
+   * Java `NumberFormatException` before reading the body. So the assertions
+   * below are ordered as the contract is: save first, buy what the save issued.
+   */
+  const quoteObject = { carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 15.5, currency: "CAD" };
   const booking = await bookShipment({
-    quote: { carrier: "Canada Post", serviceCode: "CP", serviceName: "Expedited", providerQuoteId: "Q-1" },
+    quote: { carrier: "Canada Post", serviceCode: "5000026", serviceName: "Expedited", providerQuoteId: "Q-1", raw: quoteObject },
     rateRequest,
   });
-  check("bookShipment: POST /api/v2/ship/{quoteId}", lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/ship/Q-1"), `${lastCall().method} ${lastCall().url}`);
-  check("bookShipment: reads tracking + label from the response", booking.trackingNumber === "TRK1" && booking.labelUrl === "https://labels/L.pdf");
+
+  const saveCall = calls.find((c) => c.url.endsWith("/api/v2/quote") && c.method === "PUT");
+  check(
+    "bookShipment: SAVES the quote first with PUT /api/v2/quote",
+    !!saveCall,
+    saveCall ? `${saveCall.method} ${saveCall.url}` : "no PUT to /api/v2/quote"
+  );
+  check(
+    "bookShipment: the save body is SaveQuoteRequest {quoteRequest, quote, uuid}",
+    JSON.stringify(Object.keys(saveCall?.body ?? {}).sort()) === JSON.stringify(["quote", "quoteRequest", "uuid"]) &&
+      (saveCall?.body as Record<string, unknown> | null)?.uuid === "Q-1",
+    JSON.stringify(Object.keys(saveCall?.body ?? {}).sort())
+  );
+  check(
+    "bookShipment: then POSTs to /api/v2/ship/{quoteId} with the SAVED id, not the uuid",
+    lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/ship/8000000029607"),
+    `${lastCall().method} ${lastCall().url}`
+  );
+  check(
+    "bookShipment: the ship call carries no body — the saved quote is the whole request",
+    lastCall().body === null,
+    JSON.stringify(lastCall().body)
+  );
+  check(
+    "bookShipment: ids, carrier and money are read from their documented nesting",
+    booking.providerShipmentId === "8000000029608" &&
+      booking.carrier === "Canada Post" &&
+      booking.serviceName === "Expedited Parcel",
+    `${booking.providerShipmentId} / ${booking.carrier} / ${booking.serviceName}`
+  );
+  check(
+    "bookShipment: the cost is what the reply says was BOUGHT, not what was quoted",
+    booking.bookedCost === 1625,
+    `${booking.bookedCost} (quoted was ${quoteObject.totalCharge})`
+  );
+  check(
+    "bookShipment: the label is the inline labelData.label[] document",
+    booking.label?.type === "PDF" && booking.label.data === "JVBERi0xLjQK",
+    JSON.stringify(booking.label)
+  );
+  check(
+    "bookShipment: the saved quote id is carried out for reconciliation",
+    booking.savedQuoteId === 8000000029607,
+    String(booking.savedQuoteId)
+  );
+
+  // The label arrives as data, not as a URL, so the openable href is derived.
+  // Both readings are handled because the spec does not say which `data` holds —
+  // asserted here so the derivation cannot silently become a broken link.
+  check(
+    "labelToHref: base64 data becomes an openable data: URI",
+    labelToHref({ type: "PDF", data: "JVBERi0xLjQK" }) === "data:application/pdf;base64,JVBERi0xLjQK",
+    String(labelToHref({ type: "PDF", data: "JVBERi0xLjQK" }))
+  );
+  check(
+    "labelToHref: a URL is passed through, so either reading works",
+    labelToHref({ type: "PDF", data: "https://labels/L.pdf" }) === "https://labels/L.pdf"
+  );
+
   check("bookShipment: refuses a quote with no provider id", await (async () => {
     try {
       await bookShipment({ quote: { carrier: "X", serviceCode: "X", serviceName: "X", providerQuoteId: null }, rateRequest });
@@ -331,8 +445,16 @@ async function main() {
       return true;
     }
   })());
+  check("bookShipment: refuses a quote that kept no provider quote object", await (async () => {
+    try {
+      await bookShipment({ quote: { carrier: "X", serviceCode: "X", serviceName: "X", providerQuoteId: "Q-1" }, rateRequest });
+      return false;
+    } catch {
+      return true;
+    }
+  })());
 
-  await cancelShipment("SHIP-1");
+  await cancelShipment({ providerShipmentId: "8000000029608" });
   check("cancelShipment: DELETE /api/v2/ship/cancel", lastCall().method === "DELETE" && lastCall().url.endsWith("/api/v2/ship/cancel"), `${lastCall().method} ${lastCall().url}`);
 
   await getLabel("SHIP-1");
@@ -347,8 +469,72 @@ async function main() {
   await trackByTrackingNumber("TRK1");
   check("trackByTrackingNumber: GET /api/v2/track/tracking-number/{n}", lastCall().url.endsWith("/api/v2/track/tracking-number/TRK1"));
 
-  await getReturnQuote(rateRequest);
-  check("getReturnQuote: POST /api/v2/returns/quote", lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/returns/quote"));
+  /*
+   * RETURNS. The same three-call shape on a parallel set of paths, asserted for
+   * the same reason: the previous implementation posted a service code into a
+   * path that declares `integer/int64`, and sent `returnItems`/`returnAddress`
+   * — two names that appear NOWHERE in the API's 278 schemas. Jackson drops what
+   * it does not recognise, so that call was not rejected; it was ignored.
+   */
+  const returnRates = await getReturnQuote(rateRequest);
+  check(
+    "getReturnQuote: POST /api/v2/returns/quote",
+    lastCall().method === "POST" && lastCall().url.endsWith("/api/v2/returns/quote"),
+    `${lastCall().method} ${lastCall().url}`
+  );
+  check(
+    "getReturnQuote: reads the same envelope the outbound rates come in",
+    returnRates.length === 1 && returnRates[0].providerQuoteId === "RQ-1" && returnRates[0].totalAmount === 925,
+    `${returnRates.length} rate(s), id=${returnRates[0]?.providerQuoteId}, amount=${returnRates[0]?.totalAmount}`
+  );
+  check(
+    "getReturnQuote: reads the documented field names (carrierName/serviceId/totalCharge)",
+    returnRates[0]?.carrier === "UPS" && returnRates[0]?.serviceCode === "5000200",
+    `${returnRates[0]?.carrier} / ${returnRates[0]?.serviceCode}`
+  );
+
+  const returnQuoteId = await saveReturnQuote({
+    rateUuid: "RQ-1",
+    rateRequest,
+    quote: { carrierName: "UPS", serviceId: 5000200, serviceName: "Return", totalCharge: 9.25, currency: "CAD" },
+  });
+  check(
+    "saveReturnQuote: PUT /api/v2/returns/quote takes NO path segment",
+    lastCall().method === "PUT" && lastCall().url.endsWith("/api/v2/returns/quote"),
+    `${lastCall().method} ${lastCall().url}`
+  );
+  check(
+    "saveReturnQuote: the body key is returnQuoteRequest, not quoteRequest",
+    JSON.stringify(Object.keys(lastCall().body ?? {}).sort()) === JSON.stringify(["quote", "returnQuoteRequest", "uuid"]),
+    JSON.stringify(Object.keys(lastCall().body ?? {}).sort())
+  );
+  check(
+    "saveReturnQuote: returns the numeric quoteId from SaveQuoteResponse",
+    returnQuoteId === 8000000029610,
+    String(returnQuoteId)
+  );
+
+  check(
+    "return purchasing is switched off until a sandbox return has succeeded",
+    RETURN_PURCHASING_ENABLED === false,
+    String(RETURN_PURCHASING_ENABLED)
+  );
+  check("bookReturn: refuses while return purchasing is disabled", await (async () => {
+    try {
+      await bookReturn({
+        quote: { carrier: "UPS", serviceCode: "5000200", serviceName: "Return", providerQuoteId: "RQ-1", raw: { serviceId: 5000200 } },
+        rateRequest,
+      });
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+  check(
+    "bookReturn: and never sent `returnItems`/`returnAddress`, which the API does not define",
+    !calls.some((c) => c.url.includes("/api/v2/returns/create/")),
+    calls.filter((c) => c.url.includes("/returns/")).map((c) => `${c.method} ${c.url}`).join(" | ") || "no return calls"
+  );
 
   await schedulePickup({
     shipFrom: { name: "MoonVella", address: "1 Warehouse Way", city: "Toronto", province: "ON", postalCode: "M5H2N2", country: "CA" },
@@ -452,10 +638,11 @@ async function main() {
    * STILL MOCKED: no provider answered this. It proves what WE send, not what
    * eShipper accepts.
    */
-  installFetch((url) => {
+  installFetch((url, method) => {
     if (url.includes("/authenticate")) return { body: { token: "t", expires_in: "3600", token_type: "Bearer", refresh_token: "r", refresh_expires_in: "7200" } };
+    if (url.endsWith("/api/v2/quote") && method === "PUT") return { body: { quoteId: 8000000029609, type: "Success", message: "Quote saved successfully" } };
     if (url.includes("/api/v2/quote")) return { body: { quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 20, currency: "CAD", transitDays: "3" }], uuid: "Q-2", warnings: [] } };
-    if (url.includes("/api/v2/ship/")) return { body: { shipmentId: "SHIP-2", carrier: "Canada Post", serviceName: "Expedited", trackingNumber: "TRK2", labelUrl: "https://labels/L2.pdf", cost: 20, currency: "CAD" } };
+    if (url.includes("/api/v2/ship/")) return { body: shippingReply };
     return { status: 500, body: { error: "unexpected url" } };
   });
   resetEshipperToken();
@@ -546,15 +733,29 @@ async function main() {
     `3 parcels, ${(1.134 + 2).toFixed(3)} kg`,
   );
 
+  /*
+   * Booking the same multi-parcel request. WHAT CHANGED AND WHY IT MATTERS HERE:
+   * the parcels no longer travel on the ship call. Booking is rate → SAVE → buy,
+   * and the SAVE is where the request is restated — `POST /api/v2/ship/{quoteId}`
+   * carries no body at all, only the numeric id the save issued. So the request
+   * to read back is the PUT, and the request that has to describe all three boxes
+   * is the one inside it. Reading the ship body instead would now read `null` and
+   * pass a "3 parcels" check only by accident of a stale fixture.
+   */
+  const quoteObject2 = { carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 20, currency: "CAD" };
+  const beforeBooking = calls.length;
   await bookShipment({
-    quote: { carrier: "Canada Post", serviceCode: "5000026", serviceName: "Expedited", providerQuoteId: "Q-2" },
+    quote: { carrier: "Canada Post", serviceCode: "5000026", serviceName: "Expedited", providerQuoteId: "Q-2", raw: quoteObject2 },
     rateRequest: multiRequest,
   });
-  const bookedBody = lastCall().body as {
+  const bookingCalls = calls.slice(beforeBooking);
+  const multiSaveCall = bookingCalls.find((c) => c.url.endsWith("/api/v2/quote") && c.method === "PUT");
+  const shipCall = bookingCalls.find((c) => c.url.includes("/api/v2/ship/"));
+  const savedQuoteRequest = ((multiSaveCall?.body ?? {}).quoteRequest ?? {}) as {
     packages?: { packages?: Record<string, unknown>[] };
-    serviceId?: unknown;
   };
-  const bookedPackages = bookedBody.packages?.packages ?? [];
+  const savedQuoteObject = ((multiSaveCall?.body ?? {}).quote ?? {}) as { serviceId?: unknown };
+  const bookedPackages = savedQuoteRequest.packages?.packages ?? [];
   check(
     "booking re-sends the same parcels: the label describes the boxes that were quoted",
     bookedPackages.length === 3 && bookedPackages[0]?.length === 60.96,
@@ -562,8 +763,13 @@ async function main() {
   );
   check(
     "booking names the service by the id the provider issued, not a reassembled code",
-    bookedBody.serviceId === 5000026,
-    String(bookedBody.serviceId),
+    savedQuoteObject.serviceId === 5000026,
+    String(savedQuoteObject.serviceId),
+  );
+  check(
+    "the ship call names only the saved quote — no body, nothing to re-describe",
+    !!shipCall && shipCall.body === null,
+    shipCall ? `${shipCall.method} ${shipCall.url} body=${JSON.stringify(shipCall.body)}` : "no ship call",
   );
 
   // 11. A shipment books its OWN cartons, not the whole order's ---------------

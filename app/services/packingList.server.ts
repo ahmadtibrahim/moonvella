@@ -33,8 +33,17 @@ export interface PackingListLine {
 }
 
 export interface PackingList {
+  /**
+   * The shipment this list belongs to, for the route and for the scope check.
+   *
+   * There is deliberately no short "reference" to go with it. There was one —
+   * `id.slice(0, 8)` — and it was printed in the header, in the `<title>` and in
+   * the saved filename until §5 was read as a list of what may NOT appear: an
+   * internal id on a page the customer receives names a row in our database, and
+   * the filename travels home with them. A field nothing renders and everything
+   * may reach for is how it comes back, so it is gone rather than unused.
+   */
   shipmentId: string;
-  reference: string;
   sellerId: string;
   brandName: string;
   brandColour: string;
@@ -42,6 +51,12 @@ export interface PackingList {
   customerName: string;
   shipTo: string[];
   lines: PackingListLine[];
+  /**
+   * An optional note the operator typed for this box, printed under the
+   * contents. Null when there is none, which prints nothing at all — an empty
+   * heading would be a piece of the document that says "there is nothing here".
+   */
+  message: string | null;
   packages: { count: number; length: number; width: number; height: number; weight: number }[];
   /** Parcels in this shipment, from the shipment itself rather than recounted. */
   packageCount: number;
@@ -100,6 +115,9 @@ export async function packingListFor(
       // The shipment's own parcel count, not the order's: an order can be split
       // across shipments, and the slip goes in one box.
       packageCount: true,
+      // This shipment's note, for the same reason: a split order has one slip
+      // per box and each can say something different.
+      packingSlipMessage: true,
       items: {
         select: {
           quantity: true,
@@ -129,7 +147,6 @@ export async function packingListFor(
   const brandKit = shipment.order.seller.brandKit;
   return {
     shipmentId: shipment.id,
-    reference: shipment.id.slice(0, 8),
     sellerId: shipment.order.seller.id,
     brandName: brandKit?.storeName?.trim() || shipment.order.seller.storeName,
     brandColour: brandColourOf(brandKit?.brandColours),
@@ -142,6 +159,7 @@ export async function packingListFor(
       quantity: item.quantity,
       options: item.orderItem.selectedOptions,
     })),
+    message: shipment.packingSlipMessage?.trim() || null,
     packages: shipment.order.packages,
     packageCount: shipment.packageCount || shipment.order.packages.reduce((sum, p) => sum + p.count, 0),
     totalUnits: shipment.items.reduce((sum, item) => sum + item.quantity, 0),
@@ -158,6 +176,24 @@ function escape(value: string): string {
 
 /**
  * The document itself: one printable page, no scripts, no external assets.
+ *
+ * WHAT IT MUST NOT CARRY, read as a list and checked against the output rather
+ * than against this code. §5 forbids the wholesale price, the Stripe charge,
+ * internal profit, supplier information and internal IDs. Two of those were on
+ * this slip until it was read that way:
+ *
+ *   * "Shipment <first eight characters>" — this shipment's cuid, printed on a
+ *     page that goes to a customer. An internal identifier, and one that names a
+ *     row in our database.
+ *   * "Fulfilled by MoonVella" — the supplier, named on the seller's own
+ *     paperwork. The customer bought from the seller, the slip goes in the
+ *     seller's box, and telling the recipient who else was involved discloses a
+ *     wholesale relationship that is not ours to disclose.
+ *
+ * What remains is structural rather than editorial: this document is built from
+ * `packingListFor`, which selects the seller's brand, the order name, the
+ * shipping address and the ordered lines — and selects no money column at all.
+ * A price cannot leak through a template that was never given one.
  *
  * Self-contained on purpose. A printed slip must render with the warehouse's
  * internet down, so there is no font to fetch and no stylesheet to load, and
@@ -215,7 +251,12 @@ export function renderPackingList(list: PackingList): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Packing list ${escape(list.reference)} — ${escape(list.orderName)}</title>
+<!--
+  The title names the ORDER, not the shipment. It is also the browser's default
+  filename when this is saved as a PDF, so an internal id here would end up on
+  the customer's own copy of the file.
+-->
+<title>Packing list — ${escape(list.orderName)}</title>
 <style>
   :root { --brand: ${list.brandColour}; }
   * { box-sizing: border-box; }
@@ -235,6 +276,7 @@ export function renderPackingList(list: PackingList): string {
   .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
   .opt { color: #64748b; font-size: 11px; }
   .totals { margin-top: 0.75rem; text-align: right; font-weight: 600; }
+  .msg { margin-top: 1.5rem; border: 1px solid #e2e8f0; border-left: 3px solid var(--brand); border-radius: 4px; padding: 0.6rem 0.75rem; }
   .note { margin-top: 1.5rem; border-top: 1px solid #e2e8f0; padding-top: 0.75rem; color: #64748b; font-size: 11px; }
   .toolbar { margin-bottom: 1.25rem; }
   .toolbar a, .toolbar button { font: inherit; padding: 0.4rem 0.75rem; border: 1px solid var(--brand); border-radius: 6px; background: white; color: var(--brand); font-weight: 600; cursor: pointer; text-decoration: none; margin-right: 0.4rem; }
@@ -257,7 +299,6 @@ export function renderPackingList(list: PackingList): string {
     </div>
     <div class="doc">
       <strong>${escape(list.orderName)}</strong>
-      Shipment ${escape(list.reference)}<br />
       Packed ${new Date().toLocaleDateString()}
     </div>
   </div>
@@ -270,7 +311,6 @@ export function renderPackingList(list: PackingList): string {
     <div>
       <h2>Ship from</h2>
       <div>${escape(list.brandName)}</div>
-      <div style="color:#64748b">Fulfilled by MoonVella</div>
     </div>
   </div>
 
@@ -293,10 +333,23 @@ export function renderPackingList(list: PackingList): string {
       : ""
   }
 
+  ${
+    /*
+     * The operator's own words, escaped, and nothing else. No signature, no
+     * reference number and no generated sentence: §5 asks for an OPTIONAL
+     * seller/customer message, and a template that filled the space when nobody
+     * had anything to say would be the document inventing content.
+     */
+    list.message
+      ? `<div class="msg"><h2>Message</h2><div>${escape(list.message).replace(/\n/g, "<br />")}</div></div>`
+      : ""
+  }
+
   <div class="note">
     This is a packing list. It is not a carrier document, not an invoice, and not a customs declaration, and it states no
     prices. Retail pricing is on the customer's receipt; carrier charges are on the carrier's own invoice.
   </div>
+
 </body>
 </html>`;
 }

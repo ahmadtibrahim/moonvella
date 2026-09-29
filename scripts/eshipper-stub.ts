@@ -60,7 +60,28 @@ const RATES = [
 /** One envelope uuid covers every quote returned with it — this is the booking handle. */
 const QUOTE_UUID = "STUB-QUOTE-UUID-1";
 
-function responseFor(url: string): { status: number; body: unknown } {
+/**
+ * The numeric id the SAVE issues for that envelope, and the only thing
+ * `POST /api/v2/ship/{id}` will accept — it is typed `integer/int64` and refuses
+ * a uuid before it reads the body.
+ */
+const SAVED_QUOTE_ID = 8000000029801;
+
+/**
+ * The verb is part of the question, not a detail of the call.
+ *
+ * `PUT /api/v2/quote` SAVES a rate and answers with the numeric id that makes it
+ * bookable; `POST /api/v2/quote` fetches rates and answers with an envelope of
+ * them. Same path, opposite meanings — a stub that branches on the URL alone
+ * answers the save with a rate envelope, and every booking then fails with
+ * "did not issue a bookable quote id" for a reason that has nothing to do with
+ * the suite reading it.
+ */
+function responseFor(
+  url: string,
+  method: string,
+  body: Record<string, unknown> | null
+): { status: number; body: unknown } {
   if (url.includes("/authenticate")) {
     return {
       status: 200,
@@ -80,6 +101,9 @@ function responseFor(url: string): { status: number; body: unknown } {
     // returns response — see the note on `saveReturnQuote` in the adapter.
     return { status: 200, body: { ...RATES[0], carrierName: "UPS Returns", serviceName: "Return" } };
   }
+  if (url.includes("/api/v2/quote") && method === "PUT") {
+    return { status: 200, body: { quoteId: SAVED_QUOTE_ID, type: "Success", message: "Quote saved successfully" } };
+  }
   if (url.includes("/api/v2/quote")) {
     return { status: 200, body: { quotes: RATES, uuid: QUOTE_UUID, warnings: [] } };
   }
@@ -93,18 +117,37 @@ function responseFor(url: string): { status: number; body: unknown } {
   if (url.includes("/api/v2/ship/") && url.endsWith("/customs-invoice")) {
     return { status: 200, body: { url: "https://labels.invalid/stub-customs.pdf" } };
   }
+  if (url.includes("/api/v2/ship/cancel")) {
+    /*
+     * `ShipmentCancelReply` is `{order: Order[]}` — an ARRAY, and the adapter
+     * reads a cancellation as confirmed only when it has at least one entry.
+     * The cancelled orders are echoed back from the request, so a suite can
+     * check that the shipment was cancelled by the id it actually holds rather
+     * than by whatever the stub felt like returning.
+     */
+    const asked = (body?.order ?? {}) as { orderId?: string; trackingId?: string };
+    return { status: 200, body: { order: [{ orderId: asked.orderId, trackingId: asked.trackingId }] } };
+  }
   if (url.includes("/api/v2/ship/")) {
+    /*
+     * The documented `ShippingReply`, not the flat shape this used to answer
+     * with. None of `shipmentId`, `cost` or `labelUrl` exists in the reply: the
+     * ids are nested under `order`, the carrier under `carrier`, the money under
+     * `quote`, and the label arrives as the document itself under
+     * `labelData.label[]`. A stub written to the old invention agreed with the
+     * old reader, so both looked correct while a real booking would have been
+     * recorded as an empty provider id at zero cost.
+     */
     return {
       status: 200,
       body: {
-        shipmentId: "STUB-SHIP-1",
-        carrier: "UPS",
-        serviceName: "Standard",
+        order: { orderId: "STUB-SHIP-1" },
+        carrier: { carrierName: "UPS", serviceName: "Standard" },
         trackingNumber: "STUBTRACK1",
         trackingUrl: "https://track.invalid/STUBTRACK1",
-        labelUrl: "https://labels.invalid/stub-label.pdf",
-        cost: 12.0,
-        currency: "CAD",
+        brandedTrackingUrl: "https://track.invalid/branded/STUBTRACK1",
+        labelData: { label: [{ type: "PDF", data: "JVBERi0xLjQK" }] },
+        quote: { totalCharge: 12.0, currency: "CAD" },
       },
     };
   }
@@ -153,7 +196,7 @@ export function installEshipperStub(): { calls: StubCall[] } {
     }
     calls.push({ url, method: init?.method ?? "GET", body });
 
-    const r = responseFor(url);
+    const r = responseFor(url, init?.method ?? "GET", body);
     return new Response(JSON.stringify(r.body), {
       status: r.status,
       headers: { "content-type": "application/json" },

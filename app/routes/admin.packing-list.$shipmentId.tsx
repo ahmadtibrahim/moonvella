@@ -28,7 +28,12 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   // actions are offered on the document itself so the choice is made where the
   // operator is looking, not somewhere else that has to be remembered.
   const download = new URL(request.url).searchParams.get("download") === "1";
-  const safeName = `${list.orderName}-${list.reference}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  /*
+   * The ORDER's name, and not the shipment's reference. This string becomes the
+   * customer's own filename, and the reference is an internal id — the same
+   * reason the document itself no longer prints one.
+   */
+  const safeName = list.orderName.replace(/[^A-Za-z0-9._-]+/g, "-");
 
   return new Response(renderPackingList(list), {
     headers: {

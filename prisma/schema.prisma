@@ -1269,6 +1269,21 @@ model Shipment {
   /// notify twice: Shopify sends the e-mail on the call, and a duplicate
   /// notification is not something an operator can undo.
   shopifyNotifiedAt       DateTime?
+  /// Whether the customer should be e-mailed through Shopify when this
+  /// shipment's tracking is pushed, chosen on the booking confirmation screen.
+  ///
+  /// Stored rather than passed straight through, because the two moments are
+  /// different: the choice is made when the label is bought, and the push
+  /// happens when the parcel is marked dispatched. Without a column the choice
+  /// would be lost in between, and the operator would be asked twice.
+  ///
+  /// Defaults to false — OFF — deliberately, and the confirmation screen says
+  /// so. A shipment in the test environment is still a real order with a real
+  /// customer behind it, and Shopify sends the e-mail on the call: a "your
+  /// order has shipped" notice sent by accident cannot be recalled. It is the
+  /// DEFAULT for the push, not a decision taken here; whoever marks the parcel
+  /// dispatched sees it and can still change it.
+  notifyCustomerOnPush    Boolean                 @default(false)
   /// The Shopify fulfillment this shipment created, when the push succeeded, and
   /// when it last succeeded. Recorded on the shipment so a retry can ask "have I
   /// already done this" without asking Shopify, which answers "already
@@ -1279,6 +1294,18 @@ model Shipment {
   /// row, because "this one parcel did not reach Shopify" is a fact about the
   /// parcel and an operator needs it on the parcel's page.
   shopifySyncError        String?
+  /// An optional message printed on the packing slip that goes in the box.
+  ///
+  /// The seller's slip, in the seller's words: "thanks for your order", a care
+  /// instruction, a note about the second box in a split shipment. Stored on the
+  /// shipment rather than the order because a split order has one slip per box
+  /// and a note about the pillows must not appear in the carton of towels.
+  ///
+  /// It is printed verbatim and escaped, and it is the operator's own text —
+  /// nothing here is generated, and no internal reference, price or supplier
+  /// name is ever appended to it. See packingList.server, where the document's
+  /// silence about money is a property of which columns are read.
+  packingSlipMessage      String?
   /// A return shipment points at the original shipment it returns.
   returnOfShipmentId      String?
   returnReason            String?

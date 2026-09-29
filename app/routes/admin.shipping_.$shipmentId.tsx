@@ -13,6 +13,7 @@ import {
   getShipmentOrderDetails,
   getShipmentCustomsInvoice,
   syncTrackingForShipment,
+  syncShipmentTracking,
   voidShipment,
   getReturnQuotesForOrder,
   bookReturnForOrder,
@@ -22,6 +23,8 @@ import {
   getBillingReconciliation,
   reconcileCarrierInvoice,
   resolveShipmentOrigin,
+  packagesForShipment,
+  recipientPhoneFor,
 } from "~/services/shipping.server";
 import {
   addressStatus,
@@ -32,7 +35,10 @@ import {
   validateAddress,
 } from "~/services/addressValidation.server";
 import { AddressGateCard } from "~/components/AddressGateCard";
+import { BookingConfirmation } from "~/components/BookingConfirmation";
+import type { BookingEnvironment } from "~/components/BookingConfirmation";
 import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
+import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 // The window form's rule, from the client-safe module: both ends or neither,
 // shaped and in order. Shared with the pickup-location form so the two agree on
 // what a window is.
@@ -54,7 +60,12 @@ import {
   removeOrderPackage,
   type ShipmentAdvanceEvent,
 } from "~/services/fulfillment.server";
-import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
+import {
+  describeEshipperStatus,
+  eshipperStatus,
+  RETURN_PURCHASING_ENABLED,
+  RETURN_PURCHASING_DISABLED_REASON,
+} from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
 import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
@@ -285,8 +296,37 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
    */
   const units = unitsView(await getUnitsPreference());
 
+  /*
+   * The cartons this booking would actually declare, resolved by the same
+   * function the booking itself uses.
+   *
+   * The confirmation screen's job is to show what is about to be bought, and
+   * "the parcels" is the part an operator cannot check anywhere else: the box
+   * list on the order is what was QUOTED, and the shipment's own assigned
+   * cartons are what will be LABELLED. Resolving here rather than in the
+   * component means the screen and the booking cannot disagree, and it is a
+   * read — nothing is reserved, created or sent.
+   */
+  const bookingParcels = await packagesForShipment(
+    { id: shipment.id, items: shipment.items.map((si) => ({ orderItemId: si.orderItemId, quantity: si.quantity })) },
+    order,
+  );
+
   return {
     units,
+    bookingParcels: {
+      packages: bookingParcels.packages.map((p) => ({
+        count: p.count,
+        length: p.length,
+        width: p.width,
+        height: p.height,
+        weight: p.weight,
+        units: p.units,
+      })),
+      source: bookingParcels.source,
+      notes: bookingParcels.notes,
+      missing: bookingParcels.missing,
+    },
     shipment: {
       id: shipment.id,
       reference: shipment.id.slice(0, 8),
@@ -332,6 +372,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       pickupWindow: shipment.pickupWindow,
       pickupConfirmation: shipment.pickupConfirmation,
       pickupLastError: shipment.pickupLastError,
+      // The customer-notification answer given on the confirmation screen, and
+      // the default the dispatch push will use. Shown on the dispatch control so
+      // the operator can see a choice they made earlier rather than being asked
+      // the same question again with no memory of it.
+      notifyCustomerOnPush: shipment.notifyCustomerOnPush,
+      // The note that will print on this box's packing slip, if there is one.
+      packingSlipMessage: shipment.packingSlipMessage,
     },
     order: {
       id: order.id,
@@ -345,7 +392,26 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       customerEmail: order.customerEmail,
       quotesInvalidatedAt: order.quotesInvalidatedAt,
       quoteInvalidationReason: order.quoteInvalidationReason,
+      /*
+       * WHETHER SHOPIFY CAN BE TOLD AT ALL, answered before the label is bought
+       * rather than after.
+       *
+       * The push needs a fulfillment order id, and an order ingested before the
+       * fulfillment-service setup has none. If that is the case the confirmation
+       * screen has to say so — an operator who buys a label expecting tracking to
+       * reach the customer and finds out afterwards that it cannot is being sold
+       * something the page already knew was incomplete.
+       */
+      hasFulfillmentOrder: Boolean(order.shopifyFulfillmentOrderId),
       shipTo: parseAddress(order.shippingAddress),
+      /*
+       * The phone as the BOOKING GATE sees it, not as the address blob happens to
+       * hold it: `recipientPhoneFor` also reads the number recorded on the order,
+       * and a confirmation screen that used the narrower source would tell an
+       * operator the carrier will refuse a booking the carrier would take —
+       * which is how a number that has already been fixed gets typed in twice.
+       */
+      recipientPhone: recipientPhoneFor(order),
       billingAddress: parseAddress(order.billingAddress),
       seller: { id: order.seller.id, storeName: order.seller.storeName, currency: order.seller.currency },
     },
@@ -371,6 +437,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       detail: eshipper.detail,
     },
     shopifyFulfillment: { state: shopifyFulfillment.status, detail: shopifyFulfillment.detail },
+    /*
+     * Whether a return LABEL may be bought, and the refusal in the operator's
+     * words. Carried from the adapter rather than decided here: the gate that
+     * refuses is the adapter's, and a screen that guessed at it could disagree
+     * with the call it is about to make. Quoting stays open — it is read-only
+     * and costs nothing — so only the purchase is drawn as closed.
+     */
+    returnPurchasing: { enabled: RETURN_PURCHASING_ENABLED, reason: RETURN_PURCHASING_DISABLED_REASON },
     pickupPlan,
     /*
      * Both addresses this booking will print, with their verdicts, read here
@@ -461,7 +535,20 @@ export async function action({ request, params }: ActionFunctionArgs) {
     } else if (intent === "select_quote") {
       await selectQuote(orderId, String(form.get("quoteId")), actor);
     } else if (intent === "book_shipment") {
-      await bookPreparedShipment(shipmentId, String(form.get("quoteId") || "") || undefined, actor);
+      /*
+       * The confirmation screen's answer to "will Shopify notify the customer".
+       *
+       * Read as an explicit boolean rather than defaulted here, because the
+       * three states are different: "on", "off", and "the caller did not ask"
+       * (which must leave a stored answer alone rather than silently meaning
+       * no). The form always sends the field — it is a checkbox in a modal that
+       * cannot be submitted without being seen — so `undefined` only arises for
+       * a request built by hand, and that one keeps its hands off the column.
+       */
+      const answered = form.has("notifyCustomer");
+      await bookPreparedShipment(shipmentId, String(form.get("quoteId") || "") || undefined, actor, {
+        ...(answered ? { notifyCustomerOnPush: form.get("notifyCustomer") === "on" } : {}),
+      });
     } else if (intent === "reconcile_booking") {
       const outcome = await reconcileBookingOutcome(shipmentId, actor);
       return redirect(`${back}?notice=${outcome.adopted ? "booking-recovered" : "booking-not-found"}`);
@@ -500,6 +587,49 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return redirect(invoice.customsInvoiceUrl);
     } else if (intent === "sync_tracking") {
       await syncTrackingForShipment(shipmentId, actor);
+    } else if (intent === "retry_shopify_sync") {
+      /*
+       * §6's retry, and it is deliberately the SAME call the dispatch milestone
+       * makes. There is no "retry" variant that could book something: this
+       * function pushes the tracking number this shipment already holds and
+       * returns early when Shopify already has it, so a retry cannot buy a
+       * second label, cannot re-number anything, and cannot notify a customer
+       * who has already been told.
+       */
+      const result = await syncShipmentTracking(shipmentId, actor);
+      if (!result.pushed && result.reason === "no_fulfillment_order_id") {
+        return {
+          error:
+            "Shopify sync is not possible for this order: it has no fulfillment order to push tracking to. " +
+            "The label and the tracking number are unaffected, and nothing was purchased by this attempt.",
+        };
+      }
+      if (!result.pushed && "message" in result && result.message) {
+        return { error: String(result.message) };
+      }
+    } else if (intent === "set_packing_message") {
+      /*
+       * The note for the slip in THIS box. Recorded with its before and after,
+       * because it is printed and put in a carton that ships: whoever typed it
+       * should be answerable for what the customer reads.
+       */
+      const message = String(form.get("message") || "").trim() || null;
+      const before = await prisma.shipment.findUnique({
+        where: { id: shipmentId },
+        select: { packingSlipMessage: true },
+      });
+      await prisma.shipment.update({ where: { id: shipmentId }, data: { packingSlipMessage: message } });
+      await recordAudit({
+        actorType: "ADMIN_USER",
+        actorId: user.id,
+        actorName: user.name,
+        action: "shipment.packing_message_set",
+        entityType: AUDIT_ENTITY.SHIPMENT,
+        entityId: shipmentId,
+        beforeData: { packingSlipMessage: before?.packingSlipMessage ?? null },
+        afterData: { packingSlipMessage: message },
+      });
+      return redirect(`${back}?notice=packing-message-saved`);
     } else if (intent === "cancel_shipment") {
       const result = await voidShipment(shipmentId, actor);
       if (!result.cancelled) {
@@ -688,12 +818,39 @@ interface ProcessProps {
   };
   paid: boolean;
   packages: number;
-  selectedQuote: { id: string; carrier: string; serviceName: string; totalAmount: number; currency: string; expiresAt: string | Date | null } | null;
+  selectedQuote: {
+    id: string;
+    carrier: string;
+    serviceName: string;
+    totalAmount: number;
+    currency: string;
+    transitDays: number | null;
+    quotedAt: string | Date;
+    expiresAt: string | Date | null;
+  } | null;
   canBook: boolean;
   isOwner: boolean;
+  /*
+   * The facts the confirmation screen states that are NOT the selected quote.
+   * Spelled out rather than derived from the component's props, so adding a
+   * field the screen must show is a change the compiler asks this page for
+   * rather than one that silently renders as undefined.
+   */
+  confirmation: {
+    environment: BookingEnvironment;
+    environmentDetail: string;
+    environmentHost: string | null;
+    orderName: string;
+    shipFrom: { name: string; lines: string[] } | null;
+    shipTo: { name: string; lines: string[] } | null;
+    shipToPhone: string | null;
+    parcels: { count: number; length: number; width: number; height: number; weight: number; units: string }[];
+    units: { dimensionUnit: string; weightUnit: string };
+    hasFulfillmentOrder: boolean;
+  };
 }
 
-function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isOwner }: ProcessProps) {
+function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isOwner, confirmation }: ProcessProps) {
   const when = (value: string | Date | null) => (value ? new Date(value).toLocaleString() : "—");
 
   const body = (() => {
@@ -799,10 +956,25 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
     const retrying = shipment.status === "BOOKING_FAILED";
     return (
       <>
+        {/*
+          THE FAILURE, STATED AS A LIST OF WHAT IS STILL TRUE. "It failed" leaves
+          an operator to work out whether a label exists, whether Shopify knows
+          and whether trying again is safe — and the wrong answer to any of those
+          costs money. Every line here is a fact the booking path guarantees on
+          this state, not a reassurance.
+        */}
         {retrying ? (
-          <p style={{ fontSize: "0.78rem", color: "#dc2626", marginBottom: "0.4rem" }}>
-            The last attempt failed and nothing was purchased: {shipment.lastBookingError || "no reason recorded"}.
-          </p>
+          <div style={{ background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "0.6rem 0.75rem", marginBottom: "0.6rem" }}>
+            <div style={{ fontSize: "0.8rem", fontWeight: 600, color: "#991b1b" }}>The last booking attempt did not succeed.</div>
+            <div style={{ fontSize: "0.75rem", color: "#991b1b", marginTop: "0.2rem" }}>
+              {shipment.lastBookingError || "The provider did not give a reason."}
+            </div>
+            <ul style={{ margin: "0.4rem 0 0 1rem", padding: 0, fontSize: "0.72rem", color: "#7f1d1d" }}>
+              <li>No label was purchased and no carrier was booked.</li>
+              <li>The order is still unfulfilled in Shopify, and no tracking record was created.</li>
+              <li>Retrying is safe: it reuses this shipment rather than creating a second one, so a retry cannot produce two labels.</li>
+            </ul>
+          </div>
         ) : null}
         <p style={{ fontSize: "0.78rem", marginBottom: "0.4rem" }}>
           {retrying ? "Retrying" : "Booking"} <strong>{selectedQuote.carrier} {selectedQuote.serviceName}</strong> at <strong>{money(selectedQuote.totalAmount, selectedQuote.currency)}</strong>.
@@ -814,11 +986,24 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
         <p style={{ fontSize: "0.7rem", color: "#64748b", marginBottom: "0.4rem" }}>
           This purchases a real label when eShipper is configured. The seller&apos;s fixed shipping charge is unchanged.
         </p>
-        <Form method="post">
-          <input type="hidden" name="intent" value="book_shipment" />
-          <input type="hidden" name="quoteId" value={selectedQuote.id} />
-          <button type="submit" style={btn("#059669")} disabled={!canBook}>{retrying ? "Retry booking" : "Book shipment"}</button>
-        </Form>
+        {/*
+          The button opens the confirmation, and only the confirmation books.
+          There is deliberately no second path to `book_shipment` on this page:
+          one route to a purchase is one place to state what it costs.
+        */}
+        <BookingConfirmation
+          {...confirmation}
+          carrier={selectedQuote.carrier}
+          serviceName={selectedQuote.serviceName}
+          totalCharge={selectedQuote.totalAmount}
+          currency={selectedQuote.currency}
+          transitDays={selectedQuote.transitDays}
+          quotedAt={selectedQuote.quotedAt}
+          expiresAt={selectedQuote.expiresAt}
+          quoteId={selectedQuote.id}
+          canBook={canBook}
+          retrying={retrying}
+        />
       </>
     );
   })();
@@ -829,7 +1014,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, isOwner } = data;
+  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, isOwner } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1047,9 +1232,22 @@ export default function AdminShipmentDetail() {
         {quotes.length === 0 ? (
           <p style={{ fontSize: "0.78rem", color: "#64748b" }}>No quotes yet.</p>
         ) : (
+          <>
+          {/*
+            WHEN THESE PRICES WERE ASKED FOR, and when they stop being spendable.
+            The two together are what tell an operator "this is the batch I just
+            requested" from "this is yesterday's page" without re-quoting to find
+            out — and the booking, which replays the quote into the provider's
+            save step, is buying the price on this row, not a fresh one.
+          */}
+          <p style={{ fontSize: "0.75rem", color: "#475569", marginBottom: "0.4rem" }}>
+            {quotes.length} price{quotes.length === 1 ? "" : "s"} from the rate request at{" "}
+            <strong>{new Date(quotes.reduce((newest, q) => (new Date(q.quotedAt) > newest ? new Date(q.quotedAt) : newest), new Date(quotes[0].quotedAt))).toLocaleString()}</strong>.
+            Requesting quotes again replaces this batch and clears any selection made from it.
+          </p>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead>
-              <tr><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Total</th><th style={th}>Base / surcharge / tax</th><th style={th}>Transit</th><th style={th}></th></tr>
+              <tr><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Total</th><th style={th}>Base / surcharge / tax</th><th style={th}>Transit</th><th style={th}>Quoted</th><th style={th}>Expires</th><th style={th}></th></tr>
             </thead>
             <tbody>
               {quotes.map((q) => {
@@ -1069,6 +1267,19 @@ export default function AdminShipmentDetail() {
                       {raw.taxes != null ? ` · taxes` : ""}
                     </td>
                     <td style={td}>{q.transitDays === null ? "Estimate unavailable" : `${q.transitDays} day(s)`}</td>
+                    <td style={td}>{new Date(q.quotedAt).toLocaleString()}</td>
+                    <td style={td}>
+                      {q.expiresAt ? (
+                        <span style={{ color: new Date(q.expiresAt).getTime() < Date.now() ? "#b91c1c" : undefined }}>
+                          {new Date(q.expiresAt).toLocaleString()}
+                        </span>
+                      ) : (
+                        // An absent expiry is not an expiry of "now" — the
+                        // provider does not always issue one, and a quote
+                        // without one never expires here.
+                        <span style={{ color: "#64748b" }}>Not stated</span>
+                      )}
+                    </td>
                     <td style={td}>
                       <Form method="post">
                         <input type="hidden" name="intent" value="select_quote" />
@@ -1081,6 +1292,7 @@ export default function AdminShipmentDetail() {
               })}
             </tbody>
           </table>
+          </>
         )}
 
       </div>
@@ -1094,14 +1306,90 @@ export default function AdminShipmentDetail() {
           selectedQuote={selectedQuote}
           canBook={canBook}
           isOwner={isOwner}
+          confirmation={{
+            environment: eshipper.environment,
+            environmentDetail: eshipper.description,
+            environmentHost: eshipper.host,
+            orderName: order.shopifyOrderName,
+            /*
+             * Both addresses are stated as they will be PRINTED, from the same
+             * two sources the cards above read: the dock (frozen snapshot first,
+             * live record second) and the order's own ship-to. The confirmation
+             * repeating them is not redundancy — it is the last screen before
+             * the label, and the one an operator actually reads.
+             */
+            shipFrom: origin ? { name: `${origin.name} (${origin.code})`, lines: [...origin.addressLines, ...(origin.contact ? [origin.contact] : [])] } : null,
+            shipTo: {
+              name: addr.name || order.customerName || "—",
+              lines: [
+                [addr.address1 || addr.address, addr.address2].filter(Boolean).join(", "),
+                [addr.city, addr.province || addr.provinceCode, addr.zip || addr.postalCode].filter(Boolean).join(", "),
+                addr.country || addr.countryCode || "",
+              ].filter(Boolean),
+            },
+            shipToPhone: order.recipientPhone,
+            parcels: bookingParcels.packages,
+            units: { dimensionUnit: units.dimensionUnit, weightUnit: units.weightUnit },
+            hasFulfillmentOrder: order.hasFulfillmentOrder,
+          }}
         />
       </div>
 
       <div style={card}>
         <h2 style={h2}>Documents</h2>
+        {/*
+          WHAT THE BOOKING ACTUALLY BOUGHT, stated once and in full.
+          Every figure here is read back from the shipment row rather than
+          recomputed: the provider's id, the carrier and service it confirmed
+          (which need not be the ones quoted), the cost it booked at, the
+          tracking number and URL, the document's own format, and when all of
+          that was recorded. A "BOOKED" badge on its own tells an operator
+          nothing they can act on when the phone rings.
+        */}
+        {shipment.providerShipmentId ? (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "0.5rem", marginBottom: "0.8rem" }}>
+            {[
+              { k: "Provider shipment id", v: shipment.providerShipmentId },
+              { k: "Carrier", v: shipment.carrier || "—" },
+              { k: "Service", v: shipment.serviceName || "—" },
+              // The BOOKED cost, not the quote: a provider may book at a
+              // different amount than it priced, and the label is the one that
+              // was bought.
+              { k: "Booked cost", v: money(shipment.bookedCost ?? shipment.quotedCarrierCost, order.currency) },
+              { k: "Tracking number", v: shipment.trackingNumber || "not issued" },
+              { k: "Label format", v: shipment.labelDocumentFormat || (shipment.labelUrl ? "not stated by the provider" : "no label") },
+              { k: "Booking status", v: shipment.status.replace(/_/g, " ") },
+              { k: "Booked at", v: shipment.labelCreatedAt ? new Date(shipment.labelCreatedAt).toLocaleString() : "not recorded" },
+            ].map((row) => (
+              <div key={row.k} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.45rem 0.5rem" }}>
+                <div style={{ fontSize: "0.65rem", color: "#64748b" }}>{row.k}</div>
+                <div style={{ fontSize: "0.8rem", fontWeight: 600, color: "#082a4a", wordBreak: "break-all" }}>{row.v}</div>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
         <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+          {/*
+            THE LABEL, as two deliberate actions rather than one link. "Download"
+            saves the provider's own file without displaying it — which is what
+            an operator wants when filing it against a collection — and "Open"
+            renders it for printing. They are the same URL; naming them
+            separately is the difference between a button that does what the
+            label says and one that does what the browser decides.
+
+            Retrieving a label buys nothing and books nothing: it re-reads what
+            was already issued. That is why it is offered here beside them.
+          */}
           {shipment.labelUrl ? (
-            <a href={shipment.labelUrl} target="_blank" rel="noreferrer" style={btn("#0369a1")}>Shipping label</a>
+            <>
+              <a href={shipment.labelUrl} target="_blank" rel="noreferrer" style={{ ...btn("#0369a1"), textDecoration: "none" }}>
+                Open shipping label{shipment.labelDocumentFormat ? ` (${shipment.labelDocumentFormat})` : ""}
+              </a>
+              <a href={shipment.labelUrl} download style={{ ...btn("#0369a1"), textDecoration: "none" }}>
+                Download shipping label
+              </a>
+            </>
           ) : (
             <span style={{ ...btn("#94a3b8"), cursor: "not-allowed" }}>Shipping label (none yet)</span>
           )}
@@ -1112,9 +1400,12 @@ export default function AdminShipmentDetail() {
             eShipper holds — it is not the carrier's invoice and must not be
             filed as one.
           */}
-          <Link to={`/admin/packing-list/${shipment.id}`} style={{ ...btn("#0369a1"), textDecoration: "none" }}>
-            Packing list (print, no prices)
-          </Link>
+          <a href={`/admin/packing-list/${shipment.id}?download=1`} style={{ ...btn("#0369a1"), textDecoration: "none" }}>
+            Download packing slip
+          </a>
+          <a href={`/admin/packing-list/${shipment.id}`} target="_blank" rel="noreferrer" style={{ ...btn("#0369a1"), textDecoration: "none" }}>
+            Print packing slip
+          </a>
           {shipment.providerShipmentId ? (
             <>
               <Form method="post"><button type="submit" name="intent" value="get_label" style={btn("#0369a1")}>Retrieve label (no rebook)</button></Form>
@@ -1125,12 +1416,36 @@ export default function AdminShipmentDetail() {
           <Link to={`/admin/orders/${order.id}`} style={{ ...btn("#082a4a"), textDecoration: "none" }}>Seller invoice (order)</Link>
         </div>
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.5rem" }}>
-          The provider shipment-details sheet is eShipper&apos;s own copy of the order, not the carrier&apos;s invoice. Carrier charges
-          are reconciled from the invoice the carrier issues and are recorded under Billing below.
+          The packing slip is MoonVella&apos;s own document and does not depend on the carrier: it carries no prices, no wholesale
+          cost and no supplier detail, and it can be printed from the moment a shipment exists. The provider shipment-details
+          sheet is eShipper&apos;s own copy of the order, not the carrier&apos;s invoice. Carrier charges are reconciled from the
+          invoice the carrier issues and are recorded under Billing below.
         </p>
         {shipment.lastTrackingError ? (
           <p style={{ fontSize: "0.7rem", color: "#dc2626", marginTop: "0.5rem" }}>Carrier document/tracking error: {shipment.lastTrackingError}</p>
         ) : null}
+
+        {/*
+          THE NOTE THAT GOES IN THE BOX, in the operator's own words.
+
+          Optional, and it stays empty when nobody fills it in: the slip prints
+          nothing rather than a labelled blank. Recorded on THIS shipment, so a
+          split order can say something different in each carton.
+        */}
+        <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", marginTop: "0.8rem", borderTop: "1px solid #f1f5f9", paddingTop: "0.7rem" }}>
+          <input type="hidden" name="intent" value="set_packing_message" />
+          <label style={{ ...label, flex: 1 }}>
+            Message on this box&apos;s packing slip (optional, printed as typed)
+            <textarea
+              name="message"
+              rows={2}
+              defaultValue={shipment.packingSlipMessage ?? ""}
+              placeholder="e.g. Thank you for your order — the second pillow is in a separate carton."
+              style={{ ...input, width: "100%", marginTop: "0.2rem" }}
+            />
+          </label>
+          <button type="submit" style={btn("#082a4a")}>Save message</button>
+        </Form>
       </div>
 
       <div style={card}>
@@ -1177,7 +1492,16 @@ export default function AdminShipmentDetail() {
                     <option key={ev} value={ev}>{ev.replace(/_/g, " ")}</option>
                   ))}
                 </select>
-                <label style={{ fontSize: "0.68rem", color: "#64748b" }}><input type="checkbox" name="notifyCustomer" /> notify</label>
+                {/*
+                  The answer given on the confirmation screen, shown as this
+                  control's starting position rather than asked again with no
+                  memory of it. Whatever is ticked here is what the push uses —
+                  this is the moment the choice actually takes effect, because
+                  this is the moment the parcel is dispatched.
+                */}
+                <label style={{ fontSize: "0.68rem", color: "#64748b" }} title="Ask Shopify to e-mail the customer when this tracking is pushed">
+                  <input type="checkbox" name="notifyCustomer" defaultChecked={shipment.notifyCustomerOnPush} /> notify
+                </label>
                 <button type="submit" style={btn("#082a4a")}>Record</button>
               </Form>
             ) : null}
@@ -1392,7 +1716,21 @@ export default function AdminShipmentDetail() {
                 ))}
               </div>
               <label style={label}>Reason<br /><input name="reason" style={{ ...input, width: 320 }} /></label>
-              <button type="submit" style={{ ...btn("#082a4a"), marginTop: "0.5rem" }}>Book return label</button>
+              {/*
+                THE PURCHASE, DRAWN AS CLOSED WHERE IT IS CLOSED. The adapter
+                refuses this outright, so the button would only ever return the
+                refusal — and a control that cannot do the thing it names is
+                worse than no control. The rates above stay visible and stay
+                usable: pricing a return costs nothing and is worth being able
+                to look at while the purchase is off.
+              */}
+              {returnPurchasing.enabled ? (
+                <button type="submit" style={{ ...btn("#082a4a"), marginTop: "0.5rem" }}>Book return label</button>
+              ) : (
+                <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.5rem", maxWidth: 560 }}>
+                  {returnPurchasing.reason}
+                </p>
+              )}
             </Form>
           ) : null}
         </div>
@@ -1460,18 +1798,61 @@ export default function AdminShipmentDetail() {
             rather than "failed" is the difference between an operator waiting
             and an operator retrying something that must not be retried early.
           */}
-          <div style={{ color: shipment.shopifySyncError ? "#dc2626" : "#64748b" }}>
-            {shipment.shopifyFulfillmentId
-              ? `Pushed to Shopify${shipment.shopifySyncedAt ? ` on ${new Date(shipment.shopifySyncedAt).toLocaleString()}` : ""}.`
-              : shipment.shopifySyncError
-                ? `Last push failed: ${shipment.shopifySyncError}`
-                : "Not pushed yet — the push happens when this parcel is handed to the carrier, not when the label is bought."}
-          </div>
+          {/*
+            THE TWO OUTCOMES, IN THE WORDS §6 ASKS FOR.
+
+            The distinction the whole card turns on: a booked label is not a
+            collected parcel, so "not pushed" on a freshly booked shipment is
+            the designed state and not a fault. Only a shipment that SHOULD have
+            been pushed and was not is a failure — and that is why the failure
+            line names the retry instead of leaving an operator to guess.
+          */}
+          {shipment.shopifyFulfillmentId ? (
+            <div style={{ color: "#059669", fontWeight: 600 }}>
+              Tracking pushed to Shopify — successful
+              {shipment.shopifySyncedAt ? ` (${new Date(shipment.shopifySyncedAt).toLocaleString()})` : ""}.
+            </div>
+          ) : shipment.shopifySyncError ? (
+            <div style={{ color: "#dc2626", fontWeight: 600 }}>Carrier booked, Shopify synchronization failed — Retry Shopify sync</div>
+          ) : (
+            <div style={{ color: "#64748b" }}>
+              Not pushed yet — the push happens when this parcel is handed to the carrier, not when the label is bought.
+            </div>
+          )}
+          {shipment.shopifySyncError ? (
+            <div style={{ color: "#dc2626", marginTop: "0.2rem" }}>Shopify said: {shipment.shopifySyncError}</div>
+          ) : null}
           {shipment.shopifyNotifiedAt ? (
             <div style={{ color: "#94a3b8" }}>
               Customer notified through Shopify on {new Date(shipment.shopifyNotifiedAt).toLocaleString()}. A retry does not notify again.
             </div>
           ) : null}
+          {/*
+            THE RETRY, and what it does not do. It re-sends the tracking number
+            this shipment already holds — it does not re-book, does not buy a
+            label and does not touch the tracking number. That is a property of
+            the call it makes rather than of this button: `syncShipmentTracking`
+            returns early when Shopify already holds the fulfillment, so pressing
+            this twice cannot produce two.
+          */}
+          {/*
+            Offered ONLY where a push was attempted and failed. A booked parcel
+            awaiting collection has no error and deliberately gets no button:
+            pushing there would fulfil the order in Shopify before the carrier
+            has the box, and waiting is the correct action, not retrying. An
+            error means the push was due, ran, and did not land — which is
+            exactly the case §6 gives a retry.
+          */}
+          {!shipment.shopifyFulfillmentId && shipment.shopifySyncError ? (
+            <Form method="post" style={{ marginTop: "0.5rem" }}>
+              <input type="hidden" name="intent" value="retry_shopify_sync" />
+              <button type="submit" style={btn("#0369a1")}>Retry Shopify sync</button>
+            </Form>
+          ) : null}
+          <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.4rem" }}>
+            Retrying re-sends this shipment&apos;s existing tracking number. It never buys another label, never re-numbers the
+            parcel, and will not notify the customer a second time.
+          </p>
           <div style={{ color: "#94a3b8" }}>Payment, order fulfillment and parcel tracking are separate statuses.</div>
         </div>
       </div>

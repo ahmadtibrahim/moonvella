@@ -970,56 +970,75 @@ async function main() {
   );
   check("a shipment was created with its tracking", shipment.trackingNumber === `TRACK${suffix}` && !!shipment.trackingUrl);
 
-  const syncCalls: GraphqlCall[] = [];
-  const syncAdmin = makeAdmin((query) => {
-    if (query.includes("MoonVellaResolveFO")) {
-      return {
-        data: {
-          order: {
-            id: `gid://shopify/Order/${ORDER_ID}`,
-            fulfillmentOrders: {
-              pageInfo: { hasNextPage: false, endCursor: null },
-              nodes: [
-                {
-                  id: "gid://shopify/FulfillmentOrder/1",
-                  status: "OPEN",
-                  assignedLocation: { location: { id: MOONVELLA_LOCATION_ID, name: "MoonVella fulfillment" } },
-                  lineItems: {
-                    nodes: fulfilledOrder.items.map((item, index) => ({
-                      id: `gid://shopify/FulfillmentOrderLineItem/${100 + index}`,
-                      remainingQuantity: item.quantity,
-                      totalQuantity: item.quantity,
-                      lineItem: {
-                        id: `gid://shopify/LineItem/${item.shopifyLineItemId}`,
-                        sku: item.sku,
-                        name: item.name,
-                        variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_NUMBER}` },
-                      },
-                    })),
+  /*
+   * A store that answers the two questions the push asks: which fulfillment
+   * orders carry this order's lines, and whether the fulfillment was accepted.
+   *
+   * A FUNCTION RATHER THAN ONE CLOSURE, because the push is asked several things
+   * below and each question deserves a store that answers only it — a shared
+   * call log makes "nothing was sent" unaskable, which is exactly the assertion
+   * a retry needs. `fulfillmentOrderId` is the id the store REPORTS, which is not
+   * always the id the order has stored, and that difference is one of the cases.
+   */
+  const storeFor = (
+    items: { shopifyLineItemId: string; sku: string | null; name: string; quantity: number }[],
+    trackingNumber: string,
+    fulfillmentId: string,
+    fulfillmentOrderId = "gid://shopify/FulfillmentOrder/1"
+  ) => {
+    return (query: string) => {
+      if (query.includes("MoonVellaResolveFO")) {
+        return {
+          data: {
+            order: {
+              id: `gid://shopify/Order/${ORDER_ID}`,
+              fulfillmentOrders: {
+                pageInfo: { hasNextPage: false, endCursor: null },
+                nodes: [
+                  {
+                    id: fulfillmentOrderId,
+                    status: "OPEN",
+                    assignedLocation: { location: { id: MOONVELLA_LOCATION_ID, name: "MoonVella fulfillment" } },
+                    lineItems: {
+                      nodes: items.map((item, index) => ({
+                        id: `gid://shopify/FulfillmentOrderLineItem/${100 + index}`,
+                        remainingQuantity: item.quantity,
+                        totalQuantity: item.quantity,
+                        lineItem: {
+                          id: `gid://shopify/LineItem/${item.shopifyLineItemId}`,
+                          sku: item.sku,
+                          name: item.name,
+                          variant: { id: `gid://shopify/ProductVariant/${SHOPIFY_VARIANT_NUMBER}` },
+                        },
+                      })),
+                    },
                   },
-                },
-              ],
+                ],
+              },
             },
           },
-        },
-      };
-    }
-    if (query.includes("fulfillmentCreate")) {
-      return {
-        data: {
-          fulfillmentCreate: {
-            fulfillment: {
-              id: "gid://shopify/Fulfillment/555",
-              status: "SUCCESS",
-              trackingInfo: { number: `TRACK${suffix}`, url: "https://example.invalid/track", company: "Canada Post" },
+        };
+      }
+      if (query.includes("fulfillmentCreate")) {
+        return {
+          data: {
+            fulfillmentCreate: {
+              fulfillment: {
+                id: fulfillmentId,
+                status: "SUCCESS",
+                trackingInfo: { number: trackingNumber, url: "https://example.invalid/track", company: "Canada Post" },
+              },
+              userErrors: [],
             },
-            userErrors: [],
           },
-        },
-      };
-    }
-    return { data: null };
-  }, syncCalls);
+        };
+      }
+      return { data: null };
+    };
+  };
+
+  const syncCalls: GraphqlCall[] = [];
+  const syncAdmin = makeAdmin(storeFor(fulfilledOrder.items, `TRACK${suffix}`, "gid://shopify/Fulfillment/555"), syncCalls);
 
   const pushed = await syncShipmentTracking(shipment.id, { actorId: "verify", actorName: "Verify" }, {
     notifyCustomer: false,
@@ -1052,6 +1071,174 @@ async function main() {
     "the named line and quantity were sent, not the whole fulfillment order",
     JSON.stringify(fulfillmentInput.lineItemsByFulfillmentOrder).includes("fulfillmentOrderLineItems"),
     JSON.stringify(fulfillmentInput.lineItemsByFulfillmentOrder),
+  );
+
+  /* --- §6: retrying the push must not push twice ------------------------- */
+  /*
+   * The "Retry Shopify sync" button calls this same function with nothing but
+   * the shipment. The only thing between a retry and a second fulfillment — which
+   * Shopify would accept and which would tell the customer twice — is the early
+   * return above, so the retry's own call log is the evidence.
+   */
+  const retryCalls: GraphqlCall[] = [];
+  const retried = await syncShipmentTracking(shipment.id, { actorId: "verify", actorName: "Verify" }, {
+    // Deliberately asking for the notification the first push declined: on a
+    // shipment Shopify already holds a fulfillment for, even that must not send.
+    notifyCustomer: true,
+    adminOverride: makeAdmin(() => ({ data: null }), retryCalls),
+  });
+  check(
+    "retrying a push Shopify already has reports success rather than an error",
+    (retried as { pushed?: boolean; alreadyPushed?: boolean }).pushed === true &&
+      (retried as { alreadyPushed?: boolean }).alreadyPushed === true,
+    JSON.stringify(retried),
+  );
+  check("...and asks Shopify nothing at all", retryCalls.length === 0, `${retryCalls.length} call(s)`);
+  const afterRetry = await prisma.shipment.findUnique({ where: { id: shipment.id } });
+  check(
+    "...and leaves the one fulfillment id it already had",
+    afterRetry?.shopifyFulfillmentId === "gid://shopify/Fulfillment/555",
+    afterRetry?.shopifyFulfillmentId ?? "none",
+  );
+  check(
+    "...and does not notify a customer on a retry",
+    afterRetry?.shopifyNotifiedAt === null,
+    String(afterRetry?.shopifyNotifiedAt),
+  );
+  /*
+   * §6: "a synchronization failure must never purchase another label, and
+   * retrying must reuse the existing shipment and tracking." The carrier-side
+   * columns are read back for exactly that: this function has no booking call in
+   * it, and these four fields are what would move if one crept in.
+   */
+  check(
+    "a retry buys no label and books nothing with the carrier",
+    afterRetry?.labelUrl === afterSync?.labelUrl &&
+      afterRetry?.providerShipmentId === afterSync?.providerShipmentId &&
+      afterRetry?.trackingNumber === afterSync?.trackingNumber &&
+      afterRetry?.carrier === afterSync?.carrier,
+    `${afterRetry?.providerShipmentId ?? "none"} / ${afterRetry?.labelUrl ?? "none"}`
+  );
+
+  /* --- §6: the fulfillment names the group it was matched against -------- */
+  /*
+   * THE ORDER'S STORED ID IS NOT THE ANSWER. The lines and the quantities were
+   * chosen from the group Shopify reported; naming anything else here fulfills a
+   * different fulfillment order than the parcel was matched against. The case
+   * that exposes it is a stored id the store does not report — which is exactly
+   * when the fallback to the first group runs, and exactly when the two ids
+   * differ. (The regression this pins: the stored id was sent, so on a re-resolve
+   * the parcel fulfilled whatever the stale id happened to point at.)
+   */
+  await prisma.order.update({
+    where: { id: fulfilledOrder.id },
+    data: { shopifyFulfillmentOrderId: "gid://shopify/FulfillmentOrder/999" },
+  });
+  const staleShipment = await prisma.shipment.create({
+    data: {
+      orderId: fulfilledOrder.id,
+      carrier: "Canada Post",
+      trackingNumber: `STALE${suffix}`,
+      trackingUrl: "https://example.invalid/track",
+      status: "SHIPPED",
+      notifyCustomerOnPush: true,
+      items: { create: fulfilledOrder.items.map((i) => ({ orderItemId: i.id, quantity: i.quantity })) },
+    },
+  });
+  const staleCalls: GraphqlCall[] = [];
+  const stalePush = await syncShipmentTracking(staleShipment.id, { actorId: "verify", actorName: "Verify" }, {
+    // No `notifyCustomer`: the shipment's stored answer is what should be used.
+    adminOverride: makeAdmin(
+      storeFor(fulfilledOrder.items, `STALE${suffix}`, "gid://shopify/Fulfillment/556"),
+      staleCalls,
+    ),
+  });
+  check("a stored fulfillment order id the store does not report still pushes", (stalePush as { pushed?: boolean }).pushed === true, JSON.stringify(stalePush));
+  const staleInput = (callFor(staleCalls, "fulfillmentCreate")?.variables.fulfillment ?? {}) as Record<string, unknown>;
+  const staleGroups = (staleInput.lineItemsByFulfillmentOrder ?? []) as { fulfillmentOrderId?: string }[];
+  check(
+    "the fulfillment names the group the lines were matched against, not the stored id",
+    staleGroups[0]?.fulfillmentOrderId === "gid://shopify/FulfillmentOrder/1",
+    String(staleGroups[0]?.fulfillmentOrderId),
+  );
+  check(
+    "the stored id was corrected to the one Shopify actually reported",
+    (await prisma.order.findUnique({ where: { id: fulfilledOrder.id } }))?.shopifyFulfillmentOrderId ===
+      "gid://shopify/FulfillmentOrder/1",
+  );
+
+  /* --- §6: the confirmation screen's answer is the default, and only that - */
+  check(
+    "a stored 'notify the customer' is what the push uses when nobody says otherwise",
+    staleInput.notifyCustomer === true,
+    String(staleInput.notifyCustomer),
+  );
+  const staleAfter = await prisma.shipment.findUnique({ where: { id: staleShipment.id } });
+  check(
+    "...and it is written down that the customer was told",
+    staleAfter?.shopifyNotifiedAt instanceof Date,
+    String(staleAfter?.shopifyNotifiedAt),
+  );
+
+  const quietShipment = await prisma.shipment.create({
+    data: {
+      orderId: fulfilledOrder.id,
+      carrier: "Canada Post",
+      trackingNumber: `QUIET${suffix}`,
+      trackingUrl: "https://example.invalid/track",
+      status: "SHIPPED",
+      // Stored YES, and the caller says no for this one push. The explicit
+      // answer is the operator looking at the parcel right now.
+      notifyCustomerOnPush: true,
+      items: { create: fulfilledOrder.items.map((i) => ({ orderItemId: i.id, quantity: i.quantity })) },
+    },
+  });
+  const quietCalls: GraphqlCall[] = [];
+  await syncShipmentTracking(quietShipment.id, { actorId: "verify", actorName: "Verify" }, {
+    notifyCustomer: false,
+    adminOverride: makeAdmin(
+      storeFor(fulfilledOrder.items, `QUIET${suffix}`, "gid://shopify/Fulfillment/557"),
+      quietCalls,
+    ),
+  });
+  const quietInput = (callFor(quietCalls, "fulfillmentCreate")?.variables.fulfillment ?? {}) as Record<string, unknown>;
+  check("an explicit 'do not notify' overrides a stored yes", quietInput.notifyCustomer === false, String(quietInput.notifyCustomer));
+  check(
+    "...and nothing records that the customer was told",
+    (await prisma.shipment.findUnique({ where: { id: quietShipment.id } }))?.shopifyNotifiedAt === null,
+  );
+
+  /*
+   * THE ONE-WAY DOOR. Shopify sends the e-mail during the call, so a shipment
+   * that has already notified must never notify again — not even when every
+   * other answer says yes. Reached by the state a partially-repaired shipment is
+   * in: told once, and asked to fulfill again.
+   */
+  const toldShipment = await prisma.shipment.create({
+    data: {
+      orderId: fulfilledOrder.id,
+      carrier: "Canada Post",
+      trackingNumber: `TOLD${suffix}`,
+      trackingUrl: "https://example.invalid/track",
+      status: "SHIPPED",
+      notifyCustomerOnPush: true,
+      shopifyNotifiedAt: new Date(),
+      items: { create: fulfilledOrder.items.map((i) => ({ orderItemId: i.id, quantity: i.quantity })) },
+    },
+  });
+  const toldCalls: GraphqlCall[] = [];
+  await syncShipmentTracking(toldShipment.id, { actorId: "verify", actorName: "Verify" }, {
+    notifyCustomer: true,
+    adminOverride: makeAdmin(
+      storeFor(fulfilledOrder.items, `TOLD${suffix}`, "gid://shopify/Fulfillment/558"),
+      toldCalls,
+    ),
+  });
+  const toldInput = (callFor(toldCalls, "fulfillmentCreate")?.variables.fulfillment ?? {}) as Record<string, unknown>;
+  check(
+    "a customer already notified is never notified a second time",
+    toldInput.notifyCustomer === false,
+    String(toldInput.notifyCustomer),
   );
 
   /* ====================================================================== */
