@@ -21,13 +21,14 @@ check("shared admin shell is responsive", styles.includes(".mv-admin-shell") && 
 check("seller payment ledger route exists", payments.includes("Seller payments") && payments.includes("Payment ledger"));
 check("payment ledger requires an admin permission", payments.includes('requirePermission(request, "orders.view")'));
 check("payment ledger can filter by seller and status", payments.includes('name="seller"') && payments.includes('name="status"'));
-check("captured seller money is shown separately", payments.includes("Captured") && payments.includes("capturedAt"));
+check("captured seller money is shown separately", payments.includes("Captured") && payments.includes("payment.capturedAt ?? payment.paidAt"));
 check("bank-paid money is shown separately", payments.includes("Paid to bank") && payments.includes("Bank payouts"));
 check("pending and failed payouts are visible", payments.includes("Payouts pending") && payments.includes("Payouts failed"));
 check("payment rows do not claim one-to-one settlement", payments.includes("Stripe combines multiple charges into each bank payout"));
 check("payout rows retain the Stripe reference", payments.includes("providerPayoutId") && payments.includes("Technical details"));
 check("payout data is loaded independently of order charges", payments.includes("stripePayout.findMany") && payments.includes("stripePayout.groupBy"));
 check("Stripe payout webhook events are recognized", paymentService.includes('event.type.startsWith("payout.")'));
+check("successful charges persist a captured timestamp", paymentService.includes('const capturedAt = status === "SUCCEEDED"') && paymentService.includes("capturedAt,"));
 check("Stripe payouts are idempotently persisted", paymentService.includes("stripePayout.upsert") && paymentService.includes("providerPayoutId: payoutId"));
 check("payout failures are retained for operators", paymentService.includes("failureCode") && paymentService.includes("failureMessage"));
 check("payout processing writes an audit record", paymentService.includes('action: `stripe.${event.type}`') && paymentService.includes("recordAudit"));

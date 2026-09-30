@@ -625,12 +625,14 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
       : `payment.${status.toLowerCase()}`;
 
   await prisma.$transaction(async (tx) => {
+    const capturedAt = status === "SUCCEEDED" ? (payment!.capturedAt ?? payment!.paidAt ?? new Date()) : payment!.capturedAt;
     await tx.wholesalePayment.update({
       where: { id: payment!.id },
       data: {
         status: status as never,
         failureMessage,
-        paidAt: status === "SUCCEEDED" ? (payment!.paidAt ?? new Date()) : payment!.paidAt,
+        capturedAt,
+        paidAt: status === "SUCCEEDED" ? (payment!.paidAt ?? capturedAt) : payment!.paidAt,
         ...(refundedAmount !== null ? { refundedAmount } : {}),
         ...(chargeId ? { providerChargeId: chargeId } : {}),
       },

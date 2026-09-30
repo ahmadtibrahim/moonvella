@@ -162,7 +162,7 @@ export default function AdminSellerPayments() {
                   <td>{payment.seller.storeName}<div className="mv-muted">{payment.seller.shopDomain}</div></td>
                   <td><strong>{money(payment.amount, payment.currency)}</strong>{payment.refundedAmount > 0 ? <div className="mv-muted">{money(payment.refundedAmount, payment.currency)} refunded</div> : null}</td>
                   <td><span className={`mv-badge ${STATUS_CLASS[payment.status] ?? ""}`}>{STATUS_LABEL[payment.status]}</span>{payment.failureMessage ? <div className="mv-muted">{payment.failureMessage}</div> : null}</td>
-                  <td>{payment.capturedAt ? new Date(payment.capturedAt).toLocaleString() : "—"}</td>
+                  <td>{payment.capturedAt || payment.paidAt ? new Date(payment.capturedAt ?? payment.paidAt!).toLocaleString() : "—"}</td>
                   <td><span className="mv-badge">See payouts below</span><div className="mv-muted">Stripe combines multiple charges into each bank payout</div></td>
                   <td><details><summary>Technical details</summary><div className="mv-mono mv-muted">{payment.providerPaymentIntentId ?? "No Stripe intent"}</div>{payment.providerChargeId ? <div className="mv-mono mv-muted">{payment.providerChargeId}</div> : null}</details></td>
                 </tr>
