@@ -226,6 +226,7 @@ export async function createOrReuseWholesalePayment(orderId: string) {
 type StripeEvent = {
   id: string;
   type: string;
+  created?: number;
   data: { object: Record<string, unknown> };
 };
 
@@ -368,6 +369,103 @@ export interface ApplyStripeEventResult {
   reason?: string;
 }
 
+function payoutStatus(eventType: string, objectStatus: unknown): string {
+  const supplied = String(objectStatus ?? "").trim().toUpperCase();
+  if (supplied) return supplied;
+  if (eventType === "payout.paid") return "PAID";
+  if (eventType === "payout.failed") return "FAILED";
+  if (eventType === "payout.canceled") return "CANCELED";
+  return "PENDING";
+}
+
+function stripeUnixDate(value: unknown): Date | null {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return new Date(seconds * 1000);
+}
+
+/** Record Stripe's bank settlement without pretending one payout is one order. */
+async function applyPayoutEvent(event: StripeEvent, object: Record<string, unknown>): Promise<ApplyStripeEventResult> {
+  const payoutId = String(object.id ?? "");
+  if (!payoutId.startsWith("po_")) {
+    await prisma.paymentEvent.create({
+      data: {
+        provider: "stripe",
+        eventId: event.id,
+        type: event.type,
+        payload: JSON.stringify(event),
+        status: "UNMATCHED",
+        errorMessage: "Stripe payout event did not contain a payout id.",
+        processedAt: new Date(),
+      },
+    });
+    return { matched: false, reason: "missing_payout_id" };
+  }
+
+  const amount = Number(object.amount ?? 0);
+  const currency = String(object.currency ?? "CAD").toUpperCase();
+  const status = payoutStatus(event.type, object.status);
+  const arrivalDate = stripeUnixDate(object.arrival_date);
+  const paidAt = status === "PAID" ? stripeUnixDate(event.created) ?? new Date() : null;
+  const failureCode = String(object.failure_code ?? "") || null;
+  const failureMessage = String(object.failure_message ?? "") || null;
+
+  await prisma.$transaction(async (tx) => {
+    await tx.stripePayout.upsert({
+      where: { providerPayoutId: payoutId },
+      create: {
+        providerPayoutId: payoutId,
+        amount: Number.isFinite(amount) ? amount : 0,
+        currency,
+        status,
+        arrivalDate,
+        paidAt,
+        failureCode,
+        failureMessage,
+        lastEventId: event.id,
+      },
+      update: {
+        amount: Number.isFinite(amount) ? amount : 0,
+        currency,
+        status,
+        arrivalDate,
+        ...(paidAt ? { paidAt } : {}),
+        failureCode,
+        failureMessage,
+        lastEventId: event.id,
+      },
+    });
+    await tx.paymentEvent.create({
+      data: {
+        provider: "stripe",
+        eventId: event.id,
+        type: event.type,
+        payload: JSON.stringify(event),
+        status: "PROCESSED",
+        processedAt: new Date(),
+      },
+    });
+    await recordAudit(
+      {
+        actorType: "WEBHOOK",
+        actorId: "stripe",
+        actorName: "Stripe",
+        action: `stripe.${event.type}`,
+        entityType: AUDIT_ENTITY.PAYMENT,
+        entityId: payoutId,
+        afterData: { amount, currency, status, arrivalDate, paidAt, failureCode, failureMessage },
+      },
+      tx as never
+    );
+  });
+
+  await setIntegrationState("stripe", {
+    status: status === "FAILED" ? "FAILED" : "HEALTHY",
+    detail: `Processed Stripe ${event.type} for ${payoutId}.`,
+  });
+  return { matched: true, ref: payoutId, status };
+}
+
 /** Apply a verified provider event. Idempotent by provider event id. */
 export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeEventResult> {
   const existing = await prisma.paymentEvent.findUnique({ where: { eventId: event.id } });
@@ -376,6 +474,10 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
   }
 
   const object = event.data?.object ?? {};
+
+  if (event.type.startsWith("payout.")) {
+    return applyPayoutEvent(event, object);
+  }
 
   if (isSetupEvent(event.type, object)) {
     return applySetupEvent(event, object);

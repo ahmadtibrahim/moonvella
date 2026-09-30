@@ -1,5 +1,5 @@
 import "../styles/admin.css";
-import { Outlet, useLoaderData, useLocation } from "react-router";
+import { Form, Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 import { requireAuth } from "~/utils/adminAuth.server";
 import { can, type Permission } from "~/services/permissions";
@@ -18,47 +18,38 @@ export async function loader({ request }: LoaderFunctionArgs) {
   };
 }
 
-/**
- * Navigation, gated per entry.
- *
- * Hiding a link is presentation, not authorisation — every one of these routes
- * enforces its own permission in its loader and would return 403 if reached
- * directly. The gate here exists so an OPERATIONS user is not shown a door that
- * only ever opens onto an error.
- */
-const NAV_ITEMS: { href: string; label: string; icon: string; permission?: Permission }[] = [
-  { href: "/admin", label: "Dashboard", icon: "D", permission: "dashboard.view" },
-  { href: "/admin/applications", label: "Applications", icon: "A", permission: "merchants.view" },
-  { href: "/admin/stores", label: "Stores", icon: "S", permission: "merchants.view" },
-  { href: "/admin/rankings", label: "Rankings", icon: "R", permission: "reports.view" },
-  { href: "/admin/products", label: "Products", icon: "P", permission: "products.view" },
-  // The boxes a carton row is filled from. It sits with Products rather than
-  // under Settings because it is catalogue data — what a variant ships in — and
-  // the packaging editors on every product point at it.
-  { href: "/admin/packaging", label: "Packaging", icon: "C", permission: "products.view" },
-  // Reading Odoo is enough to open the import page; only the import itself
-  // needs products.manage, so support staff can look at what would arrive
-  // without being able to write it.
-  { href: "/admin/odoo", label: "Odoo Import", icon: "I", permission: "products.view" },
-  { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view" },
-  // The warehouse's own screen: the orders a seller has paid for and that are
-  // released for fulfillment, oldest first. It sits under Orders rather than
-  // under Shipping because it is a work list over orders — the shipping section
-  // begins later, at the parcel.
-  { href: "/admin/fulfillment", label: "Fulfillment", icon: "F", permission: "orders.view" },
-  { href: "/admin/shipping", label: "Shipments", icon: "H", permission: "shipping.view" },
-  { href: "/admin/pickups", label: "Pickups", icon: "K", permission: "shipping.view" },
-  { href: "/admin/returns", label: "Returns", icon: "T", permission: "shipping.view" },
-  { href: "/admin/claims", label: "Claims", icon: "M", permission: "shipping.view" },
-  // The docks goods are collected from. It sits next to Shipping rather than
-  // under Settings because it is the record a shipping decision is made from:
-  // the booking gate reads the address verdict on each of these rows.
-  { href: "/admin/origins", label: "Pickup Locations", icon: "L", permission: "shipping.view" },
-  { href: "/admin/users", label: "Users", icon: "U", permission: "users.view" },
-  // Settings has no permission gate: every signed-in user needs it to change
-  // their own password. The sections inside it are gated individually.
-  { href: "/admin/settings", label: "Settings", icon: "G" },
-  { href: "/admin/audit", label: "Audit Log", icon: "L", permission: "audit.view" },
+type NavItem = {
+  href: string;
+  label: string;
+  icon: string;
+  permission?: Permission;
+  activePrefixes?: string[];
+};
+
+type NavGroup = { label?: string; items: NavItem[] };
+
+/** Related queues live as tabs inside one operational workspace. */
+const NAV_GROUPS: NavGroup[] = [
+  {
+    items: [
+      { href: "/admin", label: "Dashboard", icon: "D", permission: "dashboard.view" },
+      { href: "/admin/stores", label: "Stores", icon: "S", permission: "merchants.view", activePrefixes: ["/admin/applications"] },
+      { href: "/admin/products", label: "Catalog", icon: "C", permission: "products.view", activePrefixes: ["/admin/packaging", "/admin/odoo"] },
+      { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view", activePrefixes: ["/admin/fulfillment"] },
+      { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view", activePrefixes: ["/admin/pickups", "/admin/origins"] },
+      { href: "/admin/returns", label: "Returns & claims", icon: "R", permission: "shipping.view", activePrefixes: ["/admin/claims"] },
+      { href: "/admin/payments", label: "Billing", icon: "B", permission: "orders.view" },
+    ],
+  },
+  {
+    label: "Administration",
+    items: [
+      { href: "/admin/rankings", label: "Rankings", icon: "R", permission: "reports.view" },
+      { href: "/admin/users", label: "Users", icon: "U", permission: "users.view" },
+      { href: "/admin/settings", label: "Settings", icon: "G" },
+      { href: "/admin/audit", label: "Audit", icon: "A", permission: "audit.view" },
+    ],
+  },
 ];
 
 const ROLE_LABEL: Record<AdminRole, string> = {
@@ -70,190 +61,86 @@ const ROLE_LABEL: Record<AdminRole, string> = {
   VIEWER: "Viewer",
 };
 
+function navItemIsActive(pathname: string, item: NavItem) {
+  if (item.href === "/admin") return pathname === "/admin";
+  return [item.href, ...(item.activePrefixes ?? [])].some(
+    (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`)
+  );
+}
+
 export default function AdminLayout() {
   const { user } = useLoaderData<typeof loader>();
-  const location = useLocation();
-
-  const visible = NAV_ITEMS.filter(
-    (item) => !item.permission || can(user.role, item.permission)
-  );
+  const { pathname } = useLocation();
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "#f6f8fb" }}>
-      <aside
-        style={{
-          width: 260,
-          background: "#082a4a",
-          color: "white",
-          padding: "1.5rem 1rem",
-          display: "flex",
-          flexDirection: "column",
-          height: "100vh",
-          position: "fixed",
-          left: 0,
-          top: 0,
-          zIndex: 50,
-        }}
-      >
-        <div
-          style={{
-            padding: "0 1rem 1.5rem",
-            borderBottom: "1px solid rgba(255,255,255,0.1)",
-            marginBottom: "1.5rem",
-          }}
-        >
-          <div style={{ fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.25rem" }}>
-            MoonVella
-          </div>
-          <div
-            style={{
-              fontSize: "0.75rem",
-              color: "rgba(255,255,255,0.5)",
-              textTransform: "uppercase",
-              letterSpacing: "0.05em",
-            }}
-          >
-            Admin Panel
-          </div>
-        </div>
+    <div className="mv-admin-shell">
+      <aside className="mv-admin-sidebar">
+        <Link to="/admin" className="mv-admin-brand" aria-label="MoonVella admin home">
+          <span className="mv-admin-brand-mark">M</span>
+          <span className="mv-admin-brand-copy">
+            <strong>MoonVella</strong>
+            <small>Operations</small>
+          </span>
+        </Link>
 
-        <nav style={{ flex: 1, overflowY: "auto" }}>
-          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
-            {visible.map((item) => {
-              const isActive =
-                location.pathname === item.href ||
-                (item.href !== "/admin" && location.pathname.startsWith(item.href + "/"));
-              return (
-                <li key={item.href} style={{ marginBottom: "0.25rem" }}>
-                  <a
-                    href={item.href}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "0.75rem",
-                      padding: "0.75rem 1rem",
-                      color: isActive ? "white" : "rgba(255,255,255,0.7)",
-                      background: isActive ? "rgba(255,255,255,0.1)" : "transparent",
-                      textDecoration: "none",
-                      fontSize: "0.875rem",
-                      fontWeight: isActive ? 600 : 500,
-                      borderRadius: 8,
-                    }}
-                  >
-                    <span
-                      style={{
-                        width: 22,
-                        height: 22,
-                        borderRadius: 6,
-                        background: "rgba(255,255,255,0.12)",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        fontSize: "0.7rem",
-                        fontWeight: 700,
-                      }}
+        <nav className="mv-admin-navigation" aria-label="Admin navigation">
+          {NAV_GROUPS.map((group, groupIndex) => {
+            const visible = group.items.filter(
+              (item) => !item.permission || can(user.role, item.permission)
+            );
+            if (!visible.length) return null;
+            return (
+              <div className="mv-admin-nav-group" key={group.label ?? groupIndex}>
+                {group.label ? <div className="mv-admin-nav-heading">{group.label}</div> : null}
+                {visible.map((item) => {
+                  const active = navItemIsActive(pathname, item);
+                  return (
+                    <Link
+                      key={item.href}
+                      to={item.href}
+                      className={`mv-admin-nav-link${active ? " is-active" : ""}`}
+                      aria-current={active ? "page" : undefined}
                     >
-                      {item.icon}
-                    </span>
-                    <span>{item.label}</span>
-                  </a>
-                </li>
-              );
-            })}
-          </ul>
+                      <span className="mv-admin-nav-icon" aria-hidden="true">{item.icon}</span>
+                      <span>{item.label}</span>
+                    </Link>
+                  );
+                })}
+              </div>
+            );
+          })}
         </nav>
 
-        <div style={{ paddingTop: "1.5rem", borderTop: "1px solid rgba(255,255,255,0.1)" }}>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "0.75rem",
-              padding: "0.75rem",
-            }}
-          >
-            <div
-              style={{
-                width: 28,
-                height: 28,
-                borderRadius: "50%",
-                background: "rgba(255,255,255,0.1)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: "0.875rem",
-              }}
-            >
-              {user?.name?.charAt(0)?.toUpperCase() || "?"}
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <div
-                style={{
-                  fontWeight: 500,
-                  color: "white",
-                  fontSize: "0.8rem",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {user?.name || "User"}
-              </div>
-              <div style={{ fontSize: "0.625rem", color: "rgba(255,255,255,0.4)" }}>
-                {user?.isPrimaryOwner ? "Primary Owner" : ROLE_LABEL[user?.role as AdminRole] || user?.role}
-              </div>
-            </div>
-            {/* Logout is a POST: a link would be a state change a cross-site
-                image tag could trigger. */}
-            <form method="post" action="/admin/logout" style={{ margin: 0 }}>
-              <button
-                type="submit"
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "rgba(255,255,255,0.6)",
-                  fontSize: "0.75rem",
-                  cursor: "pointer",
-                  padding: 0,
-                }}
-              >
-                Logout
-              </button>
-            </form>
-          </div>
+        <div className="mv-admin-profile">
+          <span className="mv-admin-avatar" aria-hidden="true">
+            {user?.name?.charAt(0)?.toUpperCase() || "?"}
+          </span>
+          <span className="mv-admin-profile-copy">
+            <strong>{user?.name || "User"}</strong>
+            <small>{user?.isPrimaryOwner ? "Primary Owner" : ROLE_LABEL[user?.role as AdminRole] || user?.role}</small>
+          </span>
+          <Form method="post" action="/admin/logout">
+            <button type="submit" className="mv-admin-logout">Logout</button>
+          </Form>
         </div>
       </aside>
 
-      <main
-        style={{
-          flex: 1,
-          marginLeft: 260,
-          padding: "2rem",
-          background: "#f6f8fb",
-          minHeight: "100vh",
-        }}
-      >
-        {/* Required by the controlled-testing phase: this panel is connected to
-            Shopify development stores only. The banner is a reminder, not a
-            control — the real protection is that no production credential is
-            configured and the Odoo connector is not enabled. */}
-        <div
-          role="status"
-          style={{
-            background: "#fffbeb",
-            border: "1px solid #fcd34d",
-            color: "#92400e",
-            borderRadius: 8,
-            padding: "0.6rem 0.9rem",
-            marginBottom: "1.5rem",
-            fontSize: "0.8rem",
-            fontWeight: 600,
-            letterSpacing: "0.01em",
-          }}
-        >
-          TEST MODE — NO REAL PAYMENT OR FULFILLMENT
+      <main className="mv-admin-main">
+        <header className="mv-admin-topbar">
+          <div>
+            <strong>Operations</strong>
+            <span>Manage catalog, orders, shipping and seller payments</span>
+          </div>
+          <div className="mv-admin-environment" role="status">
+            <span aria-hidden="true" /> TEST MODE
+          </div>
+        </header>
+        <div className="mv-admin-content">
+          <div className="mv-admin-test-banner" role="status">
+            TEST MODE — no real payment or fulfillment
+          </div>
+          <Outlet />
         </div>
-        <Outlet />
       </main>
     </div>
   );

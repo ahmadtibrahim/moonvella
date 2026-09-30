@@ -1882,6 +1882,28 @@ model PaymentEvent {
   @@index([type])
 }
 
+/// Stripe transfers captured seller money from the MoonVella Stripe balance to
+/// the business bank account in payouts. A payout can contain many charges, so
+/// it is recorded as its own settlement row rather than pretending one order
+/// payment maps one-to-one to one bank deposit.
+model StripePayout {
+  id               String   @id @default(cuid())
+  providerPayoutId String   @unique
+  amount           Int
+  currency         String
+  status           String
+  arrivalDate      DateTime?
+  paidAt           DateTime?
+  failureCode      String?
+  failureMessage   String?
+  lastEventId      String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([status])
+  @@index([arrivalDate])
+}
+
 model FulfillmentRequest {
   id                        String                   @id @default(cuid())
   orderId                   String                   @unique
