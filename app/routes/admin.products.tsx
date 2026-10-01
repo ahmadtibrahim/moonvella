@@ -134,28 +134,6 @@ const card: React.CSSProperties = {
   padding: "1.5rem",
   marginBottom: "1.5rem",
 };
-const input: React.CSSProperties = {
-  width: "100%",
-  padding: "0.5rem",
-  border: "1px solid #cbd5e1",
-  borderRadius: 6,
-  fontSize: "0.85rem",
-  boxSizing: "border-box",
-};
-const label: React.CSSProperties = { display: "block", fontSize: "0.72rem", color: "#64748b", marginBottom: "0.25rem" };
-
-function money(cents: number, currency = "CAD") {
-  return `${(cents / 100).toFixed(2)} ${currency}`;
-}
-
-const gridCols: React.CSSProperties = {
-  display: "grid",
-  gridTemplateColumns: "2fr 1fr 110px 80px 70px 100px 260px",
-  alignItems: "center",
-  gap: "0.5rem",
-};
-const gridHead: React.CSSProperties = { fontSize: "0.7rem", color: "#64748b", fontWeight: 600 };
-
 export default function AdminProducts() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
@@ -177,23 +155,22 @@ export default function AdminProducts() {
   const hasFilters = Boolean(data.filters.q || data.filters.category || data.filters.status !== "ALL");
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "1rem" }}>
+    <div className="mv-page-wide">
+      <div className="mv-page-header">
         <div>
-          <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-            Products
-          </h1>
-          <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1.5rem" }}>
-            MoonVella supplier catalog. A product is a family; each sellable size or
-            colour underneath it is a variant with its own SKU and price. The Media
-            column counts the files attached to the product — it is not a count of
-            variants with pictures, which is shown on the product&rsquo;s Media tab.
-          </p>
+          <h1>Product catalog</h1>
+          <p>Products, variants, media and the packaging each order will use.</p>
         </div>
-        <Link to="/admin/products/new" style={{ ...btn("#082a4a"), textDecoration: "none", padding: "0.6rem 1.1rem", fontSize: "0.8rem" }}>
+        <Link to="/admin/products/new" className="mv-button mv-button-dark">
           New product
         </Link>
       </div>
+
+      <nav className="mv-workspace-nav" aria-label="Catalog">
+        <Link to="/admin/products" className="is-active">Products</Link>
+        <Link to="/admin/packaging">Packaging library</Link>
+        <Link to="/admin/odoo">Odoo import</Link>
+      </nav>
 
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
@@ -210,24 +187,12 @@ export default function AdminProducts() {
         </div>
       ) : null}
 
-      <div style={card}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "1rem" }}>
-          <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a" }}>
-            Catalog ({data.total})
-          </h2>
-          <span style={{ fontSize: "0.75rem", color: "#64748b" }}>
-            page {data.page} of {data.totalPages}
-          </span>
-        </div>
-
-        <Form method="get" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
-          <div>
-            <label style={label} htmlFor="product-filter-q">Search</label>
-            <input id="product-filter-q" style={{ ...input, width: 220 }} name="q" defaultValue={data.filters.q} placeholder="Name, code or variant SKU" />
-          </div>
-          <div>
-            <label style={label} htmlFor="product-filter-category">Category</label>
-            <select id="product-filter-category" style={{ ...input, width: 160 }} name="category" defaultValue={data.filters.category}>
+      <Form method="get" className="mv-filter-bar">
+          <label className="mv-field" htmlFor="product-filter-q">Search
+            <input id="product-filter-q" className="mv-input" name="q" defaultValue={data.filters.q} placeholder="Name, code or variant SKU" />
+          </label>
+          <label className="mv-field" htmlFor="product-filter-category">Category
+            <select id="product-filter-category" className="mv-input" name="category" defaultValue={data.filters.category}>
               <option value="">All categories</option>
               {data.categories.map((c) => (
                 <option key={c} value={c}>
@@ -235,10 +200,9 @@ export default function AdminProducts() {
                 </option>
               ))}
             </select>
-          </div>
-          <div>
-            <label style={label} htmlFor="product-filter-status">Status</label>
-            <select id="product-filter-status" style={{ ...input, width: 150 }} name="status" defaultValue={data.filters.status}>
+          </label>
+          <label className="mv-field" htmlFor="product-filter-status">Status
+            <select id="product-filter-status" className="mv-input" name="status" defaultValue={data.filters.status}>
               <option value="ALL">All</option>
               {STATUSES.filter((s) => s !== "ALL").map((s) => (
                 <option key={s} value={s}>
@@ -246,60 +210,35 @@ export default function AdminProducts() {
                 </option>
               ))}
             </select>
-          </div>
-          <button type="submit" style={btn("#082a4a")}>
-            Filter
-          </button>
+          </label>
+          <button type="submit" className="mv-button mv-button-dark">Filter</button>
           {hasFilters ? (
-            <Link to="/admin/products" style={{ ...btn("#64748b"), textDecoration: "none" }}>
-              Clear
-            </Link>
+            <Link to="/admin/products" className="mv-button">Clear</Link>
           ) : null}
-        </Form>
+      </Form>
 
+      <section className="mv-panel">
+        <div className="mv-panel-header">
+          <div><h2>Products</h2><p>{data.total} catalog products</p></div>
+          <span className="mv-badge">Page {data.page} of {data.totalPages}</span>
+        </div>
         {data.products.length === 0 ? (
-          <p style={{ color: "#64748b", fontSize: "0.85rem" }}>No products match these filters.</p>
+          <div className="mv-panel-body mv-muted">No products match these filters.</div>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-            <div style={gridCols}>
-              <span style={gridHead}>Product</span>
-              <span style={gridHead}>Code</span>
-              <span style={gridHead}>Category</span>
-              <span style={gridHead}>Variants</span>
-              <span style={gridHead}>Media</span>
-              <span style={gridHead}>Status</span>
-              <span style={gridHead}>Actions</span>
-            </div>
-            {data.products.map((p) => (
-              <div
-                key={p.id}
-                style={{
-                  ...gridCols,
-                  padding: "0.6rem 0.75rem",
-                  border: "1px solid #e2e8f0",
-                  borderRadius: 8,
-                  fontSize: "0.82rem",
-                  opacity: p.isArchived ? 0.55 : 1,
-                }}
-              >
-                <Link to={`/admin/products/${p.id}`} style={{ fontWeight: 600, color: "#082a4a" }}>
-                  {p.name}
-                </Link>
-                <span style={{ color: "#64748b", fontFamily: "ui-monospace, monospace", fontSize: "0.78rem" }}>
-                  {p.productCode}
-                </span>
-                <span style={{ color: "#64748b" }}>{p.category}</span>
-                <span style={{ color: p._count.variants === 0 ? "#b45309" : "#64748b" }}>
-                  {p._count.variants === 0 ? "none yet" : p._count.variants}
-                </span>
-                <span style={{ color: "#64748b" }}>
-                  {p._count.mediaAssets}{" "}
-                  <span style={{ fontSize: "0.7rem" }}>(media assets for publication)</span>
-                </span>
-                <span style={{ color: STATUS_COLOURS[p.status] ?? "#64748b", fontWeight: 600 }}>
-                  {STATUS_LABELS[p.status] ?? p.status}
-                </span>
-                <Form method="post" style={{ display: "flex", gap: "0.35rem", flexWrap: "wrap" }}>
+          <div className="mv-table-wrap">
+            <table className="mv-table mv-catalog-table">
+              <thead><tr><th>Product</th><th>Category</th><th>Variants</th><th>Media</th><th>Packaging</th><th>Status</th><th>Actions</th></tr></thead>
+              <tbody>{data.products.map((p) => (
+              <tr key={p.id} style={{ opacity: p.isArchived ? 0.55 : 1 }}>
+                <td><Link to={`/admin/products/${p.id}`}>{p.name}</Link><div className="mv-muted mv-mono">{p.productCode}</div></td>
+                <td className="mv-muted">{p.category}</td>
+                <td className="mv-muted">{p._count.variants === 0 ? "None" : p._count.variants}</td>
+                <td className="mv-muted">{p._count.mediaAssets}</td>
+                <td><span className={p.packaging.complete ? "mv-badge mv-badge-success" : "mv-badge mv-badge-warning"}>
+                  {p.packaging.complete ? "Ready" : p.packaging.totalVariants === 0 ? "No variants" : `${p.packaging.packagedVariants}/${p.packaging.totalVariants}`}
+                </span></td>
+                <td><span className="mv-badge" style={{ color: STATUS_COLOURS[p.status] ?? "#64748b" }}>{STATUS_LABELS[p.status] ?? p.status}</span></td>
+                <td><Form method="post" className="mv-actions">
                   <input type="hidden" name="productId" value={p.id} />
                   <input type="hidden" name="returnTo" value={returnTo} />
                   {/*
@@ -313,42 +252,38 @@ export default function AdminProducts() {
                       type="submit"
                       name="intent"
                       value={p.status === "PUBLISHED" ? "unpublish" : "publish"}
-                      style={btn("#0369a1")}
+                      className="mv-button mv-button-primary"
                     >
                       {p.status === "PUBLISHED" ? "Unpublish" : "Publish"}
                     </button>
                   ) : null}
-                  <Link to={`/admin/products/${p.id}`} style={{ ...btn("#64748b"), textDecoration: "none" }}>
-                    Edit
-                  </Link>
-                  <button type="submit" name="intent" value="duplicate" style={btn("#64748b")}>
-                    Duplicate
-                  </button>
-                  <button type="submit" name="intent" value={p.isArchived ? "restore" : "archive"} style={btn(p.isArchived ? "#059669" : "#dc2626")}>
+                  <Link to={`/admin/products/${p.id}`} className="mv-button">Edit</Link>
+                  <button type="submit" name="intent" value="duplicate" className="mv-button">Duplicate</button>
+                  <button type="submit" name="intent" value={p.isArchived ? "restore" : "archive"} className={p.isArchived ? "mv-button" : "mv-button mv-button-danger"}>
                     {p.isArchived ? "Restore" : "Archive"}
                   </button>
                   <ArmedDelete name={p.name} />
-                </Form>
-              </div>
-            ))}
+                </Form></td>
+              </tr>
+            ))}</tbody></table>
           </div>
         )}
 
         {data.totalPages > 1 ? (
           <div style={{ display: "flex", justifyContent: "flex-end", gap: "0.5rem", marginTop: "1rem" }}>
             {data.page > 1 ? (
-              <Link to={`/admin/products${qs({ page: String(data.page - 1) })}`} style={{ ...btn("#64748b"), textDecoration: "none" }}>
+              <Link to={`/admin/products${qs({ page: String(data.page - 1) })}`} className="mv-button">
                 Previous
               </Link>
             ) : null}
             {data.page < data.totalPages ? (
-              <Link to={`/admin/products${qs({ page: String(data.page + 1) })}`} style={{ ...btn("#64748b"), textDecoration: "none" }}>
+              <Link to={`/admin/products${qs({ page: String(data.page + 1) })}`} className="mv-button">
                 Next
               </Link>
             ) : null}
           </div>
         ) : null}
-      </div>
+      </section>
     </div>
   );
 }

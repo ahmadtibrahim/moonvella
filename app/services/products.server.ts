@@ -297,6 +297,13 @@ export async function listProducts(filters: ProductListFilters = {}) {
         isArchived: true,
         updatedAt: true,
         _count: { select: { variants: true, mediaAssets: true } },
+        packages: { select: { id: true } },
+        variants: {
+          select: {
+            id: true,
+            _count: { select: { packages: true } },
+          },
+        },
       },
     }),
     prisma.product.count({ where }),
@@ -308,7 +315,22 @@ export async function listProducts(filters: ProductListFilters = {}) {
   ]);
 
   return {
-    products,
+    products: products.map((product) => {
+      const { packages, variants, ...summary } = product;
+      const hasProductFallback = packages.length > 0;
+      const packagedVariants = variants.filter(
+        (variant) => variant._count.packages > 0 || hasProductFallback
+      ).length;
+      return {
+        ...summary,
+        packaging: {
+          complete: variants.length > 0 && packagedVariants === variants.length,
+          packagedVariants,
+          totalVariants: variants.length,
+          source: hasProductFallback ? "product fallback" : "variant packaging",
+        },
+      };
+    }),
     total,
     page,
     pageSize,

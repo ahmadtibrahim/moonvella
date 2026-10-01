@@ -131,7 +131,7 @@ export default function ImagePicker({
     <div style={{ marginBottom: "0.5rem" }}>
       <button
         type="button"
-        className="mv-import-btn"
+        className="mv-import-btn mv-import-btn-secondary"
         style={{ display: "block", width: "100%", textAlign: "center", marginBottom: "0.4rem" }}
         onClick={toggleOpen}
         aria-expanded={open}

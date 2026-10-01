@@ -4,6 +4,48 @@ import { loadLegacyFamilyRetailPrices, loadSellerRetailPrices } from "../service
 import { useCurrency } from "../components/CurrencyDisplay";
 import { prisma } from "../db.server";
 
+const SHOPIFY_PRODUCT_LINKS_QUERY = `#graphql
+  query MoonVellaProductLinks($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product {
+        id
+        handle
+        status
+        onlineStoreUrl
+        featuredImage { url altText }
+      }
+    }
+  }
+`;
+
+async function loadShopifyProductLinks(request, productIds) {
+  const ids = [...new Set(productIds.filter(Boolean))];
+  if (ids.length === 0) return { checked: true, products: new Map() };
+
+  try {
+    const { authenticate } = await import("../shopify.server");
+    const { admin } = await authenticate.admin(request);
+    const products = new Map();
+
+    for (let start = 0; start < ids.length; start += 100) {
+      const response = await admin.graphql(SHOPIFY_PRODUCT_LINKS_QUERY, {
+        variables: { ids: ids.slice(start, start + 100) },
+      });
+      const json = await response.json();
+      for (const product of json?.data?.nodes ?? []) {
+        if (product?.id) products.set(product.id, product);
+      }
+    }
+
+    return { checked: true, products };
+  } catch {
+    // A temporary Shopify read failure must not hide the merchant's MoonVella
+    // records. The admin link can still be constructed from the stored id; the
+    // storefront link stays unavailable until Shopify confirms it.
+    return { checked: false, products: new Map() };
+  }
+}
+
 /**
  * The imported-product list, with prices and SKUs, for approved sellers.
  *
@@ -63,6 +105,10 @@ export const loader = async ({ request }) =>
         },
       },
     });
+    const shopify = await loadShopifyProductLinks(
+      request,
+      rows.map((row) => row.shopifyProductId)
+    );
 
     /*
      * The seller's own prices, in two queries for the whole page. `?` because
@@ -100,6 +146,9 @@ export const loader = async ({ request }) =>
       const cheapestRetail = cheapest
         ? pricedByVariant.get(cheapest.id) ?? familyLegacy ?? cheapest.suggestedRetailPrice
         : 0;
+      const remote = row.shopifyProductId
+        ? shopify.products.get(row.shopifyProductId) ?? null
+        : null;
 
       return {
         id: row.id,
@@ -109,6 +158,12 @@ export const loader = async ({ request }) =>
         extraVariants,
         category: row.product.category,
         shopifyProductId: row.shopifyProductId,
+        shopifyExists: row.shopifyProductId ? (!shopify.checked || remote !== null) : false,
+        shopifyChecked: shopify.checked,
+        shopifyStatus: remote?.status ?? null,
+        storefrontUrl: remote?.onlineStoreUrl ?? null,
+        imageUrl: remote?.featuredImage?.url ?? null,
+        imageAlt: remote?.featuredImage?.altText ?? row.product.name,
         importedAt: row.importedAt,
         importStatus: row.importStatus,
         lastImportError: row.lastImportError,
@@ -126,8 +181,16 @@ export const loader = async ({ request }) =>
     access: context.access,
     canImport: context.canImport,
     imported,
+    shopDomain: context.shop,
   };
   });
+
+function shopifyProductAdminUrl(shopDomain, productGid) {
+  const productId = String(productGid || "").split("/").filter(Boolean).pop();
+  const storeHandle = String(shopDomain || "").replace(/\.myshopify\.com$/i, "");
+  if (!/^\d+$/.test(productId || "") || !storeHandle) return null;
+  return `https://admin.shopify.com/store/${encodeURIComponent(storeHandle)}/products/${productId}`;
+}
 
 export const action = async ({ request }) => {
   const { requireMerchantAccess, AccessError } = await import(
@@ -160,11 +223,12 @@ export const action = async ({ request }) => {
   });
 
   if (!result.ok) {
-    return { ok: false, error: result.error || "Re-sync failed." };
+    return { ok: false, productId, error: result.error || "Re-sync failed." };
   }
 
   return {
     ok: true,
+    productId,
     updated: result.updated === true,
     warnings: result.warnings || [],
   };
@@ -183,8 +247,24 @@ function syncBadgeClass(status) {
   return "mv-badge mv-badge-warning";
 }
 
+function storeBadge(product) {
+  if (!product.shopifyChecked) {
+    return { label: "Shopify status unavailable", className: "mv-badge mv-badge-neutral" };
+  }
+  if (product.shopifyChecked && !product.shopifyExists) {
+    return { label: "Missing in Shopify", className: "mv-badge mv-badge-danger" };
+  }
+  if (product.storefrontUrl) {
+    return { label: "Live on storefront", className: "mv-badge mv-badge-instock" };
+  }
+  if (product.shopifyStatus === "DRAFT") {
+    return { label: "Shopify draft", className: "mv-badge mv-badge-warning" };
+  }
+  return { label: "Not published online", className: "mv-badge mv-badge-neutral" };
+}
+
 export default function ProductsPage() {
-  const { access, canImport, imported } = useLoaderData();
+  const { access, canImport, imported, shopDomain } = useLoaderData();
   const fetcher = useFetcher();
   const currency = useCurrency();
 
@@ -220,26 +300,38 @@ export default function ProductsPage() {
     );
   }
 
-  const activeListings = imported.filter((p) => p.isActive).length;
+  const liveListings = imported.filter((p) => Boolean(p.storefrontUrl)).length;
+  const needsAttention = imported.filter(
+    (p) => p.importStatus === "FAILED" || (p.shopifyChecked && !p.shopifyExists)
+  ).length;
 
   return (
     <s-page heading="My Products">
       <div className="mv-container">
-        <div className="mv-page-header">
-          <h2 className="mv-page-title">Your MoonVella Products</h2>
-          <p className="mv-page-subtitle">
-            Products imported to your Shopify store from the MoonVella catalog.
-          </p>
+        <div className="mv-page-header mv-page-header-split">
+          <div>
+            <h2 className="mv-page-title">My Products</h2>
+            <p className="mv-page-subtitle">
+              Manage the MoonVella products connected to your Shopify store.
+            </p>
+          </div>
+          <Link className="mv-btn mv-btn-primary" to="/app/catalog">
+            Add products
+          </Link>
         </div>
 
-        <div className="mv-stats-grid">
+        <div className="mv-stats-grid mv-stats-grid-compact">
           <div className="mv-stat-card">
             <div className="mv-stat-title">Imported products</div>
             <div className="mv-stat-value">{imported.length}</div>
           </div>
           <div className="mv-stat-card">
-            <div className="mv-stat-title">Active listings</div>
-            <div className="mv-stat-value">{activeListings}</div>
+            <div className="mv-stat-title">Live storefront</div>
+            <div className="mv-stat-value">{liveListings}</div>
+          </div>
+          <div className="mv-stat-card">
+            <div className="mv-stat-title">Needs attention</div>
+            <div className="mv-stat-value">{needsAttention}</div>
           </div>
         </div>
 
@@ -253,79 +345,72 @@ export default function ProductsPage() {
             </Link>
           </div>
         ) : (
-          <div className="mv-section-card">
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.85rem" }}>
-              <thead>
-                <tr style={{ textAlign: "left", color: "#64748b", fontSize: "0.7rem" }}>
-                  <th style={{ padding: "0.5rem" }}>Product</th>
-                  <th style={{ padding: "0.5rem" }}>SKU</th>
-                  <th style={{ padding: "0.5rem" }}>Your retail</th>
-                  <th style={{ padding: "0.5rem" }}>Cost</th>
-                  <th style={{ padding: "0.5rem" }}>Sync</th>
-                  <th style={{ padding: "0.5rem" }}>Shopify</th>
-                  <th style={{ padding: "0.5rem" }}>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {imported.map((p) => (
-                  <tr key={p.id} style={{ borderTop: "1px solid #f1f5f9" }}>
-                    <td style={{ padding: "0.5rem", fontWeight: 600 }}>{p.name}</td>
-                    <td style={{ padding: "0.5rem", color: "#64748b" }}>
-                      {p.sku}
-                      {p.extraVariants > 0 ? (
-                        <span
-                          title={`This family contains ${p.extraVariants + 1} sellable variants.`}
-                          style={{ color: "#94a3b8" }}
-                        >
-                          {" "}
-                          +{p.extraVariants}
-                        </span>
-                      ) : null}
-                    </td>
-                    <td style={{ padding: "0.5rem" }}>{currency.format(p.retailPrice)}</td>
-                    <td style={{ padding: "0.5rem" }}>{currency.format(p.moonvillaCost)}</td>
-                    <td style={{ padding: "0.5rem" }}>
-                      <span
-                        className={syncBadgeClass(p.importStatus)}
-                        title={p.lastImportError || undefined}
-                      >
+          <div className="mv-owned-product-grid">
+            {imported.map((p) => {
+              const adminUrl = shopifyProductAdminUrl(shopDomain, p.shopifyProductId);
+              const shopify = storeBadge(p);
+              const syncing = fetcher.state !== "idle" && fetcher.formData?.get("productId") === p.productId;
+
+              return (
+                <article className="mv-owned-product-card" key={p.id}>
+                  <div className="mv-owned-product-image">
+                    {p.imageUrl ? <img src={p.imageUrl} alt={p.imageAlt} /> : <span>{p.name.slice(0, 2)}</span>}
+                  </div>
+                  <div className="mv-owned-product-body">
+                    <div className="mv-owned-product-heading">
+                      <div>
+                        <span className="mv-product-category">{p.category}</span>
+                        <h3>{p.name}</h3>
+                        <p className="mv-owned-product-sku">
+                          {p.sku}{p.extraVariants > 0 ? ` +${p.extraVariants} variants` : ""}
+                        </p>
+                      </div>
+                      <span className={shopify.className}>{shopify.label}</span>
+                    </div>
+
+                    <div className="mv-owned-product-prices">
+                      <div><span>Your retail from</span><strong>{currency.format(p.retailPrice)}</strong></div>
+                      <div><span>MoonVella cost from</span><strong>{currency.format(p.moonvillaCost)}</strong></div>
+                    </div>
+
+                    <div className="mv-owned-product-sync">
+                      <span className={syncBadgeClass(p.importStatus)} title={p.lastImportError || undefined}>
                         {SYNC_LABELS[p.importStatus] || p.importStatus}
                       </span>
-                    </td>
-                    <td style={{ padding: "0.5rem" }}>
-                      {p.shopifyProductId ? (
-                        <a
-                          href={`shopify:admin/products/${p.shopifyProductId}`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          View in Shopify
+                      <span>Imported {p.importedAt ? new Date(p.importedAt).toLocaleDateString() : "date unavailable"}</span>
+                    </div>
+                    {p.lastImportError ? <p className="mv-inline-error">{p.lastImportError}</p> : null}
+
+                    <div className="mv-owned-product-actions">
+                      {adminUrl && p.shopifyExists ? (
+                        <a className="mv-btn mv-btn-secondary" href={adminUrl} target="_blank" rel="noreferrer">
+                          Manage in Shopify
                         </a>
                       ) : (
-                        "—"
+                        <span className="mv-btn mv-btn-disabled" aria-disabled="true">Shopify product missing</span>
                       )}
-                    </td>
-                    <td style={{ padding: "0.5rem" }}>
+                      {p.storefrontUrl ? (
+                        <a className="mv-btn mv-btn-secondary" href={p.storefrontUrl} target="_blank" rel="noreferrer">
+                          View storefront
+                        </a>
+                      ) : (
+                        <span className="mv-btn mv-btn-disabled" aria-disabled="true" title="Publish this product to the Online Store sales channel in Shopify first.">
+                          Not on storefront
+                        </span>
+                      )}
                       {p.shopifyProductId ? (
                         <fetcher.Form method="post">
                           <input type="hidden" name="productId" value={p.productId} />
-                          <button
-                            type="submit"
-                            className="mv-btn mv-btn-secondary"
-                            style={{ fontSize: "0.75rem", padding: "0.3rem 0.75rem" }}
-                            disabled={fetcher.state !== "idle"}
-                          >
-                            {fetcher.state !== "idle" ? "Syncing..." : "Re-sync"}
+                          <button type="submit" className="mv-btn mv-btn-primary" disabled={fetcher.state !== "idle"}>
+                            {syncing ? "Syncing…" : "Re-sync"}
                           </button>
                         </fetcher.Form>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                      ) : null}
+                    </div>
+                  </div>
+                </article>
+              );
+            })}
           </div>
         )}
 

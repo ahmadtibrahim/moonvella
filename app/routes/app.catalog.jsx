@@ -319,15 +319,18 @@ export default function CatalogPage() {
   return (
     <s-page heading="Product Catalog">
       <div className="mv-container">
-        <div className="mv-page-header">
-          <h2 className="mv-page-title">
-            {canViewWholesale ? "Product Catalog" : "Product Catalog Preview"}
-          </h2>
-          <p className="mv-page-subtitle">
-            {canViewWholesale
-              ? "Wholesale products from MoonVella. Import to your store and start selling."
-              : "Browse MoonVella products. Wholesale pricing and import tools unlock after approval."}
-          </p>
+        <div className="mv-page-header mv-page-header-split">
+          <div>
+            <h2 className="mv-page-title">
+              {canViewWholesale ? "Product Catalog" : "Product Catalog Preview"}
+            </h2>
+            <p className="mv-page-subtitle">
+              {canViewWholesale
+                ? "Choose a product, set retail prices by size, then import it to Shopify."
+                : "Browse MoonVella products. Wholesale pricing and import tools unlock after approval."}
+            </p>
+          </div>
+          {canImport ? <Link className="mv-btn mv-btn-secondary" to="/app/products">My Products</Link> : null}
         </div>
 
         {statusMessage && (
@@ -350,7 +353,7 @@ export default function CatalogPage() {
           </div>
         )}
 
-        <div className="mv-filter-row">
+        <div className="mv-filter-row mv-catalog-filter-bar">
           <input
             type="text"
             className="mv-search-input"
@@ -387,20 +390,21 @@ export default function CatalogPage() {
               </select>
             </div>
           )}
+          <span className="mv-catalog-result-count">{sorted.length} product{sorted.length === 1 ? "" : "s"}</span>
         </div>
 
-        <div className="mv-product-grid">
+        <div className="mv-product-grid mv-catalog-grid">
           {sorted.map((product) => {
             const unpriced = (product.variants ?? []).filter((v) => v.needsRetailPrice);
 
             return (
               <div className="mv-product-card" key={product.id}>
-                <div className="mv-product-image">
+                <div className="mv-product-image mv-catalog-image">
                   {product.image ? (
                     <img
                       src={product.image}
                       alt={product.name}
-                      style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                      style={{ width: "100%", height: "100%", objectFit: "contain" }}
                     />
                   ) : (
                     <span className="mv-product-placeholder">
@@ -411,13 +415,10 @@ export default function CatalogPage() {
                 <div className="mv-product-info">
                   <h4 className="mv-product-name">{product.name}</h4>
                   <span className="mv-product-category">{product.category}</span>
+                  {product.description ? <p className="mv-product-description">{product.description}</p> : null}
                 </div>
 
                 <div className="mv-product-details">
-                  <div className="mv-product-detail-row">
-                    <span className="mv-product-detail-label">Category</span>
-                    <span className="mv-product-detail-value">{product.category}</span>
-                  </div>
                   <div className="mv-product-detail-row">
                     <span className="mv-product-detail-label">Availability</span>
                     <span className="mv-product-detail-value">
@@ -434,10 +435,16 @@ export default function CatalogPage() {
                   </div>
 
                   {canViewWholesale && (
-                    <div className="mv-product-detail-row">
-                      <span className="mv-product-detail-label">Inventory</span>
-                      <span className="mv-product-detail-value">{product.inventory}</span>
-                    </div>
+                    <>
+                      <div className="mv-product-detail-row">
+                        <span className="mv-product-detail-label">Variants</span>
+                        <span className="mv-product-detail-value">{product.variants?.length ?? 0}</span>
+                      </div>
+                      <div className="mv-product-detail-row">
+                        <span className="mv-product-detail-label">Inventory</span>
+                        <span className="mv-product-detail-value">{product.inventory}</span>
+                      </div>
+                    </>
                   )}
                 </div>
 
@@ -450,6 +457,7 @@ export default function CatalogPage() {
                 */}
                 {canViewWholesale && (product.variants ?? []).length > 0 && (
                   <div className="mv-variant-list">
+                    <div className="mv-variant-list-title">Sizes and pricing</div>
                     {product.variants.map((variant) => (
                       <div className="mv-variant-row" key={variant.id}>
                         <div className="mv-variant-head">
@@ -505,8 +513,7 @@ export default function CatalogPage() {
                       the admin's frame. */}
                   {canViewWholesale && product.marketingPackUrl ? (
                     <a
-                      className="mv-import-btn"
-                      style={{ display: "block", textAlign: "center", marginBottom: "0.4rem" }}
+                      className="mv-import-btn mv-import-btn-secondary"
                       href={product.marketingPackUrl}
                       target="_blank"
                       rel="noreferrer"
@@ -523,8 +530,7 @@ export default function CatalogPage() {
                       document navigation would drop the frame's parameters and
                       land on the App Bridge bootstrap page. */}
                   <Link
-                    className="mv-import-btn"
-                    style={{ display: "block", textAlign: "center", marginBottom: "0.4rem" }}
+                    className="mv-import-btn mv-import-btn-secondary"
                     to={`/app/product-assets/${encodeURIComponent(product.id)}`}
                   >
                     Files &amp; videos
