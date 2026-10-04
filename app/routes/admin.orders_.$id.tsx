@@ -2,6 +2,7 @@ import { Link, useLoaderData, useActionData, Form, redirect } from "react-router
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta, userCan } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
+import { formatDateTime } from "~/utils/dates";
 import {
   createOrReuseWholesalePayment,
   applyStripeEvent,
@@ -29,7 +30,7 @@ import {
   recipientPhoneFor,
   recordRecipientPhone,
 } from "~/services/shipping.server";
-import { availableWarehouseEvents, orderBookingGate } from "~/services/shippingLogic";
+import { advanceRefusal, availableWarehouseEvents, orderBookingGate } from "~/services/shippingLogic";
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
@@ -291,8 +292,38 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
    */
   const eshipper = await eshipperStatus();
 
+  /*
+   * WHERE EACH SHIPMENT COLLECTS FROM, when its own record does not say.
+   *
+   * The grouping above is the same resolution the quote and the booking use, so
+   * reading it back per shipment is not a second opinion — it is the answer
+   * those two would act on today. Without it an un-booked shipment printed "not
+   * recorded", which reads as a fault on an order whose mapping is in fact
+   * known and correct. A shipment whose lines span docks is left out, because
+   * there is no single dock to name and the grouping's own reason is the honest
+   * answer for that case.
+   */
+  const dockByOrderItem = new Map(
+    grouping.groups.flatMap((group) =>
+      group.location
+        ? group.lines.map((line) => [line.orderItemId, { code: group.location!.code, name: group.location!.name }] as const)
+        : []
+    )
+  );
+  const shipmentOrigins: Record<string, { code: string; name: string }> = {};
+  for (const shipment of order.shipments) {
+    const docks = new Map(
+      shipment.items
+        .map((si) => dockByOrderItem.get(si.orderItemId))
+        .filter((dock): dock is { code: string; name: string } => Boolean(dock))
+        .map((dock) => [dock.code, dock] as const)
+    );
+    if (docks.size === 1) shipmentOrigins[shipment.id] = [...docks.values()][0];
+  }
+
   return {
     order,
+    shipmentOrigins,
     /*
      * THE NUMBER THE LABEL WILL CARRY, or null. Read through the same function
      * the booking gate uses, so the card below and the refusal agree: it is the
@@ -871,7 +902,7 @@ function importantDetail(raw: string | null): string | null {
 }
 
 export default function AdminOrderDetail() {
-  const { order, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress } =
+  const { order, shipmentOrigins, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1054,7 +1085,7 @@ export default function AdminOrderDetail() {
           <div>
             State: <strong style={{ color: STATE_COLOR[machine.current] ?? "#334155" }}>{machine.current}</strong>
             <span style={{ color: "#94a3b8", fontSize: "0.75rem" }}>
-              {" "}· changed {new Date(order.stateChangedAt).toLocaleString()}
+              {" "}· changed {formatDateTime(order.stateChangedAt)}
             </span>
           </div>
           <div style={{ fontSize: "0.78rem", color: "#64748b" }}>
@@ -1287,7 +1318,7 @@ export default function AdminOrderDetail() {
             and only one of them means somebody should press the button. */}
         {order.quotesInvalidatedAt ? (
           <p style={{ fontSize: "0.75rem", color: "#b45309", marginBottom: "0.5rem" }} role="status">
-            Earlier quotes were withdrawn on {new Date(order.quotesInvalidatedAt).toLocaleString()}:{" "}
+            Earlier quotes were withdrawn on {formatDateTime(order.quotesInvalidatedAt)}:{" "}
             {order.quoteInvalidationReason || "no reason recorded"}. Request quotes again.
           </p>
         ) : null}
@@ -1299,7 +1330,7 @@ export default function AdminOrderDetail() {
           <>
             <p style={{ fontSize: "0.75rem", color: "#475569", marginBottom: "0.4rem" }}>
               {order.shippingQuotes.length} rate{order.shippingQuotes.length === 1 ? "" : "s"} from the request at{" "}
-              <strong>{batchQuotedAt?.toLocaleString() ?? "an unrecorded time"}</strong>. Requesting rates again
+              <strong>{formatDateTime(batchQuotedAt, { fallback: "an unrecorded time" })}</strong>. Requesting rates again
               replaces this batch and clears any selection made from it.
             </p>
             <RateSelection quotes={order.shippingQuotes} dockIds={orderDockIds} now={now} />
@@ -1485,8 +1516,19 @@ export default function AdminOrderDetail() {
                 </div>
                 <div>
                   <small>Pickup location</small>
+                  {/*
+                    The shipment's own record first — it is what was quoted and
+                    booked — then the dock the resolver names for its items, so
+                    an un-booked shipment shows where a label WOULD collect from
+                    rather than "not recorded", which read as a fault on an
+                    order whose mapping is known.
+                  */}
                   <strong>
-                    {s.originLocation ? `${s.originLocation.code ?? "—"} — ${s.originLocation.name ?? ""}`.trim() : "not recorded"}
+                    {s.originLocation
+                      ? `${s.originLocation.code ?? "—"} — ${s.originLocation.name ?? ""}`.trim()
+                      : shipmentOrigins[s.id]
+                        ? `${shipmentOrigins[s.id].code} — ${shipmentOrigins[s.id].name} (from items)`
+                        : "not recorded"}
                     {s.pickupMode ? ` · pickup ${s.pickupMode}${s.pickupStatus ? ` (${s.pickupStatus})` : ""}` : ""}
                   </strong>
                 </div>
@@ -1494,9 +1536,9 @@ export default function AdminOrderDetail() {
                   <small>Warehouse state</small>
                   <strong>
                     {s.handedToCarrierAt
-                      ? `Handed to carrier ${new Date(s.handedToCarrierAt).toLocaleString()}`
+                      ? `Handed to carrier ${formatDateTime(s.handedToCarrierAt)}`
                       : s.packedAt
-                        ? `Packed ${new Date(s.packedAt).toLocaleString()}`
+                        ? `Packed ${formatDateTime(s.packedAt)}`
                         : "Not packed yet"}
                   </strong>
                 </div>
@@ -1504,7 +1546,7 @@ export default function AdminOrderDetail() {
                   <small>Shopify sync</small>
                   <strong>
                     {s.shopifySyncedAt
-                      ? `Fulfilled ${new Date(s.shopifySyncedAt).toLocaleString()}`
+                      ? `Fulfilled ${formatDateTime(s.shopifySyncedAt)}`
                       : s.shopifySyncError
                         ? "Sync failed"
                         : "Awaiting handoff"}
@@ -1596,6 +1638,19 @@ export default function AdminOrderDetail() {
                   </Form>
                   <span style={{ fontSize: "0.7rem", color: "#64748b" }}>No customer notification is sent for packing.</span>
                 </div>
+              ) : !s.packedAt && !s.handedToCarrierAt && s.status !== "CANCELLED" ? (
+                /*
+                 * WHY THERE IS NO BUTTON, for a box still in the building: the
+                 * usual answer is now "its label has not been bought yet", and
+                 * a control that vanishes without a word reads as a fault. The
+                 * sentence is the server's own, so the card and the action
+                 * cannot describe the same refusal differently. Shipped and
+                 * cancelled parcels stay silent — their history is the
+                 * carrier's, and the progress strip above already says so.
+                 */
+                <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.5rem" }}>
+                  {advanceRefusal(s, "packed")}
+                </p>
               ) : null}
               {availableWarehouseEvents(s).includes("handed_to_carrier") ? (
                 <Form method="post" style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", alignItems: "flex-end", flexWrap: "wrap" }}>
@@ -1620,7 +1675,7 @@ export default function AdminOrderDetail() {
               ) : null}
               {s.handedToCarrierAt ? (
                 <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.5rem" }}>
-                  Handed to the carrier {new Date(s.handedToCarrierAt).toLocaleString()} — status from here follows the
+                  Handed to the carrier {formatDateTime(s.handedToCarrierAt)} — status from here follows the
                   carrier&apos;s own scans.
                 </p>
               ) : null}
@@ -1646,14 +1701,14 @@ export default function AdminOrderDetail() {
             <span style={{ color: "#64748b" }}>{order.shopifyOrderId}</span>
           </div>
           <div>Supplier reference: {order.supplierReference || "—"}</div>
-          <div>Order taken: {new Date(order.shopifyCreatedAt).toLocaleString()}</div>
+          <div>Order taken: {formatDateTime(order.shopifyCreatedAt)}</div>
           <div>Customer payment (seller&apos;s Shopify): <strong>{order.paymentStatus}</strong></div>
           <div>Wholesale payment to MoonVella: <strong style={{ color: paid ? "#059669" : "#b45309" }}>{order.wholesalePaymentStatus}</strong></div>
           <div>MoonVella total: <strong>{money(order.moonvellaTotal, order.currency)}</strong></div>
           <div>Fulfillment: {order.fulfillmentStatus}{order.shopifyFulfillmentState ? ` · Shopify says ${order.shopifyFulfillmentState}` : ""}</div>
           {order.cancelledAt ? (
             <div style={{ color: "#dc2626" }}>
-              Cancelled {new Date(order.cancelledAt).toLocaleString()}
+              Cancelled {formatDateTime(order.cancelledAt)}
               {order.cancelReason ? ` — ${order.cancelReason}` : ""}
             </div>
           ) : null}
@@ -1736,15 +1791,15 @@ export default function AdminOrderDetail() {
         {order.fulfillmentRequest ? (
           <div style={{ fontSize: "0.82rem", lineHeight: 1.7 }}>
             <div>Status: <strong>{order.fulfillmentRequest.status}</strong></div>
-            <div>Requested: {new Date(order.fulfillmentRequest.requestedAt).toLocaleString()}</div>
-            {order.fulfillmentRequest.acceptedAt ? <div>Accepted: {new Date(order.fulfillmentRequest.acceptedAt).toLocaleString()}</div> : null}
+            <div>Requested: {formatDateTime(order.fulfillmentRequest.requestedAt)}</div>
+            {order.fulfillmentRequest.acceptedAt ? <div>Accepted: {formatDateTime(order.fulfillmentRequest.acceptedAt)}</div> : null}
             {order.fulfillmentRequest.rejectedAt ? (
               <div>
-                Rejected: {new Date(order.fulfillmentRequest.rejectedAt).toLocaleString()}
+                Rejected: {formatDateTime(order.fulfillmentRequest.rejectedAt)}
                 {order.fulfillmentRequest.rejectReason ? ` — ${order.fulfillmentRequest.rejectReason}` : ""}
               </div>
             ) : null}
-            {order.fulfillmentRequest.closedAt ? <div>Closed: {new Date(order.fulfillmentRequest.closedAt).toLocaleString()}</div> : null}
+            {order.fulfillmentRequest.closedAt ? <div>Closed: {formatDateTime(order.fulfillmentRequest.closedAt)}</div> : null}
             <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.5rem", alignItems: "flex-end" }}>
               {order.fulfillmentRequest.status === "PENDING" ? (
                 <>
@@ -1923,7 +1978,7 @@ export default function AdminOrderDetail() {
               const detail = entry.kind === "audit" ? importantDetail(entry.afterData) : null;
               return (
                 <li key={`${entry.kind}-${entry.id}`} className="mv-activity-item">
-                  <span style={{ color: "#94a3b8" }}>{new Date(entry.at).toLocaleString()}</span>
+                  <span style={{ color: "#94a3b8" }}>{formatDateTime(entry.at)}</span>
                   <div>
                     <div style={{ display: "flex", gap: "0.5rem", alignItems: "baseline", flexWrap: "wrap" }}>
                       {/*

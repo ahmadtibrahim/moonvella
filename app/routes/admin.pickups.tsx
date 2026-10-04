@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 import { prisma } from "~/db.server";
 import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 import { requirePermission } from "~/utils/adminAuth.server";
+import { formatDateTime } from "~/utils/dates";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "shipping.view");
@@ -86,7 +87,7 @@ export default function AdminPickups() {
                   <td>{shipment.pickupMode === "REGULAR" ? "Regular pickup" : shipment.pickupMode === "DROPOFF" ? "Drop-off" : "One-off pickup"}</td>
                   <td>
                     <span className={`mv-badge ${pickupBadge(shipment.pickupStatus)}`}>{shipment.pickupStatus || "Not scheduled"}</span>
-                    {shipment.pickupScheduledFor ? <div className="mv-muted">{new Date(shipment.pickupScheduledFor).toLocaleString()}</div> : null}
+                    {shipment.pickupScheduledFor ? <div className="mv-muted">{formatDateTime(shipment.pickupScheduledFor)}</div> : null}
                     {shipment.pickupLastError ? <div style={{ color: "var(--mv-admin-danger)" }}>{shipment.pickupLastError}</div> : null}
                   </td>
                   <td><Link to={`/admin/shipping/${shipment.id}#pickup`}>Manage</Link></td>

@@ -3,6 +3,7 @@ import type { LoaderFunctionArgs } from "react-router";
 import type { Prisma } from "@prisma/client";
 import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
+import { formatDateTime, formatNumber } from "~/utils/dates";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "audit.view");
@@ -189,7 +190,7 @@ export default function AdminAudit() {
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.5rem" }}>
         <span style={{ fontSize: "0.78rem", color: "#64748b" }}>
-          {total.toLocaleString()} entries · page {page} of {pages}
+          {formatNumber(total)} entries · page {page} of {pages}
         </span>
         <a
           href={`/admin/audit/csv?${exportQuery.toString()}`}
@@ -243,7 +244,7 @@ export default function AdminAudit() {
               }}
             >
               <span style={{ color: "#64748b" }}>
-                {new Date(log.createdAt).toLocaleString()}
+                {formatDateTime(log.createdAt)}
               </span>
               <span style={{ fontWeight: 600, color: "#1e293b" }}>{log.action}</span>
               <span style={{ color: "#64748b" }}>

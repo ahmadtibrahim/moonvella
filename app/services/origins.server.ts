@@ -644,6 +644,17 @@ export async function resolveOriginForLines(lines: OriginOrderLine[]): Promise<S
 /** The address a carrier is given, once an origin has been resolved. */
 export interface CarrierShipFrom {
   name: string;
+  /**
+   * The dock's business name, which eShipper requires and a contact name is
+   * not. It is a separate field from `name` because the two answer different
+   * questions — `name` is who the driver asks for, this is who the goods belong
+   * to — and the provider needs both: a save whose `from.company` is blank is
+   * refused with "Company is a required field".
+   *
+   * Never null: every PickupLocation has a name, and it is the business the
+   * dock was recorded as.
+   */
+  company: string;
   /** Street and unit in one line: carriers take a single address field. */
   address: string;
   city: string;
@@ -667,12 +678,19 @@ export interface CarrierShipFrom {
  * trip, and the carrier's request has one address line to put it on. The contact
  * name is preferred over the location name for the same reason: the label is
  * read by a driver looking for a person.
+ *
+ * THE LOCATION NAME IS NOT DISCARDED, THOUGH, and that is what `company` is
+ * for. Preferring the contact there too would print "Ray" where the provider
+ * wants the business, and the provider rejects the save outright when the field
+ * is blank — so the dock's own name travels beside the person's rather than
+ * being replaced by it.
  */
 export function carrierShipFrom(snapshot: OriginSnapshot): CarrierShipFrom {
   const unit = snapshot.address.street2?.trim();
   const street = snapshot.address.street1?.trim() ?? "";
   return {
     name: snapshot.contact.name?.trim() || snapshot.name,
+    company: snapshot.name.trim(),
     address: unit ? `${street}, ${unit}` : street,
     city: snapshot.address.city?.trim() ?? "",
     province: snapshot.address.province?.trim() ?? "",

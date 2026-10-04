@@ -724,6 +724,12 @@ export interface ShipmentMilestoneFacts {
   status: string;
   packedAt: Date | string | null;
   handedToCarrierAt: Date | string | null;
+  /**
+   * The carrier's own identifier for the bought label. Read by the packing
+   * rule: `BOOKED` is a status this app writes, and this is the fact that a
+   * provider actually accepted a purchase and can be tracked against.
+   */
+  providerShipmentId: string | null;
 }
 
 /** The two events somebody at the dock actually sees happen. */
@@ -738,18 +744,30 @@ export type WarehouseEventName = (typeof WAREHOUSE_EVENTS)[number];
 const NO_LABEL_STATES = ["PENDING", "BOOKING", "BOOKING_FAILED", "BOOKING_UNKNOWN"];
 
 /**
- * The states a box may still be taped shut in: no label yet, a label, or a
- * failed attempt that bought nothing. NOT `BOOKING` (a booking is writing the
- * row) and not `BOOKING_UNKNOWN` (a label may exist and somebody has to
- * reconcile it first) — the two states where the warehouse is waiting on the
- * booking question rather than the other way round.
+ * The states a box may be taped shut in: THE BOOKED PARCEL, AND NOTHING ELSE.
+ *
+ * This list used to hold PENDING and BOOKING_FAILED as well, on the argument
+ * that packing is a physical fact no failed booking attempt can unsay. The
+ * argument is true about the warehouse and wrong about the record: a `packedAt`
+ * written before any label existed is what let the packing control stand above
+ * a parcel with nothing bought for it, and the milestone it stamps is the one
+ * the dispatch chain reads. Packing now answers to the booking — buy the label,
+ * then tape the box — so the list holds exactly the state a bought label
+ * produces.
+ *
+ * NOT `BOOKING` (a booking is writing the row) and not `BOOKING_UNKNOWN` (a
+ * label may exist and somebody has to reconcile it first); those were already
+ * excluded and stay excluded. The other half of the rule is
+ * `hasProviderShipmentId`: "BOOKED" with no carrier identifier recorded is a
+ * booking whose identifier never landed, and there is nothing to pack against
+ * that either.
  *
  * One list, read by both `availableWarehouseEvents` (what the pages draw),
  * `advanceRefusal` (what the server accepts) and `advanceShipment`'s
  * conditional claim (what the write is allowed to touch), because those
  * disagreeing is a control that throws when it is pressed.
  */
-export const PACKABLE_STATES = ["PENDING", "BOOKED", "BOOKING_FAILED"] as const;
+export const PACKABLE_STATES = ["BOOKED"] as const;
 
 /**
  * Whether a status is one of them. A predicate rather than `.includes` at each
@@ -760,6 +778,18 @@ export const PACKABLE_STATES = ["PENDING", "BOOKED", "BOOKING_FAILED"] as const;
  */
 export function isPackableState(status: string): boolean {
   return (PACKABLE_STATES as readonly string[]).includes(status);
+}
+
+/**
+ * Whether the provider's own record of this shipment exists on the row.
+ *
+ * The reply reader can produce an empty string when a booking response carries
+ * no `order.orderId`, and an empty string is not an identifier — so the rule is
+ * a trimmed, non-empty value, in ONE place, read by the refusal and available
+ * to any page that needs to ask the same question.
+ */
+export function hasProviderShipmentId(facts: { providerShipmentId: string | null }): boolean {
+  return Boolean(facts.providerShipmentId && facts.providerShipmentId.trim());
 }
 
 /** How a status reads in a refusal sentence. */
@@ -778,18 +808,13 @@ const STATE_WORD: Record<string, string> = {
 /**
  * THE MATRIX. Which warehouse events a shipment may accept right now.
  *
- *   packed            — a box being taped shut. It is recorded once, and only
- *                       while the shipment is somewhere packing can still be
- *                       true: PENDING (packing before the label is bought is
- *                       how the dock works), BOOKED (label bought, parcel
- *                       still here), or BOOKING_FAILED (an attempt that bought
- *                       nothing — the box is still on the dock, and refusing to
- *                       record it here would leave the packing page's own
- *                       control throwing on a parcel it is showing). Never on a
- *                       shipment the carrier already owns the record of, never
- *                       twice, and never while a booking is in flight or its
- *                       outcome is unknown: those two rows are being reconciled
- *                       by somebody else.
+ *   packed            — a box being taped shut, which is only true of a parcel
+ *                       whose carrier label has been BOUGHT: the booking
+ *                       succeeded and the provider issued a shipment
+ *                       identifier. Recorded once, never on a shipment the
+ *                       carrier already owns the record of, and never while a
+ *                       booking is in flight or its outcome is unknown — those
+ *                       two rows are being reconciled by somebody else.
  *   handed_to_carrier — the parcel leaving the building. Only after packing
  *                       (the handoff is the milestone that tells Shopify the
  *                       goods have left, and an unpacked box has not left),
@@ -799,17 +824,14 @@ const STATE_WORD: Record<string, string> = {
  * nothing: those shipments' remaining history is the carrier's own scans, and
  * a stale tab re-posting "handed to carrier" must not drag an EXCEPTION back
  * to SHIPPED.
+ *
+ * THE LIST IS `advanceRefusal`'s ANSWER, not a second copy of the rule. These
+ * conditions are the ones the server enforces, so a control drawn from here is
+ * a control the action accepts; when the two were written out separately, the
+ * way they drifted apart was a button that threw.
  */
 export function availableWarehouseEvents(facts: ShipmentMilestoneFacts): WarehouseEventName[] {
-  const events: WarehouseEventName[] = [];
-  if (facts.handedToCarrierAt) return events;
-  if (!facts.packedAt && isPackableState(facts.status)) {
-    events.push("packed");
-  }
-  if (facts.packedAt && facts.status === "BOOKED") {
-    events.push("handed_to_carrier");
-  }
-  return events;
+  return WAREHOUSE_EVENTS.filter((event) => advanceRefusal(facts, event) === null);
 }
 
 /**
@@ -834,14 +856,27 @@ export function advanceRefusal(facts: ShipmentMilestoneFacts, event: string): st
         return "This parcel has already been handed to the carrier, so packing cannot be recorded now.";
       }
       if (facts.packedAt) return "Packing is already recorded for this shipment.";
-      if (isPackableState(facts.status)) return null;
       if (facts.status === "CANCELLED") {
         return "This shipment was cancelled, so it cannot be recorded as packed.";
       }
       if (gone) {
         return `This shipment is ${word}; the carrier's own record owns the rest of its journey, so packing is not recorded from here.`;
       }
-      return `This shipment is ${word}, so packing is not recorded from here.`;
+      /*
+       * PACKING ANSWERS TO THE BOOKING. Buy the label, then tape the box: that
+       * is the sequence the record enforces, so a PENDING box has nothing to
+       * pack against yet, and a BOOKING_FAILED or BOOKING_UNKNOWN one bought
+       * nothing (or may have bought something still being reconciled). Both are
+       * refused here for the same reason a control is not drawn for them — the
+       * milestone is about the parcel the carrier knows about.
+       */
+      if (!isPackableState(facts.status)) {
+        return `This shipment is ${word}, and packing is only recorded for a parcel whose carrier label has been bought — book the shipment first.`;
+      }
+      if (!hasProviderShipmentId(facts)) {
+        return "This shipment reads as booked but records no carrier shipment identifier, so there is no bought label to pack against. Reconcile the booking before packing.";
+      }
+      return null;
     }
 
     case "handed_to_carrier": {
@@ -1119,6 +1154,18 @@ export function nextQueueAction(order: QueueOrderFacts): QueueAction {
   }
 
   if (shipment.status === "BOOKED") {
+    /*
+     * A BOOKED ROW WITH NO CARRIER IDENTIFIER IS NOT A PACKABLE PARCEL. The
+     * status is written by this app; the provider id is the fact that a carrier
+     * accepted the purchase, and packing is refused without it (see
+     * `hasProviderShipmentId`). "Pack order" here would point an operator at a
+     * control that is hidden, so the queue points at the shipment instead —
+     * which is where the row's own record and the provider's portal are
+     * compared.
+     */
+    if (!hasProviderShipmentId(shipment)) {
+      return { label: "Review the booked shipment", tone: "warning", to: `/admin/shipping/${shipment.id}` };
+    }
     if (!shipment.packedAt) return { label: "Pack order", tone: "brand" };
     return { label: "Hand to carrier", tone: "brand" };
   }

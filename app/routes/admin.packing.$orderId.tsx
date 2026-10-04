@@ -3,12 +3,13 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { getVariantPackages, toCm, toKg } from "~/services/packaging.server";
+import { formatDateTime } from "~/utils/dates";
 import {
   createPackingShipment,
   markShipmentPacked,
   deletePackingShipment,
 } from "~/services/fulfillment.server";
-import { availableWarehouseEvents } from "~/services/shippingLogic";
+import { advanceRefusal, availableWarehouseEvents } from "~/services/shippingLogic";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   await requirePermission(request, "orders.view");
@@ -286,7 +287,7 @@ export default function AdminPacking() {
           shipments.map((s) => (
             <div key={s.id} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.6rem", marginBottom: "0.5rem", fontSize: "0.8rem" }}>
               <div>
-                <strong>{s.status}</strong> · {s.carrier || "no carrier"} · {s.packedAt ? `packed ${new Date(s.packedAt).toLocaleString()}` : "not packed"}
+                <strong>{s.status}</strong> · {s.carrier || "no carrier"} · {s.packedAt ? `packed ${formatDateTime(s.packedAt)}` : "not packed"}
                 {s.providerShipmentId ? ` · provider ${s.providerShipmentId}` : ""}
                 {s.shopifyFulfillmentId ? ` · Shopify ${s.shopifyFulfillmentId}` : ""}
               </div>
@@ -314,14 +315,19 @@ export default function AdminPacking() {
                   </Form>
                 ) : s.packedAt ? (
                   <span style={{ fontSize: "0.72rem", color: "#059669" }}>
-                    Packed {new Date(s.packedAt).toLocaleString()}
+                    Packed {formatDateTime(s.packedAt)}
                   </span>
                 ) : (
-                  // Nothing to offer and nothing to explain: the box is either
-                  // with the carrier already or its booking outcome is being
-                  // settled somewhere else.
+                  /*
+                   * Nothing to offer — and now something to explain. Packing is
+                   * only recorded for a parcel whose label has been bought, so
+                   * the common case on this page is a box that has not been
+                   * booked yet: without a sentence the operator is left looking
+                   * at a missing button. The sentence is `advanceRefusal`'s own,
+                   * so what is read here is what the server would have said.
+                   */
                   <span style={{ fontSize: "0.72rem", color: "#64748b" }}>
-                    Packing is not recorded from here at this status.
+                    {advanceRefusal(s, "packed") ?? "Packing is not recorded from here at this status."}
                   </span>
                 )}
                 {s.status === "PENDING" && !s.providerShipmentId && !s.shopifyFulfillmentId ? (

@@ -4,6 +4,7 @@ import type { Prisma, WholesalePaymentStatus } from "@prisma/client";
 import { prisma } from "~/db.server";
 import { requirePermission } from "~/utils/adminAuth.server";
 import { stripeMode } from "~/services/payments.server";
+import { CALENDAR_DATE_TIME_ZONE, formatDate, formatDateTime } from "~/utils/dates";
 
 const PAGE_SIZE = 100;
 
@@ -162,7 +163,7 @@ export default function AdminSellerPayments() {
                   <td>{payment.seller.storeName}<div className="mv-muted">{payment.seller.shopDomain}</div></td>
                   <td><strong>{money(payment.amount, payment.currency)}</strong>{payment.refundedAmount > 0 ? <div className="mv-muted">{money(payment.refundedAmount, payment.currency)} refunded</div> : null}</td>
                   <td><span className={`mv-badge ${STATUS_CLASS[payment.status] ?? ""}`}>{STATUS_LABEL[payment.status]}</span>{payment.failureMessage ? <div className="mv-muted">{payment.failureMessage}</div> : null}</td>
-                  <td>{payment.capturedAt || payment.paidAt ? new Date(payment.capturedAt ?? payment.paidAt!).toLocaleString() : "—"}</td>
+                  <td>{payment.capturedAt || payment.paidAt ? formatDateTime(payment.capturedAt ?? payment.paidAt!) : "—"}</td>
                   <td><span className="mv-badge">See payouts below</span><div className="mv-muted">Stripe combines multiple charges into each bank payout</div></td>
                   <td><details><summary>Technical details</summary><div className="mv-mono mv-muted">{payment.providerPaymentIntentId ?? "No Stripe intent"}</div>{payment.providerChargeId ? <div className="mv-mono mv-muted">{payment.providerChargeId}</div> : null}</details></td>
                 </tr>
@@ -188,8 +189,9 @@ export default function AdminSellerPayments() {
                   <td><span className="mv-mono">{payout.providerPayoutId}</span></td>
                   <td><strong>{money(payout.amount, payout.currency)}</strong><div className="mv-muted">{payout.currency}</div></td>
                   <td><span className={`mv-badge ${payout.status === "PAID" ? "mv-badge-success" : payout.status === "FAILED" || payout.status === "CANCELED" ? "mv-badge-danger" : "mv-badge-warning"}`}>{payout.status.replaceAll("_", " ")}</span></td>
-                  <td>{payout.arrivalDate ? new Date(payout.arrivalDate).toLocaleDateString() : "—"}</td>
-                  <td>{payout.paidAt ? new Date(payout.paidAt).toLocaleString() : "—"}</td>
+                  {/* Stripe states an arrival DATE, which is midnight UTC — see the calendar-date rule in ~/utils/dates. */}
+                  <td>{payout.arrivalDate ? formatDate(payout.arrivalDate, { timeZone: CALENDAR_DATE_TIME_ZONE }) : "—"}</td>
+                  <td>{payout.paidAt ? formatDateTime(payout.paidAt) : "—"}</td>
                   <td>{payout.failureMessage ?? payout.failureCode ?? "—"}</td>
                 </tr>
               ))}

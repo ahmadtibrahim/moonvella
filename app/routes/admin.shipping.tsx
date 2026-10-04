@@ -4,6 +4,7 @@ import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adm
 import { prisma } from "~/db.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
 import { syncTrackingForShipment, voidShipment } from "~/services/shipping.server";
+import { CALENDAR_DATE_TIME_ZONE, formatDate, formatDateTime } from "~/utils/dates";
 // The tracking vocabulary is rendered by the component below, so it must come
 // from the isomorphic module — importing it from shipping.server would pull
 // server-only code into the client bundle, which React Router refuses at build
@@ -404,8 +405,13 @@ function money(cents: number | null, currency = "CAD") {
  * The live location answers first, because that is where a truck would be sent
  * today. The frozen copy answers for a shipment booked under a code that has
  * since been renamed or retired — §1's snapshot, doing the job it exists for.
- * When neither is there the cell says so, in the same words the booking gate
- * uses, rather than showing a blank an operator would read as "fine".
+ *
+ * The third answer is about THIS ROW, not about the mapping: a shipment that has
+ * neither was never quoted or booked, and the dock for its items is resolved
+ * from those items at quote and booking time. It deliberately does not say
+ * "Pickup location required", which would report a mapping fault the item
+ * resolution may not have — a list page cannot afford one resolution per row,
+ * and a wrong fault is worse than a narrow statement.
  */
 function originLabel(shipment: {
   originLocation: { code: string; name: string } | null;
@@ -414,7 +420,7 @@ function originLabel(shipment: {
   if (shipment.originLocation) return shipment.originLocation.code;
   const snap = shipment.originSnapshot as { code?: unknown } | null;
   if (snap && typeof snap === "object" && typeof snap.code === "string") return snap.code;
-  return "Pickup location required";
+  return "No dock recorded";
 }
 
 /**
@@ -448,7 +454,7 @@ function shopifySync(shipment: {
   shopifySyncError: string | null;
 }): { text: string; badge: string; title: string | null } {
   if (shipment.shopifyFulfillmentId) {
-    const when = shipment.shopifySyncedAt ? new Date(shipment.shopifySyncedAt).toLocaleDateString() : null;
+    const when = shipment.shopifySyncedAt ? formatDate(shipment.shopifySyncedAt) : null;
     return {
       text: when ? `Fulfilled ${when}` : "Fulfilled",
       badge: "mv-badge-success",
@@ -649,7 +655,7 @@ export default function AdminShipping() {
                       <Link to={`/admin/shipping/${s.id}`}>
                         {s.returnOfShipmentId ? "Return " : ""}{s.id.slice(0, 8)}
                       </Link>
-                      <div className="mv-muted">{new Date(s.createdAt).toLocaleDateString()}</div>
+                      <div className="mv-muted">{formatDate(s.createdAt)}</div>
                     </td>
                     <td>
                       <Link to={`/admin/orders/${s.order.id}`}>{s.order.shopifyOrderName}</Link>
@@ -705,11 +711,13 @@ export default function AdminShipping() {
                       {latest ? (
                         <div className="mv-muted">
                           {latest.location ? `${latest.location} · ` : ""}
-                          {new Date(latest.eventAt).toLocaleString()}
+                          {formatDateTime(latest.eventAt)}
                         </div>
                       ) : null}
                     </td>
-                    <td>{s.estimatedDelivery ? new Date(s.estimatedDelivery).toLocaleDateString() : "—"}</td>
+                    {/* The carrier states a calendar date, parsed as midnight UTC: read in a
+                        western zone it would print the day before. */}
+                    <td>{s.estimatedDelivery ? formatDate(s.estimatedDelivery, { timeZone: CALENDAR_DATE_TIME_ZONE }) : "—"}</td>
                     <td>
                       {s.pickupMode ? (
                         <div>{PICKUP_MODE_LABEL[s.pickupMode] ?? s.pickupMode}</div>
@@ -724,18 +732,18 @@ export default function AdminShipping() {
                         </div>
                       ) : null}
                       {s.pickupScheduledFor ? (
-                        <div className="mv-muted">{new Date(s.pickupScheduledFor).toLocaleString()}</div>
+                        <div className="mv-muted">{formatDateTime(s.pickupScheduledFor)}</div>
                       ) : null}
                       {s.pickupWindow ? <div className="mv-muted">{s.pickupWindow}</div> : null}
                     </td>
                     <td>
                       <span className={`mv-badge ${sync.badge}`} title={sync.title ?? undefined}>{sync.text}</span>
                       {s.shopifyNotifiedAt ? (
-                        <div className="mv-muted">customer told {new Date(s.shopifyNotifiedAt).toLocaleDateString()}</div>
+                        <div className="mv-muted">customer told {formatDate(s.shopifyNotifiedAt)}</div>
                       ) : null}
                     </td>
                     <td>
-                      {s.lastTrackingSyncAt ? new Date(s.lastTrackingSyncAt).toLocaleString() : "—"}
+                      {s.lastTrackingSyncAt ? formatDateTime(s.lastTrackingSyncAt) : "—"}
                       {s.trackingSyncFailures > 0 ? (
                         <div style={{ marginTop: "0.2rem" }}>
                           <span className="mv-badge mv-badge-warning">

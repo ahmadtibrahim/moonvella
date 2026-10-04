@@ -3,6 +3,7 @@ import type { LoaderFunctionArgs } from "react-router";
 import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { listIntegrationStates } from "~/services/integrationHealth.server";
+import { formatDateTime, formatNumber } from "~/utils/dates";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "dashboard.view");
@@ -117,12 +118,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 }
 
 function money(cents: number) {
-  return `$${(cents / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function formatDateTime(date: Date | string | null) {
-  if (!date) return "Never";
-  return new Date(date).toLocaleString();
+  return `$${formatNumber(cents / 100, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function StatCard({
@@ -359,7 +355,7 @@ export default function AdminDashboard() {
           <div style={{ padding: "1rem", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8 }}>
             <div style={{ fontSize: "0.75rem", color: "#64748b" }}>Last successful sync</div>
             <div style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a" }}>
-              {formatDateTime(stats.lastSync)}
+              {formatDateTime(stats.lastSync, { fallback: "Never" })}
             </div>
           </div>
           <div style={{ padding: "1rem", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8 }}>

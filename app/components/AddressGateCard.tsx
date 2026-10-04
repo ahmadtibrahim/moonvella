@@ -1,4 +1,5 @@
 import { Form } from "react-router";
+import { formatDateTime } from "~/utils/dates";
 
 /*
  * One address, its verdict, and what a person can do about it.
@@ -123,11 +124,16 @@ function addressLine(address: GateAddress | null | undefined): string {
     .join(", ");
 }
 
+/*
+ * WHEN THE VERDICT WAS REACHED. Through the shared formatter rather than a
+ * local one: this panel had already pinned the locale and the zone by hand,
+ * which is the right instinct and still left the string to the engine's CLDR
+ * text ("p.m." in one browser, "PM" in another) — and a verdict's date that
+ * reads differently to two people looking at the same page is the thing the
+ * shared formatter exists to stop.
+ */
 function when(value: Date | string | null): string {
-  if (!value) return "never";
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return "never";
-  return date.toLocaleString("en-CA", { timeZone: "America/Toronto", dateStyle: "medium", timeStyle: "short" });
+  return formatDateTime(value, { fallback: "never" });
 }
 
 export function AddressGateCard({

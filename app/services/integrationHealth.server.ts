@@ -289,16 +289,27 @@ async function probeShopifyFulfillment(): Promise<IntegrationCheckResult> {
   try {
     const { unauthenticated } = await import("~/shopify.server");
     const { admin } = await unauthenticated.admin(store.shop);
+    /*
+     * `shop { fulfillmentServices }` — NOT a root field, and NOT a connection.
+     *
+     * The previous query asked `QueryRoot.fulfillmentServices(first: 20)`, which
+     * the sandbox rejected: there is no such root field. Reading the schema at
+     * this app's API version says where the field really is and what shape it
+     * has: `Shop.fulfillmentServices` is `[FulfillmentService!]!` — a plain
+     * LIST, with no arguments and no `nodes` — so asking it for `first:` compiles
+     * to a second error, which is why this is written from the schema rather
+     * than from the old query with the path changed.
+     */
     const res = await admin.graphql(
       `#graphql
         query MoonVellaFulfillmentProbe {
-          fulfillmentServices(first: 20) { nodes { id serviceName handle location { id name } } }
+          shop { fulfillmentServices { id serviceName handle location { id name } } }
         }`,
     );
     const json: {
       data?: {
-        fulfillmentServices?: {
-          nodes?: { id: string; serviceName?: string | null; location?: { id?: string } | null }[];
+        shop?: {
+          fulfillmentServices?: { id: string; serviceName?: string | null; location?: { id?: string } | null }[] | null;
         } | null;
       };
       errors?: { message: string }[];
@@ -319,7 +330,7 @@ async function probeShopifyFulfillment(): Promise<IntegrationCheckResult> {
     // here would be a cycle.
     const { MOONVELLA_FULFILLMENT_SERVICE_NAME: wanted } = await import("./shopifyFulfillment.server");
 
-    const services = json?.data?.fulfillmentServices?.nodes ?? [];
+    const services = json?.data?.shop?.fulfillmentServices ?? [];
     const ours = services.find(
       (s) => String(s.serviceName ?? "").toLowerCase() === wanted.toLowerCase(),
     );
@@ -389,12 +400,42 @@ export interface IntegrationActor {
   userAgent?: string | null;
 }
 
+/**
+ * What a state row says about itself when its own `detail` is missing.
+ *
+ * THE DEFECT THIS REPLACES: the detail was `row?.detail ?? fallback.message`, so
+ * a row whose detail was NULL rendered the DEFAULTS message — for eShipper,
+ * "eShipper is not configured. … Simulated mode is active meanwhile." A FAILED
+ * row is written exactly that way: a refused booking records the provider's own
+ * words in `lastError` and leaves `detail` null. So the shipment page rendered
+ * "eShipper: TEST environment — calls reach the account's test host … · eShipper
+ * is not configured … Simulated mode is active meanwhile." on one line, above an
+ * operator whose rates had just come back from that test host. The sentence was
+ * not merely stale; it named the wrong state and hid the real error.
+ *
+ * The rule now: the DEFAULTS message describes ONE state — NOT_CONFIGURED — and
+ * appears only for a row in that state, or for no row at all. Every other state
+ * answers with its own last error, because a failure that names itself is
+ * actionable and a failure wearing the words "not configured" is not.
+ */
+function stateDetail(
+  key: IntegrationKey,
+  row: { status: string; detail: string | null; lastError: string | null } | null
+): string {
+  const recorded = row?.detail?.trim();
+  if (recorded) return recorded;
+  if (!row || row.status === "NOT_CONFIGURED") return DEFAULTS[key].message;
+  const error = row.lastError?.trim();
+  if (error) return `${row.status} — the last recorded error was: ${error}`;
+  return `${row.status} — no detail was recorded for this state.`;
+}
+
 export async function getIntegrationState(
   key: IntegrationKey
 ): Promise<IntegrationStateView> {
   const row = await prisma.integrationState.findUnique({ where: { key } });
   const fallback = DEFAULTS[key];
-  const detail = row?.detail ?? fallback.message;
+  const detail = stateDetail(key, row);
   return {
     key,
     status: row?.status ?? fallback.status,

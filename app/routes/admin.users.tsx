@@ -6,6 +6,7 @@ import { listUsers, setUserActive, revokeUserSessions } from "~/services/adminUs
 import { createInvitation, cancelInvitation, listInvitations } from "~/services/invitations.server";
 import { ADMIN_ROLES, ROLE_LABEL, isAdminRole } from "~/utils/adminRoles";
 import type { AdminRole } from "@prisma/client";
+import { formatDate, formatDateTime } from "~/utils/dates";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const viewer = await requirePermission(request, "users.view");
@@ -192,7 +193,7 @@ export default function AdminUsers() {
             Copy this now and send it to them yourself. It is shown only once and
             cannot be recovered. It expires{" "}
             {actionData.inviteExpiresAt
-              ? new Date(actionData.inviteExpiresAt).toLocaleString()
+              ? formatDateTime(actionData.inviteExpiresAt)
               : "in 24 hours"}{" "}
             and works exactly once. No email has been sent.
           </p>
@@ -307,7 +308,7 @@ export default function AdminUsers() {
                   ) : null}
                 </span>
                 <span style={{ color: "#64748b", fontSize: "0.72rem" }}>
-                  {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : "Never"}
+                  {u.lastLoginAt ? formatDateTime(u.lastLoginAt) : "Never"}
                   <span style={{ display: "block", color: "#94a3b8" }}>
                     {u._count.sessions} active session(s)
                   </span>
@@ -389,7 +390,7 @@ export default function AdminUsers() {
                   <span style={{ color: "#334155" }}>{ROLE_LABEL[inv.role]}</span>
                   <span style={{ color: colour, fontWeight: 700, fontSize: "0.7rem" }}>{effective}</span>
                   <span style={{ color: "#64748b", fontSize: "0.72rem" }}>
-                    {new Date(inv.expiresAt).toLocaleString()}
+                    {formatDateTime(inv.expiresAt)}
                     <span style={{ display: "block", color: "#94a3b8" }}>
                       by {inv.invitedBy?.name || "—"}
                     </span>
@@ -406,7 +407,7 @@ export default function AdminUsers() {
                     ) : (
                       <span style={{ color: "#cbd5e1", fontSize: "0.7rem" }}>
                         {effective === "ACCEPTED" && inv.acceptedAt
-                          ? new Date(inv.acceptedAt).toLocaleDateString()
+                          ? formatDate(inv.acceptedAt)
                           : "—"}
                       </span>
                     )}

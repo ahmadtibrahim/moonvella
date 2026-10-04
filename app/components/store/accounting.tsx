@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
+import { formatNumber } from "~/utils/dates";
 
 /**
  * A store's money and its correspondence — the shape, drawn before the wiring.
@@ -55,7 +56,7 @@ const note: CSSProperties = {
 };
 
 const money = (amount: number, currency: string) =>
-  `${amount.toLocaleString("en-CA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+  `${formatNumber(amount, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
 
 /**
  * Marks a panel that is drawn but not fed.

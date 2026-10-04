@@ -46,6 +46,7 @@ import {
   trackingDisplayLabel,
   pickCheapestQuote,
   availableWarehouseEvents,
+  advanceRefusal,
   shipmentMayBeBooked,
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
@@ -61,6 +62,7 @@ import {
 } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
+import { CALENDAR_DATE_TIME_ZONE, formatDate, formatDateTime } from "~/utils/dates";
 import { convertedDisplay, unitsView } from "~/utils/measurementUnits";
 import { MAX_PROPOSAL_SCAN } from "~/services/holidays";
 import {
@@ -111,12 +113,44 @@ interface OriginView {
   /** The dock's own opening hours, in the dock's own words. */
   pickupLine: string | null;
   instructions: string | null;
-  /** True when these are the facts frozen at quotation, not today's row. */
-  frozen: boolean;
+  /**
+   * Which of the three sources answered, so the card can say so.
+   *
+   * `snapshot` is the facts frozen at quotation or booking, `live` is the dock
+   * row the shipment points at, and `resolved` is the dock the same resolver
+   * that prices and books these items names today — the answer an un-booked
+   * shipment has even before anything was frozen.
+   */
+  source: "snapshot" | "live" | "resolved";
 }
 
 function nonEmpty(values: (string | null | undefined)[]): string[] {
   return values.map((v) => (v ?? "").trim()).filter(Boolean);
+}
+
+/**
+ * The fields a dock must carry to be shown on the origin card.
+ *
+ * Both the shipment's linked row and the resolver's own `OriginLocation`
+ * satisfy it, which is what lets the card render either source through one
+ * block instead of two that can drift apart.
+ */
+interface LiveDock {
+  code: string;
+  name: string;
+  street1: string | null;
+  street2: string | null;
+  city: string | null;
+  province: string | null;
+  postalCode: string | null;
+  country: string | null;
+  contactName: string | null;
+  contactPhone: string | null;
+  contactEmail: string | null;
+  timeZone: string | null;
+  pickupOpenTime: string | null;
+  pickupCloseTime: string | null;
+  instructions: string | null;
 }
 
 /**
@@ -125,31 +159,23 @@ function nonEmpty(values: (string | null | undefined)[]): string[] {
  * The snapshot wins once it exists: it is what was quoted and booked, and a dock
  * that was edited afterwards must not retroactively rewrite the page for a
  * parcel already on a truck. The live row answers for a shipment that has no
- * snapshot yet. Neither being present returns null, and the caller says
- * "Pickup location required" rather than borrowing an address — §1's rule, and
- * the reason this replaced a card that printed MOONVELLA_SHIP_FROM_* with a
+ * snapshot yet. Failing both, the resolver's own answer for these items is
+ * used — the same call the quote and the booking make — so an un-booked or
+ * failed shipment still shows where a label WOULD collect from instead of
+ * leaving the operator to guess.
+ *
+ * The three sources are labelled on the card, because "where from" has three
+ * different meanings here and a reader has to know which one they are holding.
+ *
+ * Only when no source answers at all does this return null, and the caller then
+ * prints the resolver's own reason rather than borrowing an address — §1's rule,
+ * and the reason this replaced a card that printed MOONVELLA_SHIP_FROM_* with a
  * "1 Warehouse Way" default under a heading that read like a fact.
  */
-function originView(shipment: {
-  originSnapshot: unknown;
-  originLocation: {
-    code: string;
-    name: string;
-    street1: string | null;
-    street2: string | null;
-    city: string | null;
-    province: string | null;
-    postalCode: string | null;
-    country: string | null;
-    contactName: string | null;
-    contactPhone: string | null;
-    contactEmail: string | null;
-    timeZone: string | null;
-    pickupOpenTime: string | null;
-    pickupCloseTime: string | null;
-    instructions: string | null;
-  } | null;
-}): OriginView | null {
+function originView(
+  shipment: { originSnapshot: unknown; originLocation: LiveDock | null },
+  resolvedDock?: { groups: { location: LiveDock | null }[] } | null
+): OriginView | null {
   const snapshot = shipment.originSnapshot as {
     code?: unknown;
     name?: unknown;
@@ -178,11 +204,26 @@ function originView(shipment: {
       contact: nonEmpty([text(contact.name), text(contact.phone), text(contact.email)]).join(" · ") || null,
       pickupLine: open && close ? `${open}–${close}${zone ? ` (${zone})` : ""}` : null,
       instructions: text(pickup.instructions) || null,
-      frozen: true,
+      source: "snapshot",
     };
   }
 
-  const live = shipment.originLocation;
+  /*
+   * The dock the resolver names for THIS shipment's items, before the row the
+   * shipment happens to point at.
+   *
+   * It is the answer the quote and the booking use, so for a shipment that has
+   * not been booked it is the operative truth: a label bought from this screen
+   * would collect from here. The resolver answers with one group when these
+   * lines leave from one dock and several when they do not — and in the second
+   * case there is no single address to print, so `groups[0]` is NOT used: one
+   * dock shown as if it were the answer is the guess §1 forbids, and the
+   * caller prints the resolver's own reason instead.
+   */
+  const resolved =
+    resolvedDock && resolvedDock.groups.length === 1 ? resolvedDock.groups[0].location : null;
+
+  const live: LiveDock | null | undefined = resolved ?? shipment.originLocation;
   if (!live) return null;
   return {
     code: live.code,
@@ -196,7 +237,7 @@ function originView(shipment: {
     contact: nonEmpty([live.contactName, live.contactPhone, live.contactEmail]).join(" · ") || null,
     pickupLine: live.pickupOpenTime && live.pickupCloseTime ? `${live.pickupOpenTime}–${live.pickupCloseTime}${live.timeZone ? ` (${live.timeZone})` : ""}` : null,
     instructions: live.instructions,
-    frozen: false,
+    source: resolved ? "resolved" : "live",
   };
 }
 
@@ -471,9 +512,15 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       seller: { id: order.seller.id, storeName: order.seller.storeName, currency: order.seller.currency },
     },
     items,
-    // Where this parcel ships from — the dock's facts, or null when there is no
-    // mapping, which the page states in the same words the booking gate uses.
-    origin: originView(shipment),
+    /*
+     * Where this parcel ships from — the dock's facts, the row it points at, or
+     * the dock the resolver names for its items, in that order. Null only when
+     * none of the three answers, and then the page prints the resolver's own
+     * reason: the booking refuses in those same words, so the two cannot say
+     * different things about the same shipment.
+     */
+    origin: originView(shipment, resolvedDock),
+    originReason: resolvedDock.ready ? null : resolvedDock.reason,
     quotes,
     returnQuotes,
     selectedQuote,
@@ -859,7 +906,7 @@ interface ProcessProps {
 }
 
 function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isOwner, confirmation }: ProcessProps) {
-  const when = (value: string | Date | null) => (value ? new Date(value).toLocaleString() : "—");
+  const when = (value: string | Date | null) => formatDateTime(value);
 
   const body = (() => {
     if (shipment.status === "BOOKING") {
@@ -986,7 +1033,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
         ) : null}
         <p style={{ fontSize: "0.78rem", marginBottom: "0.4rem" }}>
           {retrying ? "Retrying" : "Booking"} <strong>{selectedQuote.carrier} {selectedQuote.serviceName}</strong> at <strong>{money(selectedQuote.totalAmount, selectedQuote.currency)}</strong>.
-          {selectedQuote.expiresAt ? ` Quote expires ${new Date(selectedQuote.expiresAt).toLocaleTimeString()}.` : ""}
+          {selectedQuote.expiresAt ? ` Quote expires ${formatDateTime(selectedQuote.expiresAt)}.` : ""}
           {shipment.quotedCarrierCost != null && shipment.quotedCarrierCost !== selectedQuote.totalAmount ? (
             <span style={{ color: "#b45309" }}> The quote changed from {money(shipment.quotedCarrierCost)} since it was prepared.</span>
           ) : null}
@@ -1022,7 +1069,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress, dockIds, now } = data;
+  const { shipment, order, items, origin, originReason, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress, dockIds, now } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1040,6 +1087,17 @@ export default function AdminShipmentDetail() {
     paid &&
     bookingParcels.packages.length > 0 &&
     bookingParcels.missing.length === 0;
+  /*
+   * What this box may record at the dock, and — when it may not be packed —
+   * the sentence saying why. Computed from the same matrix the action enforces,
+   * so a hidden control is never a mystery: after the sequence rule, the usual
+   * reason "Mark packed" is absent is that the label has not been bought yet.
+   */
+  const warehouseEvents = availableWarehouseEvents(shipment);
+  const packingRefusal =
+    warehouseEvents.includes("packed") || shipment.packedAt
+      ? null
+      : advanceRefusal(shipment, "packed");
   /*
    * The dock's own hours, as the two fields start out. `suggestedWindow` is
    * "HH:MM-HH:MM" and is null unless BOTH ends are recorded — half a window is
@@ -1119,10 +1177,17 @@ export default function AdminShipmentDetail() {
         <div className="mv-panel mv-panel-body">
           <h2 className="mv-panel-title">Ship from</h2>
           {/*
-            The dock, or nothing. This card used to print MOONVELLA_SHIP_FROM_*
-            with a "1 Warehouse Way" default, which meant the page and the label
-            could disagree while both looked authoritative. §1 settles it: a
-            missing mapping is stated and booking is blocked, never substituted.
+            The dock, or the reason there is none. This card used to print
+            MOONVELLA_SHIP_FROM_* with a "1 Warehouse Way" default, which meant
+            the page and the label could disagree while both looked
+            authoritative. §1 settles it: a missing mapping is stated and
+            booking is blocked, never substituted.
+
+            The refusal is the RESOLVER'S OWN SENTENCE, not a sentence written
+            here. The card used to say the items were "not mapped to an Odoo
+            warehouse location" whatever the actual fault was — a split across
+            two docks, a deactivated location, a variant with no product — and
+            an operator acting on that reads the wrong problem.
           */}
           {origin ? (
             <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
@@ -1136,13 +1201,25 @@ export default function AdminShipmentDetail() {
               {origin.pickupLine ? <div style={{ color: "#94a3b8" }}>Dock hours {origin.pickupLine}</div> : null}
               {origin.instructions ? <div style={{ color: "#94a3b8" }}>{origin.instructions}</div> : null}
               <div style={{ color: "#94a3b8", marginTop: "0.3rem" }}>
-                {origin.frozen ? "Frozen when this shipment was quoted or booked." : "Live dock record — this shipment has no frozen copy yet."}
+                {origin.source === "snapshot"
+                  ? "Frozen when this shipment was quoted or booked."
+                  : origin.source === "resolved"
+                    ? "Resolved from this shipment's items — the dock a quote or booking for them uses today."
+                    : "Live dock record — this shipment has no frozen copy yet."}
               </div>
+              {/* A dock that resolved but is not usable is stated here too, in
+                  the resolver's words: the card naming a dock must not read as
+                  a promise that a label can be bought against it. */}
+              {origin.source !== "snapshot" && originReason ? (
+                <div style={{ color: "#b45309", marginTop: "0.3rem" }} role="status">
+                  {originReason}
+                </div>
+              ) : null}
             </div>
           ) : (
-            <p style={{ fontSize: "0.8rem", color: "#b45309" }}>
-              Pickup location required. This shipment&apos;s items are not mapped to an Odoo warehouse location, so there is no
-              address to collect from and booking is blocked. Map the items&apos; origin, then requote.
+            <p style={{ fontSize: "0.8rem", color: "#b45309" }} role="status">
+              {originReason ??
+                "Pickup location required. These items do not resolve to a dock, so there is no address to collect from and booking is blocked."}
             </p>
           )}
         </div>
@@ -1257,7 +1334,7 @@ export default function AdminShipmentDetail() {
             packages changed" call for different next actions. */}
         {order.quotesInvalidatedAt ? (
           <p style={{ fontSize: "0.72rem", color: "#b45309", marginBottom: "0.5rem" }} role="status">
-            Earlier quotes were withdrawn on {new Date(order.quotesInvalidatedAt).toLocaleString()}:{" "}
+            Earlier quotes were withdrawn on {formatDateTime(order.quotesInvalidatedAt)}:{" "}
             {order.quoteInvalidationReason || "no reason recorded"}. Request quotes again.
           </p>
         ) : null}
@@ -1279,7 +1356,7 @@ export default function AdminShipmentDetail() {
           */}
           <p style={{ fontSize: "0.75rem", color: "#475569", marginBottom: "0.4rem" }}>
             {quotes.length} price{quotes.length === 1 ? "" : "s"} from the rate request at{" "}
-            <strong>{new Date(quotes.reduce((newest, q) => (new Date(q.quotedAt) > newest ? new Date(q.quotedAt) : newest), new Date(quotes[0].quotedAt))).toLocaleString()}</strong>.
+            <strong>{formatDateTime(quotes.reduce((newest, q) => (new Date(q.quotedAt) > newest ? new Date(q.quotedAt) : newest), new Date(quotes[0].quotedAt)))}</strong>.
             Requesting quotes again replaces this batch and clears any selection made from it.
           </p>
           <RateSelection quotes={quotes} dockIds={dockIds} now={now} subject="shipment" />
@@ -1350,7 +1427,7 @@ export default function AdminShipmentDetail() {
               { k: "Tracking number", v: shipment.trackingNumber || "not issued" },
               { k: "Label format", v: shipment.labelDocumentFormat || (shipment.labelUrl ? "not stated by the provider" : "no label") },
               { k: "Booking status", v: shipment.status.replace(/_/g, " ") },
-              { k: "Booked at", v: shipment.labelCreatedAt ? new Date(shipment.labelCreatedAt).toLocaleString() : "not recorded" },
+              { k: "Booked at", v: formatDateTime(shipment.labelCreatedAt, { fallback: "not recorded" }) },
             ].map((row) => (
               <div key={row.k} style={{ border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.45rem 0.5rem" }}>
                 <div style={{ fontSize: "0.65rem", color: "#64748b" }}>{row.k}</div>
@@ -1474,14 +1551,14 @@ export default function AdminShipmentDetail() {
           </p>
         ) : null}
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginBottom: "0.6rem" }}>
-          Last successful update: {shipment.lastTrackingSyncAt ? new Date(shipment.lastTrackingSyncAt).toLocaleString() : "never"}
+          Last successful update: {formatDateTime(shipment.lastTrackingSyncAt, { fallback: "never" })}
           {shipment.trackingSyncFailures > 0
             ? ` · ${shipment.trackingSyncFailures} failed ${shipment.trackingSyncFailures === 1 ? "attempt" : "attempts"} since (the last good status above is kept)`
             : ""}
         </p>
         <p style={{ fontSize: "0.72rem", marginBottom: "0.4rem" }}>
           {shipment.estimatedDelivery
-            ? `Carrier's delivery estimate: ${new Date(shipment.estimatedDelivery).toLocaleDateString()}`
+            ? `Carrier's delivery estimate: ${formatDate(shipment.estimatedDelivery, { timeZone: CALENDAR_DATE_TIME_ZONE })}`
             : "No delivery estimate from the carrier. An estimate is only shown when the carrier gives one — nothing is inferred from elapsed time."}
         </p>
         {shipment.trackingNumber ? (
@@ -1503,9 +1580,9 @@ export default function AdminShipmentDetail() {
               fact on the record nobody here observed and, on handoff, push
               tracking to Shopify the carrier had not reported.
             */}
-            {availableWarehouseEvents(shipment).length > 0 || shipment.packedAt || shipment.handedToCarrierAt ? (
+            {warehouseEvents.length > 0 || shipment.packedAt || shipment.handedToCarrierAt || packingRefusal ? (
               <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
-                {availableWarehouseEvents(shipment).includes("packed") ? (
+                {warehouseEvents.includes("packed") ? (
                   <Form method="post">
                     <input type="hidden" name="intent" value="advance_shipment" />
                     <input type="hidden" name="event" value="packed" />
@@ -1513,10 +1590,14 @@ export default function AdminShipmentDetail() {
                   </Form>
                 ) : shipment.packedAt ? (
                   <span style={{ fontSize: "0.72rem", color: "#334155" }}>
-                    Packed {new Date(shipment.packedAt).toLocaleString()}
+                    Packed {formatDateTime(shipment.packedAt)}
                   </span>
+                ) : packingRefusal ? (
+                  /* The server's own sentence, so the page and the action
+                     cannot describe the same refusal in two ways. */
+                  <span style={{ fontSize: "0.72rem", color: "#64748b" }}>{packingRefusal}</span>
                 ) : null}
-                {availableWarehouseEvents(shipment).includes("handed_to_carrier") ? (
+                {warehouseEvents.includes("handed_to_carrier") ? (
                   <Form method="post" style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
                     <input type="hidden" name="intent" value="advance_shipment" />
                     <input type="hidden" name="event" value="handed_to_carrier" />
@@ -1546,7 +1627,7 @@ export default function AdminShipmentDetail() {
                   </Form>
                 ) : shipment.handedToCarrierAt ? (
                   <span style={{ fontSize: "0.72rem", color: "#334155" }}>
-                    Handed to the carrier {new Date(shipment.handedToCarrierAt).toLocaleString()}
+                    Handed to the carrier {formatDateTime(shipment.handedToCarrierAt)}
                     {shipment.shopifyNotifiedAt ? " · Shopify notified" : ""}
                     {shipment.notifyCustomerOnPush === false ? " · customer notification declined" : ""}
                   </span>
@@ -1563,7 +1644,7 @@ export default function AdminShipmentDetail() {
             <tbody>
               {trackingEvents.map((ev) => (
                 <tr key={ev.id} style={{ borderTop: "1px solid #f1f5f9" }}>
-                  <td style={td}>{new Date(ev.eventAt).toLocaleString()}</td>
+                  <td style={td}>{formatDateTime(ev.eventAt)}</td>
                   <td style={td}>{ev.location || "—"}</td>
                   <td style={td}>{ev.description || ev.statusText || "—"}</td>
                   <td style={td}>{ev.carrierEventCode || "—"}</td>
@@ -1595,7 +1676,7 @@ export default function AdminShipmentDetail() {
         </p>
         <p style={{ fontSize: "0.78rem", marginBottom: "0.5rem", color: PICKUP_COLOR[shipment.pickupStatus ?? "NONE"] ?? "#64748b" }}>
           {PICKUP_LABEL[shipment.pickupStatus ?? "NONE"] ?? `Pickup state: ${shipment.pickupStatus}`}
-          {shipment.pickupScheduledFor ? ` · ${new Date(shipment.pickupScheduledFor).toLocaleDateString()}` : ""}
+          {shipment.pickupScheduledFor ? ` · ${formatDateTime(shipment.pickupScheduledFor)}` : ""}
           {shipment.pickupWindow ? ` · ${shipment.pickupWindow}` : ""}
           {shipment.pickupConfirmation ? ` · confirmation ${shipment.pickupConfirmation}` : ""}
           {shipment.providerPickupId ? ` · provider pickup ${shipment.providerPickupId}` : ""}
@@ -1932,7 +2013,7 @@ export default function AdminShipmentDetail() {
           {shipment.shopifyFulfillmentId ? (
             <div style={{ color: "#059669", fontWeight: 600 }}>
               Tracking pushed to Shopify — successful
-              {shipment.shopifySyncedAt ? ` (${new Date(shipment.shopifySyncedAt).toLocaleString()})` : ""}.
+              {shipment.shopifySyncedAt ? ` (${formatDateTime(shipment.shopifySyncedAt)})` : ""}.
             </div>
           ) : shipment.shopifySyncError ? (
             <div style={{ color: "#dc2626", fontWeight: 600 }}>Carrier booked, Shopify synchronization failed — Retry Shopify sync</div>
@@ -1946,7 +2027,7 @@ export default function AdminShipmentDetail() {
           ) : null}
           {shipment.shopifyNotifiedAt ? (
             <div style={{ color: "#94a3b8" }}>
-              Customer notified through Shopify on {new Date(shipment.shopifyNotifiedAt).toLocaleString()}. A retry does not notify again.
+              Customer notified through Shopify on {formatDateTime(shipment.shopifyNotifiedAt)}. A retry does not notify again.
             </div>
           ) : null}
           {/*

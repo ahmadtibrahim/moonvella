@@ -1,4 +1,5 @@
 import React from "react";
+import { formatDateTime } from "~/utils/dates";
 import {
   Form,
   Link,
@@ -466,7 +467,7 @@ export default function AdminSettings() {
             </div>
             {user.lastLoginAt ? (
               <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>
-                Last sign-in: {new Date(user.lastLoginAt).toLocaleString()}
+                Last sign-in: {formatDateTime(user.lastLoginAt)}
               </div>
             ) : null}
           </div>
@@ -618,7 +619,7 @@ function DetailCard({ integration }: DetailCardProps) {
           configured, and the difference matters: this one was switched off. */}
       {integration.disconnectedAt ? (
         <p style={{ fontSize: "0.75rem", color: "#b45309", marginBottom: "0.5rem" }}>
-          Disconnected {new Date(integration.disconnectedAt).toLocaleString()} — provider operations are
+          Disconnected {formatDateTime(integration.disconnectedAt)} — provider operations are
           disabled, and the deployment environment is suppressed for this integration until credentials
           are saved again.
         </p>
@@ -713,14 +714,14 @@ function DetailCard({ integration }: DetailCardProps) {
         */}
       <p style={{ fontSize: "0.65rem", color: "#64748b", marginTop: "0.4rem" }}>
         {integration.lastSuccessAt
-          ? `Last successful check: ${new Date(integration.lastSuccessAt).toLocaleString()}.`
+          ? `Last successful check: ${formatDateTime(integration.lastSuccessAt)}.`
           : "No successful check has been recorded yet."}
       </p>
       {integration.lastError ? (
         <p style={{ fontSize: "0.65rem", color: "#dc2626", marginTop: "0.15rem" }}>
           Last failure
           {integration.lastErrorAt
-            ? ` (${new Date(integration.lastErrorAt).toLocaleString()})`
+            ? ` (${formatDateTime(integration.lastErrorAt)})`
             : ""}
           : {integration.lastError}
         </p>
@@ -834,7 +835,7 @@ function CredentialsForm({
                     // difference matters: it is the deployment's, and saving a
                     // value here is what overrides it.
                     "Saved (from the deployment environment)"
-                  : `Saved${state.updatedAt ? ` ${new Date(state.updatedAt).toLocaleString()}` : ""}`
+                  : `Saved${state.updatedAt ? ` ${formatDateTime(state.updatedAt)}` : ""}`
                 : "Not set";
             const statusTone = state?.problem ? "#dc2626" : state?.isSet ? "#059669" : "#b45309";
 

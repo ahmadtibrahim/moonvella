@@ -1,5 +1,6 @@
 import { Link, useLoaderData, useNavigate } from "react-router";
 import { BLOCKED_MESSAGE, withMerchantAccess } from "../services/seller.server";
+import { formatDate } from "../utils/dates";
 
 /**
  * The status page reads the application the seller context already resolved.
@@ -87,13 +88,7 @@ export default function StatusPage() {
    * which was a literal in the template — a date that was never true for any
    * store. A stage now says whether it is done and nothing more.
    */
-  const submittedLabel = submittedAt
-    ? `Submitted on ${new Date(submittedAt).toLocaleDateString(undefined, {
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-      })}`
-    : "Not yet submitted";
+  const submittedLabel = submittedAt ? `Submitted on ${formatDate(submittedAt, { style: "long" })}` : "Not yet submitted";
 
   // Review stages follow the real status. A store still waiting is at the first
   // stage; anything decided has been through all of them.

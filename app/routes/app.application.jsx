@@ -2,6 +2,7 @@ import React from "react";
 import PropTypes from "prop-types";
 import { Link, useFetcher, useLoaderData, useNavigate } from "react-router";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import { formatDateTime } from "../utils/dates";
 import {
   asAccessResponse,
   merchantRedirect,
@@ -862,15 +863,7 @@ export default function ApplicationPage() {
   const clearField = (field) =>
     fetcher.submit({ intent: "clear_field", field }, { method: "POST" });
 
-  const refreshedLabel = imported.refreshedAt
-    ? new Date(imported.refreshedAt).toLocaleString(undefined, {
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      })
-    : null;
+  const refreshedLabel = imported.refreshedAt ? formatDateTime(imported.refreshedAt) : null;
 
   if (submitted) {
     return (

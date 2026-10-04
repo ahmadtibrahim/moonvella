@@ -17,6 +17,7 @@ import {
   LINE,
   helpText,
 } from "./ui";
+import { CALENDAR_DATE_TIME_ZONE, formatDate } from "~/utils/dates";
 
 /**
  * Documents — the PDFs a seller needs to sell the product.
@@ -273,20 +274,22 @@ function countLanguages(documents: MediaAssetView[]): Record<string, number> {
   return counts;
 }
 
-/** A calendar date, rendered as written rather than shifted by the reader's clock. */
-function formatDate(value: Date | string | null): string | null {
+/**
+ * A calendar date, rendered as written rather than shifted by the reader's
+ * clock, and null rather than a placeholder when there is none.
+ *
+ * A wrapper rather than a formatter of its own: the shared one decides the
+ * string, and this only fixes the two choices a document's dates need — the UTC
+ * reading, and the long month name.
+ */
+function documentDate(value: Date | string | null): string | null {
   if (!value) return null;
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return null;
   // Effective dates are stored at midnight UTC. Formatting in the viewer's own
   // time zone would show the day before for anyone west of Greenwich, which is
   // the kind of off-by-one that makes a warranty look like it started early.
-  return date.toLocaleDateString("en-CA", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-    timeZone: "UTC",
-  });
+  return formatDate(date, { timeZone: CALENDAR_DATE_TIME_ZONE, style: "long" });
 }
 
 function dateInputValue(value: Date | string | null): string {
@@ -332,10 +335,10 @@ function DocumentRow({ chain, product }: { chain: DocChain; product: Product }) 
             {head.isLegacy ? " · uploaded before the current storage system" : ""}
           </div>
           <div style={{ fontSize: "0.72rem", color: FAINT, marginTop: "0.15rem" }}>
-            {formatDate(head.effectiveDate)
+            {documentDate(head.effectiveDate)
               ? state === "future"
-                ? `Takes effect ${formatDate(head.effectiveDate)}`
-                : `In force since ${formatDate(head.effectiveDate)}`
+                ? `Takes effect ${documentDate(head.effectiveDate)}`
+                : `In force since ${documentDate(head.effectiveDate)}`
               : "No effective date recorded"}
             {" · "}
             {scope}
@@ -410,7 +413,7 @@ function DocumentRow({ chain, product }: { chain: DocChain; product: Product }) 
             {history.map((version) => (
               <li key={version.id}>
                 v{version.version ?? "unversioned"} — uploaded{" "}
-                {formatDate(version.createdAt) ?? "at an unknown date"}, {fileSize(version.fileSize)},{" "}
+                {documentDate(version.createdAt) ?? "at an unknown date"}, {fileSize(version.fileSize)},{" "}
                 {version.sellerVisible ? "still offered to sellers" : "withdrawn from sellers"}{" "}
                 <a href={version.url} target="_blank" rel="noopener noreferrer" style={{ color: INK }}>
                   open
@@ -739,7 +742,7 @@ function DocumentEditor({ chain, product }: { chain: DocChain; product: Product 
             {history.map((version) => (
               <li key={version.id}>
                 v{version.version ?? "unversioned"} — {fileSize(version.fileSize)}, uploaded{" "}
-                {formatDate(version.createdAt) ?? "at an unknown date"},{" "}
+                {documentDate(version.createdAt) ?? "at an unknown date"},{" "}
                 {version.sellerVisible ? "still offered to sellers" : "withdrawn from sellers"}{" "}
                 <a href={version.url} target="_blank" rel="noopener noreferrer" style={{ color: INK }}>
                   open

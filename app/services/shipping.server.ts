@@ -128,8 +128,18 @@ function parseAddress(raw: string | null): Record<string, string> {
  * "1 Warehouse Way" as though somebody had chosen it.
  */
 function configuredReturnAddress() {
+  const name = process.env.MOONVELLA_RETURN_NAME || process.env.MOONVELLA_SHIP_FROM_NAME || "MoonVella";
   return {
-    name: process.env.MOONVELLA_RETURN_NAME || process.env.MOONVELLA_SHIP_FROM_NAME || "MoonVella",
+    name,
+    /*
+     * The carrier's Address type requires a company, and a request whose
+     * `from.company` is blank is refused with "Company is a required field" —
+     * the 400 that stopped a real booking. The return destination has no
+     * separate business field yet (it is placeholder configuration awaiting the
+     * return-destination record), so the name stands in, which is the same
+     * deterministic rule `wireCompany` applies to every other address.
+     */
+    company: name,
     address: process.env.MOONVELLA_RETURN_ADDRESS || process.env.MOONVELLA_SHIP_FROM_ADDRESS || "",
     city: process.env.MOONVELLA_RETURN_CITY || process.env.MOONVELLA_SHIP_FROM_CITY || "",
     province: process.env.MOONVELLA_RETURN_PROVINCE || process.env.MOONVELLA_SHIP_FROM_PROVINCE || "",
@@ -168,6 +178,19 @@ function deliveryAddressFor(order: {
   const street = [to.address1 || to.address, to.address2].map((part) => part?.trim()).filter(Boolean);
   return {
     name: to.name,
+    /*
+     * The company Shopify captured on the shipping address, when it captured
+     * one, and NOTHING when it did not.
+     *
+     * This is the read half of a rule that must stay read-only: a business
+     * customer's address arrives with a company and the carrier prints it, but
+     * a consumer address has none and is not ours to fill in. The value that
+     * satisfies the provider's required field is supplied later, at the wire,
+     * where it can be derived and thrown away — see `toWireAddress`. Writing a
+     * stand-in back onto the order here would put a company on a customer's
+     * saved address that they never typed.
+     */
+    company: to.company || to.companyName || to.company_name || null,
     address: street.join(", "),
     city: to.city,
     province: to.province || to.provinceCode || to.province_code,
@@ -310,6 +333,12 @@ function buildRateRequest(
   return {
     shipFrom: {
       name: from.name,
+      /*
+       * The dock's business, carried separately from the contact name for the
+       * same reason it is carried separately on the wire: the provider requires
+       * `from.company`, and the person a driver asks for is not it.
+       */
+      company: from.company,
       address: from.address,
       city: from.city,
       province: from.province,
@@ -3034,6 +3063,9 @@ export async function schedulePickupForShipment(
     booking = await schedulePickup({
       shipFrom: {
         name: from.name,
+        // The dock's own business, from the same resolver the quote used, so
+        // the collection names the same company the label was booked under.
+        company: from.company,
         address: from.address,
         city: from.city,
         province: from.province,

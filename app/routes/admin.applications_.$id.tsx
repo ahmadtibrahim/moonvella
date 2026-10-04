@@ -2,6 +2,7 @@ import { Link, useLoaderData, useActionData, Form, redirect } from "react-router
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
+import { formatDateTime } from "~/utils/dates";
 import {
   approveApplication,
   rejectApplication,
@@ -97,7 +98,7 @@ function val(value: unknown, extra = "") {
 
 function fmtDate(value: Date | string | null) {
   if (!value) return "—";
-  return new Date(value).toLocaleString();
+  return formatDateTime(value);
 }
 
 function money(cents: number, currency = "CAD") {

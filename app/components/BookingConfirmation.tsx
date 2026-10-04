@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Form } from "react-router";
+import { formatDateTime } from "~/utils/dates";
 import { convertedDisplay } from "~/utils/measurementUnits";
 
 /**
@@ -261,11 +262,11 @@ export function BookingConfirmation(props: BookingConfirmationProps) {
               </div>
               <div>
                 <div style={rowLabel}>Quoted</div>
-                <div style={rowValue}>{props.quotedAt ? new Date(props.quotedAt).toLocaleString() : "—"}</div>
+                <div style={rowValue}>{formatDateTime(props.quotedAt)}</div>
               </div>
               <div>
                 <div style={rowLabel}>Quote expires</div>
-                <div style={rowValue}>{props.expiresAt ? new Date(props.expiresAt).toLocaleString() : "Not stated"}</div>
+                <div style={rowValue}>{formatDateTime(props.expiresAt, { fallback: "Not stated" })}</div>
               </div>
             </div>
 

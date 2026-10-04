@@ -1,4 +1,5 @@
 import "../styles/admin.css";
+import { formatDateTime } from "~/utils/dates";
 import {
   Form,
   Link,
@@ -164,7 +165,7 @@ export default function AcceptInvite() {
                   <>
                     {" "}
                     This link expires{" "}
-                    {new Date(data.expiresAt).toLocaleString()}.
+                    {formatDateTime(data.expiresAt)}.
                   </>
                 ) : null}
               </p>

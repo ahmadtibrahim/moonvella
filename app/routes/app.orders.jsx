@@ -1,5 +1,6 @@
 import React from "react";
 import { Link, Form, useLoaderData, useActionData, useNavigation } from "react-router";
+import { formatDate } from "../utils/dates";
 import {
   BLOCKED_MESSAGE,
   withMerchantAccess,
@@ -755,11 +756,7 @@ export default function OrdersPage() {
    * server and another in a seller's browser, and React would resolve that by
    * throwing the tree away and rebuilding it.
    */
-  const placedOn = (value) =>
-    new Date(value).toLocaleDateString("en-CA", {
-      timeZone: "America/Toronto",
-      dateStyle: "medium",
-    });
+  const placedOn = (value) => formatDate(value);
 
   /*
    * Every payment button on the page is disabled while any of them is in

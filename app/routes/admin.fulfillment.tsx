@@ -4,6 +4,7 @@ import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import type { Prisma } from "@prisma/client";
 import { ORDER_STATE, isFulfillmentUnlocked, type OrderState } from "~/services/orderState.server";
+import { formatDate } from "~/utils/dates";
 
 /**
  * THE WAREHOUSE QUEUE, AND WHY IT CANNOT SHOW AN ORDER NOBODY HAS PAID FOR.
@@ -253,7 +254,7 @@ export default function AdminFulfillmentQueue() {
                       {order.state}
                     </div>
                     <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
-                      since {new Date(order.stateChangedAt).toLocaleDateString()}
+                      since {formatDate(order.stateChangedAt)}
                     </div>
                   </td>
                   <td style={td}>
@@ -277,7 +278,7 @@ export default function AdminFulfillmentQueue() {
                     <strong>{order.wholesalePayment ? money(order.wholesalePayment.amount, order.wholesalePayment.currency) : "—"}</strong>
                     <div style={{ fontSize: "0.68rem", color: "#64748b" }}>
                       {order.wholesalePayment?.status ?? "no payment row"}
-                      {order.wholesalePayment?.paidAt ? ` · ${new Date(order.wholesalePayment.paidAt).toLocaleDateString()}` : ""}
+                      {order.wholesalePayment?.paidAt ? ` · ${formatDate(order.wholesalePayment.paidAt)}` : ""}
                     </div>
                   </td>
                   <td style={td}>

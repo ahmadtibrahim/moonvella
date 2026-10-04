@@ -3,6 +3,7 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import { getSellerDetail } from "~/services/seller.server";
+import { formatDateTime } from "~/utils/dates";
 import {
   blockSeller,
   deactivateSeller,
@@ -225,7 +226,7 @@ function val(value: unknown) {
 
 function fmtDate(value: Date | string | null) {
   if (!value) return "—";
-  return new Date(value).toLocaleString();
+  return formatDateTime(value);
 }
 
 function money(cents: number, currency = "CAD") {

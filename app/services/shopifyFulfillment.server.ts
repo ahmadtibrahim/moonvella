@@ -84,12 +84,38 @@ export interface ResolvedFulfillmentItem {
   name: string | null;
 }
 
+/**
+ * Where one fulfillment order's goods are going.
+ *
+ * READ FROM THE SAME FULFILLMENT ORDER AS THE QUANTITIES, ALWAYS. Shopify splits
+ * an order across fulfillment orders by location and by delivery group, and two
+ * of them can carry different destinations — a gift to a second address, a
+ * partial ship. A parcel fulfils one group's lines, so the address on the label
+ * belongs to that group; taking the first destination seen and pairing it with
+ * another group's quantities is how a box of one customer's goods gets sent to
+ * another's address. This is carried on the group, beside the lines it came
+ * with, rather than looked up separately by the caller.
+ */
+export interface ResolvedFulfillmentDestination {
+  firstName: string | null;
+  lastName: string | null;
+  company: string | null;
+  address1: string | null;
+  address2: string | null;
+  city: string | null;
+  province: string | null;
+  countryCode: string | null;
+  zip: string | null;
+}
+
 export interface ResolvedFulfillmentGroup {
   fulfillmentOrderId: string;
   status: string;
   assignedLocation: string | null;
   /** The location's id, so routing can tell whether it is already ours. */
   assignedLocationId: string | null;
+  /** The destination belonging to THIS fulfillment order, with its own lines. */
+  destination: ResolvedFulfillmentDestination | null;
   items: ResolvedFulfillmentItem[];
 }
 
@@ -98,6 +124,17 @@ interface ShopifyFulfillmentOrderNode {
   status: string;
   assignedLocation?: {
     location?: { id?: string | null; name?: string | null } | null;
+  } | null;
+  destination?: {
+    firstName?: string | null;
+    lastName?: string | null;
+    company?: string | null;
+    address1?: string | null;
+    address2?: string | null;
+    city?: string | null;
+    province?: string | null;
+    countryCode?: string | null;
+    zip?: string | null;
   } | null;
   lineItems?: {
     nodes?: {
@@ -186,6 +223,10 @@ export async function resolveFulfillmentOrders(orderId: string, adminOverride?: 
               id
               status
               assignedLocation { location { id name } }
+              # The destination of THIS fulfillment order, read beside its own
+              # lines and carried on the group with them rather than looked up
+              # separately by the caller. See ResolvedFulfillmentDestination.
+              destination { firstName lastName company address1 address2 city province countryCode zip }
               lineItems(first: 100) {
                 nodes {
                   id
@@ -251,11 +292,28 @@ export async function resolveFulfillmentOrders(orderId: string, adminOverride?: 
       }
       if (mvItems.length === 0) continue;
       if (!primary) primary = fo.id;
+      const destination = fo.destination ?? null;
       groups.push({
         fulfillmentOrderId: fo.id,
         status: fo.status,
         assignedLocation: fo.assignedLocation?.location?.name ?? null,
         assignedLocationId: fo.assignedLocation?.location?.id ?? null,
+        // `?? null` on each field rather than `Boolean(...)`: an empty string is
+        // what Shopify sends for a field the customer left blank, and turning
+        // that into null here would be this code inventing a value's absence.
+        destination: destination
+          ? {
+              firstName: destination.firstName ?? null,
+              lastName: destination.lastName ?? null,
+              company: destination.company ?? null,
+              address1: destination.address1 ?? null,
+              address2: destination.address2 ?? null,
+              city: destination.city ?? null,
+              province: destination.province ?? null,
+              countryCode: destination.countryCode ?? null,
+              zip: destination.zip ?? null,
+            }
+          : null,
         items: mvItems,
       });
     }
@@ -423,10 +481,21 @@ export async function ensureMoonvellaFulfillmentService(
 
   const admin = await adminFor(seller.shopDomain, adminOverride);
 
+  /*
+   * WHERE THE FIELD ACTUALLY IS, read from the schema rather than guessed.
+   *
+   * This asked `QueryRoot.fulfillmentServices(first: 50) { nodes { … } }`, and
+   * the sandbox refused it: there is no such root field. Introspection at this
+   * app's API version (2026-10) gives both halves of the answer, and both are
+   * different from what the old query assumed — `fulfillmentServices` is a field
+   * of `Shop`, and it is `[FulfillmentService!]!`: a plain list with no
+   * arguments and no connection. So there is no `first:` to pass and no `nodes`
+   * to unwrap.
+   */
   const readServices = `#graphql
     query MoonVellaFulfillmentServices {
-      fulfillmentServices(first: 50) {
-        nodes { id serviceName handle location { id name } }
+      shop {
+        fulfillmentServices { id serviceName handle location { id name } }
       }
     }`;
 
@@ -442,13 +511,13 @@ export async function ensureMoonvellaFulfillmentService(
     const existingRes = await admin.graphql(readServices);
     const existingJson: {
       data?: {
-        fulfillmentServices?: {
-          nodes?: {
+        shop?: {
+          fulfillmentServices?: {
             id: string;
             serviceName?: string | null;
             handle?: string | null;
             location?: { id?: string | null; name?: string | null } | null;
-          }[];
+          }[] | null;
         } | null;
       };
       errors?: { message: string }[];
@@ -458,7 +527,7 @@ export async function ensureMoonvellaFulfillmentService(
     }
 
     const wanted = MOONVELLA_FULFILLMENT_SERVICE_NAME.toLowerCase();
-    const found = (existingJson?.data?.fulfillmentServices?.nodes ?? []).find(
+    const found = (existingJson?.data?.shop?.fulfillmentServices ?? []).find(
       (service) =>
         String(service.serviceName ?? "").toLowerCase() === wanted ||
         String(service.handle ?? "").toLowerCase() === wanted

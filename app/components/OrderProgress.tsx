@@ -1,3 +1,4 @@
+import { formatDateTime } from "~/utils/dates";
 import type { ProgressStage, ProgressState } from "~/services/orderProgress.server";
 
 /**
@@ -37,10 +38,9 @@ const RETRY_HREF: Record<string, string> = {
 };
 
 function when(iso: string | null): string {
-  if (!iso) return "";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  // "" rather than the formatter's dash: an unstamped stage prints no time at
+  // all under its name, not a placeholder that looks like one.
+  return formatDateTime(iso, { fallback: "" });
 }
 
 /**

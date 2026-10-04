@@ -24,6 +24,8 @@
 
 import PDFDocument from "pdfkit";
 import { prisma } from "~/db.server";
+import { DEFAULT_TIME_ZONE } from "~/services/holidays";
+import { localDateIn } from "~/services/shippingLogic";
 
 /**
  * The sentence both renderers end with, written once.
@@ -74,6 +76,54 @@ export interface PackingList {
   /** Parcels in this shipment, from the shipment itself rather than recounted. */
   packageCount: number;
   totalUnits: number;
+  /**
+   * The dock's calendar day the parcel was packed (YYYY-MM-DD), or null when no
+   * packing has been recorded for it.
+   */
+  packedOn: string | null;
+  /** The dock's calendar day this document was produced (YYYY-MM-DD). */
+  preparedOn: string;
+}
+
+/**
+ * The line under the order number: when the box was packed, or when this sheet
+ * was prepared.
+ *
+ * THE TWO ARE NOT INTERCHANGEABLE. "Packed" is a claim about a warehouse step,
+ * and printing it for a parcel whose packing has not been recorded is the
+ * document asserting work nobody has done — the slip is printed before the box
+ * is closed, which is exactly when it goes in. So a parcel with no `packedAt`
+ * gets "Prepared", which says what is true of the paper in the reader's hand.
+ *
+ * ONE FUNCTION FOR BOTH RENDERERS, for the reason the footer sentence above is
+ * written once: two copies of this choice drift, and the copy that drifts is
+ * the one making a claim the other does not.
+ */
+export function packingStatusLine(list: Pick<PackingList, "packedOn" | "preparedOn">): string {
+  return list.packedOn ? `Packed ${list.packedOn}` : `Prepared ${list.preparedOn}`;
+}
+
+/**
+ * The zone the sheet's dates are read in: the dock's.
+ *
+ * The frozen pickup facts answer first for a booked parcel, then the location
+ * row, then the company's own default. A box packed at 9pm in Vancouver must not
+ * be dated tomorrow by a server whose clock is UTC, and a document whose date
+ * depends on WHERE it was rendered is a document that cannot be checked.
+ *
+ * THE LAST FALLBACK IS THE COMPANY'S ZONE, NOT THE SERVER'S. A sheet printed
+ * before the parcel is booked has no dock to ask — and it is printed exactly
+ * then, which is why "Prepared" exists. Answering "UTC" would date every slip
+ * drawn after 8pm Eastern with tomorrow, which is the same defect as reading the
+ * renderer's locale, only quieter. An unconfigured dock is Toronto everywhere
+ * else in this system (`DEFAULT_TIME_ZONE`), so it is Toronto here too.
+ */
+function dockTimeZone(originSnapshot: unknown, liveTimeZone: string | null): string {
+  const snapshot = originSnapshot as { pickup?: { timeZone?: unknown } } | null;
+  const frozen = snapshot && typeof snapshot === "object" ? snapshot.pickup?.timeZone : null;
+  if (typeof frozen === "string" && frozen.trim()) return frozen.trim();
+  if (liveTimeZone && liveTimeZone.trim()) return liveTimeZone.trim();
+  return DEFAULT_TIME_ZONE;
 }
 
 /** The seller's brand colour, if they have set one. */
@@ -125,6 +175,16 @@ export async function packingListFor(
     select: {
       id: true,
       createdAt: true,
+      /*
+       * When this parcel was packed, so the sheet can say "Packed" only about a
+       * box somebody has actually packed. Null on a slip printed ahead of the
+       * packing step, which is the ordinary case: the paper goes in the carton.
+       */
+      packedAt: true,
+      // The dock's own calendar, for that date and for this document's. Read
+      // from the frozen facts first, exactly as the pickup sweep reads them.
+      originSnapshot: true,
+      originLocation: { select: { timeZone: true } },
       // The shipment's own parcel count, not the order's: an order can be split
       // across shipments, and the slip goes in one box.
       packageCount: true,
@@ -158,6 +218,7 @@ export async function packingListFor(
   if (!shipment) return null;
 
   const brandKit = shipment.order.seller.brandKit;
+  const zone = dockTimeZone(shipment.originSnapshot, shipment.originLocation?.timeZone ?? null);
   return {
     shipmentId: shipment.id,
     sellerId: shipment.order.seller.id,
@@ -176,6 +237,11 @@ export async function packingListFor(
     packages: shipment.order.packages,
     packageCount: shipment.packageCount || shipment.order.packages.reduce((sum, p) => sum + p.count, 0),
     totalUnits: shipment.items.reduce((sum, item) => sum + item.quantity, 0),
+    packedOn: shipment.packedAt ? localDateIn(zone, shipment.packedAt) : null,
+    // Resolved ONCE, on the object both renderers read, so the printable copy
+    // and the downloadable PDF cannot name different days — and so neither
+    // names the locale of whatever machine drew it.
+    preparedOn: localDateIn(zone, new Date()),
   };
 }
 
@@ -312,7 +378,7 @@ export function renderPackingList(list: PackingList): string {
     </div>
     <div class="doc">
       <strong>${escape(list.orderName)}</strong>
-      Packed ${new Date().toLocaleDateString()}
+      ${escape(packingStatusLine(list))}
     </div>
   </div>
 
@@ -432,7 +498,7 @@ export function renderPackingSlipPdf(list: PackingList): Promise<Buffer> {
     width,
     align: "right",
   });
-  doc.font("Helvetica").fontSize(9).fillColor("#64748b").text(`Packed ${new Date().toLocaleDateString()}`, {
+  doc.font("Helvetica").fontSize(9).fillColor("#64748b").text(packingStatusLine(list), {
     width,
     align: "right",
   });

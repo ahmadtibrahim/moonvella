@@ -1,6 +1,7 @@
 import { Link, useLoaderData, Form } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 import { requirePermission } from "~/utils/adminAuth.server";
+import { formatNumber } from "~/utils/dates";
 import {
   computeRankings,
   resolvePeriod,
@@ -47,7 +48,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
 }
 
 function money(cents: number, currency = "CAD") {
-  return `${(cents / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
+  return `${formatNumber(cents / 100, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency}`;
 }
 
 const th: React.CSSProperties = { textAlign: "right", padding: "0.5rem", fontSize: "0.7rem", color: "#64748b" };

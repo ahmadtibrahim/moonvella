@@ -71,6 +71,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
             packedAt: true,
             handedToCarrierAt: true,
             deliveredAt: true,
+            // Read by `nextQueueAction`'s milestone facts: "a label has been
+            // bought" is a provider identifier, not only a status.
+            providerShipmentId: true,
           },
         },
         // The amount actually charged, beside the status. A status alone cannot

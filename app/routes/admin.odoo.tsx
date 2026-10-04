@@ -25,6 +25,7 @@ import { requirePermission, assertSameOrigin } from "~/utils/adminAuth.server";
 import { previewOdooImport } from "~/services/odooImport.server";
 import { catalogSyncStatus, runCatalogSyncNow } from "~/services/odooSync.server";
 import { RECURRING_JOBS, JOB_KIND } from "~/services/jobs.server";
+import { formatDateTime } from "~/utils/dates";
 
 const SYNC_EVERY_MS =
   RECURRING_JOBS.find((job) => job.kind === JOB_KIND.ODOO_CATALOG_SYNC)?.everyMs ?? 6 * 60 * 60 * 1000;
@@ -75,7 +76,7 @@ function untilLabel(target: Date | null, now: number): string {
 }
 
 function whenLabel(value: Date | null): string {
-  return value ? new Date(value).toLocaleString() : "never";
+  return value ? formatDateTime(value) : "never";
 }
 
 export default function AdminOdooImport() {

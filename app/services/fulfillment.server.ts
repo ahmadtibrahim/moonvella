@@ -147,7 +147,7 @@ export async function advanceShipment(
 ) {
   const before = await prisma.shipment.findUnique({
     where: { id: shipmentId },
-    select: { id: true, status: true, packedAt: true, handedToCarrierAt: true },
+    select: { id: true, status: true, packedAt: true, handedToCarrierAt: true, providerShipmentId: true },
   });
   if (!before) throw new Error("Shipment not found.");
   const refusal = advanceRefusal(before, event);
@@ -171,14 +171,27 @@ export async function advanceShipment(
   if (event === "packed" || event === "handed_to_carrier") {
     /*
      * The claim, not a blind write. Each event states the exact record it is
-     * allowed to move — for packing, still unpacked; for handoff, packed and
-     * still here — and a count of zero means the row moved between the read
-     * above and this write, so the request is refused rather than replayed.
+     * allowed to move — for packing, a booked parcel with the provider's own
+     * identifier recorded and no milestones yet; for handoff, packed and still
+     * here — and a count of zero means the row moved between the read above and
+     * this write, so the request is refused rather than replayed.
+     *
+     * The provider-id half of the packing rule is in this WHERE for the same
+     * reason the status half is: a booking whose identifier landed between the
+     * read and the write would otherwise be packable by a caller that had
+     * already been told no, and the reverse — a row whose identifier was
+     * cleared — would be packed on a claim that no longer describes it.
      */
     const claimed = await prisma.shipment.updateMany({
       where:
         event === "packed"
-          ? { id: shipmentId, status: { in: [...PACKABLE_STATES] }, packedAt: null, handedToCarrierAt: null }
+          ? {
+              id: shipmentId,
+              status: { in: [...PACKABLE_STATES] },
+              AND: [{ providerShipmentId: { not: null } }, { NOT: { providerShipmentId: "" } }],
+              packedAt: null,
+              handedToCarrierAt: null,
+            }
           : { id: shipmentId, status: "BOOKED", packedAt: { not: null }, handedToCarrierAt: null },
       data,
     });
@@ -358,9 +371,10 @@ export async function createPackingShipment(
  * an audit event — so "packed at" became the moment somebody clicked twice, and
  * the trail showed one box packed twice. The read cannot be the claim. The
  * conditional write in `advanceShipment` states the exact row it may move
- * (`packedAt: null`, no handover, a packable status) and refuses the loser with
- * the stale-milestone message, and the audit event is recorded exactly once
- * because exactly one caller gets past the claim.
+ * (`packedAt: null`, no handover, a booked status, the provider's identifier
+ * present) and refuses the loser with the stale-milestone message, and the
+ * audit event is recorded exactly once because exactly one caller gets past
+ * the claim.
  *
  * The name stays because the packing page reads it as its own action, and
  * because routing it here is the guarantee: whichever screen asks, "packed" has

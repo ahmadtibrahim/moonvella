@@ -31,6 +31,18 @@ import { COUNTRIES } from "~/utils/countries";
 export interface RateRequest {
   shipFrom: {
     name?: string;
+    /**
+     * The business at the dock, which is NOT the same thing as `name`.
+     *
+     * `name` is the person a driver asks for (`attention` on the wire);
+     * `company` is the business the parcel is collected from, and the provider
+     * REQUIRES it on the saved quote: a booking whose `quoteRequest.from` has no
+     * company is refused with "Company is a required field", which is the 400
+     * that stopped a real test booking here. It travels separately rather than
+     * being derived from `name` because a dock whose contact is "Ray" would
+     * otherwise be collected from a company called "Ray".
+     */
+    company?: string | null;
     address: string;
     city?: string;
     province?: string;
@@ -42,6 +54,15 @@ export interface RateRequest {
   };
   shipTo: {
     name?: string;
+    /**
+     * The customer's company, when their Shopify shipping address carries one.
+     *
+     * Absent for most consumer orders, and the provider still requires the
+     * field, so the wire fallback is the recipient's own name — see
+     * `toWireAddress`. That fallback exists ONLY on the wire: the stored
+     * Shopify address is never rewritten to carry it.
+     */
+    company?: string | null;
     address: string;
     city?: string;
     province?: string;
@@ -380,6 +401,11 @@ export async function eshipperStatus(): Promise<EshipperStatus> {
 /**
  * The one sentence every admin screen uses, so two pages cannot describe the
  * same provider differently.
+ *
+ * Each branch leads with ONE of the three environment words — `LIVE`, `TEST`,
+ * `NOT CONFIGURED` — because that token is what the operator is reading for.
+ * The wording of the unconfigured branch is uppercase for the same reason the
+ * other two are: it is a state, not a turn of phrase.
  */
 export function describeEshipperStatus(status: EshipperStatus): string {
   const account = status.account ? ` · account ${status.account}` : "";
@@ -389,7 +415,7 @@ export function describeEshipperStatus(status: EshipperStatus): string {
     case "test":
       return `TEST environment — calls reach the account's test host ${status.host ?? "(host unrecorded)"}${account}`;
     default:
-      return "not configured — quotes and bookings are simulated and no label is bought";
+      return "NOT CONFIGURED — quotes and bookings are simulated and no label is bought";
   }
 }
 
@@ -853,6 +879,17 @@ interface WireAddress {
   country: string;
   residential?: boolean;
   attention?: string;
+  /**
+   * The business, and a REQUIRED field on this wire.
+   *
+   * `PUT /api/v2/quote` rejects a request whose `from` or `to` has no company —
+   * "quoteRequest.to.company: Company is a required field" — and the booking
+   * buys the quote that save produced, so the field has to be right here rather
+   * than patched at booking time. Optional in the app's own types (a dock with
+   * no contact and a consumer address with no business genuinely have none) and
+   * never optional on the wire: `toWireAddress` fills it deterministically.
+   */
+  company?: string;
   phone?: string;
   email?: string;
 }
@@ -1131,6 +1168,47 @@ function checkedDispatchAddress<
   };
 }
 
+/**
+ * The company this address goes on the wire with, never blank.
+ *
+ * THE PROVIDER REQUIRES IT AND SAYS SO ONLY AFTER THE FACT. A save with no
+ * company comes back `400 ERR_VALIDATION` naming `quoteRequest.from.company`
+ * and `quoteRequest.to.company` — after the operator has picked a rate and
+ * pressed the button that was supposed to buy the label. Since the fallback is
+ * determinable at the boundary, the boundary applies it: the recipient's (or
+ * contact's) own name stands in for a business that was never supplied.
+ *
+ * It is a FALLBACK, not a rewrite. The value is computed here, sent, and
+ * discarded — nothing writes it back to the dock record or to the customer's
+ * stored Shopify address, which is the difference between describing a parcel
+ * accurately and corrupting the customer's own data to satisfy a form.
+ *
+ * `attention` is guaranteed present by `checkedDispatchAddress`, which refuses
+ * an address with no recipient name before this runs, so the fallback can never
+ * itself be empty and the field is never sent blank.
+ */
+function wireCompany(company: string | null | undefined, recipient: string | null | undefined): string {
+  const named = (company ?? "").trim();
+  if (named) return named;
+  return (recipient ?? "").trim();
+}
+
+/**
+ * The same rule, for payloads that are NOT built by `toWireAddress`.
+ *
+ * The pickup hand-builds its body, so it would otherwise have to remember that
+ * a blank company is a rejected call — and the way that failure presents is a
+ * 400 after the fact, which is exactly how this defect reached a real booking.
+ * Exported rather than copied for the same reason `checkedDispatchAddress` is
+ * a function.
+ */
+export function carrierCompanyField(
+  company: string | null | undefined,
+  recipient: string | null | undefined
+): string {
+  return wireCompany(company, recipient);
+}
+
 function toWireAddress(
   source: RateRequest["shipFrom"] | RateRequest["shipTo"],
   side: "pickup" | "delivery"
@@ -1147,6 +1225,7 @@ function toWireAddress(
     // to deliver to. Whether `attention` renders as the recipient is confirmed
     // on a label, not by a quote -- recorded as open.
     attention: checked.name,
+    company: wireCompany(checked.company, checked.name),
     residential: "residential" in checked ? checked.residential : undefined,
   };
   if (checked.phone) address.phone = checked.phone;
@@ -1957,7 +2036,7 @@ export async function getReturn(returnId: string): Promise<ReturnDetails | null>
 }
 
 export async function schedulePickup(data: {
-  shipFrom: { name: string; address: string; city: string; province: string; postalCode: string; country: string; phone?: string; email?: string };
+  shipFrom: { name: string; company?: string | null; address: string; city: string; province: string; postalCode: string; country: string; phone?: string; email?: string };
   pickupDate: string;
   pickupTimeWindow: string;
   packages: { count: number; weight: number; length?: number; width?: number; height?: number }[];
@@ -1973,8 +2052,13 @@ export async function schedulePickup(data: {
   }
   await requireRealMode("schedulePickup");
   // `data` IS the payload on this endpoint, so the ship-from address is not
-  // built by `toWireAddress` and gets the same treatment by hand.
-  const payload = { ...data, shipFrom: checkedDispatchAddress(data.shipFrom, "pickup") };
+  // built by `toWireAddress` and gets the same treatment by hand -- including
+  // the company rule, so the pickup names the same business the label did.
+  const shipFrom = checkedDispatchAddress(data.shipFrom, "pickup");
+  const payload = {
+    ...data,
+    shipFrom: { ...shipFrom, company: carrierCompanyField(shipFrom.company, shipFrom.name) },
+  };
   const raw = await eshipperFetch("POST", "/api/v2/pickup", payload) as Record<string, unknown>;
   return {
     pickupId: String(raw.pickupId ?? raw.id ?? ""),

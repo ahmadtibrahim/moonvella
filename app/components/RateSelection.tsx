@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Form } from "react-router";
+import { formatDateTime } from "~/utils/dates";
 
 /*
  * RATE CHOOSING — a decision, a confirmation, and nothing bought.
@@ -151,13 +152,13 @@ export function RateSelection({
                       <small>{q.transitDays === null ? "Transit not stated" : `${q.transitDays} day(s)`}</small>
                     </span>
                     <span>
-                      <small>Quoted {new Date(q.quotedAt).toLocaleString()}</small>
+                      <small>Quoted {formatDateTime(q.quotedAt)}</small>
                       {blocked ? (
                         <small style={{ color: "#b91c1c" }}>{blocked}</small>
                       ) : (
                         /* Nullable because the provider does not always state
                            one. An absent expiry is not an expiry of "now". */
-                        <small>{q.expiresAt ? `Expires ${new Date(q.expiresAt).toLocaleString()}` : "No stated expiry"}</small>
+                        <small>{q.expiresAt ? `Expires ${formatDateTime(q.expiresAt)}` : "No stated expiry"}</small>
                       )}
                     </span>
                   </label>

@@ -2,6 +2,7 @@ import { Form, Link, useActionData, useLoaderData, useNavigation } from "react-r
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { can } from "~/services/permissions";
+import { formatDateTime } from "~/utils/dates";
 import {
   getUserDetail,
   setUserRole,
@@ -138,7 +139,7 @@ const row: React.CSSProperties = {
 };
 
 function fmt(value: Date | string | null | undefined): string {
-  return value ? new Date(value).toLocaleString() : "—";
+  return value ? formatDateTime(value) : "—";
 }
 
 export default function AdminUserDetail() {

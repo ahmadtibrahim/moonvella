@@ -3,6 +3,7 @@ import { withMerchantAccess } from "../services/seller.server";
 import { loadLegacyFamilyRetailPrices, loadSellerRetailPrices } from "../services/sellerPricing.server";
 import { useCurrency } from "../components/CurrencyDisplay";
 import { prisma } from "../db.server";
+import { formatDate } from "../utils/dates";
 
 const SHOPIFY_PRODUCT_LINKS_QUERY = `#graphql
   query MoonVellaProductLinks($ids: [ID!]!) {
@@ -377,7 +378,7 @@ export default function ProductsPage() {
                       <span className={syncBadgeClass(p.importStatus)} title={p.lastImportError || undefined}>
                         {SYNC_LABELS[p.importStatus] || p.importStatus}
                       </span>
-                      <span>Imported {p.importedAt ? new Date(p.importedAt).toLocaleDateString() : "date unavailable"}</span>
+                      <span>Imported {p.importedAt ? formatDate(p.importedAt) : "date unavailable"}</span>
                     </div>
                     {p.lastImportError ? <p className="mv-inline-error">{p.lastImportError}</p> : null}
 
