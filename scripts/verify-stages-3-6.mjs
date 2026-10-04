@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /* global process */
 
@@ -18,11 +20,75 @@ import { readFileSync } from "node:fs";
 
 const read = (path) => readFileSync(new URL(`../${path}`, import.meta.url), "utf8");
 
+/**
+ * Every .ts/.tsx/.js/.jsx file under app/, comments stripped.
+ *
+ * Comments go because the sweep below is a "this call is ABSENT" rule, and a
+ * comment that quotes the illegal call — the exact fixture the fulfillment-scopes
+ * suite injects on purpose — would otherwise read as a live one. Strings stay:
+ * the handle being searched for is a string literal, so a stripper that ate
+ * strings would find nothing and pass while the call sat there.
+ */
+function stripComments(source) {
+  let out = "";
+  let i = 0;
+  let quote = null;
+  while (i < source.length) {
+    const ch = source[i];
+    const next = source[i + 1];
+    if (quote) {
+      out += ch;
+      if (ch === "\\") {
+        out += next ?? "";
+        i += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      out += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < source.length && source[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < source.length && !(source[i] === "*" && source[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+function appSources() {
+  const out = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.(ts|tsx|js|jsx)$/.test(entry.name)) out.push(stripComments(readFileSync(full, "utf8")));
+    }
+  };
+  walk(fileURLToPath(new URL("../app", import.meta.url)));
+  return out;
+}
+
 const ordersQueue = read("app/routes/admin.orders.tsx");
+const shippingLogic = read("app/services/shippingLogic.ts");
 const orderPage = read("app/routes/admin.orders_.$id.tsx");
 const shipmentPage = read("app/routes/admin.shipping_.$shipmentId.tsx");
 const shipmentsList = read("app/routes/admin.shipping.tsx");
 const pickups = read("app/routes/admin.pickups.tsx");
+const packingPage = read("app/routes/admin.packing.$orderId.tsx");
 const returns = read("app/routes/admin.returns.tsx");
 const claims = read("app/routes/admin.claims.tsx");
 const rateSelection = read("app/components/RateSelection.tsx");
@@ -31,6 +97,7 @@ const fulfillment = read("app/services/fulfillment.server.ts");
 const eshipper = read("app/services/eshipper.server.ts");
 const shippingOps = read("app/services/shippingOperations.server.ts");
 const shopifyAppToml = read("shopify.app.toml");
+const ordersApp = read("app/routes/app.orders.jsx");
 
 const checks = [];
 function check(name, ok) {
@@ -61,7 +128,7 @@ check(
     ordersQueue.includes('name="payment"'),
 );
 check(
-  "next action is derived from stored order and shipment state",
+  "next action is derived from stored order and shipment state, in one shared rule",
   [
     "Collect seller payment",
     "Select rate / book label",
@@ -71,7 +138,22 @@ check(
     "Carrier tracking",
     "Delivered",
     "Cancelled",
-  ].every((label) => ordersQueue.includes(`"${label}"`)),
+  ].every((label) => shippingLogic.includes(`"${label}"`)) &&
+    ordersQueue.includes("nextQueueAction(") &&
+    ordersQueue.includes('from "~/services/shippingLogic"'),
+);
+check(
+  "the queue's action for a booking already under way is a statement, never a door",
+  shippingLogic.includes('"Booking in progress"') &&
+    /label: "Booking in progress", tone: "warning" \}/.test(shippingLogic) &&
+    shippingLogic.includes('"Retry failed booking"') &&
+    shippingLogic.includes('"Reconcile booking"'),
+);
+check(
+  "a queue action that IS a door carries the shipment it opens",
+  /to: `\/admin\/shipping\/\$\{shipment\.id\}`/.test(shippingLogic) &&
+    ordersQueue.includes("<Link to={next.to}") &&
+    ordersQueue.includes("NEXT_ACTION_CLASS[next.tone]"),
 );
 check(
   "the Shopify customer payment is labelled as the store's, not the seller's",
@@ -119,10 +201,51 @@ check(
 );
 check(
   "no manual package entry or removal remains on the workflow pages",
-  [orderPage, shipmentPage, shipmentsList].every(
+  [orderPage, shipmentPage, shipmentsList, packingPage].every(
     (source) =>
       !source.includes("add_package") && !source.includes("remove_package") && !source.includes("Add parcel"),
   ),
+);
+check(
+  "the packing page shows the order's parcels read-only and writes none",
+  packingPage.includes("READ-ONLY") &&
+    !packingPage.includes("add_variant_package") &&
+    !packingPage.includes("name=\"count\"") &&
+    !packingPage.includes("name=\"weight\"") &&
+    packingPage.includes("getVariantPackages"),
+);
+check(
+  "the packing page's own Mark packed control is drawn from the same matrix the server enforces",
+  packingPage.includes('availableWarehouseEvents(s).includes("packed")') &&
+    packingPage.includes("handedToCarrierAt: s.handedToCarrierAt"),
+);
+check(
+  "a second booking cannot be started from the order page",
+  orderPage.includes("orderBookingGate(") &&
+    orderPage.includes("bookPreparedShipment(") &&
+    /gate\.kind === "blocked"/.test(orderPage) &&
+    /throw new Error\(gate\.refusal\)/.test(orderPage),
+);
+check(
+  "the booking gate and the server read the same shipped set",
+  shippingLogic.includes("export function orderBookingGate") &&
+    shippingLogic.includes("export function shipmentMayBeBooked") &&
+    shippingLogic.includes("providerShipmentId") &&
+    orderPage.includes("status: { not: \"CANCELLED\" }") &&
+    shipmentPage.includes("shipmentMayBeBooked(shipment)"),
+);
+check(
+  "a shipped, excepted, delivered or cancelled parcel offers no warehouse milestone",
+  shippingLogic.includes("export function availableWarehouseEvents") &&
+    shippingLogic.includes("export function advanceRefusal") &&
+    [orderPage, shipmentPage, shipmentsList].every((source) => source.includes("availableWarehouseEvents(s")),
+);
+check(
+  "the server enforces the milestone order, not just the pages that draw it",
+  fulfillment.includes("advanceRefusal(") &&
+    fulfillment.includes("prisma.shipment.updateMany(") &&
+    fulfillment.includes("packedAt: null") &&
+    /status: "BOOKED", packedAt: \{ not: null \}/.test(fulfillment),
 );
 check(
   "packaging is resolved from the order, variants and products",
@@ -216,8 +339,53 @@ check(
 check("neither required scope is duplicated as an optional scope", /^optional_scopes = \[\]$/m.test(shopifyAppToml));
 check(
   "an older installation is told to approve the newly required permissions",
-  read("app/routes/app.orders.jsx").includes("newly required permissions") &&
+  ordersApp.includes("newly required permissions") &&
     read("app/services/shopifyFulfillment.server.ts").includes("approve the newly required scopes"),
+);
+check(
+  "the old in-app grant request is gone, and the card says where approval really happens",
+  ordersApp.includes('value="recheck_fulfillment_scopes"') &&
+    !ordersApp.includes("grant_fulfillment_scopes") &&
+    ordersApp.includes("Check again") &&
+    ordersApp.includes("app-update flow"),
+);
+check(
+  "no required scope is passed to a dynamic scope request, and the detector can fail",
+  (() => {
+    const requiredScopes = ["write_fulfillments", "write_locations"];
+    // The same rule the fulfillment-scopes suite applies, kept here too because
+    // this is the stage that declares them required: Shopify accepts a dynamic
+    // `scopes.request()` only for OPTIONAL scopes, so naming a required one is
+    // a call that cannot succeed.
+    const offending = (source) => {
+      const needle = "scopes.request(";
+      const hits = [];
+      for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
+        let i = at + needle.length;
+        let depth = 1;
+        let args = "";
+        while (i < source.length && depth > 0) {
+          const ch = source[i];
+          if (ch === "(") depth += 1;
+          else if (ch === ")") {
+            depth -= 1;
+            if (depth === 0) break;
+          }
+          args += ch;
+          i += 1;
+        }
+        if (/FULFILLMENT_SCOPES/.test(args)) hits.push(args.trim());
+        for (const scope of requiredScopes) if (args.includes(`"${scope}"`)) hits.push(args.trim());
+      }
+      return hits;
+    };
+    const selfTest =
+      offending('await scopes.request(["write_fulfillments"]);').length === 1 &&
+      offending("await scopes.request([...FULFILLMENT_SCOPES]);").length === 1 &&
+      offending('await scopes.request(["write_discounts"]);').length === 0;
+    const live = appSources().filter((source) => offending(source).length > 0);
+    return selfTest && live.length === 0;
+  })(),
 );
 
 const failures = checks.filter((item) => !item.ok);

@@ -45,6 +45,8 @@ import {
   trackingDisplay,
   trackingDisplayLabel,
   pickCheapestQuote,
+  availableWarehouseEvents,
+  shipmentMayBeBooked,
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
 import {
@@ -1025,7 +1027,19 @@ export default function AdminShipmentDetail() {
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
   const returnCheapest = pickCheapestQuote(returnQuotes);
-  const canBook = !shipment.providerShipmentId && paid && bookingParcels.packages.length > 0 && bookingParcels.missing.length === 0;
+  /*
+   * BOOKING IS OFFERED ONLY WHERE A BOOKING MAY START. `shipmentMayBeBooked`
+   * is the state half of that — a PENDING or BOOKING_FAILED row with no
+   * provider label — and `bookPreparedShipment` refuses on the same states, so
+   * the control and the service answer together. The parcel half is the
+   * existing refusal-by-name: an incomplete set of cartons is a question for
+   * the packing page, not a booking to attempt.
+   */
+  const canBook =
+    shipmentMayBeBooked(shipment) &&
+    paid &&
+    bookingParcels.packages.length > 0 &&
+    bookingParcels.missing.length === 0;
   /*
    * The dock's own hours, as the two fields start out. `suggestedWindow` is
    * "HH:MM-HH:MM" and is null unless BOTH ends are recorded — half a window is
@@ -1489,20 +1503,20 @@ export default function AdminShipmentDetail() {
               fact on the record nobody here observed and, on handoff, push
               tracking to Shopify the carrier had not reported.
             */}
-            {shipment.status !== "CANCELLED" ? (
+            {availableWarehouseEvents(shipment).length > 0 || shipment.packedAt || shipment.handedToCarrierAt ? (
               <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
-                {!shipment.packedAt ? (
+                {availableWarehouseEvents(shipment).includes("packed") ? (
                   <Form method="post">
                     <input type="hidden" name="intent" value="advance_shipment" />
                     <input type="hidden" name="event" value="packed" />
                     <button type="submit" style={btn("#082a4a")}>Mark packed</button>
                   </Form>
-                ) : (
+                ) : shipment.packedAt ? (
                   <span style={{ fontSize: "0.72rem", color: "#334155" }}>
                     Packed {new Date(shipment.packedAt).toLocaleString()}
                   </span>
-                )}
-                {shipment.packedAt && !shipment.handedToCarrierAt ? (
+                ) : null}
+                {availableWarehouseEvents(shipment).includes("handed_to_carrier") ? (
                   <Form method="post" style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
                     <input type="hidden" name="intent" value="advance_shipment" />
                     <input type="hidden" name="event" value="handed_to_carrier" />

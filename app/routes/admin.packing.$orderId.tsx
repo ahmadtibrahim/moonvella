@@ -2,17 +2,14 @@ import { Link, Form, useLoaderData, useActionData, redirect } from "react-router
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
-import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
-import { getVariantPackages, toCm, toKg, parcelProblems, ParcelValidationError } from "~/services/packaging.server";
+import { getVariantPackages, toCm, toKg } from "~/services/packaging.server";
 import {
   createPackingShipment,
   markShipmentPacked,
   markOrderReadyToShip,
   deletePackingShipment,
-  addOrderPackage,
-  removeOrderPackage,
 } from "~/services/fulfillment.server";
-import { invalidateQuotes, QUOTE_INVALIDATION } from "~/services/shipping.server";
+import { availableWarehouseEvents } from "~/services/shippingLogic";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
   await requirePermission(request, "orders.view");
@@ -98,6 +95,10 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       carrier: s.carrier,
       serviceName: s.serviceName,
       packedAt: s.packedAt,
+      // Read by `availableWarehouseEvents`, which is where "may this box be
+      // marked packed at all" is decided — the same rule the server enforces, so
+      // this page cannot offer a control that throws when it is pressed.
+      handedToCarrierAt: s.handedToCarrierAt,
       providerShipmentId: s.providerShipmentId,
       shopifyFulfillmentId: s.shopifyFulfillmentId,
       attachedPackageIds: order.packages.filter((p) => p.shipmentId === s.id).map((p) => p.id),
@@ -119,64 +120,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
   const intent = String(form.get("intent") || "");
 
   try {
-    if (intent === "add_package") {
-      await addOrderPackage(
-        orderId,
-        {
-          count: Number(form.get("count") || 1),
-          length: Number(form.get("length")),
-          width: Number(form.get("width")),
-          height: Number(form.get("height")),
-          weight: Number(form.get("weight")),
-        },
-        actor
-      );
-    } else if (intent === "remove_package") {
-      await removeOrderPackage(orderId, String(form.get("packageId")), actor);
-    } else if (intent === "add_variant_package") {
-      const orderItemId = String(form.get("orderItemId"));
-      const item = await prisma.orderItem.findUnique({ where: { id: orderItemId } });
-      if (!item || item.orderId !== orderId) throw new Error("Order item not found.");
-      if (!item.variantId) throw new Error("This item has no variant packaging to reference.");
-      const rows = await getVariantPackages(item.variantId);
-      if (rows.length === 0) throw new Error("No variant packaging rows exist for this item.");
-      const parcels = rows.map((r) => ({
-        count: Math.max(1, item.quantity * r.packagesPerUnit),
-        length: Number(toCm(r.length, r.dimensionUnit).toFixed(2)),
-        width: Number(toCm(r.width, r.dimensionUnit).toFixed(2)),
-        height: Number(toCm(r.height, r.dimensionUnit).toFixed(2)),
-        weight: Number(toKg(r.grossWeight, r.weightUnit).toFixed(3)),
-      }));
-      // Checked here as well as in addOrderPackage, because this is the one
-      // parcel write that does not go through it. The values are converted, not
-      // typed, so a packaging row stored before its own rules existed — or
-      // stored with a unit the conversion does not know — can arrive as a zero
-      // or a NaN, and either would be quoted rather than refused.
-      const problems = parcels.flatMap((p) => parcelProblems(p));
-      if (problems.length > 0) throw new ParcelValidationError(problems);
-      const created = await prisma.$transaction(
-        parcels.map((p) =>
-          prisma.orderPackage.create({
-            data: { orderId, ...p, units: "cm_kg" },
-          })
-        )
-      );
-      await recordAudit({
-        actorType: "ADMIN_USER",
-        actorId: user.id,
-        actorName: user.name,
-        action: "order.package_from_variant",
-        entityType: AUDIT_ENTITY.ORDER,
-        entityId: orderId,
-        afterData: { orderItemId, variantId: item.variantId, created: created.length },
-        ipAddress: ip,
-        userAgent,
-      });
-      // The one parcel write that does not go through addOrderPackage, because
-      // it inserts several rows at once. Same rule, same reason: the quotes on
-      // this order now price a different set of parcels.
-      await invalidateQuotes(orderId, QUOTE_INVALIDATION.packagesChanged, actor);
-    } else if (intent === "create_shipment") {
+    if (intent === "create_shipment") {
       const allocations: { orderItemId: string; quantity: number }[] = [];
       for (const [key, value] of form.entries()) {
         if (!key.startsWith("qty_")) continue;
@@ -289,31 +233,28 @@ export default function AdminPacking() {
             <button type="submit" style={btn("#082a4a")}>Create packing shipment</button>
           </div>
         </Form>
-        <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap", marginTop: "0.6rem" }}>
-          {items.filter((i) => i.variantId).map((i) => (
-            <Form method="post" key={i.id}>
-              <input type="hidden" name="intent" value="add_variant_package" />
-              <input type="hidden" name="orderItemId" value={i.id} />
-              <button type="submit" style={btn("#0369a1")} disabled={i.variantPackaging.length === 0}>Use variant packaging: {i.sku}</button>
-            </Form>
-          ))}
-        </div>
       </div>
 
       <div style={card}>
         <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>Consolidated parcel review</h2>
         <p style={{ fontSize: "0.72rem", color: "#64748b", margin: 0, marginBottom: "0.5rem" }}>
-          Ticking a carton assigns it to the box being created. A carton assigned to a box is what
-          that box&apos;s carrier booking describes; an unassigned carton is described by every box
-          that has none of its own. Nothing is merged or moved by ticking &mdash; it only records
-          which parcels a booking is allowed to declare.
+          READ-ONLY, AND THAT IS THE POINT. A carrier prices whatever dimensions it is handed, so a
+          carton typed by hand becomes a quote — and then a label — for a parcel that may not
+          exist. Parcels are therefore resolved from what the variants and products already record
+          (shown beside each item above), or from the carton rows already on this order. Rows
+          written before this rule stay visible and are never edited here. Ticking a carton assigns
+          it to the box being created: that is what the box&apos;s carrier booking will describe,
+          and it moves no numbers.
         </p>
         {packages.length === 0 ? (
-          <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No parcel dimensions recorded.</p>
+          <p style={{ fontSize: "0.82rem", color: "#64748b" }}>
+            No carton rows on this order. A booking resolves its parcels from the variants&apos; and
+            products&apos; stored packaging instead.
+          </p>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.75rem" }}>
             <thead>
-              <tr><th style={th}>Add</th><th style={th}>Count</th><th style={th}>Dimensions (cm)</th><th style={th}>Weight (kg)</th><th style={th}>Total weight</th><th style={th}>Box</th><th style={th}></th></tr>
+              <tr><th style={th}>Assign</th><th style={th}>Count</th><th style={th}>Dimensions (cm)</th><th style={th}>Weight (kg)</th><th style={th}>Total weight</th><th style={th}>Box</th></tr>
             </thead>
             <tbody>
               {packages.map((p) => (
@@ -334,27 +275,11 @@ export default function AdminPacking() {
                       <span style={{ fontSize: "0.7rem", color: "#94a3b8" }}>unassigned</span>
                     )}
                   </td>
-                  <td style={{ padding: "0.4rem" }}>
-                    <Form method="post">
-                      <input type="hidden" name="intent" value="remove_package" />
-                      <input type="hidden" name="packageId" value={p.id} />
-                      <button type="submit" style={btn("#dc2626")}>Remove</button>
-                    </Form>
-                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
-        <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
-          <input type="hidden" name="intent" value="add_package" />
-          <label style={{ fontSize: "0.7rem", color: "#64748b" }}>Count<br /><input style={input} name="count" type="number" defaultValue={1} min={1} /></label>
-          <label style={{ fontSize: "0.7rem", color: "#64748b" }}>L (cm)<br /><input style={input} name="length" type="number" required /></label>
-          <label style={{ fontSize: "0.7rem", color: "#64748b" }}>W (cm)<br /><input style={input} name="width" type="number" required /></label>
-          <label style={{ fontSize: "0.7rem", color: "#64748b" }}>H (cm)<br /><input style={input} name="height" type="number" required /></label>
-          <label style={{ fontSize: "0.7rem", color: "#64748b" }}>Weight (kg)<br /><input style={input} name="weight" type="number" step="0.01" required /></label>
-          <button type="submit" style={btn("#0369a1")}>Add parcel</button>
-        </Form>
       </div>
 
       <div style={card}>
@@ -385,13 +310,24 @@ export default function AdminPacking() {
                   : "No carton assigned — a booking of this box would describe every carton on the order."}
               </div>
               <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
-                {!s.packedAt ? (
+                {availableWarehouseEvents(s).includes("packed") ? (
                   <Form method="post">
                     <input type="hidden" name="intent" value="mark_packed" />
                     <input type="hidden" name="shipmentId" value={s.id} />
                     <button type="submit" style={btn("#059669")}>Mark packed</button>
                   </Form>
-                ) : null}
+                ) : s.packedAt ? (
+                  <span style={{ fontSize: "0.72rem", color: "#059669" }}>
+                    Packed {new Date(s.packedAt).toLocaleString()}
+                  </span>
+                ) : (
+                  // Nothing to offer and nothing to explain: the box is either
+                  // with the carrier already or its booking outcome is being
+                  // settled somewhere else.
+                  <span style={{ fontSize: "0.72rem", color: "#64748b" }}>
+                    Packing is not recorded from here at this status.
+                  </span>
+                )}
                 {s.status === "PENDING" && !s.providerShipmentId && !s.shopifyFulfillmentId ? (
                   <Form method="post">
                     <input type="hidden" name="intent" value="delete_packing" />

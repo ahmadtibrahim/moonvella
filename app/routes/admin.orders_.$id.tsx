@@ -23,11 +23,13 @@ import {
   getQuotesForOrder,
   selectQuote,
   bookShipmentForOrder,
+  bookPreparedShipment,
   voidShipment,
   syncShipmentTracking,
   recipientPhoneFor,
   recordRecipientPhone,
 } from "~/services/shipping.server";
+import { availableWarehouseEvents, orderBookingGate } from "~/services/shippingLogic";
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
@@ -512,6 +514,32 @@ export async function action({ request, params }: ActionFunctionArgs) {
       });
     } else if (intent === "book_shipment") {
       /*
+       * A BOOKING BUYS A LABEL, SO THE ORDER'S SHIPMENTS DECIDE WHETHER ONE MAY
+       * BE STARTED — read here, from the database, not from anything the form
+       * posted. The gate is the same function the page draws its controls from
+       * (`orderBookingGate`), which is what makes a stale tab safe: a page
+       * opened before a label existed and submitted after it did meets the
+       * refusal, not a second purchase.
+       *
+       * Three answers, three destinations:
+       *   first_booking — no live shipment, so the order-level booker runs.
+       *   prepared / retry — a prepared box (or a failed attempt that bought
+       *     nothing) has its own workflow; booking goes through
+       *     `bookPreparedShipment`, which prices the box's own parcels, claims
+       *     the row before calling the provider, and refuses the states where a
+       *     label may already exist.
+       *   blocked — BOOKING, BOOKING_UNKNOWN, BOOKED, a provider id, or an
+       *     already-dispatched parcel: refused with the operator's sentence.
+       */
+      const liveShipments = await prisma.shipment.findMany({
+        where: { orderId, status: { not: "CANCELLED" } },
+        orderBy: { createdAt: "desc" },
+        select: { id: true, createdAt: true, status: true, providerShipmentId: true },
+      });
+      const gate = orderBookingGate(liveShipments);
+      if (gate.kind === "blocked") throw new Error(gate.refusal);
+
+      /*
        * The confirmation screen's answer to "will Shopify notify the customer",
        * carried into the booking and stored on the shipment. Read as a VALUE
        * rather than as the presence of a tick: the modal always posts it, and
@@ -519,14 +547,15 @@ export async function action({ request, params }: ActionFunctionArgs) {
        * "asked, and the answer was no".
        */
       const notifyAnswer = form.get("notifyCustomer");
-      await bookShipmentForOrder(
-        orderId,
-        {
-          quoteId: String(form.get("quoteId") || "") || undefined,
-          ...(notifyAnswer === null ? {} : { notifyCustomerOnPush: notifyAnswer === "on" }),
-        },
-        actor
-      );
+      const quoteId = String(form.get("quoteId") || "") || undefined;
+      const notify =
+        notifyAnswer === null ? {} : { notifyCustomerOnPush: notifyAnswer === "on" };
+
+      if (gate.kind === "first_booking") {
+        await bookShipmentForOrder(orderId, { quoteId, ...notify }, actor);
+      } else {
+        await bookPreparedShipment(gate.shipmentId, quoteId, actor, notify);
+      }
     } else if (intent === "record_phone") {
       /*
        * The one remedy for the booking prerequisite stated on this page. The
@@ -929,6 +958,26 @@ export default function AdminOrderDetail() {
 
   const bookingReady = bookingGatesOpen && quoteBookable;
 
+  /*
+   * WHAT THE ORDER'S OWN SHIPMENTS SAY ABOUT BOOKING.
+   *
+   * Read from the same function the action enforces, so the panel below cannot
+   * offer a booking the server would refuse — and cannot hide one it would
+   * accept. A prepared box has its own workflow on the shipment page (its
+   * parcels, its dock, its confirmation), a failed attempt is retried there
+   * through that same safe path, and the states where a label may already
+   * exist (BOOKING, BOOKING_UNKNOWN, BOOKED, a provider id) offer no booking
+   * control at all.
+   */
+  const bookingGate = orderBookingGate(
+    order.shipments.map((s) => ({
+      id: s.id,
+      createdAt: s.createdAt,
+      status: s.status,
+      providerShipmentId: s.providerShipmentId,
+    }))
+  );
+
   return (
     <div className="mv-page-wide">
       <div className="mv-page-header">
@@ -1253,56 +1302,91 @@ export default function AdminOrderDetail() {
             <RateSelection quotes={order.shippingQuotes} dockIds={orderDockIds} now={now} />
           </>
         )}
-        <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
-          {/*
-            Disabled unless a valid, unexpired, correctly-priced quote is
-            selected. An empty or failed quote response leaves no selected
-            quote, so it cannot open this. Address verdicts are not part of
-            `bookingReady` any more — see `bookingGatesOpen` above.
-          */}
-          {/*
-            The confirmation screen, not a second booking path. This button used
-            to post `book_shipment` directly, which meant the page with the least
-            context was the one that spent the money without asking.
-          */}
-          {selectedQuote ? (
-            <BookingConfirmation
-              environment={eshipper.environment}
-              environmentDetail={eshipper.description}
-              environmentHost={eshipper.host}
-              orderName={order.shopifyOrderName}
-              carrier={selectedQuote.carrier}
-              serviceName={selectedQuote.serviceName}
-              totalCharge={selectedQuote.totalAmount}
-              currency={selectedQuote.currency}
-              transitDays={selectedQuote.transitDays}
-              quotedAt={selectedQuote.quotedAt}
-              expiresAt={selectedQuote.expiresAt}
-              shipFrom={(() => {
-                // The dock the SELECTED QUOTE was priced from, which is the dock
-                // this booking would leave. Falling back to the first group
-                // would name a dock the price did not come from.
-                const group =
-                  collection.groups.find((g) => g.locationId === selectedQuote.originLocationId) ?? collection.groups[0];
-                return group ? { name: `${group.name ?? "Pickup location"} (${group.code ?? "—"})`, lines: group.pickupAddress } : null;
-              })()}
-              shipTo={shipTo}
-              shipToPhone={recipientPhone}
-              parcels={parcels.packages}
-              units={{ dimensionUnit: units.dimensionUnit, weightUnit: units.weightUnit }}
-              hasFulfillmentOrder={Boolean(order.shopifyFulfillmentOrderId)}
-              quoteId={selectedQuote.id}
-              canBook={paid && bookingReady}
-              // A retry is a shipment whose attempt failed and bought nothing.
-              // Anything else is a first booking, and the screen says so.
-              retrying={order.shipments.some((s) => s.status === "BOOKING_FAILED")}
-            />
-          ) : (
-            <button type="button" disabled style={btn("#94a3b8")}>
-              Book shipment
-            </button>
-          )}
-        </div>
+        {/*
+          WHEN A SHIPMENT EXISTS, THE ANSWER IS ITS STATE — not a booking
+          control. Nothing here can start a second purchase: the blocked
+          states say why and open the shipment whose record is the reason, a
+          prepared box is booked from its own page, and a failed attempt is
+          retried there through the same prepared-shipment path. Only an order
+          with no live shipment shows the booking confirmation.
+        */}
+        {bookingGate.kind === "blocked" ? (
+          <div
+            style={{ marginTop: "0.75rem", padding: "0.6rem 0.75rem", border: "1px solid #fecaca", background: "#fef2f2", borderRadius: 8 }}
+            role="status"
+          >
+            <p style={{ fontSize: "0.78rem", color: "#991b1b", margin: "0 0 0.5rem" }}>{bookingGate.refusal}</p>
+            <Link to={`/admin/shipping/${bookingGate.shipmentId}`} className="mv-button">
+              {bookingGate.linkLabel}
+            </Link>
+          </div>
+        ) : bookingGate.kind === "prepared" || bookingGate.kind === "retry" ? (
+          <div
+            style={{ marginTop: "0.75rem", padding: "0.6rem 0.75rem", border: "1px solid #bfdbfe", background: "#eff6ff", borderRadius: 8 }}
+            role="status"
+          >
+            <p style={{ fontSize: "0.78rem", color: "#1e3a8a", margin: "0 0 0.5rem" }}>
+              {bookingGate.kind === "retry"
+                ? "The last booking attempt failed and bought nothing. Its label is retried from the shipment page, through the same confirmation, so the box's own parcels and dock decide the purchase."
+                : "This order already has a prepared shipment. Its label is bought from the shipment page, where the box's own parcels, dock and confirmation are shown."}
+            </p>
+            <Link to={`/admin/shipping/${bookingGate.shipmentId}`} className="mv-button mv-button-dark">
+              {bookingGate.kind === "retry" ? "Retry failed booking" : "Open prepared shipment"}
+            </Link>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem" }}>
+            {/*
+              Disabled unless a valid, unexpired, correctly-priced quote is
+              selected. An empty or failed quote response leaves no selected
+              quote, so it cannot open this. Address verdicts are not part of
+              `bookingReady` any more — see `bookingGatesOpen` above.
+            */}
+            {/*
+              The confirmation screen, not a second booking path. This button used
+              to post `book_shipment` directly, which meant the page with the least
+              context was the one that spent the money without asking.
+            */}
+            {selectedQuote ? (
+              <BookingConfirmation
+                environment={eshipper.environment}
+                environmentDetail={eshipper.description}
+                environmentHost={eshipper.host}
+                orderName={order.shopifyOrderName}
+                carrier={selectedQuote.carrier}
+                serviceName={selectedQuote.serviceName}
+                totalCharge={selectedQuote.totalAmount}
+                currency={selectedQuote.currency}
+                transitDays={selectedQuote.transitDays}
+                quotedAt={selectedQuote.quotedAt}
+                expiresAt={selectedQuote.expiresAt}
+                shipFrom={(() => {
+                  // The dock the SELECTED QUOTE was priced from, which is the dock
+                  // this booking would leave. Falling back to the first group
+                  // would name a dock the price did not come from.
+                  const group =
+                    collection.groups.find((g) => g.locationId === selectedQuote.originLocationId) ?? collection.groups[0];
+                  return group ? { name: `${group.name ?? "Pickup location"} (${group.code ?? "—"})`, lines: group.pickupAddress } : null;
+                })()}
+                shipTo={shipTo}
+                shipToPhone={recipientPhone}
+                parcels={parcels.packages}
+                units={{ dimensionUnit: units.dimensionUnit, weightUnit: units.weightUnit }}
+                hasFulfillmentOrder={Boolean(order.shopifyFulfillmentOrderId)}
+                quoteId={selectedQuote.id}
+                canBook={paid && bookingReady}
+                // `first_booking` by construction here: a shipment in any other
+                // bookable state is answered by the panel above, so this screen
+                // never describes a retry.
+                retrying={false}
+              />
+            ) : (
+              <button type="button" disabled style={btn("#94a3b8")}>
+                Book shipment
+              </button>
+            )}
+          </div>
+        )}
         {!paid && <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>Booking is blocked until the wholesale payment succeeds.</p>}
         {paid && quoteBlock ? (
           <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.4rem" }}>{quoteBlock}</p>
@@ -1490,8 +1574,16 @@ export default function AdminOrderDetail() {
                 transit, delivered, exception — belongs to the carrier's own
                 scans, which arrive through tracking; a hand-set status here
                 would only be a second, guessable version of that history.
+
+                WHICH of the two is available is `availableWarehouseEvents`'
+                answer, not this page's: packing only while packing can still
+                be true, the handover only for a packed box still here. A
+                SHIPPED, EXCEPTION, DELIVERED or CANCELLED shipment therefore
+                shows no control at all — its remaining history is the
+                carrier's record, and the server refuses the same movements
+                this list omits.
               */}
-              {s.status !== "CANCELLED" && !s.packedAt ? (
+              {availableWarehouseEvents(s).includes("packed") ? (
                 <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", alignItems: "center", flexWrap: "wrap" }}>
                   <Form method="post">
                     <input type="hidden" name="intent" value="advance_shipment" />
@@ -1502,7 +1594,7 @@ export default function AdminOrderDetail() {
                   <span style={{ fontSize: "0.7rem", color: "#64748b" }}>No customer notification is sent for packing.</span>
                 </div>
               ) : null}
-              {s.status !== "CANCELLED" && s.packedAt && !s.handedToCarrierAt ? (
+              {availableWarehouseEvents(s).includes("handed_to_carrier") ? (
                 <Form method="post" style={{ display: "flex", gap: "0.5rem", marginTop: "0.5rem", alignItems: "flex-end", flexWrap: "wrap" }}>
                   <input type="hidden" name="intent" value="advance_shipment" />
                   <input type="hidden" name="shipmentId" value={s.id} />

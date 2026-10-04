@@ -36,11 +36,14 @@ name = "MoonVella"
 #
 # Stores installed BEFORE these two became required hold a grant that does not
 # include them; Shopify does not widen an existing grant when an app's required
-# list grows. Those older installations are repaired in-app: the orders screen
-# reads the live grant (`scopes.query()`), a banner names the missing
-# permissions, and its button requests them through the Scopes API, falling
-# back to a full reauthorization whose approval screen lists the newly required
-# permissions. A merchant may decline; the banner stays, orders are read
+# list grows, and it does not let an app ask for a REQUIRED scope dynamically —
+# `scopes.request()` is accepted only for scopes declared as OPTIONAL, which
+# these are not. Those older installations are therefore repaired where the
+# platform actually allows it: through Shopify's own managed installation /
+# reauthorization flow, whose approval screen lists the newly required
+# permissions. The orders screen reads the live grant (`scopes.query()`), names
+# the missing permissions, points the merchant at that flow, and lets them
+# re-read the answer. A merchant may decline; the banner stays, orders are read
 # normally, and what does not happen is fulfillment — which is exactly what the
 # missing permission means.
 #

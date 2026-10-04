@@ -1411,6 +1411,10 @@ async function bookingOutcomeChecks() {
     check("...and does not claim the customer was notified", booked.shopifyNotifiedAt === null);
 
     /* --- the dispatch tries the push ------------------------------------- */
+    // Packing first, because handing a parcel to a carrier before it has been
+    // packed is exactly the transition the guard rails refuse: the milestone
+    // order is a rule now, not a convention this fixture may skip.
+    await advanceShipment(shipment.id, "packed", ACTOR);
     await advanceShipment(shipment.id, "handed_to_carrier", ACTOR);
     const dispatched = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
     const retry = await prisma.backgroundJob.findFirst({
@@ -1451,6 +1455,7 @@ async function bookingOutcomeChecks() {
     const { shipment, quote } = await createBookableOrder(seller.id, "nosync");
     responder = () => ({ status: 200, body: BOOKED_BODY("NOSYNC") });
     await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    await advanceShipment(shipment.id, "packed", ACTOR);
     await advanceShipment(shipment.id, "handed_to_carrier", ACTOR);
     const job = await prisma.backgroundJob.findFirst({
       where: { kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, payload: { path: ["shipmentId"], equals: shipment.id } },

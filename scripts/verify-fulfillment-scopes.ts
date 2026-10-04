@@ -1,6 +1,6 @@
 /**
- * The fulfillment-permission gate: it asks Shopify, it asks ONCE, and it asks
- * because a person pressed a button.
+ * The fulfillment-permission gate: it reads Shopify, it never asks, and it
+ * cannot ask.
  *
  * WHY THIS EXISTS. MoonVella needs `write_fulfillments` and `write_locations`
  * to own the fulfillment service and the location its stock ships from. The app
@@ -9,37 +9,46 @@
  * does not assert the configured scopes against the grant: `authenticate.admin`
  * builds the scopes API and never calls it, and the only caller of the grant
  * redirect is the opt-in `scopes.request()`. An app that declares more than it
- * holds serves normally and silently, forever. Asking is a thing the app has to
- * do deliberately.
+ * holds serves normally and silently, forever.
  *
- * THE TWO WAYS ASKING GOES WRONG, and this suite is written against both:
+ * THE REPAIR THAT DOES NOT EXIST, AND WHY THIS SUITE EXISTS TO KEEP IT GONE.
+ * The first answer to that silence was an in-app repair: a button that called
+ * `scopes.request(FULFILLMENT_SCOPES)` and carried the resulting grant url back
+ * to the page. It could not have worked. Shopify accepts a dynamic
+ * `scopes.request()` ONLY for scopes declared as OPTIONAL, and these two are
+ * required installation scopes — the platform does not offer the call for them.
+ * An installed store approves newly required scopes through Shopify's OWN
+ * managed installation / reauthorization flow, which belongs to Shopify and the
+ * Partner Dashboard and is not drivable from inside an app. So the request path
+ * is removed rather than repaired, and the two failure modes this suite is
+ * written against are:
  *
- *   1. ASKING FROM A LOADER. A page that requested the scopes whenever it
- *      noticed they were missing would send the merchant to Shopify's grant
- *      screen on every load. That is a loop, this app has already spent ten
- *      hours inside one, and it is why the request is an INTENT behind a button
- *      and the loader only ever READS. Checks 7-11 hold that line, and they are
- *      source assertions on purpose: the property is "no loader in this tree
- *      calls request", which is a statement about code that does not exist yet.
+ *   1. SOMEONE PUTS IT BACK. A `scopes.request()` for a required scope is a
+ *      button that fails on the wire, and it fails as a consent screen that
+ *      never appears. Section B sweeps the whole tree for the call, and section
+ *      E is the detector's own test: an injected
+ *      `scopes.request(["write_fulfillments"])` fixture MUST be caught, so a
+ *      detector that silently matched nothing cannot make this suite green.
  *
  *   2. TRUSTING THE SESSION. The `Session.scope` column is written at install
  *      and by the `app/scopes_update` webhook; a stale value in it is
  *      indistinguishable from a current one by reading it. Detection goes to
- *      Shopify (`scopes.query()`), and checks 16-18 are what stop a later
+ *      Shopify (`scopes.query()`), and checks 19-20 are what stop a later
  *      "optimisation" from quietly making the banner read a local string.
  *
  * WHAT IT DOES NOT DO. It reaches no provider — no Shopify, no Stripe. It
  * cannot prove the merchant will approve, and it cannot prove the approved
  * grant is effective on the wire.
  *
- * The half that needs a real store is proved instead by two probes run against
- * the live deployment from OUTSIDE this repo, because the verify harness is
+ * The half that needs a real store is proved instead by probes run against a
+ * live deployment from OUTSIDE this repo, because the verify harness is
  * forbidden a non-`_verify` database and these must read the merchant's own
- * session: one POSTs the grant intent with a signed session token and asserts
- * the answer is Shopify's reauth signal naming both scopes, and one makes the
- * two real calls with the offline token to show each scope works rather than
- * merely being listed. Both are written to fail before approval, so a green
- * result after it means something.
+ * session: one POSTs the re-check intent with a signed session token and
+ * asserts the answer is JSON — a plain object naming what Shopify reports, with
+ * no reauthorization header on it, since this route no longer has a grant
+ * screen to send anyone to — and one makes the two real calls with the offline
+ * token to show each scope works rather than merely being listed. The second is
+ * written to fail before approval, so a green result after it means something.
  *
  * Usage, inside the app image:
  *   node scripts/run-verify.mjs scripts/verify-fulfillment-scopes.ts
@@ -80,11 +89,11 @@ function check(number: number, name: string, pass: boolean, detail: unknown = ""
  * A character scanner rather than a pair of regexes, for the reason the
  * checkout-frame suite gives: most of what this file asserts is that some text
  * is ABSENT, and a stripper that ate real code would turn a defect into a PASS.
- * Strings are preserved deliberately — `"grant_fulfillment_scopes"` is a value
- * this suite has to be able to see, and a stripper that removed it would make
- * checks 12-14 pass by finding nothing.
+ * Strings are preserved deliberately — `"recheck_fulfillment_scopes"` is a
+ * value this suite has to be able to see, and a stripper that removed it would
+ * make the intent checks pass by finding nothing.
  *
- * Check 19 is the stripper's own test: it is shown to remove a comment while
+ * Check 25 is the stripper's own test: it is shown to remove a comment while
  * the raw text still contains it, so a stripper that silently did nothing —
  * or everything — cannot make this suite green.
  */
@@ -135,6 +144,52 @@ function sourceFiles(dir: string, found: string[] = []): string[] {
     else if (/\.(ts|tsx|js|jsx)$/.test(entry)) found.push(full);
   }
   return found;
+}
+
+/** The argument text of every `scopes.request(...)` call in a source string. */
+function requestArgs(source: string): string[] {
+  const needle = "scopes.request(";
+  const out: string[] = [];
+  for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
+    let i = at + needle.length;
+    let depth = 1;
+    let args = "";
+    while (i < source.length && depth > 0) {
+      const ch = source[i];
+      if (ch === "(") depth += 1;
+      else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      args += ch;
+      i += 1;
+    }
+    out.push(args);
+  }
+  return out;
+}
+
+/**
+ * WHICH REQUESTS ARE ILLEGAL, stated once so both the live sweep and the
+ * self-tests read the same rule.
+ *
+ * A dynamic request is legal only for an OPTIONAL scope. Both scopes here are
+ * REQUIRED installation scopes, so any `scopes.request()` that names one of
+ * them — as a literal, or by naming the `FULFILLMENT_SCOPES` tuple that holds
+ * exactly them — is a call the platform will refuse, and returns the scope's
+ * handle so a failure says which one.
+ */
+function requiredScopesAskedFor(source: string, required: readonly string[]): string[] {
+  const offenders: string[] = [];
+  for (const args of requestArgs(source)) {
+    if (/FULFILLMENT_SCOPES/.test(args)) offenders.push(`FULFILLMENT_SCOPES → scopes.request(${args.trim()})`);
+    for (const scope of required) {
+      if (args.includes(`"${scope}"`) || args.includes(`'${scope}'`) || args.includes("`" + scope + "`")) {
+        offenders.push(`${scope} → scopes.request(${args.trim()})`);
+      }
+    }
+  }
+  return offenders;
 }
 
 function main() {
@@ -229,7 +284,7 @@ function main() {
   );
 
   /* ------------------------------------------------------------------ *
-   * B. The request is made from the action, and from nowhere else.
+   * B. Nothing asks. The request path is gone from the tree.
    * ------------------------------------------------------------------ */
 
   const loaderAt = orders.indexOf("export const loader");
@@ -247,91 +302,141 @@ function main() {
     requestSites.push(at);
   }
 
+  /*
+   * ZERO, and the earlier version of this check asserted one. The one call that
+   * used to be here asked for `write_fulfillments` and `write_locations` —
+   * required scopes, which Shopify will not accept a dynamic request for. A
+   * route that keeps the call keeps a button that cannot work.
+   */
   check(
     8,
-    "The orders route calls `scopes.request` exactly once",
-    requestSites.length === 1,
-    requestSites.length ? `at ${requestSites.join(", ")}` : "none found"
+    "The orders route makes no dynamic scope request at all",
+    requestSites.length === 0,
+    requestSites.length ? `at ${requestSites.join(", ")}` : "no call sites"
   );
 
   /*
-   * THE LOOP CHECK. Everything above `actionAt` is loader code — and, in this
-   * file, module-level constants. A `scopes.request` anywhere in there means the
-   * scopes are requested on a page load, which is the ten-hour loop.
+   * THE TREE SWEEP, RUN THROUGH THE DETECTOR rather than a bare substring test.
+   * One file, one call site was the property before; the property now is that
+   * no file asks for a scope the app cannot run without, and that is a rule
+   * about arguments rather than about a call existing.
    */
+  const treeOffenders: string[] = [];
+  for (const file of sourceFiles(APP_DIR)) {
+    const offenders = requiredScopesAskedFor(stripComments(readFileSync(file, "utf8")), FULFILLMENT_SCOPES);
+    for (const offender of offenders) treeOffenders.push(`${file.replace(`${APP_DIR}/`, "app/")}: ${offender}`);
+  }
   check(
     9,
-    "Every `scopes.request` call sits in the action, never in the loader",
-    requestSites.length > 0 && requestSites.every((at) => at > actionAt),
-    requestSites.length
-      ? requestSites.map((at) => (at > actionAt ? "action" : "LOADER")).join(", ")
-      : "no call sites"
+    "No file in the app requests a required scope dynamically",
+    treeOffenders.length === 0,
+    treeOffenders.length ? treeOffenders.join("; ") : "none found"
+  );
+
+  /*
+   * The transport that carried the old throw is gone with it: a header constant
+   * and a reader that only made sense while a 401 could be produced. Their
+   * names must not survive as decoration, because a reader who finds
+   * `REAUTHORIZE_URL_HEADER` has found the first half of a path that no longer
+   * has a second half.
+   */
+  check(
+    10,
+    "The reauth transport is gone from the service, not merely unused",
+    !/REAUTHORIZE_URL_HEADER/.test(scopesService) &&
+      !/reauthorizeUrl/.test(scopesService) &&
+      !/X-Shopify-API-Request-Failure-Reauthorize-Url/.test(scopesService) &&
+      !/X-Shopify-API-Request-Failure-Reauthorize-Url/.test(orders),
+    "no constant, no reader, no header literal"
   );
 
   check(
-    10,
+    11,
     "The loader READS the granted scopes (detection) but never requests them",
-    orders.includes("readFulfillmentScopes(") &&
-      orders.indexOf("readFulfillmentScopes(") < actionAt,
+    orders.includes("readFulfillmentScopes(") && orders.indexOf("readFulfillmentScopes(") < actionAt,
     `read at ${orders.indexOf("readFulfillmentScopes(")}`
   );
 
-  /*
-   * The tree sweep. One file, one call site: a second caller anywhere — a
-   * helper, another route, a component — is the beginning of "the merchant is
-   * asked again from somewhere nobody remembered".
-   */
-  const requestFiles = sourceFiles(APP_DIR).filter((file) =>
-    stripComments(readFileSync(file, "utf8")).includes("scopes.request(")
-  );
-  check(
-    11,
-    "Exactly one file in the whole app requests scopes",
-    requestFiles.length === 1 && requestFiles[0] === ordersPath,
-    requestFiles.length
-      ? requestFiles.map((f) => f.replace(`${APP_DIR}/`, "app/")).join(", ")
-      : "none found"
-  );
-
   /* ------------------------------------------------------------------ *
-   * C. The button: one action, correctly labelled, correctly wired.
+   * C. The button and the action: a re-check, not a grant.
    * ------------------------------------------------------------------ */
 
   check(
     12,
-    "The page renders the grant action only when a scope is missing",
+    "The page renders the permission card only when a scope is missing",
     /missingScopes\.length > 0 \?/.test(orders),
     orders.includes("missingScopes") ? "missingScopes present" : "missingScopes ABSENT"
-  );
-
-  check(
-    13,
-    "The action is labelled exactly \"Grant fulfillment permissions\"",
-    orders.includes("Grant fulfillment permissions"),
-    "label"
   );
 
   /*
    * The intent string has to match on both sides. A form posting one name and
    * an action testing another is a button that does nothing, visibly, with no
-   * error — which is the failure mode a source check is actually good at.
+   * error — which is the failure mode a source check is actually good at. The
+   * name itself is checked too: it is a RE-check, and a name that still says
+   * "grant" would outlive the mechanism it describes.
    */
-  const formIntent = /name="intent"\s+value="(grant_fulfillment_scopes)"/.exec(orders);
-  const actionIntent = /intent === "(grant_fulfillment_scopes)"/.exec(orders);
+  const formIntent = /name="intent"\s+value="(recheck_fulfillment_scopes)"/.exec(orders);
+  const actionIntent = /intent === "(recheck_fulfillment_scopes)"/.exec(orders);
   check(
-    14,
-    "The form's intent name is the name the action tests",
+    13,
+    "The form's intent name is the name the action tests, and it is the re-check",
     Boolean(formIntent) && Boolean(actionIntent) && formIntent![1] === actionIntent![1],
     `form=${formIntent?.[1] ?? "MISSING"} action=${actionIntent?.[1] ?? "MISSING"}`
   );
 
   check(
-    15,
-    "The grant form is submitted by POST to this route, not linked to",
-    /<Form method="post">\s*<input type="hidden" name="intent" value="grant_fulfillment_scopes"/.test(
+    14,
+    "The re-check form is submitted by POST to this route, not linked to",
+    /<Form method="post">\s*<input type="hidden" name="intent" value="recheck_fulfillment_scopes"/.test(
       orders
     ),
     "Form method=post"
+  );
+
+  /*
+   * THE ANSWER IS WHAT SHOPIFY SAYS, AND THE REFUSAL BRANCH IS THE PROOF.
+   * An action that answered "granted" without asking would be the original
+   * silence in a new shape; one that reads and then reports only success would
+   * hide a merchant who declined. So the action must read, and it must have a
+   * branch that returns the missing handles when the read still finds them.
+   */
+  const actionBody = orders.slice(actionAt);
+  check(
+    15,
+    "The action reads Shopify and reports what it found, including \"still missing\"",
+    actionBody.includes("readFulfillmentScopes(") &&
+      /state\.missing\.length > 0/.test(actionBody) &&
+      /missing: state\.missing/.test(actionBody),
+    "read + refusal branch + live handles"
+  );
+
+  check(
+    16,
+    "The button offers a check, not a grant that cannot happen",
+    orders.includes("Check again") && !orders.includes("Grant fulfillment permissions"),
+    "label"
+  );
+
+  check(
+    17,
+    "The card names the permissions and points at Shopify's own approval flow",
+    orders.includes("newly required permissions") &&
+      /app-update flow/.test(orders) &&
+      /Shopify admin/.test(orders),
+    "newly required permissions + Shopify admin flow"
+  );
+
+  /*
+   * NOTHING LEFT TO NAVIGATE TO. The page used to open the grant url in the top
+   * window, keyed on a per-ask stamp. With no request there is no url and no
+   * stamp, and a leftover effect keyed on one would be a navigation that fires
+   * on an action result that no longer carries it.
+   */
+  check(
+    18,
+    "The page has no grant navigation left — no url, no ask stamp, no window.open",
+    !/grantUrl/.test(orders) && !/grantAsk/.test(orders) && !/window\.open\(grantUrl/.test(orders),
+    "no grantUrl, no grantAsk"
   );
 
   /* ------------------------------------------------------------------ *
@@ -339,7 +444,7 @@ function main() {
    * ------------------------------------------------------------------ */
 
   check(
-    16,
+    19,
     "The scope service reads through `scopes.query()`, Shopify's own live API",
     scopesService.includes("scopes.query()"),
     "scopes.query()"
@@ -356,7 +461,7 @@ function main() {
     ["routes/app.orders.jsx", orders],
   ].filter(([, text]) => /session\.scope/.test(text));
   check(
-    17,
+    20,
     "Nothing in the gate reads the session's stored `scope` string",
     sessionScopeOffenders.length === 0,
     sessionScopeOffenders.length
@@ -364,143 +469,90 @@ function main() {
       : "no session.scope reads in either file"
   );
 
+  /*
+   * The cache is dropped by the ACTION, never by the loader: the merchant
+   * presses the button precisely because they have just approved, and a loader
+   * that dropped the cache would put an uncached Shopify call on the layout's
+   * 30-second revalidation timer. Anything above `actionAt` is loader or
+   * module-level code, so that is the line the position is compared against.
+   */
+  const forgetAt = orders.indexOf("forgetFulfillmentScopes(");
   check(
-    18,
-    "A cached read is dropped when the grant action runs, so approval is not outlived",
-    scopesService.includes("export function forgetFulfillmentScopes") &&
-      orders.includes("forgetFulfillmentScopes("),
-    "cache invalidation wired"
+    21,
+    "The cached read is dropped by the re-check action, never on a page load",
+    forgetAt > actionAt && actionAt !== -1,
+    `forget at ${forgetAt}, action at ${actionAt}`
   );
 
   /* ------------------------------------------------------------------ *
-   * E. The stripper can fail, so the checks above mean something.
+   * E. The detector can fail, so the checks above mean something.
+   *
+   * This is the required-scope rule's own test. The fixture is the call that
+   * actually shipped in this repo — `scopes.request([...FULFILLMENT_SCOPES])` —
+   * plus the bare-literal form a later author would more likely type. A
+   * detector that matched nothing, or matched everything, is caught here rather
+   * than at the merchant.
    * ------------------------------------------------------------------ */
 
-  const rawComment = 'const x = 1; // scopes.request(injected)\nconst y = 2;';
-  const stripped = stripComments(rawComment);
+  const literalFixture = 'await scopes.request(["write_fulfillments"]);';
+  const literalHits = requiredScopesAskedFor(literalFixture, FULFILLMENT_SCOPES);
   check(
-    19,
-    "The comment stripper removes a comment while the raw text still has it",
-    rawComment.includes("scopes.request(") && !stripped.includes("scopes.request("),
-    `raw has it: ${rawComment.includes("scopes.request(")}, stripped has it: ${stripped.includes("scopes.request(")}`
+    22,
+    "An injected `scopes.request([\"write_fulfillments\"])` is caught and names the scope",
+    literalHits.length === 1 && literalHits[0].includes("write_fulfillments"),
+    literalHits.join("; ") || "NOTHING CAUGHT"
   );
 
-  const rawString = 'const intent = "grant_fulfillment_scopes";';
+  const spreadFixture = "await scopes.request([...FULFILLMENT_SCOPES]);";
+  const spreadHits = requiredScopesAskedFor(spreadFixture, FULFILLMENT_SCOPES);
   check(
-    20,
+    23,
+    "An injected `scopes.request([...FULFILLMENT_SCOPES])` is caught through the tuple",
+    spreadHits.length === 1 && spreadHits[0].includes("FULFILLMENT_SCOPES"),
+    spreadHits.join("; ") || "NOTHING CAUGHT"
+  );
+
+  /*
+   * The negative control. A detector that fired on every request would pass
+   * both checks above while proving nothing — a request for a scope the app does
+   * NOT require is exactly the legal case this rule must leave alone.
+   */
+  const optionalFixture = 'await scopes.request(["write_discounts"]);';
+  check(
+    24,
+    "The detector leaves a request for a scope the app does not require alone",
+    requiredScopesAskedFor(optionalFixture, FULFILLMENT_SCOPES).length === 0,
+    requiredScopesAskedFor(optionalFixture, FULFILLMENT_SCOPES).join("; ") || "not flagged"
+  );
+
+  const rawComment = 'const x = 1; // scopes.request([...FULFILLMENT_SCOPES])\nconst y = 2;';
+  const stripped = stripComments(rawComment);
+  check(
+    25,
+    "The comment stripper removes a comment while the raw text still has it",
+    requestArgs(rawComment).length === 1 &&
+      requiredScopesAskedFor(stripComments(rawComment), FULFILLMENT_SCOPES).length === 0 &&
+      stripped.includes("const y = 2;"),
+    `raw args: ${requestArgs(rawComment).length}, stripped offenders: ${requiredScopesAskedFor(stripped, FULFILLMENT_SCOPES).length}`
+  );
+
+  const rawString = 'const intent = "recheck_fulfillment_scopes";';
+  check(
+    26,
     "The comment stripper keeps string literals, so the intent checks can see them",
-    stripComments(rawString).includes("grant_fulfillment_scopes"),
+    stripComments(rawString).includes("recheck_fulfillment_scopes"),
     "literal survived"
   );
 
   /* ------------------------------------------------------------------ *
-   * F. The transport. A 401 must not be able to reach a script.
+   * F. The configuration that makes the two scopes legal.
    *
-   * The merchant's failure was not that the ask was wrong — the action asked,
-   * and answered 401 + `X-Shopify-API-Request-Failure-Reauthorize-Url` exactly
-   * as the library intends. It was that the response reached React Router
-   * instead of App Bridge's patched fetch, and React Router rendered it. These
-   * checks hold the property that fixes it: the url is taken OUT of the throw
-   * and returned as data, so that no response the route can produce is one React
-   * Router is able to render as an error.
-   * ------------------------------------------------------------------ */
-
-  check(
-    21,
-    "The action catches the reauth throw rather than letting it reach the router",
-    /catch \(thrown\)[\s\S]{0,400}?reauthorizeUrl\(thrown\)/.test(orders),
-    "catch + reauthorizeUrl"
-  );
-
-  /*
-   * ONE ANSWER, NOT TWO — and this check used to assert the opposite.
-   *
-   * It required a document submission to be handed to the library's own
-   * `redirect(grantUrl, { target: "_top" })`, on the reasoning that
-   * `redirectFactory` knows what an embedded document request needs. Driving
-   * that branch in a browser showed what the library's answer actually is here:
-   * the App Bridge bounce document, a 200 whose body is HTML. React Router 7 has
-   * no "return this document verbatim" case for an action — a thrown Response
-   * that is not a redirect is an ERROR — so the error boundary rendered the
-   * bounce's `<script>window.open(...)</script>` as visible text on the page.
-   * The merchant reached the grant screen anyway, because the script still ran,
-   * which is luck rather than design.
-   *
-   * So the branch is gone, and this check now fails if it returns. One path is
-   * the property that matters: a JSON answer that both transports can carry, and
-   * no response shape that React Router can turn into an error page.
-   */
-  check(
-    22,
-    "The grant has exactly one answer — the url as JSON — and no document branch",
-    !/isDocumentNavigation/.test(orders) &&
-      !/throw redirect\(grantUrl/.test(orders) &&
-      /return Response\.json\(\{[\s\S]{0,200}?grantUrl,/.test(orders),
-    "no document branch, url returned as JSON"
-  );
-
-  check(
-    23,
-    "A script is given the url to open, never the thrown 401",
-    /return Response\.json\(\{[\s\S]{0,200}?grantUrl,/.test(orders) &&
-      !/return thrown;/.test(orders),
-    "grantUrl returned, raw throw not returned"
-  );
-
-  /*
-   * The page opens it, and opens it ONCE PER ASK. Both halves matter: an effect
-   * keyed on the url fires only on the first press (the url is the same string
-   * every time), and one keyed on `actionData` fires again on every layout
-   * revalidation. Either mistake turns the consent screen into a loop of its
-   * own, which is the failure this whole feature exists to avoid.
-   */
-  check(
-    24,
-    "The page opens the grant url in the top window",
-    /window\.open\(grantUrl, "_top"\)/.test(orders),
-    "window.open(grantUrl, _top)"
-  );
-
-  check(
-    25,
-    "That effect is keyed on the ask, so a second press opens it again and a poll does not",
-    /const grantAsk = actionData\?\.grantAsk/.test(orders) &&
-      /\}, \[grantAsk, grantUrl\]\)/.test(orders) &&
-      /grantAsk: Date\.now\(\)/.test(orders),
-    "stamped by the action, depended on by the effect"
-  );
-
-  /*
-   * THE SPLIT IS GONE FROM BOTH FILES, and the signal it keyed on with it.
-   *
-   * `Sec-Fetch-Dest` was the right signal for the wrong question — it correctly
-   * distinguishes a form post from a fetch, and the answer to "which transport
-   * is this?" turned out not to change what the route should send. Leaving the
-   * helper behind would leave a reader to wonder which branch is live. `redirect`
-   * is checked here too: it was destructured from `authenticate.admin` only to
-   * build the bounce document, so its disappearance is the same fact.
-   */
-  check(
-    26,
-    "The removed document/fetch split left nothing behind — no signal, no unused redirect",
-    !/sec-fetch-dest/i.test(scopesService) &&
-      !/isDocumentNavigation/.test(scopesService) &&
-      /const \{ scopes, session \} = await authenticate\.admin\(request\)/.test(orders),
-    "no Sec-Fetch-Dest read, no isDocumentNavigation, no unused redirect"
-  );
-
-  /* ------------------------------------------------------------------ *
-   * G. The configuration that makes the ask legal.
-   *
-   * Both scopes are REQUIRED installation scopes: the workflow cannot finish
-   * an order without them, so a new installation is asked for them on the
-   * install screen, and they are deliberately NOT duplicated as optional — a
-   * scope declared in both places is ambiguous, and an optional declaration
-   * would describe them as permissions the merchant may decline. Stores
-   * installed before this became the shape hold a grant without them, and
-   * Shopify does not widen an existing grant when an app's required list
-   * grows; those older installations are what the in-app repair path in
-   * section F exists for.
+   * Both are REQUIRED installation scopes: the workflow cannot finish an order
+   * without them, so a new installation is asked for them on the install screen,
+   * and they are deliberately NOT duplicated as optional — a scope declared in
+   * both places is ambiguous, an optional declaration would describe them as
+   * permissions the merchant may decline, and it is the optional declaration
+   * that would make a dynamic request legal where a required one is not.
    * ------------------------------------------------------------------ */
 
   const toml = readFileSync(join(process.cwd(), "shopify.app.toml"), "utf8");
@@ -551,14 +603,6 @@ function main() {
     "read_locations stays required — the read half never changed",
     required.includes("read_locations"),
     required.includes("read_locations") ? "read_locations required" : "read_locations MISSING"
-  );
-
-  check(
-    31,
-    "The reauth header name is written once, in the service",
-    scopesService.includes("REAUTHORIZE_URL_HEADER = \"X-Shopify-API-Request-Failure-Reauthorize-Url\"") &&
-      !/X-Shopify-API-Request-Failure-Reauthorize-Url/.test(orders),
-    "one definition, no literals in the route"
   );
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);

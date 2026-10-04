@@ -15,6 +15,7 @@ import {
   trackingDisplay,
   trackingDisplayLabel,
   trackingDisplayWhere,
+  availableWarehouseEvents,
   TRACKING_DISPLAY_ORDER,
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
@@ -206,6 +207,12 @@ export async function loader({ request }: LoaderFunctionArgs) {
         // The row gates its cancel control on this, and the search above matches
         // on it; without it in the select the row cannot render that control.
         providerShipmentId: true,
+        // The warehouse milestones, so the row can draw the same two controls
+        // `availableWarehouseEvents` allows — and no others. Without these two
+        // columns the row cannot tell a packed box from an unpacked one and
+        // would have to offer both events on faith.
+        packedAt: true,
+        handedToCarrierAt: true,
         sellerShippingCharge: true,
         quotedCarrierCost: true,
         bookedCost: true,
@@ -780,12 +787,23 @@ export default function AdminShipping() {
                             </Form>
                           </>
                         ) : null}
-                        {s.status === "BOOKED" || s.status === "SHIPPED" || s.status === "EXCEPTION" ? (
+                        {/*
+                          ONLY WHAT THE SHIPMENT'S OWN RECORD ALLOWS. The old
+                          guard offered both events on BOOKED, SHIPPED and
+                          EXCEPTION rows — so a shipped or exception parcel
+                          still showed "handed to carrier", which the service
+                          now refuses and which would have regressed the
+                          carrier's own status. The options come from the same
+                          function the server validates with, so a listed event
+                          is an accepted one, and a row with nothing to record
+                          shows no control at all.
+                        */}
+                        {availableWarehouseEvents(s).length > 0 ? (
                           <Form method="post" className="mv-actions" style={{ gap: "0.25rem" }}>
                             <input type="hidden" name="intent" value="advance_shipment" />
                             <input type="hidden" name="shipmentId" value={s.id} />
-                            <select name="event" defaultValue="packed" className="mv-input" style={{ padding: "0.15rem 0.25rem", fontSize: "0.62rem", minHeight: "auto" }}>
-                              {ADVANCE_EVENTS.map((ev) => (
+                            <select name="event" defaultValue={availableWarehouseEvents(s)[0]} className="mv-input" style={{ padding: "0.15rem 0.25rem", fontSize: "0.62rem", minHeight: "auto" }}>
+                              {availableWarehouseEvents(s).map((ev) => (
                                 <option key={ev} value={ev}>{ev.replace(/_/g, " ")}</option>
                               ))}
                             </select>

@@ -4,6 +4,10 @@ import { requirePermission } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
 import type { Prisma } from "@prisma/client";
 import { ORDER_STATE, type OrderState } from "~/services/orderState.server";
+// The decision itself lives in the isomorphic module: the queue renders it,
+// and a verifier drives it as a function — one definition, so the badge an
+// operator clicks and the rule the server enforces cannot drift apart.
+import { nextQueueAction, type QueueAction } from "~/services/shippingLogic";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "orders.view");
@@ -93,69 +97,7 @@ function money(cents: number, currency = "CAD") {
 
 type QueueOrder = Awaited<ReturnType<typeof loader>>["orders"][number];
 
-type NextAction = { label: string; tone: "brand" | "warning" | "success" | "danger" | "muted" };
-
-/**
- * The one thing to do next, derived from what is stored on the order.
- *
- * Every branch reads a column that already exists — the seller's payment
- * status, the newest shipment's status and its packed/handed timestamps, the
- * tracking number — so the answer cannot disagree with the order page, and it
- * updates the moment a carrier event or a booking lands. Nothing is inferred
- * from `fulfillmentStatus`, which is Shopify's view and lags MoonVella's own
- * booking by design.
- */
-function nextActionFor(order: QueueOrder): NextAction {
-  if (order.state === "CANCELLED") return { label: "Cancelled", tone: "muted" };
-
-  const shipment = order.shipments[0] ?? null;
-
-  if (order.state === "DELIVERED" || shipment?.deliveredAt || shipment?.status === "DELIVERED") {
-    return { label: "Delivered", tone: "success" };
-  }
-
-  // Seller payment comes first: nothing may be booked until MoonVella has been
-  // paid, so pointing anywhere else would point past the actual blocker.
-  if (order.wholesalePaymentStatus !== "SUCCEEDED") {
-    return { label: "Collect seller payment", tone: "warning" };
-  }
-
-  if (
-    !shipment ||
-    shipment.status === "CANCELLED" ||
-    shipment.status === "PENDING" ||
-    shipment.status === "BOOKING" ||
-    shipment.status === "BOOKING_FAILED"
-  ) {
-    return { label: "Select rate / book label", tone: "brand" };
-  }
-
-  if (shipment.status === "BOOKING_UNKNOWN") {
-    // A booking attempt whose outcome is unknown. Re-booking is blocked until
-    // it is reconciled, so "book a label" would point at a door that does not
-    // open; the reconcile control is on the order page this row links to.
-    return { label: "Reconcile booking", tone: "danger" };
-  }
-
-  if (shipment.status === "BOOKED") {
-    if (!shipment.packedAt) return { label: "Pack order", tone: "brand" };
-    if (!shipment.handedToCarrierAt) return { label: "Hand to carrier", tone: "brand" };
-  }
-
-  // SHIPPED and EXCEPTION are carrier-side now: the carrier's own scans drive
-  // the rest, and the operator's job is to watch them.
-  if (
-    shipment.trackingNumber ||
-    shipment.status === "SHIPPED" ||
-    shipment.status === "EXCEPTION"
-  ) {
-    return { label: "Carrier tracking", tone: "brand" };
-  }
-
-  return { label: "Select rate / book label", tone: "brand" };
-}
-
-const NEXT_ACTION_CLASS: Record<NextAction["tone"], string> = {
+const NEXT_ACTION_CLASS: Record<QueueAction["tone"], string> = {
   brand: "mv-badge mv-badge-brand",
   warning: "mv-badge mv-badge-warning",
   success: "mv-badge mv-badge-success",
@@ -241,7 +183,11 @@ export default function AdminOrders() {
                 </tr>
               ) : (
                 orders.map((o) => {
-                  const next = nextActionFor(o);
+                  const next = nextQueueAction({
+                    state: o.state,
+                    wholesalePaymentStatus: o.wholesalePaymentStatus,
+                    shipment: o.shipments[0] ?? null,
+                  });
                   const shipment = o.shipments[0] ?? null;
                   const sellerPaid = o.wholesalePaymentStatus === "SUCCEEDED";
                   return (
@@ -272,7 +218,21 @@ export default function AdminOrders() {
                         ) : null}
                       </td>
                       <td>
-                        <span className={NEXT_ACTION_CLASS[next.tone]}>{next.label}</span>
+                        {/*
+                          Some next actions ARE a door — a prepared shipment's
+                          label, a failed attempt's retry, a reconciliation —
+                          and those carry the shipment page they open. The
+                          rest are statements about the order ("Booking in
+                          progress"), rendered as plain badges because there
+                          is nothing safe for a click to do.
+                        */}
+                        {next.to ? (
+                          <Link to={next.to} className={NEXT_ACTION_CLASS[next.tone]}>
+                            {next.label}
+                          </Link>
+                        ) : (
+                          <span className={NEXT_ACTION_CLASS[next.tone]}>{next.label}</span>
+                        )}
                       </td>
                       <td>
                         {shipment ? (

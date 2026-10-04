@@ -695,3 +695,433 @@ export function pickFastestQuote<T extends { transitDays: number | null }>(quote
   if (known.length === 0) return null;
   return known.reduce((best, q) => ((q.transitDays as number) < (best.transitDays as number) ? q : best));
 }
+
+/* ====================================================================== *
+ * THE LIFECYCLE'S GUARD RAILS.
+ *
+ * Three questions the admin asks, answered here so no two screens can
+ * disagree about them, and so the SERVER answers them the same way the
+ * buttons are drawn:
+ *
+ *   1. May this shipment accept "packed" or "handed to carrier"?  —
+ *      availableWarehouseEvents / advanceRefusal. `advanceShipment` refuses
+ *      an event its matrix forbids, so a stale tab, a forged post and a
+ *      double click meet one answer, and the controls are drawn from the
+ *      same list so a button that exists is a button that would be accepted.
+ *
+ *   2. May a booking be started, given the order's live shipment? —
+ *      orderBookingGate / shipmentMayBeBooked. A booking buys a label, and a
+ *      second one is a second purchase, so the states that mean "a label may
+ *      already exist" (BOOKING, BOOKING_UNKNOWN, BOOKED, a provider id) block
+ *      it outright rather than being retried.
+ *
+ *   3. What is the one thing to do next with this order? — nextQueueAction,
+ *      which the orders queue renders and a verifier can drive as a function.
+ * ====================================================================== */
+
+/** A shipment's own record, as much as any milestone decision needs. */
+export interface ShipmentMilestoneFacts {
+  status: string;
+  packedAt: Date | string | null;
+  handedToCarrierAt: Date | string | null;
+}
+
+/** The two events somebody at the dock actually sees happen. */
+export const WAREHOUSE_EVENTS = ["packed", "handed_to_carrier"] as const;
+export type WarehouseEventName = (typeof WAREHOUSE_EVENTS)[number];
+
+/**
+ * States in which no label exists yet — nothing can have been packed FOR a
+ * carrier, handed over, shipped or delivered, because the parcel is not yet
+ * the carrier's to move.
+ */
+const NO_LABEL_STATES = ["PENDING", "BOOKING", "BOOKING_FAILED", "BOOKING_UNKNOWN"];
+
+/**
+ * The states a box may still be taped shut in: no label yet, a label, or a
+ * failed attempt that bought nothing. NOT `BOOKING` (a booking is writing the
+ * row) and not `BOOKING_UNKNOWN` (a label may exist and somebody has to
+ * reconcile it first) — the two states where the warehouse is waiting on the
+ * booking question rather than the other way round.
+ *
+ * One list, read by both `availableWarehouseEvents` (what the pages draw),
+ * `advanceRefusal` (what the server accepts) and `advanceShipment`'s
+ * conditional claim (what the write is allowed to touch), because those
+ * disagreeing is a control that throws when it is pressed.
+ */
+export const PACKABLE_STATES = ["PENDING", "BOOKED", "BOOKING_FAILED"] as const;
+
+/**
+ * Whether a status is one of them. A predicate rather than `.includes` at each
+ * call site, because the tuple is `as const` — which is what makes the same
+ * list usable as a Prisma `status: { in: [...] }` filter without a cast — and
+ * `includes` on a literal tuple only accepts its own literals, not the plain
+ * `string` a row's status arrives as.
+ */
+export function isPackableState(status: string): boolean {
+  return (PACKABLE_STATES as readonly string[]).includes(status);
+}
+
+/** How a status reads in a refusal sentence. */
+const STATE_WORD: Record<string, string> = {
+  PENDING: "prepared but not booked",
+  BOOKING: "being booked right now",
+  BOOKING_FAILED: "left by a failed booking attempt",
+  BOOKING_UNKNOWN: "waiting on an unknown booking outcome",
+  BOOKED: "booked",
+  SHIPPED: "already on its way",
+  EXCEPTION: "flagged with an exception by the carrier",
+  DELIVERED: "already delivered",
+  CANCELLED: "cancelled",
+};
+
+/**
+ * THE MATRIX. Which warehouse events a shipment may accept right now.
+ *
+ *   packed            — a box being taped shut. It is recorded once, and only
+ *                       while the shipment is somewhere packing can still be
+ *                       true: PENDING (packing before the label is bought is
+ *                       how the dock works), BOOKED (label bought, parcel
+ *                       still here), or BOOKING_FAILED (an attempt that bought
+ *                       nothing — the box is still on the dock, and refusing to
+ *                       record it here would leave the packing page's own
+ *                       control throwing on a parcel it is showing). Never on a
+ *                       shipment the carrier already owns the record of, never
+ *                       twice, and never while a booking is in flight or its
+ *                       outcome is unknown: those two rows are being reconciled
+ *                       by somebody else.
+ *   handed_to_carrier — the parcel leaving the building. Only after packing
+ *                       (the handoff is the milestone that tells Shopify the
+ *                       goods have left, and an unpacked box has not left),
+ *                       only on a booked shipment, and only once.
+ *
+ * Everything else — SHIPPED, EXCEPTION, DELIVERED, CANCELLED — offers
+ * nothing: those shipments' remaining history is the carrier's own scans, and
+ * a stale tab re-posting "handed to carrier" must not drag an EXCEPTION back
+ * to SHIPPED.
+ */
+export function availableWarehouseEvents(facts: ShipmentMilestoneFacts): WarehouseEventName[] {
+  const events: WarehouseEventName[] = [];
+  if (facts.handedToCarrierAt) return events;
+  if (!facts.packedAt && isPackableState(facts.status)) {
+    events.push("packed");
+  }
+  if (facts.packedAt && facts.status === "BOOKED") {
+    events.push("handed_to_carrier");
+  }
+  return events;
+}
+
+/**
+ * Why a shipment event is refused, or null when it may be recorded. One
+ * sentence, naming the fact that blocks it — this is what a stale request is
+ * told, and what the audit trail would otherwise record as a milestone.
+ *
+ * Covers the carrier-side events too, not just the warehouse's two. No screen
+ * offers them, but `advanceShipment` is a service and a service does not get
+ * to assume its callers: "delivered must not overwrite a cancelled shipment"
+ * and "an EXCEPTION must not slip back to SHIPPED" are properties of the
+ * record, not of the form that happened to submit.
+ */
+export function advanceRefusal(facts: ShipmentMilestoneFacts, event: string): string | null {
+  const gone =
+    facts.status === "SHIPPED" || facts.status === "EXCEPTION" || facts.status === "DELIVERED";
+  const word = STATE_WORD[facts.status] ?? `in ${facts.status}`;
+
+  switch (event) {
+    case "packed": {
+      if (facts.handedToCarrierAt) {
+        return "This parcel has already been handed to the carrier, so packing cannot be recorded now.";
+      }
+      if (facts.packedAt) return "Packing is already recorded for this shipment.";
+      if (isPackableState(facts.status)) return null;
+      if (facts.status === "CANCELLED") {
+        return "This shipment was cancelled, so it cannot be recorded as packed.";
+      }
+      if (gone) {
+        return `This shipment is ${word}; the carrier's own record owns the rest of its journey, so packing is not recorded from here.`;
+      }
+      return `This shipment is ${word}, so packing is not recorded from here.`;
+    }
+
+    case "handed_to_carrier": {
+      if (facts.handedToCarrierAt) {
+        return "The handover to the carrier is already recorded for this shipment.";
+      }
+      if (facts.status === "CANCELLED") {
+        return "This shipment was cancelled, so there is nothing to hand to a carrier.";
+      }
+      if (gone) {
+        return `This shipment is ${word}; the carrier's own record owns the rest of its journey, and the handover cannot be recorded now.`;
+      }
+      if (facts.status !== "BOOKED") {
+        return `This shipment is ${word}, so there is no booked parcel to hand over yet.`;
+      }
+      if (!facts.packedAt) {
+        return "Pack the parcel before recording the handover — this milestone is what tells Shopify the goods have left, and it is only recorded for a box that is packed.";
+      }
+      return null;
+    }
+
+    case "shipped":
+    case "in_transit": {
+      if (facts.status === "CANCELLED") return "This shipment was cancelled.";
+      if (facts.status === "DELIVERED") {
+        return "This shipment is already delivered; a carrier scan cannot move it back.";
+      }
+      if (facts.status === "EXCEPTION") {
+        return "The carrier has already flagged this shipment with an exception; a later scan belongs to tracking sync, not to re-marking it shipped.";
+      }
+      if (event === "shipped" && facts.status === "SHIPPED") {
+        return "This shipment is already marked shipped.";
+      }
+      if (facts.status === "BOOKED" || facts.status === "SHIPPED") return null;
+      return `This shipment is ${word}, so it cannot be marked ${event === "shipped" ? "shipped" : "in transit"}.`;
+    }
+
+    case "delivered": {
+      if (facts.status === "CANCELLED") return "This shipment was cancelled.";
+      if (facts.status === "DELIVERED") return "This shipment is already recorded as delivered.";
+      if (NO_LABEL_STATES.includes(facts.status)) {
+        return `This shipment is ${word}, so there is nothing that could have been delivered.`;
+      }
+      return null;
+    }
+
+    case "exception": {
+      if (facts.status === "CANCELLED") return "This shipment was cancelled.";
+      if (facts.status === "DELIVERED") {
+        return "This shipment is already delivered; an exception cannot follow a delivery.";
+      }
+      if (NO_LABEL_STATES.includes(facts.status)) {
+        return `This shipment is ${word}, so there is no carrier movement to flag.`;
+      }
+      return null;
+    }
+
+    default:
+      return `Unknown shipment event "${event}".`;
+  }
+}
+
+/**
+ * The shipment facts a booking decision reads. `createdAt` is how the LIVE
+ * shipment is picked when an order has several: a cancelled label is replaced
+ * by a new row, so the newest non-cancelled row is the one in play.
+ */
+export interface ExistingShipmentFacts {
+  id: string;
+  createdAt: Date | string;
+  status: string;
+  providerShipmentId: string | null;
+}
+
+/**
+ * What the order page may do about booking, given the order's shipments.
+ *
+ *   first_booking — no live shipment: `bookShipmentForOrder` books the order.
+ *   prepared      — a prepared (PENDING) shipment exists: its label is bought
+ *                   through `bookPreparedShipment`, which prices the box's own
+ *                   parcels and claims the row before calling the provider.
+ *   retry         — the last attempt FAILED and bought nothing: the same
+ *                   prepared-shipment path is the only safe retry.
+ *   blocked       — a label may already exist (BOOKING, BOOKING_UNKNOWN,
+ *                   BOOKED, a provider id) or the parcel is already gone
+ *                   (SHIPPED, EXCEPTION, DELIVERED). Booking is refused with
+ *                   the sentence the operator reads, and the link points at
+ *                   the shipment whose state is the reason.
+ *
+ * A cancelled shipment is not an obstacle — voiding a label is exactly when a
+ * replacement is booked — so only non-cancelled rows are considered.
+ */
+export type OrderBookingGate =
+  | { kind: "first_booking" }
+  | { kind: "prepared"; shipmentId: string }
+  | { kind: "retry"; shipmentId: string }
+  | { kind: "blocked"; shipmentId: string; refusal: string; linkLabel: string };
+
+function latestLiveShipment(
+  shipments: readonly ExistingShipmentFacts[]
+): ExistingShipmentFacts | null {
+  const live = shipments.filter((s) => s.status !== "CANCELLED");
+  if (live.length === 0) return null;
+  return live.reduce((newest, s) =>
+    new Date(s.createdAt).getTime() > new Date(newest.createdAt).getTime() ? s : newest
+  );
+}
+
+function bookingObstacle(
+  shipment: ExistingShipmentFacts
+): { refusal: string; linkLabel: string } | null {
+  if (shipment.providerShipmentId) {
+    return {
+      refusal:
+        "This order already has a booked carrier label. Booking again would buy a second one — a replacement is only booked after the existing label is voided.",
+      linkLabel: "Open shipment",
+    };
+  }
+  switch (shipment.status) {
+    case "PENDING":
+    case "BOOKING_FAILED":
+      return null;
+    case "BOOKING":
+      return {
+        refusal:
+          "A booking attempt for this order is already in flight. Starting another could buy a second label, so booking stays blocked until it finishes or fails.",
+        linkLabel: "View the booking attempt",
+      };
+    case "BOOKING_UNKNOWN":
+      return {
+        refusal:
+          "The outcome of the last booking attempt is unknown, so a label may already have been bought. Booking is blocked until the provider is asked what it holds.",
+        linkLabel: "Reconcile the booking",
+      };
+    case "BOOKED":
+      return {
+        refusal:
+          "This order's parcel is already booked — its label exists, and the next steps are packing and handoff.",
+        linkLabel: "Open shipment",
+      };
+    case "SHIPPED":
+    case "EXCEPTION":
+    case "DELIVERED":
+      return {
+        refusal:
+          "This order's parcel has already left the building; the carrier's own scans own the rest of its journey.",
+        linkLabel: "Open shipment",
+      };
+    default:
+      return {
+        refusal: `This order's shipment is ${STATE_WORD[shipment.status] ?? `in ${shipment.status}`}, which is not a state a booking may start from.`,
+        linkLabel: "Open shipment",
+      };
+  }
+}
+
+export function orderBookingGate(
+  shipments: readonly ExistingShipmentFacts[]
+): OrderBookingGate {
+  const live = latestLiveShipment(shipments);
+  if (!live) return { kind: "first_booking" };
+  const obstacle = bookingObstacle(live);
+  if (obstacle) return { kind: "blocked", shipmentId: live.id, ...obstacle };
+  return {
+    kind: live.status === "BOOKING_FAILED" ? "retry" : "prepared",
+    shipmentId: live.id,
+  };
+}
+
+/**
+ * Whether one shipment's own record allows a booking attempt. The shipment
+ * page draws its Book control from this, and `bookPreparedShipment` refuses on
+ * the same states, so the button and the service answer together.
+ */
+export function shipmentMayBeBooked(facts: {
+  status: string;
+  providerShipmentId: string | null;
+}): boolean {
+  // `createdAt` is what `bookingObstacle` never reads — the caller here has
+  // already chosen the shipment — so the epoch stands in for "this one".
+  return bookingObstacle({ id: "", createdAt: new Date(0), ...facts }) === null;
+}
+
+/** How the queue colours an action badge. */
+export type QueueActionTone = "brand" | "warning" | "success" | "danger" | "muted";
+
+/**
+ * The one thing to do next, derived from what is stored on the order.
+ *
+ * Every branch reads a column that already exists — the seller's payment
+ * status, the newest shipment's status and its packed/handed timestamps, the
+ * tracking number — so the answer cannot disagree with the order page, and it
+ * updates the moment a carrier event or a booking lands. Nothing is inferred
+ * from `fulfillmentStatus`, which is Shopify's view and lags MoonVella's own
+ * booking by design.
+ *
+ * `to` is set only where the action IS a door: a prepared shipment's label is
+ * bought on the shipment page, a failed attempt is retried there (through the
+ * same prepared-shipment path), and an unknown outcome is reconciled there and
+ * nowhere else. A badge with no `to` is a statement — "Booking in progress" —
+ * not an invitation, because there is nothing safe to open a booking flow on.
+ */
+export interface QueueAction {
+  label: string;
+  tone: QueueActionTone;
+  to?: string;
+}
+
+export interface QueueOrderFacts {
+  state: string;
+  wholesalePaymentStatus: string;
+  shipment: (ShipmentMilestoneFacts & { id: string; trackingNumber: string | null; deliveredAt: Date | string | null }) | null;
+}
+
+export function nextQueueAction(order: QueueOrderFacts): QueueAction {
+  if (order.state === "CANCELLED") return { label: "Cancelled", tone: "muted" };
+
+  const shipment = order.shipment;
+
+  if (order.state === "DELIVERED" || shipment?.deliveredAt || shipment?.status === "DELIVERED") {
+    return { label: "Delivered", tone: "success" };
+  }
+
+  // Seller payment comes first: nothing may be booked until MoonVella has been
+  // paid, so pointing anywhere else would point past the actual blocker.
+  if (order.wholesalePaymentStatus !== "SUCCEEDED") {
+    return { label: "Collect seller payment", tone: "warning" };
+  }
+
+  if (!shipment || shipment.status === "CANCELLED") {
+    // No live shipment: the first label is bought on the order page, where the
+    // order's own quotes and parcels are.
+    return { label: "Select rate / book label", tone: "brand" };
+  }
+
+  if (shipment.status === "PENDING") {
+    // A prepared box has its own workflow — its parcels, its dock, its
+    // confirmation — and that lives on the shipment page.
+    return { label: "Select rate / book label", tone: "brand", to: `/admin/shipping/${shipment.id}` };
+  }
+
+  if (shipment.status === "BOOKING") {
+    // Offered as a statement, never as a door: a second booking is how an
+    // order gets two labels.
+    return { label: "Booking in progress", tone: "warning" };
+  }
+
+  if (shipment.status === "BOOKING_FAILED") {
+    // The attempt bought nothing, so the retry is safe — and it goes through
+    // the prepared-shipment path on the shipment page, which claims the row
+    // before asking the provider.
+    return { label: "Retry failed booking", tone: "danger", to: `/admin/shipping/${shipment.id}` };
+  }
+
+  if (shipment.status === "BOOKING_UNKNOWN") {
+    // A label may already exist. The only door is reconciliation.
+    return { label: "Reconcile booking", tone: "danger", to: `/admin/shipping/${shipment.id}` };
+  }
+
+  /*
+   * SHIPPED and EXCEPTION are carrier-side now: the carrier's own scans drive
+   * the rest, and the operator's job is to watch them. `handedToCarrierAt`
+   * belongs on this side of the test for the same reason, and it is checked
+   * before the BOOKED block: a parcel that has been handed over has LEFT,
+   * whatever its status column still says, and "buy another label" is the one
+   * answer that must never be given to it.
+   */
+  if (
+    shipment.handedToCarrierAt ||
+    shipment.trackingNumber ||
+    shipment.status === "SHIPPED" ||
+    shipment.status === "EXCEPTION"
+  ) {
+    return { label: "Carrier tracking", tone: "brand" };
+  }
+
+  if (shipment.status === "BOOKED") {
+    if (!shipment.packedAt) return { label: "Pack order", tone: "brand" };
+    return { label: "Hand to carrier", tone: "brand" };
+  }
+
+  return { label: "Select rate / book label", tone: "brand" };
+}

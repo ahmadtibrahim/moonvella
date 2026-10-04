@@ -516,6 +516,24 @@ const CHECKS = [
     file: "scripts/verify-booking.ts",
     requires: [],
   },
+  // The guard rails around a shipment's milestones and a booking: which
+  // warehouse events a shipment still accepts, why one is refused, whether a
+  // booking may start at all, and what the orders queue tells an operator to do
+  // about each state.
+  //
+  // It runs the same shared decision matrix the pages draw their controls from
+  // — as a pure table over every status, and against real rows through
+  // `advanceShipment` for the two events the dock performs. The fixtures carry
+  // no tracking number, which is what keeps the dispatch milestone off the
+  // network: `syncShipmentTracking` returns before building an admin client.
+  // Nothing is booked, fulfilled, cancelled or charged, and no eShipper,
+  // Shopify or Odoo request is made.
+  {
+    name: "shipment-guards",
+    kind: "ts",
+    file: "scripts/verify-shipment-guards.ts",
+    requires: [],
+  },
   // Phase C of the shipping work: the tracking vocabulary, the polling
   // schedule, the dispatch milestone and the pickup window.
   //

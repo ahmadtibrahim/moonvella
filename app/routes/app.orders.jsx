@@ -17,12 +17,7 @@ import { createSetupSession, getDefaultPaymentMethod } from "../services/sellerB
 import { shopifyAdminAppUrl } from "../services/shopifyNavigation.server";
 import { MONEY_CLEARED, IllegalTransitionError } from "../services/orderState.server";
 import { authenticate } from "../shopify.server";
-import {
-  FULFILLMENT_SCOPES,
-  readFulfillmentScopes,
-  forgetFulfillmentScopes,
-  reauthorizeUrl,
-} from "../services/shopifyScopes.server";
+import { readFulfillmentScopes, forgetFulfillmentScopes } from "../services/shopifyScopes.server";
 
 /**
  * The seller's own orders: what MoonVella is shipping for them, what it is
@@ -528,24 +523,30 @@ export const action = async ({ request }) => {
   const intent = String(form.get("intent") || "");
 
   /*
-   * GRANTING A PERMISSION IS NOT SPENDING MONEY, so it sits above the BUSINESS
-   * gate rather than behind it, with the `VIEW` floor the loader already uses.
-   * The two scopes are what MoonVella needs to ship an order at all; a store
-   * whose orders are read-only still owns the decision about what this app may
-   * do in its Shopify admin, and a store that is blocked is refused here the
-   * same as everywhere else.
+   * CHECKING FOR A PERMISSION IS NOT SPENDING MONEY, so it sits above the
+   * BUSINESS gate rather than behind it, with the `VIEW` floor the loader
+   * already uses. The two scopes are what MoonVella needs to ship an order at
+   * all; a store whose orders are read-only still owns the decision about what
+   * this app may do in its Shopify admin, and a store that is blocked is
+   * refused here the same as everywhere else.
    *
-   * IT IS THE BUTTON THAT ASKS, NEVER A LOADER. That is the whole reason this
-   * is an intent rather than something the page does on render: a page that
-   * requested scopes whenever it noticed they were missing would send a
-   * merchant to the grant screen again on every load — which is the loop this
-   * app has already spent ten hours inside once. Pressing the button is the
-   * only thing that starts this, and `scopes.request` is itself guarded: it
-   * asks Shopify what is granted and returns without redirecting when the
-   * answer is already yes, so a second press is a no-op rather than a second
-   * trip through the grant screen.
+   * THIS INTENT READS; IT DOES NOT ASK. It used to call `scopes.request()` to
+   * make Shopify widen the grant, and that call is gone because it cannot work:
+   * the two scopes are REQUIRED installation scopes, and Shopify permits a
+   * dynamic `scopes.request()` only for scopes declared as OPTIONAL. An
+   * installed store approves newly required scopes through Shopify's own
+   * managed installation / reauthorization flow, which belongs to Shopify and
+   * the Partner Dashboard and is not drivable from inside an app. What is left
+   * for this page is to tell the merchant the permissions are missing, point
+   * them at that flow, and let them re-read the answer afterwards.
+   *
+   * IT IS STILL A BUTTON, NEVER A LOADER. A page that read scopes whenever it
+   * rendered would put a Shopify Admin API call on the layout's 30-second
+   * revalidation timer for as long as anyone leaves the tab open — which is why
+   * the read is cached at all, and why the one moment freshness matters is
+   * handled here instead: the cache is dropped, then Shopify is asked again.
    */
-  if (intent === "grant_fulfillment_scopes") {
+  if (intent === "recheck_fulfillment_scopes") {
     try {
       await requireMerchantAccess(request, "VIEW");
     } catch (error) {
@@ -556,70 +557,26 @@ export const action = async ({ request }) => {
     }
 
     const { scopes, session } = await authenticate.admin(request);
-    // Dropped before the ask, because the ask usually ends in a redirect out of
-    // the app: whatever the merchant sees when Shopify sends them back must not
-    // be a cached "still missing" that outlives the approval.
+    // Dropped before the read, never after: the merchant presses this button
+    // precisely because they have just approved, and a cached "still missing"
+    // is the one answer that would make the button look broken.
     forgetFulfillmentScopes(session.shop);
+    const state = await readFulfillmentScopes(session.shop, scopes);
 
-    /*
-     * `scopes.request` THROWS WHEN EITHER SCOPE IS ABSENT — a 401 carrying
-     * `X-Shopify-API-Request-Failure-Reauthorize-Url`, the url of Shopify's
-     * grant screen. That throw is the library's mechanism and it is kept; what
-     * is added is the transport, because the throw alone only works for a
-     * request that App Bridge's patched `fetch` is on the path of.
-     *
-     * IT WAS NOT ON THE PATH OF THE MERCHANT'S, and the failure was silent in
-     * the worst way: the 401 came back to React Router instead of to App
-     * Bridge, React Router did the only thing it can with an error response,
-     * and the iframe printed "401 Unauthorized" where the merchant expected
-     * Shopify's consent screen. Nothing logged an error, because nothing went
-     * wrong — the response simply reached the wrong consumer.
-     *
-     * So the url is taken out of the throw and handed back as a value the page
-     * can act on. The route answers with the url, and the page opens it in the
-     * TOP window. A 401 cannot be rendered, because none is ever returned.
-     *
-     * THERE IS DELIBERATELY ONLY ONE PATH HERE, and the second one was tried and
-     * removed. The library's own answer for a document submission is
-     * `redirect(grantUrl, { target: "_top" })`, which for an embedded request
-     * returns the App Bridge bounce document — an HTML page that loads App
-     * Bridge and calls `window.open(<grant url>, "_top")`. That is a 200 whose
-     * body is HTML, and React Router 7 does not have a "return this document
-     * verbatim" case for an action: a thrown Response that is not a redirect is
-     * an ERROR, so React Router routed it to the error boundary and rendered the
-     * bounce document's script source as text inside an error card. The merchant
-     * would have seen `<script>window.open(...)</script>` printed on the page.
-     * It reached the grant screen anyway — the script still ran — but that is
-     * luck, not design.
-     *
-     * The one path covers both transports better than the two did. A submission
-     * from the running page is a fetch to `/app/orders.data` and gets this JSON
-     * directly. A submission the browser posted itself (scripts not yet running,
-     * e.g. a click before hydration) gets the app's document rendered with this
-     * same JSON as its action data, and the page's effect opens the grant screen
-     * as soon as that document hydrates — same destination, no error card, and
-     * no dependence on a bounce document this framework will not serve.
-     */
-    try {
-      await scopes.request([...FULFILLMENT_SCOPES]);
-    } catch (thrown) {
-      const grantUrl = reauthorizeUrl(thrown);
-      if (!grantUrl) throw thrown;
-
+    if (state.missing.length > 0) {
       return Response.json({
         ok: false,
-        grantUrl,
-        // See the effect in the component: the url alone cannot tell one press
-        // from the next, and this is what the page opens the grant screen on.
-        grantAsk: Date.now(),
-        message: "Shopify needs your approval for two permissions before MoonVella can ship orders.",
+        granted: false,
+        missing: state.missing,
+        message: `Shopify still reports ${state.missing.join(" and ")} as not granted. Approve the newly required permissions from your Shopify admin, then check again.`,
       });
     }
 
     return Response.json({
       ok: true,
       granted: true,
-      message: "Shopify has already granted MoonVella both fulfillment permissions.",
+      missing: [],
+      message: "Shopify has granted MoonVella both fulfillment permissions.",
     });
   }
 
@@ -834,32 +791,6 @@ export default function OrdersPage() {
     if (url) window.open(url, "_top");
   }, [actionData]);
 
-  /*
-   * SHOPIFY'S GRANT SCREEN, BY THE SAME HOP AND FOR THE SAME REASON.
-   *
-   * The grant action cannot answer a script with the 401 that App Bridge reads,
-   * because that response is only interpreted by App Bridge's patched `fetch` —
-   * and when it is not on the path, React Router renders the 401 into the frame
-   * instead of anyone being asked for anything. So the action returns the url
-   * and this opens it in the top window: the same navigation the library's own
-   * bounce document performs, without depending on a page load to perform it.
-   *
-   * KEYED ON THE ASK, NOT ON THE URL. The url is the same string every time —
-   * same client id, same scopes — so an effect that depended on it would fire
-   * once and never again: a merchant who declined and pressed the button a
-   * second time would get nothing, which is a worse bug than the one being
-   * fixed. Depending on `actionData` instead is the same trap from the other
-   * side, because action data outlives a revalidation and the layout polls
-   * every thirty seconds. So the action stamps each ask and this fires on the
-   * stamp: exactly once per press, never on a poll.
-   */
-  const grantAsk = actionData?.grantAsk;
-  const grantUrl = actionData?.grantUrl;
-  React.useEffect(() => {
-    if (!grantAsk || !grantUrl) return;
-    window.open(grantUrl, "_top");
-  }, [grantAsk, grantUrl]);
-
   if (!canViewOrders) {
     return (
       <s-page heading="Orders">
@@ -908,20 +839,22 @@ export default function OrdersPage() {
   );
 
   /*
-   * THE ONE PLACE THAT ASKS SHOPIFY FOR THE TWO SCOPES.
+   * THE ONE PLACE THAT SAYS THE TWO REQUIRED PERMISSIONS ARE MISSING.
    *
    * Shown only when the loader has read, from Shopify, that one of them is
-   * absent — and shown as a BUTTON rather than performed when the page loads.
-   * That is the difference between a permission screen the merchant sees once
-   * and the ten-hour loop this app has already been through: a page that asked
-   * whenever it noticed the scopes were missing would send them back to the
-   * grant screen on every single load, and a merchant who declined would be
-   * asked again forever. Nothing else on this page starts this request.
+   * absent — and it opens no grant screen of its own, because there is none to
+   * open: the two are required installation scopes, Shopify only accepts a
+   * dynamic `scopes.request()` for optional ones, and the approval happens in
+   * Shopify's managed installation / reauthorization flow rather than on a page
+   * this app can navigate anyone to. So the card does the two things that are
+   * actually available: it tells the merchant which permissions are newly
+   * required and where approval happens, and it lets them re-read the answer
+   * once they have approved.
    *
-   * The scope handles are named because Shopify's own grant screen names them,
-   * and a merchant who is about to read "write_fulfillments" on Shopify's page
-   * should have met the word here first rather than in a list of permissions
-   * they cannot connect to anything.
+   * The scope handles are named because Shopify's own approval screen names
+   * them, and a merchant who is about to read "write_fulfillments" on Shopify's
+   * page should have met the word here first rather than in a list of
+   * permissions they cannot connect to anything.
    */
   const missingScopes = fulfillmentScopes?.missing ?? [];
   const grantPermissions =
@@ -938,24 +871,25 @@ export default function OrdersPage() {
           This store was installed before MoonVella required the{" "}
           <strong>{missingScopes.join(" and ")}</strong>{" "}
           {missingScopes.length === 1 ? "permission" : "permissions"}, and Shopify does not widen an
-          existing grant on its own. Until the newly required permissions are approved, MoonVella
-          cannot create the location its stock ships from or send a fulfillment, so orders cannot be
-          completed. Shopify will ask you to approve them on its own page.
+          existing grant on its own. The newly required permissions are approved in Shopify&apos;s
+          own app-update flow — open MoonVella in your Shopify admin and follow the prompt to
+          approve the new permissions. Until they are granted, MoonVella cannot create the location
+          its stock ships from or send a fulfillment, so orders cannot be completed.
         </p>
         <Form method="post">
-          <input type="hidden" name="intent" value="grant_fulfillment_scopes" />
+          <input type="hidden" name="intent" value="recheck_fulfillment_scopes" />
           <button type="submit" className="mv-btn mv-btn-primary" disabled={busy}>
-            Grant fulfillment permissions
+            Check again
           </button>
         </Form>
       </div>
     ) : null;
 
   /*
-   * What the grant action says when it did NOT have to redirect — Shopify
-   * already held both. The redirect path never reaches this page at all: the
-   * merchant leaves for Shopify's grant screen and comes back through the
-   * admin, which is a fresh load of this loader with a fresh read.
+   * What the re-check action answers: either "still missing" with the handles
+   * Shopify reports, or "granted". Rendered as a plain notice — there is no
+   * navigation left for this page to perform, so nothing here has to be
+   * transport-shaped.
    */
   const grantNotice = actionData?.message ? (
     <div className="mv-alert-banner" role="status">

@@ -1,7 +1,7 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
 import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./shipping.server";
-import { isFulfillmentMilestone } from "./shippingLogic";
+import { advanceRefusal, isFulfillmentMilestone, PACKABLE_STATES } from "./shippingLogic";
 import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
 import { parcelProblems, ParcelValidationError } from "./packaging.server";
 import { isFulfillmentUnlocked } from "./orderState.server";
@@ -128,6 +128,16 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
  * Advance a shipment through the physical lifecycle. The schema only stores a
  * coarse ShipmentStatus, so intermediate states are represented by their
  * timestamps (packed -> handed to carrier -> shipped -> in transit).
+ *
+ * EVERY MOVEMENT IS VALIDATED AGAINST THE SHIPMENT'S OWN RECORD FIRST, and the
+ * warehouse's two events are then claimed with a CONDITIONAL write. Both halves
+ * exist because the failure they prevent is silent: a stale tab re-posting
+ * "handed to carrier" would otherwise drag an EXCEPTION back to SHIPPED, a
+ * double click would re-stamp a milestone, and a forged post could mark a
+ * cancelled shipment packed. `advanceRefusal` is the same matrix the buttons
+ * are drawn from, so a control that exists is a movement the server accepts;
+ * the conditional update closes the gap between the read and the write, where
+ * two operators can both have read "not packed yet".
  */
 export async function advanceShipment(
   shipmentId: string,
@@ -135,6 +145,14 @@ export async function advanceShipment(
   actor: Actor,
   opts?: { notifyCustomer?: boolean }
 ) {
+  const before = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    select: { id: true, status: true, packedAt: true, handedToCarrierAt: true },
+  });
+  if (!before) throw new Error("Shipment not found.");
+  const refusal = advanceRefusal(before, event);
+  if (refusal) throw new Error(refusal);
+
   const now = new Date();
   const data =
     event === "packed"
@@ -149,7 +167,30 @@ export async function advanceShipment(
               ? { status: "DELIVERED" as const, deliveredAt: now }
               : { status: "EXCEPTION" as const, exceptionAt: now };
 
-  const shipment = await prisma.shipment.update({ where: { id: shipmentId }, data });
+  let shipment;
+  if (event === "packed" || event === "handed_to_carrier") {
+    /*
+     * The claim, not a blind write. Each event states the exact record it is
+     * allowed to move — for packing, still unpacked; for handoff, packed and
+     * still here — and a count of zero means the row moved between the read
+     * above and this write, so the request is refused rather than replayed.
+     */
+    const claimed = await prisma.shipment.updateMany({
+      where:
+        event === "packed"
+          ? { id: shipmentId, status: { in: [...PACKABLE_STATES] }, packedAt: null, handedToCarrierAt: null }
+          : { id: shipmentId, status: "BOOKED", packedAt: { not: null }, handedToCarrierAt: null },
+      data,
+    });
+    if (claimed.count === 0) {
+      throw new Error(
+        "This shipment changed while the page was open — reload it before recording the milestone again."
+      );
+    }
+    shipment = await prisma.shipment.findUniqueOrThrow({ where: { id: shipmentId } });
+  } else {
+    shipment = await prisma.shipment.update({ where: { id: shipmentId }, data });
+  }
 
   if (event === "delivered") {
     await prisma.order.update({ where: { id: shipment.orderId }, data: { fulfillmentStatus: "DELIVERED" } });
@@ -310,6 +351,11 @@ export async function createPackingShipment(
 export async function markShipmentPacked(shipmentId: string, actor: Actor) {
   const before = await prisma.shipment.findUnique({ where: { id: shipmentId } });
   if (!before) throw new Error("Shipment not found.");
+  // The same matrix `advanceShipment` enforces: packing is recorded once, and
+  // never on a shipment the carrier's record already owns (or one that was
+  // cancelled), whichever screen asks.
+  const refusal = advanceRefusal(before, "packed");
+  if (refusal) throw new Error(refusal);
   const shipment = await prisma.shipment.update({
     where: { id: shipmentId },
     data: { packedAt: before.packedAt ?? new Date() },
