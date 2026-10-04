@@ -8,7 +8,10 @@
  *     SHIPPED, so the carrier's own exception disappeared from the record of a
  *     parcel that was in trouble.
  *   - A double click re-stamped a milestone, so "packed at" became the moment
- *     somebody clicked twice rather than the moment the box was taped.
+ *     somebody clicked twice rather than the moment the box was taped. The
+ *     packing page's own control was the worst of it: it read the row, decided,
+ *     and then wrote unconditionally, so two requests that overlapped both won.
+ *     §6 drives that race with two real concurrent calls.
  *   - The order page offered a booking for an order that already had a booked
  *     label. `bookShipmentForOrder` answered with its idempotency record and
  *     retried nothing, so the button looked like a retry and did nothing —
@@ -665,6 +668,90 @@ async function refusalsAgainstRows() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* §6 Two packing requests at once — the race the claim exists for              */
+/* -------------------------------------------------------------------------- */
+
+async function concurrentPackingChecks() {
+  console.log("\n-- two packing requests at once --");
+
+  /*
+   * THE RACE, DRIVEN FOR REAL. Both promises are started before either is
+   * awaited, which is what a double submit, or two operators on two screens,
+   * looks like from the database. The old implementation — read, decide, write
+   * unconditionally — passed both reads and wrote twice; the packing page now
+   * goes through `advanceShipment`, whose conditional UPDATE re-checks
+   * `packedAt: null` after taking the row lock, so the second writer matches
+   * zero rows before it writes or records anything.
+   *
+   * WHICH REFUSAL THE LOSER GETS IS TIMING, and the check accepts both, because
+   * both are correct: if the loser's read happened before the winner's write it
+   * fails the claim ("changed while the page was open"), and if it happened after
+   * it fails the read ("already recorded"). What is NOT timing — and what the
+   * checks below hold to — is that one caller succeeds, the stored moment is the
+   * one that caller wrote, and the trail gains a single event.
+   */
+  const shipment = await createShipment("PENDING");
+  const results = await Promise.allSettled([
+    markShipmentPacked(shipment.id, ACTOR),
+    markShipmentPacked(shipment.id, ACTOR),
+  ]);
+
+  type PackedShipment = Awaited<ReturnType<typeof markShipmentPacked>>;
+  const fulfilled = results.filter(
+    (result): result is PromiseFulfilledResult<PackedShipment> => result.status === "fulfilled"
+  );
+  const refused = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  const refusalText = refused.length
+    ? refused[0].reason instanceof Error
+      ? refused[0].reason.message
+      : String(refused[0].reason)
+    : "";
+
+  check(
+    "exactly one of two concurrent packing requests succeeds",
+    fulfilled.length === 1 && refused.length === 1,
+    `${fulfilled.length} succeeded, ${refused.length} refused`
+  );
+  check(
+    "the other is refused as a stale or a repeated milestone",
+    /changed while the page was open|already recorded/.test(refusalText),
+    refusalText ? refusalText.slice(0, 80) : "NOT REFUSED"
+  );
+
+  const after = await reload(shipment.id);
+  const winnerStamp = fulfilled.length === 1 ? fulfilled[0].value.packedAt : null;
+  check(
+    "packedAt is written once, and it is the winner's stamp",
+    after.packedAt !== null && winnerStamp !== null && after.packedAt.getTime() === winnerStamp.getTime(),
+    after.packedAt ? after.packedAt.toISOString() : "not packed"
+  );
+
+  const auditRows = await prisma.auditLog.count({
+    where: { action: "shipment.packed", entityId: shipment.id },
+  });
+  check("exactly one packing audit event is recorded", auditRows === 1, `${auditRows} rows`);
+
+  /* A third attempt cannot move the moment or add a second event. */
+  let thirdRefusal = "";
+  try {
+    await markShipmentPacked(shipment.id, ACTOR);
+  } catch (error) {
+    thirdRefusal = error instanceof Error ? error.message : String(error);
+  }
+  const settled = await reload(shipment.id);
+  const auditAfterThird = await prisma.auditLog.count({
+    where: { action: "shipment.packed", entityId: shipment.id },
+  });
+  check(
+    "a later attempt cannot re-stamp a box the race already packed",
+    thirdRefusal.length > 0 &&
+      settled.packedAt?.getTime() === after.packedAt?.getTime() &&
+      auditAfterThird === 1,
+    thirdRefusal ? thirdRefusal.slice(0, 70) : "NOT REFUSED"
+  );
+}
+
+/* -------------------------------------------------------------------------- */
 /* Cleanup                                                                     */
 /* -------------------------------------------------------------------------- */
 
@@ -697,6 +784,7 @@ async function main() {
   bookingGateChecks();
   queueActionChecks();
   await refusalsAgainstRows();
+  await concurrentPackingChecks();
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   return failures;

@@ -95,8 +95,6 @@ function money(cents: number, currency = "CAD") {
   return `${(cents / 100).toFixed(2)} ${currency}`;
 }
 
-type QueueOrder = Awaited<ReturnType<typeof loader>>["orders"][number];
-
 const NEXT_ACTION_CLASS: Record<QueueAction["tone"], string> = {
   brand: "mv-badge mv-badge-brand",
   warning: "mv-badge mv-badge-warning",

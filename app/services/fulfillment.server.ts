@@ -347,32 +347,27 @@ export async function createPackingShipment(
   return shipment;
 }
 
-/** Stamp packedAt on a packing shipment without shipping it. */
+/**
+ * Stamp packedAt on a packing shipment without shipping it — the packing page's
+ * own door.
+ *
+ * IT IS `advanceShipment`, not a second implementation of it. This function used
+ * to read the row, ask `advanceRefusal`, and then write UNCONDITIONALLY: two
+ * operators on two screens, or one operator double-clicking, both read "not
+ * packed yet", both passed the check, both wrote a `packedAt` and both recorded
+ * an audit event — so "packed at" became the moment somebody clicked twice, and
+ * the trail showed one box packed twice. The read cannot be the claim. The
+ * conditional write in `advanceShipment` states the exact row it may move
+ * (`packedAt: null`, no handover, a packable status) and refuses the loser with
+ * the stale-milestone message, and the audit event is recorded exactly once
+ * because exactly one caller gets past the claim.
+ *
+ * The name stays because the packing page reads it as its own action, and
+ * because routing it here is the guarantee: whichever screen asks, "packed" has
+ * one definition and one writer.
+ */
 export async function markShipmentPacked(shipmentId: string, actor: Actor) {
-  const before = await prisma.shipment.findUnique({ where: { id: shipmentId } });
-  if (!before) throw new Error("Shipment not found.");
-  // The same matrix `advanceShipment` enforces: packing is recorded once, and
-  // never on a shipment the carrier's record already owns (or one that was
-  // cancelled), whichever screen asks.
-  const refusal = advanceRefusal(before, "packed");
-  if (refusal) throw new Error(refusal);
-  const shipment = await prisma.shipment.update({
-    where: { id: shipmentId },
-    data: { packedAt: before.packedAt ?? new Date() },
-  });
-  await recordAudit({
-    actorType: actor.actorType ?? "ADMIN_USER",
-    actorId: actor.actorId,
-    actorName: actor.actorName,
-    action: "shipment.packed",
-    entityType: AUDIT_ENTITY.SHIPMENT,
-    entityId: shipmentId,
-    beforeData: { packedAt: before.packedAt },
-    afterData: { packedAt: shipment.packedAt, orderId: shipment.orderId },
-    ipAddress: actor.ipAddress,
-    userAgent: actor.userAgent,
-  });
-  return shipment;
+  return advanceShipment(shipmentId, "packed", actor);
 }
 
 /** Mark every populated pending shipment as packed and the order ready to ship. */

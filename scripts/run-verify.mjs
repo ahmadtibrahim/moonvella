@@ -522,8 +522,10 @@ const CHECKS = [
   // about each state.
   //
   // It runs the same shared decision matrix the pages draw their controls from
-  // — as a pure table over every status, and against real rows through
-  // `advanceShipment` for the two events the dock performs. The fixtures carry
+  // — as a pure table over every status, against real rows through
+  // `advanceShipment` for the two events the dock performs, and as two packing
+  // requests issued at once, to prove the milestone is claimed by one caller
+  // rather than written by both. The fixtures carry
   // no tracking number, which is what keeps the dispatch milestone off the
   // network: `syncShipmentTracking` returns before building an admin client.
   // Nothing is booked, fulfilled, cancelled or charged, and no eShipper,
