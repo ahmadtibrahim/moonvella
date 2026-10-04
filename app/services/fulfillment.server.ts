@@ -370,40 +370,17 @@ export async function markShipmentPacked(shipmentId: string, actor: Actor) {
   return advanceShipment(shipmentId, "packed", actor);
 }
 
-/** Mark every populated pending shipment as packed and the order ready to ship. */
-export async function markOrderReadyToShip(orderId: string, actor: Actor) {
-  const order = await prisma.order.findUnique({ where: { id: orderId } });
-  if (!order) throw new Error("Order not found.");
-  const pending = await prisma.shipment.findMany({
-    where: { orderId, status: "PENDING" },
-    include: { items: true },
-  });
-  const populated = pending.filter((s) => s.items.length > 0);
-  if (populated.length === 0) throw new Error("Create a packing shipment with items before marking ready to ship.");
-
-  const now = new Date();
-  await prisma.$transaction([
-    ...populated.map((s) =>
-      prisma.shipment.update({ where: { id: s.id }, data: { packedAt: s.packedAt ?? now } })
-    ),
-    prisma.order.update({ where: { id: orderId }, data: { fulfillmentStatus: "PROCESSING" } }),
-  ]);
-
-  await recordAudit({
-    actorType: actor.actorType ?? "ADMIN_USER",
-    actorId: actor.actorId,
-    actorName: actor.actorName,
-    action: "shipment.ready_to_ship",
-    entityType: AUDIT_ENTITY.ORDER,
-    entityId: orderId,
-    beforeData: { fulfillmentStatus: order.fulfillmentStatus },
-    afterData: { fulfillmentStatus: "PROCESSING", packedShipments: populated.map((s) => s.id) },
-    ipAddress: actor.ipAddress,
-    userAgent: actor.userAgent,
-  });
-
-  return { packed: populated.length };
-}
+/*
+ * THERE IS NO BULK "MARK READY TO SHIP" HERE, and there was. It swept every
+ * populated PENDING shipment into a `$transaction` of unconditional updates —
+ * `packedAt: s.packedAt ?? now` — with the order moved to PROCESSING behind it.
+ * That is the bypass the milestone rule forbids: no `advanceRefusal`, no
+ * conditional claim, one order-level audit row standing in for N packing events
+ * that no per-shipment record ever saw, and a status that said "ready" whether
+ * or not the boxes existed. Packing is recorded one parcel at a time, by the
+ * person holding it, through `advanceShipment` — which is also the only writer
+ * of `packedAt` on an existing shipment.
+ */
 
 export interface OrderPackageInput {
   count: number;

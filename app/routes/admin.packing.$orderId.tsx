@@ -6,7 +6,6 @@ import { getVariantPackages, toCm, toKg } from "~/services/packaging.server";
 import {
   createPackingShipment,
   markShipmentPacked,
-  markOrderReadyToShip,
   deletePackingShipment,
 } from "~/services/fulfillment.server";
 import { availableWarehouseEvents } from "~/services/shippingLogic";
@@ -141,8 +140,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await markShipmentPacked(String(form.get("shipmentId")), actor);
     } else if (intent === "delete_packing") {
       await deletePackingShipment(String(form.get("shipmentId")), actor);
-    } else if (intent === "mark_ready") {
-      await markOrderReadyToShip(orderId, actor);
     } else {
       throw new Error("Unknown action.");
     }
@@ -162,7 +159,6 @@ export default function AdminPacking() {
   const actionData = useActionData<typeof action>();
   const totalOrdered = items.reduce((s, i) => s + i.quantity, 0);
   const totalPacked = items.reduce((s, i) => s + i.packed, 0);
-  const hasPending = shipments.some((s) => s.status === "PENDING");
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
@@ -339,11 +335,7 @@ export default function AdminPacking() {
             </div>
           ))
         )}
-        <Form method="post" style={{ marginTop: "0.5rem" }}>
-          <input type="hidden" name="intent" value="mark_ready" />
-          <button type="submit" style={btn("#082a4a")} disabled={!hasPending}>Mark ready to ship</button>
-        </Form>
-        <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.4rem" }}>
+        <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.5rem" }}>
           Booking a carrier label and pushing Shopify fulfillment happens on the order page. Shopify sync reports NOT_CONFIGURED until a fulfillment order is resolved.
         </p>
       </div>

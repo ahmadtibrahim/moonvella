@@ -82,6 +82,33 @@ function appSources() {
   return out;
 }
 
+/**
+ * The argument text of every `needle(...)` call in a source, read with a
+ * balanced-paren scan rather than a regex — nested calls, a `)` inside a string
+ * and a bracket inside a template literal are exactly what a regex gets wrong,
+ * and these rules are about what is INSIDE the call.
+ */
+function callArgs(source, needle) {
+  const out = [];
+  for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
+    let i = at + needle.length;
+    let depth = 1;
+    let args = "";
+    while (i < source.length && depth > 0) {
+      const ch = source[i];
+      if (ch === "(") depth += 1;
+      else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      args += ch;
+      i += 1;
+    }
+    out.push(args);
+  }
+  return out;
+}
+
 const ordersQueue = read("app/routes/admin.orders.tsx");
 const shippingLogic = read("app/services/shippingLogic.ts");
 const orderPage = read("app/routes/admin.orders_.$id.tsx");
@@ -218,6 +245,59 @@ check(
   "the packing page's own Mark packed control is drawn from the same matrix the server enforces",
   packingPage.includes('availableWarehouseEvents(s).includes("packed")') &&
     packingPage.includes("handedToCarrierAt: s.handedToCarrierAt"),
+);
+check(
+  "the packing page offers one parcel at a time and no bulk ready-to-ship sweep",
+  packingPage.includes('value="mark_packed"') &&
+    !packingPage.includes("mark_ready") &&
+    !packingPage.includes("Mark ready to ship") &&
+    !packingPage.includes("hasPending") &&
+    !/prisma\.[a-zA-Z]+\.(update|updateMany|create|delete|upsert)\(/.test(packingPage),
+);
+check(
+  "the bulk ready-to-ship service is gone, not merely unwired",
+  !read("app/services/fulfillment.server.ts").includes("markOrderReadyToShip") &&
+    !read("app/services/fulfillment.server.ts").includes('action: "shipment.ready_to_ship"'),
+);
+check(
+  "no shipment update writes packedAt outside the atomic milestone claim, and the detector can fail",
+  (() => {
+    /*
+     * Only the DATA payload counts as a write. A `where: { packedAt: null }` is
+     * the atomic claim STATING which row it may take — the guard itself — and a
+     * detector that flagged it would forbid the very code this rule exists to
+     * protect. Prisma's argument order makes the last `data:` the payload.
+     */
+    const writesPackedAt = (args) => {
+      const at = args.lastIndexOf("data:");
+      return at !== -1 && /packedAt\s*:/.test(args.slice(at));
+    };
+    const offenders = (source) =>
+      callArgs(source, "shipment.update(")
+        .concat(callArgs(source, "shipment.updateMany("))
+        .filter(writesPackedAt);
+    // The fixture is the call that WAS there, verbatim: `markOrderReadyToShip`
+    // swept every pending parcel into one of these. A detector that cannot flag
+    // the code it was written for cannot flag anything.
+    //
+    // The scan reads comments-stripped sources, so the paragraph in
+    // `fulfillment.server.ts` explaining that removal — which quotes the call —
+    // is not a hit. A CREATE is deliberately out of scope: `addManualShipment`
+    // records a parcel that shipped outside the system with all of its
+    // milestones at once, which is a different act from packing a box here.
+    const selfTest =
+      offenders("await prisma.shipment.update({ where: { id: s.id }, data: { packedAt: s.packedAt ?? now } });")
+        .length === 1 &&
+      offenders("await prisma.shipment.update({ where: { id: s.id }, data: { handedToCarrierAt: now } });")
+        .length === 0 &&
+      // ...and it must NOT fire on the milestone claim's own shape, where the
+      // condition names packedAt but the payload is passed as a value.
+      offenders(
+        'await prisma.shipment.updateMany({ where: { id, status: { in: [...PACKABLE_STATES] }, packedAt: null, handedToCarrierAt: null }, data });'
+      ).length === 0;
+    const live = appSources().filter((source) => offenders(source).length > 0);
+    return selfTest && live.length === 0;
+  })(),
 );
 check(
   "a second booking cannot be started from the order page",
@@ -357,28 +437,11 @@ check(
     // this is the stage that declares them required: Shopify accepts a dynamic
     // `scopes.request()` only for OPTIONAL scopes, so naming a required one is
     // a call that cannot succeed.
-    const offending = (source) => {
-      const needle = "scopes.request(";
-      const hits = [];
-      for (let at = source.indexOf(needle); at !== -1; at = source.indexOf(needle, at + 1)) {
-        let i = at + needle.length;
-        let depth = 1;
-        let args = "";
-        while (i < source.length && depth > 0) {
-          const ch = source[i];
-          if (ch === "(") depth += 1;
-          else if (ch === ")") {
-            depth -= 1;
-            if (depth === 0) break;
-          }
-          args += ch;
-          i += 1;
-        }
-        if (/FULFILLMENT_SCOPES/.test(args)) hits.push(args.trim());
-        for (const scope of requiredScopes) if (args.includes(`"${scope}"`)) hits.push(args.trim());
-      }
-      return hits;
-    };
+    const offending = (source) =>
+      callArgs(source, "scopes.request(").filter(
+        (args) =>
+          /FULFILLMENT_SCOPES/.test(args) || requiredScopes.some((scope) => args.includes(`"${scope}"`)),
+      );
     const selfTest =
       offending('await scopes.request(["write_fulfillments"]);').length === 1 &&
       offending("await scopes.request([...FULFILLMENT_SCOPES]);").length === 1 &&

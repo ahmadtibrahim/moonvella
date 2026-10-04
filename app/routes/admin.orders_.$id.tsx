@@ -805,6 +805,9 @@ const ACTIVITY_TEXT: Record<string, string> = {
   "shipment.created": "Shipment created",
   "shipment.packed": "Parcel marked packed",
   "shipment.handed_to_carrier": "Parcel handed to the carrier",
+  // Historic only: the bulk ready-to-ship action is gone and nothing writes
+  // this any more, but the audit rows it left behind are append-only and still
+  // have to read as something.
   "shipment.ready_to_ship": "Parcel marked ready to ship",
   "shipment.packing_created": "Packing shipment created",
 };
