@@ -34,6 +34,7 @@ import {
   bookPreparedShipment,
   bookShipmentForOrder,
   cancelPickupForShipment,
+  getQuotesForOrder,
   invalidateQuotes,
   packagesForShipment,
   recipientPhoneFor,
@@ -56,10 +57,21 @@ import {
 } from "../app/services/addressValidation.server";
 import { acceptBookingAddresses, recordVerdict } from "./verify-address-fixtures";
 import { intakeOrder } from "../app/services/orderIntake.server";
-import { packingListFor, parseAddressLines, renderPackingList, renderPackingSlipPdf } from "../app/services/packingList.server";
+import { packingListFor, packingStatusLine, parseAddressLines, renderPackingList, renderPackingSlipPdf } from "../app/services/packingList.server";
 import { orderProgress, shipmentProgress } from "../app/services/orderProgress.server";
 import type { ProgressInput, ProgressShipment, ProgressStage } from "../app/services/orderProgress.server";
-import { eshipperMode } from "../app/services/eshipper.server";
+import { describeEshipperStatus, eshipperMode, eshipperStatus } from "../app/services/eshipper.server";
+import {
+  DEFAULT_TIME_ZONE,
+  addDays,
+  closedOn,
+  localPartsAt,
+  parseWorkingDays,
+  pickupDateReasons,
+  weekdayOf,
+  zoneOf,
+} from "../app/services/holidays";
+import type { LocationSchedule } from "../app/services/holidays";
 import { JOB_KIND } from "../app/services/jobs.server";
 
 let failures = 0;
@@ -1002,6 +1014,122 @@ async function bookingOutcomeChecks() {
     );
   }
 
+  /* --- the company fields the provider requires --------------------------- */
+  /*
+   * A SAVE WITH NO COMPANY IS REFUSED, and the refusal arrives as an HTTP 400
+   * naming `quoteRequest.from.company` / `quoteRequest.to.company` — after the
+   * operator has chosen a rate and pressed the button that was supposed to buy
+   * the label. It reached a real booking attempt that way.
+   *
+   * These read the SAVE, which is the request that describes the shipment: the
+   * purchase that follows carries no body at all, because the draft it names
+   * already holds the addresses. So the draft is where the companies have to be
+   * right, and that is where they are read.
+   *
+   * THE TWO ENDS ARE DIFFERENT FACTS and are checked apart. On the pickup end
+   * the company is the DOCK's business and the attention is the person a driver
+   * asks for; a payload that sent the contact name in both would print a label
+   * collected from a person rather than a business, which is what the provider's
+   * two fields exist to distinguish.
+   */
+  {
+    const { order, shipment, quote, origin } = await createBookableOrder(seller.id, "company");
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        shippingAddress: JSON.stringify({
+          name: "Verify Customer",
+          company: "Ottawa Demo Retail Inc.",
+          phone: "(416) 555-0142",
+          address1: "1 Test Street",
+          city: "Ottawa",
+          province: "ON",
+          province_code: "ON",
+          zip: "K1P 1J1",
+          country: "Canada",
+          country_code: "CA",
+        }),
+      },
+    });
+    responder = () => ({ status: 200, body: BOOKED_BODY("company") });
+    providerCalls = [];
+    await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+
+    const body = savedRequest() as
+      | { from?: { company?: string; attention?: string }; to?: { company?: string; attention?: string } }
+      | undefined;
+    check(
+      "the pickup company on the wire is the dock's business",
+      body?.from?.company === origin?.location.name,
+      `from.company=${JSON.stringify(body?.from?.company)} dock=${JSON.stringify(origin?.location.name)}`
+    );
+    check(
+      "...and the pickup attention is still the person a driver asks for",
+      body?.from?.attention === origin?.location.contactName,
+      `from.attention=${JSON.stringify(body?.from?.attention)}`
+    );
+    check(
+      "the customer's own company reaches the wire when Shopify supplies one",
+      body?.to?.company === "Ottawa Demo Retail Inc.",
+      `to.company=${JSON.stringify(body?.to?.company)}`
+    );
+    check(
+      "...and the delivery attention stays the recipient, not the business",
+      body?.to?.attention === "Verify Customer",
+      `to.attention=${JSON.stringify(body?.to?.attention)}`
+    );
+  }
+
+  /* --- a consumer with no company at all --------------------------------- */
+  /*
+   * A CONSUMER IS NOT A BUSINESS, and most orders are from one. The provider
+   * still demands the field, so the boundary supplies the recipient's own name —
+   * deterministically, from the name that is already on the address the customer
+   * gave. It is computed, sent, and discarded.
+   *
+   * The last check is the one that matters most: the fallback must not be written
+   * back. A store that "corrected" a customer's address to name them as their own
+   * company would corrupt the record every later read depends on — the packing
+   * slip, the shipment page, and the next booking.
+   */
+  {
+    const { order, shipment, quote } = await createBookableOrder(seller.id, "nocompany");
+    const consumerAddress = JSON.stringify({
+      name: "Verify Customer",
+      phone: "(416) 555-0142",
+      address1: "1 Test Street",
+      city: "Ottawa",
+      province: "ON",
+      province_code: "ON",
+      zip: "K1P 1J1",
+      country: "Canada",
+      country_code: "CA",
+    });
+    await prisma.order.update({ where: { id: order.id }, data: { shippingAddress: consumerAddress } });
+
+    responder = () => ({ status: 200, body: BOOKED_BODY("nocompany") });
+    providerCalls = [];
+    await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+
+    const body = savedRequest() as { to?: { company?: string; attention?: string } } | undefined;
+    check(
+      "an address with no company is sent the recipient's own name, as the provider requires",
+      body?.to?.company === "Verify Customer",
+      `to.company=${JSON.stringify(body?.to?.company)}`
+    );
+    check(
+      "...and the label is still bought",
+      (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId ===
+        orderIdFor("nocompany")
+    );
+    const stored = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    check(
+      "...and the stored Shopify address is not rewritten to make that fallback work",
+      stored.shippingAddress === consumerAddress,
+      stored.shippingAddress === consumerAddress ? "unchanged" : "the stored address was modified"
+    );
+  }
+
   /* --- the fields a carrier actually needs ------------------------------- */
   /*
    * The half of the old rule that SURVIVES. Google is gone from this path, but
@@ -1225,6 +1353,82 @@ async function bookingOutcomeChecks() {
     providerCalls = [];
     await bookPreparedShipment(shipment.id, quote.id, ACTOR);
     check("booking an already-booked shipment buys nothing", apiCalls().length === 0, `calls=${apiCalls().length}`);
+  }
+
+  /* --- a refusal is not a configuration ---------------------------------- */
+  /*
+   * THE ENVIRONMENT IS A FACT ABOUT THE CREDENTIAL, NOT ABOUT THE LAST CALL.
+   *
+   * The operator's question at the confirmation panel is "will this spend
+   * money?", and the three words that answer it — LIVE, TEST, NOT CONFIGURED —
+   * are read from the stored credential. A booking that fails is still a
+   * booking against the host that was configured; if a refusal were allowed to
+   * move the display to NOT CONFIGURED, the next person to look would read
+   * "simulated, nothing is bought" above an account that is in fact live, and
+   * press the button on that understanding.
+   *
+   * This runs directly after the refusal above, which is the state that would
+   * expose it. The environment is read BEFORE as well as after, because the
+   * claim is not that it equals some expected value — that would only re-check
+   * the classification, which verify-shipping does purely and exhaustively —
+   * but that a failed booking does not move it.
+   *
+   * The suite cannot run unconfigured: `allowedHost()` refuses when no base URL
+   * is stored, precisely so no check here passes against a simulated provider.
+   * So "unconfigured" before the refusal would be a broken fixture, and it is
+   * reported as one.
+   */
+  {
+    const before = await eshipperStatus();
+    check(
+      "this suite is running against a configured provider, as its wire checks require",
+      before.environment !== "unconfigured",
+      `environment=${before.environment} host=${before.host ?? "(none)"}`
+    );
+
+    // A second refusal, so the two reads genuinely straddle a failure on THIS
+    // order rather than arriving after the block above finished with its own.
+    // The order row itself is not read here: this block is about the provider
+    // status, and the shipment carries the ids the booking needs.
+    const { shipment, quote } = await createBookableOrder(seller.id, "envrefuse");
+    responder = () => ({ status: 500, body: { message: "carrier rejected the shipment" } });
+    providerCalls = [];
+    let refused = false;
+    try {
+      await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    } catch {
+      refused = true;
+    }
+    check("...and the booking under it was in fact refused", refused);
+
+    const after = await eshipperStatus();
+    check(
+      "a refused booking does not report the provider as unconfigured",
+      after.environment !== "unconfigured",
+      `environment=${after.environment}`
+    );
+    check(
+      "...and leaves the environment exactly as it was",
+      after.environment === before.environment && after.host === before.host && after.account === before.account,
+      `${before.environment}@${before.host ?? "(none)"} -> ${after.environment}@${after.host ?? "(none)"}`
+    );
+    /*
+     * The last step is the operator's view of it: the sentence both admin
+     * screens show, whose FIRST word is the answer. Read from the same status
+     * object the screens read, so a display branch that keyed off a shipment
+     * outcome would have to do it here too.
+     */
+    const word = { production: "LIVE", test: "TEST", unconfigured: "NOT CONFIGURED" }[after.environment];
+    check(
+      "...and the sentence the operator reads still leads with that environment's word",
+      describeEshipperStatus(after).startsWith(word),
+      `${JSON.stringify(describeEshipperStatus(after).slice(0, 40))} for ${after.environment}`
+    );
+    check(
+      "...so a live account is never told its bookings are simulated",
+      after.environment !== "production" || !/simulated/i.test(describeEshipperStatus(after)),
+      describeEshipperStatus(after).slice(0, 60)
+    );
   }
 
   /* --- the provider does not answer -------------------------------------- */
@@ -1470,6 +1674,55 @@ async function bookingOutcomeChecks() {
 /* §9 pickup                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A collection date this dock will still accept, computed rather than typed.
+ *
+ * THESE WERE LITERALS, AND THEY ROTTED. The pickup checks below used to ask for
+ * `2026-10-01`, which was a future weekday when it was written and is neither
+ * now: booking refuses a date that has already passed at the dock, so this
+ * section reported three failures — a refused pickup not recorded as FAILED, no
+ * reason stored, nothing telling the operator to retry — about a shipment that
+ * is booked, a provider that answers 500 and a cancellation, none of which has
+ * anything to do with the calendar. It is the same rot the packing dates at §5
+ * were cured of: a fixed date in a suite is a suite with an expiry date.
+ *
+ * THE DOCK'S OWN CALENDAR, NOT THE SERVER'S. The walk starts from TODAY WHERE
+ * THE GOODS ARE — a dock in Toronto and a server in UTC disagree about the date
+ * for four hours a day — and stops at the first day that is both a working
+ * weekday and not a statutory holiday the dock has not opened for. It skips
+ * today by construction, so the same-day cutoff cannot make the answer depend
+ * on the hour the suite happens to run.
+ *
+ * IT IS THEN PUT TO THE APP'S OWN RULE. `pickupDateReasons` is called on the
+ * result, independently of the walk, and the check below fails loudly if it
+ * finds any reason to refuse — so a dock configured with a lead time, or a
+ * helper that has drifted from the calendar it feeds, is reported as itself
+ * rather than as a mysterious pickup failure three checks later.
+ */
+function dockSchedule(location: { timeZone?: string | null; workingDays?: string | null }): LocationSchedule {
+  return {
+    timeZone: location.timeZone ?? DEFAULT_TIME_ZONE,
+    // The same default the column and the booking path apply to a dock that has
+    // configured no working days. Repeated rather than shared because the two
+    // live in different layers; the check below is what proves they agree.
+    workingDays: location.workingDays ?? "1,2,3,4,5",
+  };
+}
+
+function nextPickupDate(location: { timeZone?: string | null; workingDays?: string | null }): string {
+  const schedule = dockSchedule(location);
+  const now = new Date();
+  const today = localPartsAt(now, zoneOf(schedule)).date;
+  const working = parseWorkingDays(schedule.workingDays);
+  for (let offset = 1; offset <= 14; offset += 1) {
+    const date = addDays(today, offset);
+    if (!working.includes(weekdayOf(date))) continue;
+    if (closedOn(date, schedule).closed) continue;
+    return date;
+  }
+  throw new Error(`no open collection day within 14 days of ${today} at ${zoneOf(schedule)}`);
+}
+
 async function pickupChecks() {
   console.log("\n-- pickup --");
   installStub();
@@ -1478,8 +1731,15 @@ async function pickupChecks() {
   // Nothing has been bought for this one yet.
   const unbooked = await createBookableOrder(seller.id, "unbooked");
   let refused = "";
+  const pickupDate = nextPickupDate(unbooked.origin!.location);
+  const calendarReasons = pickupDateReasons(pickupDate, dockSchedule(unbooked.origin!.location), new Date());
+  check(
+    "the suite asks for a date this dock's own calendar accepts",
+    calendarReasons.length === 0,
+    `${pickupDate}${calendarReasons.length ? ` — ${calendarReasons.join("; ")}` : ""}`
+  );
   try {
-    await schedulePickupForShipment(unbooked.shipment.id, { pickupDate: "2026-10-01", pickupTimeWindow: "09:00-17:00" }, ACTOR);
+    await schedulePickupForShipment(unbooked.shipment.id, { pickupDate, pickupTimeWindow: "09:00-17:00" }, ACTOR);
   } catch (error) {
     refused = error instanceof Error ? error.message : String(error);
   }
@@ -1497,7 +1757,7 @@ async function pickupChecks() {
   responder = () => ({ status: 500, body: { message: "no capacity that day" } });
   let pickupError = "";
   try {
-    await schedulePickupForShipment(target.id, { pickupDate: "2026-10-01", pickupTimeWindow: "09:00-17:00" }, ACTOR);
+    await schedulePickupForShipment(target.id, { pickupDate, pickupTimeWindow: "09:00-17:00" }, ACTOR);
   } catch (error) {
     pickupError = error instanceof Error ? error.message : String(error);
   }
@@ -1511,9 +1771,9 @@ async function pickupChecks() {
   /* --- a successful pickup ---------------------------------------------- */
   responder = () => ({
     status: 200,
-    body: { pickupId: `PU-${suffix}`, scheduledDate: "2026-10-01", status: "SCHEDULED", confirmationNumber: `CONF${suffix}` },
+    body: { pickupId: `PU-${suffix}`, scheduledDate: pickupDate, status: "SCHEDULED", confirmationNumber: `CONF${suffix}` },
   });
-  const scheduled = await schedulePickupForShipment(target.id, { pickupDate: "2026-10-01", pickupTimeWindow: "09:00-17:00" }, ACTOR);
+  const scheduled = await schedulePickupForShipment(target.id, { pickupDate, pickupTimeWindow: "09:00-17:00" }, ACTOR);
   const afterSchedule = await prisma.shipment.findUniqueOrThrow({ where: { id: target.id } });
   check("a scheduled pickup records its state", afterSchedule.pickupStatus === "SCHEDULED", afterSchedule.pickupStatus ?? "(null)");
   check("...and the provider pickup id, so it can be cancelled later", afterSchedule.providerPickupId === `PU-${suffix}`);
@@ -1579,7 +1839,25 @@ async function packingListChecks() {
   console.log("\n-- packing list --");
   const owner = await createSeller("pl");
   const other = await createSeller("pl-other");
-  const { order, shipment, quote } = await createBookableOrder(owner.id, "pl");
+  const { order, shipment, quote, origin } = await createBookableOrder(owner.id, "pl");
+
+  /*
+   * The parcel is given the dock it really has. `createBookableOrder` makes the
+   * dock and maps the items to it but writes no origin onto the shipment, and a
+   * BOOKED shipment always carries one — booking refuses without a resolved
+   * origin, so it freezes the pickup facts as it buys the label. Attaching them
+   * here is what makes the date checks below about a parcel the document can
+   * actually ask where it was packed: without it every slip falls to the
+   * no-dock-yet branch, and a suite that never exercises the frozen facts would
+   * not notice them being ignored.
+   *
+   * Only the field this document reads is written; the rest of the snapshot
+   * belongs to the booking path and is covered there.
+   */
+  await prisma.shipment.update({
+    where: { id: shipment.id },
+    data: { originSnapshot: { pickup: { name: origin!.location.name, timeZone: origin!.location.timeZone } } as never },
+  });
 
   // Give the fixture money, so a document that leaked a price would have one to
   // leak. None of these figures may appear below.
@@ -1744,6 +2022,59 @@ async function packingListChecks() {
   check("a message of spaces prints nothing at all", blanked?.message === null, JSON.stringify(blanked?.message));
   check("...and its document has no message block", blanked ? !/class="msg"/.test(renderPackingList(blanked)) : false);
   await prisma.shipment.update({ where: { id: shipment.id }, data: { packingSlipMessage: null } });
+
+  /*
+   * §5: "Packed" IS A CLAIM ABOUT A WAREHOUSE STEP, and the slip is printed
+   * before the box is closed — which is when it goes in. A parcel whose packing
+   * has not been recorded must therefore not be described as packed, and once
+   * packing IS recorded the date must be the DOCK's day of packing rather than
+   * the day, or the time zone, of whoever rendered the page.
+   *
+   * The instant below is chosen to tell those two apart: 03:30 UTC on the 5th is
+   * 22:30 on the 4th in the fixture dock's America/Toronto, so a document that
+   * read the date in UTC (or in the server's own zone) would print 03-05.
+   */
+  check("a parcel that has not been packed says Prepared, not Packed", /Prepared \d{4}-\d{2}-\d{2}/.test(html) && !/Packed \d/.test(html), html.match(/(Prepared|Packed) \d{4}-\d{2}-\d{2}/)?.[0] ?? "(no status line)");
+
+  await prisma.shipment.update({ where: { id: shipment.id }, data: { packedAt: new Date("2026-03-05T03:30:00Z") } });
+  const packedList = await packingListFor(shipment.id);
+  check(
+    "a packed parcel is dated the dock's own day of packing",
+    packedList?.packedOn === "2026-03-04",
+    `${packedList?.packedOn} (UTC would be 2026-03-05)`
+  );
+  const packedHtml = packedList ? renderPackingList(packedList) : "";
+  check("...and it says Packed, with that date", packedHtml.includes("Packed 2026-03-04"), packedHtml.match(/(Prepared|Packed) \d{4}-\d{2}-\d{2}/)?.[0] ?? "(no status line)");
+  check("...and the printed copy and the PDF take the line from one place", packedList ? packingStatusLine(packedList) === `Packed ${packedList.packedOn}` : false);
+
+  /*
+   * AND THE SAME DAY WHEN THERE IS NO DOCK TO ASK. A sheet is printed before the
+   * parcel is booked — that is when it goes in the box — so most of them have no
+   * frozen pickup facts at all, and answering "UTC" there would date every slip
+   * drawn after 8pm Eastern with tomorrow. The second box on this order has no
+   * origin of any kind, which is exactly that case: the company's own zone is
+   * the only honest answer, and it is the one every other part of this system
+   * gives for an unconfigured dock.
+   */
+  await prisma.shipment.update({ where: { id: secondBox.id }, data: { packedAt: new Date("2026-03-05T03:30:00Z") } });
+  const docklessList = await packingListFor(secondBox.id);
+  check(
+    "a parcel with no dock recorded is dated the company's day, not the server's",
+    docklessList?.packedOn === "2026-03-04",
+    `${docklessList?.packedOn} (UTC would be 2026-03-05)`
+  );
+  await prisma.shipment.update({ where: { id: secondBox.id }, data: { packedAt: null } });
+
+  await prisma.shipment.update({ where: { id: shipment.id }, data: { packedAt: null } });
+
+  /*
+   * The date is formatted from the dock's zone rather than through the locale of
+   * whatever machine drew the document: the same slip printed by two servers, or
+   * read by two browsers, must carry one date. That is a property of the source,
+   * so it is checked against the source.
+   */
+  const listSource = readFileSync(join(process.cwd(), "app/services/packingList.server.ts"), "utf8");
+  check("the slip's dates never come from the rendering machine's locale", !/toLocaleDateString|toLocaleString/.test(listSource));
 
   const lines = parseAddressLines(
     JSON.stringify({ name: "A", address1: "1 St", city: "Toronto", province: "ON", zip: "M5H 2N2", country: "CA" })
@@ -2646,6 +2977,56 @@ async function addressGateChecks() {
     }
     check(`${verdict} on the pickup address does not refuse the booking`, booked, message.slice(0, 180));
     check(`...and the carrier is called once for ${verdict}`, purchaseCalls().length === 1, `purchases=${purchaseCalls().length}`);
+  }
+
+  /* --- and a verdict does not stop a PRICE either ------------------------ */
+  /*
+   * The order the owner described was both halves at once: "Google refused the
+   * address AND the app would not even price it." A quote is a question to the
+   * carrier and a number on a screen; it commits nothing, and an operator who
+   * cannot see a price cannot decide whether the address is worth fixing before
+   * they book. So the same verdict is put in front of the quote path here, and
+   * the price has to come back with the advice still shut.
+   *
+   * The verdict is CORRECTION_REQUIRED because it is the worst the validator
+   * issues: Google has actively disagreed with the address rather than failed to
+   * confirm it. If this one does not stop a price, none of them do.
+   */
+  {
+    const { order, origin } = await createBookableOrder(seller.id, "agate-quotegate");
+    if (!origin) throw new Error("fixture expected an origin");
+    await prisma.addressValidation.deleteMany({ where: { subjectId: { in: [order.id, origin.location.id] } } });
+    await recordVerdict(prisma, { subjectType: "PICKUP", subjectId: origin.location.id, verdict: "CORRECTION_REQUIRED" });
+
+    responder = () => ({
+      status: 200,
+      // The documented RateReply, in the shape the adapter parses: the envelope's
+      // `uuid` is the transaction id, not a per-quote field.
+      body: {
+        quotes: [{ carrierName: "Canada Post", serviceId: 5000026, serviceName: "Expedited", totalCharge: 15.5, currency: "CAD", transitDays: "3" }],
+        uuid: `AGATE-Q-${suffix}`,
+        warnings: [],
+      },
+    });
+    providerCalls = [];
+
+    let quotes: Awaited<ReturnType<typeof getQuotesForOrder>> = [];
+    let message = "";
+    try {
+      quotes = await getQuotesForOrder(order.id, ACTOR);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    check("an address Google corrected is still priced", quotes.length > 0, message.slice(0, 180) || `${quotes.length} quote(s)`);
+    check("...because the carrier is asked for a rate", purchaseCalls().length === 0 && apiCalls().some((c) => /\/api\/v2\/quote$/.test(c.url)), `calls=${apiCalls().length}`);
+    check("...and the quote reaches the order, not just this function", (await prisma.shippingQuote.count({ where: { orderId: order.id } })) > 0);
+
+    const gate = await bookingAddressGate({ originLocationId: origin.location.id, orderId: order.id });
+    check(
+      "...while the advice is still shut, and says so after the price was fetched",
+      gate.allowed === false && gate.pickup?.verdict === "CORRECTION_REQUIRED",
+      `allowed=${gate.allowed} verdict=${gate.pickup?.verdict}`
+    );
   }
 
   /* --- the destination is reported too, not just the dock ---------------- */

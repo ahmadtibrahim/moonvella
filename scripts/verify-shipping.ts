@@ -43,6 +43,7 @@ import {
   RETURN_PURCHASING_ENABLED,
   schedulePickup,
   classifyEshipperEnvironment,
+  describeEshipperStatus,
   isRecognizedTestHost,
   testEshipperAuthentication,
   resetEshipperToken,
@@ -230,6 +231,63 @@ async function main() {
   check(
     "a lookalike host falls back to the env rules, not to trust",
     classifyEshipperEnvironment({ ...creds, baseUrl: "https://uu2.eshipper.com.evil.example", env: null }) === "unconfigured"
+  );
+
+  // 6c. The three words an operator reads -------------------------------------
+  /*
+   * `describeEshipperStatus` is the ONE sentence both admin screens show, and
+   * its first word is the whole of what the person reading it needs: does this
+   * spend money? The sentence is a pure function of the classified status, so
+   * it is exercised here the same way the classification is — against all three
+   * environments, with no credential store and no host involved.
+   *
+   * "Never infer simulated" is the rule that gives these checks their shape.
+   * The words TEST and NOT CONFIGURED are not degrees of the same thing: TEST
+   * still calls the provider and can still buy a label, NOT CONFIGURED calls
+   * nobody. A sentence that hedged between them would be read as the safe one.
+   */
+  const statusOf = (environment: "production" | "test" | "unconfigured") => ({
+    environment,
+    host: environment === "unconfigured" ? null : "eshipper.example",
+    account: environment === "unconfigured" ? null : "op***@example.com",
+  });
+  const words = {
+    production: describeEshipperStatus(statusOf("production")),
+    test: describeEshipperStatus(statusOf("test")),
+    unconfigured: describeEshipperStatus(statusOf("unconfigured")),
+  } as const;
+
+  check("a production account is described as LIVE", words.production.startsWith("LIVE"), words.production.slice(0, 60));
+  check("a test account is described as TEST", words.test.startsWith("TEST"), words.test.slice(0, 60));
+  check(
+    "an unconfigured provider is described as NOT CONFIGURED",
+    words.unconfigured.startsWith("NOT CONFIGURED"),
+    words.unconfigured.slice(0, 60)
+  );
+  check(
+    "...and each sentence names exactly one of the three states",
+    (["LIVE", "TEST", "NOT CONFIGURED"] as const).every(
+      (token) => ["production", "test", "unconfigured"].filter((e) => words[e as keyof typeof words].includes(token)).length === 1
+    ),
+    ["LIVE", "TEST", "NOT CONFIGURED"].map((t) => `${t}:${["production", "test", "unconfigured"].filter((e) => words[e as keyof typeof words].includes(t)).join(",")}`).join(" ")
+  );
+  check(
+    "only the unconfigured sentence claims no call is made",
+    /no label is bought|simulated/i.test(words.unconfigured) &&
+      !/simulated/i.test(words.test) &&
+      !/simulated/i.test(words.production),
+    "test and live sentences claim no simulation"
+  );
+  /*
+   * Shown to be capable of failing: the same scan over a CORRECTED sentence —
+   * a test account described in the unconfigured words — reports both states,
+   * which is the mistake the check above exists to catch.
+   */
+  const muddled = "TEST environment — NOT CONFIGURED, so no label is bought";
+  check(
+    "...and the scan can tell a hedged sentence from a clean one",
+    ["LIVE", "TEST", "NOT CONFIGURED"].filter((t) => muddled.includes(t)).length === 2,
+    "shown to be capable of failing"
   );
 
   // The mocked provider section below drives the real functions, which resolve

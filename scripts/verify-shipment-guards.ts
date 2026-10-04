@@ -83,10 +83,19 @@ const ALL_STATUSES = [
   "CANCELLED",
 ] as const;
 
-const facts = (status: string, packed = false, handed = false): ShipmentMilestoneFacts => ({
+const facts = (
+  status: string,
+  packed = false,
+  handed = false,
+  providerId: string | null = "PROV-TEST"
+): ShipmentMilestoneFacts => ({
   status,
   packedAt: packed ? new Date("2026-01-02T03:04:05Z") : null,
   handedToCarrierAt: handed ? new Date("2026-01-03T03:04:05Z") : null,
+  // Present by default, because a BOOKED row in this app is one whose booking
+  // returned a provider identifier — the rows that pass null or "" below are
+  // the ones proving the packing rule reads it.
+  providerShipmentId: providerId,
 });
 
 /* -------------------------------------------------------------------------- */
@@ -101,41 +110,47 @@ function warehouseMatrixChecks() {
    * A check that recomputed the expected answer from the same rule it is
    * testing would pass on any rule at all.
    *
-   *   [status, packed, handed, expected]
+   *   [status, packed, handed, providerShipmentId, expected]
    */
-  const table: [string, boolean, boolean, string[]][] = [
-    ["PENDING", false, false, ["packed"]],
-    ["PENDING", true, false, []],
-    ["BOOKING", false, false, []],
-    ["BOOKING", true, false, []],
-    ["BOOKING_FAILED", false, false, ["packed"]],
-    ["BOOKING_FAILED", true, false, []],
-    ["BOOKING_UNKNOWN", false, false, []],
-    ["BOOKING_UNKNOWN", true, false, []],
-    ["BOOKED", false, false, ["packed"]],
-    ["BOOKED", true, false, ["handed_to_carrier"]],
-    ["BOOKED", true, true, []],
-    ["SHIPPED", true, true, []],
-    ["SHIPPED", true, false, []],
-    ["EXCEPTION", true, true, []],
-    ["EXCEPTION", true, false, []],
-    ["DELIVERED", true, true, []],
-    ["DELIVERED", true, false, []],
-    ["CANCELLED", false, false, []],
-    ["CANCELLED", true, false, []],
+  const table: [string, boolean, boolean, string | null, string[]][] = [
+    ["PENDING", false, false, null, []],
+    ["PENDING", true, false, null, []],
+    ["PENDING", false, false, "PROV-TEST", []],
+    ["BOOKING", false, false, null, []],
+    ["BOOKING", true, false, null, []],
+    ["BOOKING_FAILED", false, false, null, []],
+    ["BOOKING_FAILED", false, false, "PROV-TEST", []],
+    ["BOOKING_FAILED", true, false, "PROV-TEST", []],
+    ["BOOKING_UNKNOWN", false, false, null, []],
+    ["BOOKING_UNKNOWN", false, false, "PROV-TEST", []],
+    ["BOOKING_UNKNOWN", true, false, "PROV-TEST", []],
+    ["BOOKED", false, false, "PROV-TEST", ["packed"]],
+    ["BOOKED", false, false, null, []],
+    ["BOOKED", false, false, "", []],
+    ["BOOKED", false, false, "   ", []],
+    ["BOOKED", true, false, "PROV-TEST", ["handed_to_carrier"]],
+    ["BOOKED", true, true, "PROV-TEST", []],
+    ["SHIPPED", true, true, "PROV-TEST", []],
+    ["SHIPPED", true, false, "PROV-TEST", []],
+    ["EXCEPTION", true, true, "PROV-TEST", []],
+    ["EXCEPTION", true, false, "PROV-TEST", []],
+    ["DELIVERED", true, true, "PROV-TEST", []],
+    ["DELIVERED", true, false, "PROV-TEST", []],
+    ["CANCELLED", false, false, null, []],
+    ["CANCELLED", true, false, null, []],
   ];
 
-  const wrong = table.filter(([status, packed, handed, expected]) => {
-    const got = availableWarehouseEvents(facts(status, packed, handed));
+  const wrong = table.filter(([status, packed, handed, provider, expected]) => {
+    const got = availableWarehouseEvents(facts(status, packed, handed, provider));
     return JSON.stringify(got) !== JSON.stringify(expected);
   });
   check(
-    "the warehouse event matrix is exactly the table, for all 19 rows",
+    `the warehouse event matrix is exactly the table, for all ${table.length} rows`,
     wrong.length === 0,
     wrong
-      .map(([status, packed, handed, expected]) => {
-        const got = availableWarehouseEvents(facts(status, packed, handed));
-        return `${status} packed=${packed} handed=${handed}: got ${got.join("+") || "(none)"} want ${expected.join("+") || "(none)"}`;
+      .map(([status, packed, handed, provider, expected]) => {
+        const got = availableWarehouseEvents(facts(status, packed, handed, provider));
+        return `${status} packed=${packed} handed=${handed} provider=${JSON.stringify(provider)}: got ${got.join("+") || "(none)"} want ${expected.join("+") || "(none)"}`;
       })
       .join("; ")
   );
@@ -144,22 +159,39 @@ function warehouseMatrixChecks() {
     "no later status ever offers a warehouse event",
     ["SHIPPED", "EXCEPTION", "DELIVERED", "CANCELLED"].every(
       (status) =>
-        availableWarehouseEvents(facts(status, false, false)).length === 0 &&
-        availableWarehouseEvents(facts(status, true, false)).length === 0
+        availableWarehouseEvents(facts(status, false, false, null)).length === 0 &&
+        availableWarehouseEvents(facts(status, true, false, null)).length === 0
     )
   );
 
+  /*
+   * THE SEQUENCE RULE, IN BOTH DIRECTIONS. Packing is offered only for a
+   * booked parcel whose booking produced a provider identifier — the order the
+   * work order fixes (buy the label, then tape the box) — and the states that
+   * bought nothing, or may have bought something still being reconciled, are
+   * refused rather than drawn.
+   */
   check(
-    "packing before the label is bought stays allowed (the dock's own order)",
-    availableWarehouseEvents(facts("PENDING", false, false)).includes("packed") &&
-      availableWarehouseEvents(facts("BOOKED", false, false)).includes("packed")
+    "packing is offered only for a booked parcel with a provider identifier",
+    availableWarehouseEvents(facts("BOOKED", false, false, "PROV-TEST")).includes("packed") &&
+      !availableWarehouseEvents(facts("PENDING", false, false, null)).includes("packed") &&
+      !availableWarehouseEvents(facts("BOOKING", false, false, null)).includes("packed") &&
+      !availableWarehouseEvents(facts("BOOKING_FAILED", false, false, "PROV-TEST")).includes("packed") &&
+      !availableWarehouseEvents(facts("BOOKING_UNKNOWN", false, false, "PROV-TEST")).includes("packed")
+  );
+
+  check(
+    "a booked row with no provider identifier offers nothing at all",
+    availableWarehouseEvents(facts("BOOKED", false, false, null)).length === 0 &&
+      availableWarehouseEvents(facts("BOOKED", false, false, "")).length === 0 &&
+      availableWarehouseEvents(facts("BOOKED", false, false, "   ")).length === 0
   );
 
   check(
     "a handoff is offered only to a booked AND packed parcel",
-    availableWarehouseEvents(facts("BOOKED", false, false)).join() === "packed" &&
-      availableWarehouseEvents(facts("BOOKED", true, false)).join() === "handed_to_carrier" &&
-      !availableWarehouseEvents(facts("PENDING", true, false)).includes("handed_to_carrier")
+    availableWarehouseEvents(facts("BOOKED", false, false, "PROV-TEST")).join() === "packed" &&
+      availableWarehouseEvents(facts("BOOKED", true, false, "PROV-TEST")).join() === "handed_to_carrier" &&
+      !availableWarehouseEvents(facts("PENDING", true, false, null)).includes("handed_to_carrier")
   );
 }
 
@@ -213,11 +245,35 @@ function refusalChecks() {
     "a shipment cannot be handed over, shipped or delivered before a label exists",
     ["PENDING", "BOOKING", "BOOKING_FAILED", "BOOKING_UNKNOWN"].every(
       (status) =>
-        refused(facts(status, false, false), "handed_to_carrier") &&
-        refused(facts(status, false, false), "shipped") &&
-        refused(facts(status, false, false), "delivered") &&
-        refused(facts(status, false, false), "exception")
+        refused(facts(status, false, false, null), "handed_to_carrier") &&
+        refused(facts(status, false, false, null), "shipped") &&
+        refused(facts(status, false, false, null), "delivered") &&
+        refused(facts(status, false, false, null), "exception")
     )
+  );
+
+  /*
+   * THE SEQUENCE RULE. Packing answers to the booking: the label is bought
+   * first, so every state that bought nothing — and the two where a label may
+   * exist but is being reconciled — is refused, and the refusal names the
+   * booking as the missing step. `BOOKED` without a provider identifier is the
+   * third case: the status is written by this app, the identifier is the
+   * carrier's own record of the purchase, and there is nothing to pack against
+   * a purchase nothing can point at.
+   */
+  check(
+    "packing before the label is bought is refused, and says so",
+    ["PENDING", "BOOKING_FAILED", "BOOKING_UNKNOWN", "BOOKING"].every((status) => {
+      const answer = advanceRefusal(facts(status, false, false, status === "BOOKING_FAILED" ? "PROV-TEST" : null), "packed");
+      return typeof answer === "string" && /book the shipment first/.test(answer);
+    })
+  );
+
+  check(
+    "a booked parcel with no provider identifier cannot be packed",
+    /reconcile the booking/i.test(String(advanceRefusal(facts("BOOKED", false, false, null), "packed"))) &&
+      /reconcile the booking/i.test(String(advanceRefusal(facts("BOOKED", false, false, ""), "packed"))) &&
+      allowed(facts("BOOKED", false, false, "PROV-TEST"), "packed")
   );
 
   check(
@@ -455,11 +511,33 @@ function queueActionChecks() {
 
   check(
     "a booked parcel asks for packing, then the handoff, then shows tracking",
-    order({ id: "s", status: "BOOKED", packedAt: null, handedToCarrierAt: null }).label === "Pack order" &&
-      order({ id: "s", status: "BOOKED", packedAt: new Date(), handedToCarrierAt: null }).label ===
-        "Hand to carrier" &&
-      order({ id: "s", status: "BOOKED", packedAt: new Date(), handedToCarrierAt: new Date() }).label ===
-        "Carrier tracking"
+    order({ id: "s", status: "BOOKED", packedAt: null, handedToCarrierAt: null, providerShipmentId: "PROV-1" })
+      .label === "Pack order" &&
+      order({
+        id: "s",
+        status: "BOOKED",
+        packedAt: new Date(),
+        handedToCarrierAt: null,
+        providerShipmentId: "PROV-1",
+      }).label === "Hand to carrier" &&
+      order({
+        id: "s",
+        status: "BOOKED",
+        packedAt: new Date(),
+        handedToCarrierAt: new Date(),
+        providerShipmentId: "PROV-1",
+      }).label === "Carrier tracking"
+  );
+
+  /*
+   * A booked row whose provider identifier never landed cannot be packed (the
+   * rule above) or handed over, so the queue must not say "Pack order" — it
+   * sends the operator to the shipment, where the row's own record is read.
+   */
+  const noProvider = order({ id: "s6", status: "BOOKED", packedAt: null, handedToCarrierAt: null });
+  check(
+    "a booked parcel with no provider identifier sends the operator to the shipment, not to packing",
+    noProvider.label === "Review the booked shipment" && noProvider.to === "/admin/shipping/s6"
   );
 
   check(
@@ -472,7 +550,13 @@ function queueActionChecks() {
   check(
     "every action is one of the queue's vocabulary, and every link is a shipment page",
     ALL_STATUSES.every((status) => {
-      const action = order({ id: "s", status, packedAt: null, handedToCarrierAt: null });
+      const action = order({
+        id: "s",
+        status,
+        packedAt: null,
+        handedToCarrierAt: null,
+        providerShipmentId: "PROV-1",
+      });
       const known = [
         "Cancelled",
         "Delivered",
@@ -481,6 +565,7 @@ function queueActionChecks() {
         "Booking in progress",
         "Retry failed booking",
         "Reconcile booking",
+        "Review the booked shipment",
         "Pack order",
         "Hand to carrier",
         "Carrier tracking",
@@ -494,7 +579,10 @@ function queueActionChecks() {
 /* §5 The rows — advanceShipment against real shipments                        */
 /* -------------------------------------------------------------------------- */
 
-async function createShipment(status: string) {
+async function createShipment(
+  status: string,
+  providerShipmentId: string | null = status === "BOOKED" ? `PROV-${suffix}` : null
+) {
   if (created.sellerIds.length === 0) {
     const shopDomain = `verify-guards-${suffix.toLowerCase()}.myshopify.com`;
     const seller = await prisma.seller.create({
@@ -542,6 +630,9 @@ async function createShipment(status: string) {
       orderId,
       status: status as never,
       provider: "eshipper",
+      // The carrier's own record of the purchase. Present for the BOOKED rows
+      // this suite packs, and passable as null to prove the packing refusal.
+      providerShipmentId,
       carrier: "Purolator",
       serviceCode: "PUR-EXP",
       serviceName: "Purolator Express",
@@ -565,8 +656,13 @@ async function reload(shipmentId: string) {
 async function refusalsAgainstRows() {
   console.log("\n-- advanceShipment, against rows --");
 
-  const expectation = async (label: string, status: string, event: ShipmentAdvanceEvent) => {
-    const shipment = await createShipment(status);
+  const expectation = async (
+    label: string,
+    status: string,
+    event: ShipmentAdvanceEvent,
+    providerShipmentId: string | null = status === "BOOKED" ? `PROV-${suffix}` : null
+  ) => {
+    const shipment = await createShipment(status, providerShipmentId);
     let message = "";
     try {
       await advanceShipment(shipment.id, event, ACTOR);
@@ -588,6 +684,17 @@ async function refusalsAgainstRows() {
   await expectation("a booking in flight refuses to be packed", "BOOKING", "packed");
   await expectation("an unknown outcome refuses the handoff", "BOOKING_UNKNOWN", "handed_to_carrier");
   await expectation("an unbooked parcel refuses the handoff", "PENDING", "handed_to_carrier");
+
+  /*
+   * THE SEQUENCE RULE, AGAINST ROWS. Packing is refused until a label has been
+   * bought, and refused for a "booked" row that cannot name the carrier's own
+   * record of the purchase — the two ways a manually constructed or stale
+   * request could otherwise stamp a milestone nothing was bought for.
+   */
+  await expectation("an unbooked parcel refuses packing — the label comes first", "PENDING", "packed");
+  await expectation("a failed booking refuses packing until a label is bought", "BOOKING_FAILED", "packed");
+  await expectation("an unknown outcome refuses packing", "BOOKING_UNKNOWN", "packed");
+  await expectation("a booked parcel with no provider identifier refuses packing", "BOOKED", "packed", null);
 
   /* --- the happy path, in the order the dock actually performs it --------- */
   const booked = await createShipment("BOOKED");
@@ -633,13 +740,22 @@ async function refusalsAgainstRows() {
     secondHandoff ? secondHandoff.slice(0, 70) : "NOT REFUSED"
   );
 
-  /* --- packing before the label is bought, which is how the dock works ---- */
+  /* --- packing before the label is bought, which is now refused ----------- */
   const prepared = await createShipment("PENDING");
-  await advanceShipment(prepared.id, "packed", ACTOR);
+  let earlyPacking = "";
+  try {
+    await advanceShipment(prepared.id, "packed", ACTOR);
+  } catch (error) {
+    earlyPacking = error instanceof Error ? error.message : String(error);
+  }
   const preparedRow = await reload(prepared.id);
   check(
-    "a prepared box can be packed before its label is bought",
-    preparedRow.packedAt !== null && preparedRow.status === "PENDING"
+    "an unbooked box cannot be packed, and the refusal names the booking",
+    earlyPacking.length > 0 &&
+      preparedRow.packedAt === null &&
+      preparedRow.status === "PENDING" &&
+      /book the shipment first/.test(earlyPacking),
+    earlyPacking ? earlyPacking.slice(0, 90) : "NOT REFUSED"
   );
   let preparedHandoff = "";
   try {
@@ -648,7 +764,7 @@ async function refusalsAgainstRows() {
     preparedHandoff = error instanceof Error ? error.message : String(error);
   }
   check(
-    "...but it cannot be handed over without a label",
+    "...and it cannot be handed over without a label",
     preparedHandoff.length > 0 && (await reload(prepared.id)).status === "PENDING"
   );
 
@@ -690,7 +806,14 @@ async function concurrentPackingChecks() {
    * checks below hold to — is that one caller succeeds, the stored moment is the
    * one that caller wrote, and the trail gains a single event.
    */
-  const shipment = await createShipment("PENDING");
+  /*
+   * The fixture is a BOOKED row, because that is the only state the sequence
+   * rule lets two callers race over: an unbooked box is refused before the
+   * claim is reached, which is a different check (§5) and not this one. A
+   * provider identifier is present for the same reason — without it the row is
+   * not packable at all.
+   */
+  const shipment = await createShipment("BOOKED");
   const results = await Promise.allSettled([
     markShipmentPacked(shipment.id, ACTOR),
     markShipmentPacked(shipment.id, ACTOR),

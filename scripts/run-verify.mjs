@@ -300,6 +300,26 @@ const CHECKS = [
   // is what actually happened when the 14-scope config was deployed and the
   // merchant saw no permission screen at all.
   { name: "fulfillment-scopes", kind: "ts", file: "scripts/verify-fulfillment-scopes.ts" },
+  // Dates on every page, read identically by the server that renders them and
+  // the browser that hydrates them.
+  //
+  // PURE, and registered for the same reason as checkout-frame: the failure it
+  // describes is invisible to any check that only reads one machine. React
+  // reports a mismatch as #418/#423 and redraws the page, so the old
+  // `toLocaleString()` — which formatted in the locale and zone OF WHOEVER RAN
+  // IT — disagreed on every load between a UTC/en-US server and a Toronto
+  // browser, and the same timestamp could read as two different days within one
+  // page.
+  //
+  // The suite therefore does not stop at pinning the formatter's answers. It
+  // runs the same calls in a CHILD PROCESS configured with another zone and
+  // locale and requires identical output, while requiring the OLD expression,
+  // computed in that same child, to DIFFER — so the equality is shown to come
+  // from the new code rather than from the machine, and the suite is able to
+  // fail if the defect is still there. It then reads every route and component,
+  // comments stripped, for a `toLocale*` date call left behind, which is how
+  // this comes back: one page at a time.
+  { name: "hydration", kind: "ts", file: "scripts/verify-hydration.ts" },
   // Media is verified inside `product-system` (checks 65-69 cover what a
   // multi-file batch depends on: two files to two assets, per-file variant
   // assignment, the typed duplicate refusal and its two fields, and that a
@@ -620,6 +640,29 @@ const CHECKS = [
     kind: "ts",
     file: "scripts/verify-shopify-orders.ts",
     env: SIMULATED_STRIPE,
+    requires: [],
+  },
+  // The fulfillment read itself, against the schema Shopify serves rather than
+  // the one this code assumed. The old query asked for `fulfillmentServices` at
+  // the ROOT of the query, where no such field exists, and both call sites read
+  // the refusal as "the service does not exist yet" — so a broken query was
+  // reported as a store with no MoonVella fulfillment service, which is a
+  // sentence an operator would act on by creating one that already existed.
+  //
+  // Registered because the replacement's SHAPE is the whole point and a stub
+  // cannot be made to disagree with it: the field lives on `shop`, and it is a
+  // plain LIST rather than a connection, so `first:` and `nodes` are both wrong
+  // even after the path is fixed. The suite reads the shipped queries for that
+  // shape, resolves a real order's fulfillment orders on the SANDBOX read-only —
+  // each with its own assigned location, remaining quantities and destination —
+  // and scans every call it made to prove no mutation was issued. Without a
+  // stored offline session for the sandbox shop the live half is reported
+  // SKIPPED rather than passed or failed. Nothing is booked, fulfilled or
+  // notified, and the sandbox is only ever read.
+  {
+    name: "shopify-fulfillment",
+    kind: "ts",
+    file: "scripts/verify-shopify-fulfillment.ts",
     requires: [],
   },
   // The `app/scopes_update` subscription: declared in the config, absent from

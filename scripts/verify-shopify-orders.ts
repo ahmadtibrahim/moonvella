@@ -834,7 +834,11 @@ async function main() {
 
   const routingCalls: GraphqlCall[] = [];
   const storeAdmin = makeAdmin((query, variables) => {
-    if (query.includes("fulfillmentServices")) return { data: { fulfillmentServices: { nodes: [] } } };
+    // `Shop.fulfillmentServices` — a plain list, not a connection. The stub
+    // answers in the shape the schema actually has, so a query that still asked
+    // `QueryRoot.fulfillmentServices(first: …) { nodes }` would find nothing
+    // here and be reported as "no service exists" rather than quietly passing.
+    if (query.includes("fulfillmentServices")) return { data: { shop: { fulfillmentServices: [] } } };
     if (query.includes("fulfillmentServiceCreate")) {
       return {
         data: {
@@ -863,6 +867,17 @@ async function main() {
                   id: "gid://shopify/FulfillmentOrder/1",
                   status: "OPEN",
                   assignedLocation: { location: { id: SHOP_LOCATION_ID, name: "Shop location" } },
+                  destination: {
+                    firstName: "Verify",
+                    lastName: "Customer",
+                    company: null,
+                    address1: "1 Test Street",
+                    address2: null,
+                    city: "Toronto",
+                    province: "ON",
+                    countryCode: "CA",
+                    zip: "M5H 2N2",
+                  },
                   lineItems: {
                     nodes: [
                       {
@@ -883,6 +898,20 @@ async function main() {
                   id: "gid://shopify/FulfillmentOrder/2",
                   status: "OPEN",
                   assignedLocation: { location: { id: SHOP_LOCATION_ID, name: "Shop location" } },
+                  // A DIFFERENT destination on purpose: a suite that asserted
+                  // only "a destination was read" would pass on code that took
+                  // whichever one it saw first.
+                  destination: {
+                    firstName: "Merchant",
+                    lastName: "Customer",
+                    company: "Somebody Else Ltd.",
+                    address1: "9 Other Road",
+                    address2: null,
+                    city: "Ottawa",
+                    province: "ON",
+                    countryCode: "CA",
+                    zip: "K1P 5K8",
+                  },
                   lineItems: {
                     nodes: [
                       {
@@ -933,6 +962,30 @@ async function main() {
     "the MoonVella line is matched by its stored binding, not by SKU",
     resolved.groups[0]?.items[0]?.lineItemId === `gid://shopify/LineItem/${mixed.order!.items[0]?.shopifyLineItemId}`,
     resolved.groups[0]?.items[0]?.lineItemId ?? "none",
+  );
+
+  /*
+   * THE DESTINATION BELONGS TO THE GROUP, NOT TO THE ORDER.
+   *
+   * Shopify splits an order across fulfillment orders by location and by
+   * delivery group, and two of them can be going to two different addresses. The
+   * parcel fulfils one group's lines, so the address that belongs on its label is
+   * that group's — and the way this goes wrong is not a crash, it is a box of one
+   * customer's goods arriving at another customer's door. So the stub gives the
+   * two fulfillment orders DIFFERENT destinations and the check requires each
+   * group to carry its own.
+   */
+  check(
+    "the MoonVella group carries its own destination, with its own lines",
+    resolved.groups[0]?.destination?.city === "Toronto" &&
+      resolved.groups[0]?.destination?.zip === "M5H 2N2",
+    JSON.stringify(resolved.groups[0]?.destination ?? null),
+  );
+  check(
+    "...and not the other fulfillment order's",
+    resolved.groups[0]?.destination?.company !== "Somebody Else Ltd." &&
+      resolved.groups[0]?.destination?.address1 !== "9 Other Road",
+    resolved.groups[0]?.destination?.address1 ?? "none",
   );
 
   const routing = await routeFulfillmentOrdersToMoonvella(mixed.order!.id, storeAdmin);
