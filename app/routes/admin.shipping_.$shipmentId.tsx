@@ -2,7 +2,6 @@ import { Link, Form, useLoaderData, useActionData, redirect } from "react-router
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import { prisma } from "~/db.server";
-import { toCm, toKg } from "~/services/packaging.server";
 import {
   getQuotesForOrder,
   selectQuote,
@@ -22,26 +21,17 @@ import {
   pickupPlanForShipment,
   getBillingReconciliation,
   reconcileCarrierInvoice,
-  resolveShipmentOrigin,
   packagesForShipment,
   recipientPhoneFor,
+  resolveShipmentOrigin,
 } from "~/services/shipping.server";
-import {
-  addressStatus,
-  loadSubjectAddress,
-  applySuggestedAddress,
-  recordAddressOverride,
-  recordValidation,
-  validateAddress,
-} from "~/services/addressValidation.server";
 import { orderProgress } from "~/services/orderProgress.server";
 import type { ProgressStage } from "~/services/orderProgress.server";
-import { AddressGateCard } from "~/components/AddressGateCard";
 import { BookingConfirmation } from "~/components/BookingConfirmation";
 import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 import type { BookingEnvironment } from "~/components/BookingConfirmation";
 import { OrderProgress, stageByKey } from "~/components/OrderProgress";
-import { addressSubject, addressSubjectLabel } from "~/utils/addressSubject";
+import { RateSelection } from "~/components/RateSelection";
 import { recordAudit, AUDIT_ENTITY } from "~/services/audit.server";
 // The window form's rule, from the client-safe module: both ends or neither,
 // shaped and in order. Shared with the pickup-location form so the two agree on
@@ -55,13 +45,10 @@ import {
   trackingDisplay,
   trackingDisplayLabel,
   pickCheapestQuote,
-  pickFastestQuote,
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
 import {
   advanceShipment,
-  addOrderPackage,
-  removeOrderPackage,
   type ShipmentAdvanceEvent,
 } from "~/services/fulfillment.server";
 import {
@@ -72,7 +59,7 @@ import {
 } from "~/services/eshipper.server";
 import { getIntegrationState } from "~/services/integrationHealth.server";
 import { getUnitsPreference } from "~/services/adminPreferences.server";
-import { convertedDisplay, isUnitPreference, unitsView } from "~/utils/measurementUnits";
+import { convertedDisplay, unitsView } from "~/utils/measurementUnits";
 import { MAX_PROPOSAL_SCAN } from "~/services/holidays";
 import {
   createReturnRequest,
@@ -80,14 +67,29 @@ import {
 } from "~/services/shippingOperations.server";
 import type { ReturnShippingPayer, ShippingClaimType } from "@prisma/client";
 
-const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
-  "packed",
-  "handed_to_carrier",
-  "shipped",
-  "in_transit",
-  "delivered",
-  "exception",
-];
+/*
+ * THE TWO EVENTS AN OPERATOR CAN WITNESS.
+ *
+ * Packing a carton and handing it to a driver happen in front of a person, so
+ * an operator may record them. Everything after that — the carrier's own scans,
+ * delivery, an exception — arrives through tracking sync from the carrier's
+ * record, and typing one in by hand would be recording a fact nobody here
+ * observed. Both the form and the action check this list, so a hand-made
+ * request cannot write a later status either.
+ */
+const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = ["packed", "handed_to_carrier"];
+
+/*
+ * Where the cartons this shipment will be labelled with came from, said the way
+ * the card has to say it. The three answers are the three branches of
+ * `packagesForShipment`, in its own order, so an operator told "from the order's
+ * parcel rows" knows which record to correct.
+ */
+const SHIPMENT_PARCEL_SOURCE: Record<"linked" | "derived" | "order", string> = {
+  linked: "from the cartons assigned to this box on the packing page",
+  order: "from the parcel rows recorded for this order in the packing workspace",
+  derived: "from the packaging stored on the ordered variants and products",
+};
 
 function parseAddress(raw: string | null): Record<string, string> {
   if (!raw) return {};
@@ -269,7 +271,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   }));
 
   const [quotes, returnQuotes, billing, eshipper, shopifyFulfillment, pickupPlan] = await Promise.all([
-    prisma.shippingQuote.findMany({ where: { orderId: order.id, provider: "eshipper" }, orderBy: { totalAmount: "asc" } }),
+    /*
+     * The dock comes with the rate, because it is half of what makes it
+     * bookable: the selection dialog prints which location priced each line and
+     * refuses a rate priced anywhere else.
+     */
+    prisma.shippingQuote.findMany({
+      where: { orderId: order.id, provider: "eshipper" },
+      orderBy: { totalAmount: "asc" },
+      include: { originLocation: { select: { code: true, name: true } } },
+    }),
     prisma.shippingQuote.findMany({ where: { orderId: order.id, provider: "eshipper-return" }, orderBy: { totalAmount: "asc" } }),
     getBillingReconciliation(shipmentId),
     getIntegrationState("eshipper"),
@@ -293,17 +304,28 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
    */
   const status = await eshipperStatus();
 
-  /*
-   * Which dock this booking will actually use — resolved the same way
-   * `bookPreparedShipment` resolves it, deliberately, rather than read from
-   * `shipment.originLocationId`. The column can be empty on a parcel whose dock
-   * is implied by its lines, and the gate has to be asked about the dock the
-   * booking will name. Asking about a different one would either block a
-   * booking that is fine or bless one that is not.
-   */
-  const resolvedDock = await resolveShipmentOrigin(shipment, order.items);
-
   const selectedQuote = quotes.find((q) => q.selected) ?? null;
+
+  /*
+   * WHICH DOCKS A RATE MAY BE PRICED FROM, resolved with the same function the
+   * booking gate uses, so the selection dialog refuses exactly the rows the
+   * booking would refuse. A shipment holds the lines it holds, so this answers
+   * "where do THESE parcels leave from" — the reason a two-dock order can ship
+   * at all.
+   */
+  const resolvedDock = await resolveShipmentOrigin(
+    { id: shipment.id, items: shipment.items.map((si) => ({ orderItemId: si.orderItemId, quantity: si.quantity })) },
+    order.items.map((i) => ({ id: i.id, variantId: i.variantId, sku: i.sku, quantity: i.quantity })),
+  );
+  const dockIds = resolvedDock.groups.map((group) => group.locationId).filter((id): id is string => id !== null);
+
+  /*
+   * The clock the rate dialog reads expiry against, fixed here rather than in
+   * the component: a browser's clock is the reader's, and a rate that reads
+   * live on one screen and expired on another is a discrepancy nobody can act
+   * on. The service's own check is the authority; this is the same reading.
+   */
+  const now = Date.now();
 
   /*
    * The admin's unit preference, for reading a parcel's stored centimetres and
@@ -384,6 +406,14 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       lastBookingError: shipment.lastBookingError,
       pickupStatus: shipment.pickupStatus,
       pickupMode: shipment.pickupMode,
+      /*
+       * What the collection gate will actually apply: the shipment's own mode,
+       * or the dock's when the shipment predates the mapping — the same
+       * fallback `schedulePickupForShipment` uses — or NEEDED when neither
+       * exists. The form below has to agree with the gate that refuses it, so
+       * it reads the gate's own resolution rather than the raw column.
+       */
+      resolvedPickupMode: shipment.pickupMode ?? shipment.originLocation?.pickupMode ?? "NEEDED",
       providerPickupId: shipment.providerPickupId,
       pickupScheduledFor: shipment.pickupScheduledFor,
       pickupWindow: shipment.pickupWindow,
@@ -394,6 +424,12 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
       // the operator can see a choice they made earlier rather than being asked
       // the same question again with no memory of it.
       notifyCustomerOnPush: shipment.notifyCustomerOnPush,
+      // The two warehouse facts an operator may witness and record. Everything
+      // after them is the carrier's own scan, arriving through tracking sync —
+      // which is why the dispatch control offers exactly these two and reads
+      // its state from these two timestamps.
+      packedAt: shipment.packedAt,
+      handedToCarrierAt: shipment.handedToCarrierAt,
       // The note that will print on this box's packing slip, if there is one.
       packingSlipMessage: shipment.packingSlipMessage,
     },
@@ -436,10 +472,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     // Where this parcel ships from — the dock's facts, or null when there is no
     // mapping, which the page states in the same words the booking gate uses.
     origin: originView(shipment),
-    packages: order.packages,
     quotes,
     returnQuotes,
     selectedQuote,
+    // The docks a rate may be priced from, and the clock the dialog reads
+    // expiry against — both computed in the loader, never in the browser.
+    dockIds,
+    now,
     billing,
     eshipper: {
       /*
@@ -465,25 +504,6 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     returnRequests: shipment.returnRequests,
     shippingClaims: shipment.shippingClaims,
     pickupPlan,
-    /*
-     * Both addresses this booking will print, with their verdicts, read here
-     * rather than fetched from the panel's own endpoint: the panel exists to
-     * answer "may I book", and a page that draws a Book button before it knows
-     * the answer is a page that offers an action it will refuse.
-     *
-     * The pickup end is keyed on the DOCK, which is the same record the origins
-     * page validates — one verdict per address, however many screens read it.
-     * It is null when no dock is mapped, which is a different problem with its
-     * own message, already shown on this page.
-     */
-    addressGate: {
-      delivery: await addressStatus("DELIVERY", order.id),
-      pickup: resolvedDock?.location?.id ? await addressStatus("PICKUP", resolvedDock.location.id) : null,
-      // The id travels with the status so the panel's Check and Accept buttons
-      // name the same record the status was read from, rather than re-deriving
-      // the dock in the component.
-      pickupSubjectId: resolvedDock?.location?.id ?? null,
-    },
     trackingEvents: shipment.trackingEvents,
     // Deciding that a booking which timed out did not happen is a judgement
     // about money and about whether a second label may be bought. It is not a
@@ -529,48 +549,7 @@ export async function action({ request, params }: ActionFunctionArgs) {
     if (!shipment) throw new Error("Shipment not found.");
     const orderId = shipment.orderId;
 
-    if (intent === "add_package") {
-      /*
-       * The unit the form was drawn in — the admin's, not a per-parcel choice.
-       * There is one unit setting for the whole admin and this form reads it
-       * like every other: an operator who set centimetres should not have to
-       * remember to also change a dropdown before typing a parcel.
-       *
-       * The value the form carried back wins over the stored preference, for the
-       * same reason it does everywhere else: a preference changed in another tab
-       * while this page sat open must not reinterpret a number somebody typed
-       * while looking at a label in the old unit. A hand-made request with
-       * neither falls back to the stored preference rather than guessing.
-       */
-      const submitted = form.get("units");
-      const preference = isUnitPreference(submitted) ? submitted : await getUnitsPreference();
-      const dimensionUnit = unitsView(preference).dimensionUnit;
-      const weightUnit = unitsView(preference).weightUnit;
-      const length = Number(form.get("length"));
-      const width = Number(form.get("width"));
-      const height = Number(form.get("height"));
-      const weight = Number(form.get("weight"));
-      if (!(length > 0) || !(width > 0) || !(height > 0)) {
-        throw new Error("Length, width and height must all be greater than zero.");
-      }
-      if (!(weight > 0)) throw new Error("Gross shipping weight must be greater than zero.");
-      // Written through the shared helper rather than here, so the audit row and
-      // the quote withdrawal travel with the write instead of depending on this
-      // page remembering both.
-      await addOrderPackage(
-        orderId,
-        {
-          count: Math.max(1, Math.floor(Number(form.get("count") || 1))),
-          length: Number(toCm(length, dimensionUnit).toFixed(2)),
-          width: Number(toCm(width, dimensionUnit).toFixed(2)),
-          height: Number(toCm(height, dimensionUnit).toFixed(2)),
-          weight: Number(toKg(weight, weightUnit).toFixed(3)),
-        },
-        actor
-      );
-    } else if (intent === "remove_package") {
-      await removeOrderPackage(orderId, String(form.get("packageId")), actor);
-    } else if (intent === "get_quotes") {
+    if (intent === "get_quotes") {
       await getQuotesForOrder(orderId, actor);
     } else if (intent === "select_quote") {
       await selectQuote(orderId, String(form.get("quoteId")), actor);
@@ -676,10 +655,20 @@ export async function action({ request, params }: ActionFunctionArgs) {
         return { error: `Cancellation outcome is not confirmed${result.providerMessage ? `: ${result.providerMessage}` : "."} The shipment is shown as an exception, not cancelled.` };
       }
     } else if (intent === "advance_shipment") {
+      /*
+       * The notify answer has three states, not two, exactly as it does on the
+       * booking confirmation: "on" asks Shopify to e-mail the customer, "off"
+       * refuses, and an absent field means "use the stored preference" — the
+       * answer given when the label was bought lives on the shipment, and
+       * reading absence as "off" would silently overwrite it. The event list is
+       * the two an operator can witness; a hand-made request for a later status
+       * is refused here as well as absent from the form.
+       */
       const event = String(form.get("event") || "");
       if (!ADVANCE_EVENTS.includes(event as ShipmentAdvanceEvent)) throw new Error("Unknown shipment event.");
+      const answered = form.has("notifyCustomer");
       await advanceShipment(shipmentId, event as ShipmentAdvanceEvent, actor, {
-        notifyCustomer: form.get("notifyCustomer") === "on",
+        ...(answered ? { notifyCustomer: form.get("notifyCustomer") === "on" } : {}),
       });
     } else if (intent === "create_return_request") {
       const returnItems: { orderItemId: string; quantity: number }[] = [];
@@ -720,55 +709,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
         },
         actor
       );
-    } else if (intent === "check_address") {
-      /*
-       * An address is checked here, on the booking screen, because that is where
-       * the refusal lands. Sending an operator to another page to press a button
-       * that unblocks this one is how a missing step turns into a workaround.
-       *
-       * `refresh: true` — a person pressed Check now, so the stored verdict is
-       * not reused; every page render goes through the cached path instead.
-       */
-      const subject = addressSubject(form);
-      const address = await loadSubjectAddress(subject.type, subject.id);
-      if (!address) throw new Error("That address could not be found.");
-      const outcome = await validateAddress(address, { refresh: true });
-      await recordValidation({ subjectType: subject.type, subjectId: subject.id, outcome });
-      if (outcome.verdict === "ACCEPTED") return redirect(back);
-      return {
-        error: `${addressSubjectLabel(subject.type)}: ${
-          outcome.reason ?? "the address needs review before it can be booked against."
-        }`,
-      };
-    } else if (intent === "apply_suggestion") {
-      /*
-       * The values written are read back from the stored verdict inside the
-       * service, never posted by this form, and the role rule is checked there
-       * against the stored account.
-       *
-       * Redirecting on success, as the check above does: the address this page
-       * prints has changed, so the page is re-read rather than annotated, and
-       * the panel comes back showing the new address under its new verdict.
-       */
-      const subject = addressSubject(form);
-      const result = await applySuggestedAddress({
-        subjectType: subject.type,
-        subjectId: subject.id,
-        actorId: user.id,
-      });
-      if (!result.ok) return { error: result.error };
-      return redirect(back);
-    } else if (intent === "override_address") {
-      // The role check that matters is inside the service, against the stored
-      // account: a role posted by this form would be a role the submitter chose.
-      const subject = addressSubject(form);
-      const result = await recordAddressOverride({
-        subjectType: subject.type,
-        subjectId: subject.id,
-        actorId: user.id,
-        reason: String(form.get("reason") || ""),
-      });
-      if (!result.ok) return { error: result.error };
     } else if (intent === "schedule_pickup") {
       await schedulePickupForShipment(
         shipmentId,
@@ -783,6 +723,15 @@ export async function action({ request, params }: ActionFunctionArgs) {
             form.get("pickupWindowClose")
           ) ?? "",
           notes: String(form.get("notes") || "") || undefined,
+          /*
+           * A dock with a standing collection is refused unless the operator
+           * confirms this request is a one-off: a second truck for the same door
+           * is how two drivers arrive for one carton. Read as present-or-absent,
+           * like the calendar override below — an unticked checkbox posts
+           * nothing, and nothing means "the standing collection applies", which
+           * is the safe answer.
+           */
+          oneOffAtRegularDock: form.get("oneOffAtRegularDock") === "true",
           // The tick-box that steps over the dock's own calendar. Read as
           // present-or-absent rather than as a value, because an unticked
           // checkbox posts nothing at all.
@@ -812,8 +761,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
   return redirect(back);
 }
 
-const card: React.CSSProperties = { background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1.25rem", marginBottom: "1.25rem" };
-const h2: React.CSSProperties = { fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.6rem" };
 const input: React.CSSProperties = { padding: "0.4rem 0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.78rem", boxSizing: "border-box" };
 const label: React.CSSProperties = { fontSize: "0.68rem", color: "#64748b", display: "block" };
 const btn = (color: string): React.CSSProperties => ({ padding: "0.4rem 0.75rem", border: `1px solid ${color}`, borderRadius: 6, background: "white", color, fontSize: "0.72rem", fontWeight: 600, cursor: "pointer" });
@@ -1006,7 +953,7 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
       return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Booking is blocked until the wholesale payment succeeds.</p>;
     }
     if (packages === 0) {
-      return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Add the packed dimensions and gross weight before booking.</p>;
+      return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>No cartons could be resolved for this shipment. Complete the packaging on the items — there is no parcel entry form on this page — then request rates.</p>;
     }
     if (!selectedQuote) {
       return <p style={{ fontSize: "0.78rem", color: "#b45309" }}>Select a quote above. Selecting does not book.</p>;
@@ -1073,14 +1020,12 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  const { shipment, order, items, origin, packages, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, addressGate, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress } = data;
+  const { shipment, order, items, origin, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress, dockIds, now } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
   const addr = order.shipTo;
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
-  const cheapest = pickCheapestQuote(quotes);
-  const fastest = pickFastestQuote(quotes);
   const returnCheapest = pickCheapestQuote(returnQuotes);
-  const canBook = !shipment.providerShipmentId && paid && packages.length > 0;
+  const canBook = !shipment.providerShipmentId && paid && bookingParcels.packages.length > 0 && bookingParcels.missing.length === 0;
   /*
    * The dock's own hours, as the two fields start out. `suggestedWindow` is
    * "HH:MM-HH:MM" and is null unless BOTH ends are recorded — half a window is
@@ -1097,17 +1042,22 @@ export default function AdminShipmentDetail() {
   const trackingStage = stageByKey(progress, "tracking_sent");
 
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+    <div className="mv-page-wide">
       <ShippingOperationsNav />
-      <p style={{ fontSize: "0.75rem", marginBottom: "0.5rem" }}>
-        <Link to="/admin/shipping" style={{ color: "#082a4a" }}>&larr; All shipments</Link>
-      </p>
-      <h1 style={{ fontSize: "1.5rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-        Shipment {shipment.reference}{shipment.returnOfShipmentId ? " (return)" : ""}
-      </h1>
-      <p style={{ color: "#64748b", fontSize: "0.8rem", marginBottom: "1.25rem" }}>
-        {order.shopifyOrderName} · {order.seller.storeName} · {order.supplierReference} · {trackingLabel(shipment.trackingStatus)} ({shipment.status})
-      </p>
+      <div className="mv-page-header">
+        <div>
+          <h1>
+            Shipment {shipment.reference}{shipment.returnOfShipmentId ? " (return)" : ""}
+          </h1>
+          <p className="mv-muted">
+            {order.shopifyOrderName} · {order.seller.storeName} · {order.supplierReference} · {trackingLabel(shipment.trackingStatus)} ({shipment.status})
+          </p>
+        </div>
+        <div className="mv-actions">
+          <Link to="/admin/shipping" className="mv-button">&larr; All shipments</Link>
+          <Link to={`/admin/orders/${order.id}`} className="mv-button">Open order</Link>
+        </div>
+      </div>
 
       {/*
         The same six stages the order page draws, from the same rows. This is
@@ -1115,17 +1065,17 @@ export default function AdminShipmentDetail() {
         answer belongs above the controls that move it.
       */}
       {progress.length > 0 ? (
-        <div style={card}>
+        <div className="mv-panel mv-panel-body">
           <OrderProgress title="Progress" stages={progress} />
         </div>
       ) : null}
 
       {actionData?.error ? (
-        <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>{actionData.error}</div>
+        <div className="mv-panel mv-panel-body" style={{ background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>{actionData.error}</div>
       ) : null}
 
-      <div style={card}>
-        <h2 style={h2}>Related order and remaining quantities</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Related order and remaining quantities</h2>
         <div style={{ fontSize: "0.8rem", lineHeight: 1.7, marginBottom: "0.5rem" }}>
           <div>Order: <Link to={`/admin/orders/${order.id}`} style={{ color: "#082a4a" }}>{order.shopifyOrderName}</Link> · Invoice ref: {order.supplierReference}</div>
           <div>Wholesale payment: <strong>{order.wholesalePaymentStatus}</strong> · Fulfillment: {order.fulfillmentStatus}</div>
@@ -1152,8 +1102,8 @@ export default function AdminShipmentDetail() {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.25rem" }}>
-        <div style={card}>
-          <h2 style={h2}>Ship from</h2>
+        <div className="mv-panel mv-panel-body">
+          <h2 className="mv-panel-title">Ship from</h2>
           {/*
             The dock, or nothing. This card used to print MOONVELLA_SHIP_FROM_*
             with a "1 Warehouse Way" default, which meant the page and the label
@@ -1182,8 +1132,8 @@ export default function AdminShipmentDetail() {
             </p>
           )}
         </div>
-        <div style={card}>
-          <h2 style={h2}>Ship to</h2>
+        <div className="mv-panel mv-panel-body">
+          <h2 className="mv-panel-title">Ship to</h2>
           <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
             <div>{addr.name || order.customerName || "—"}</div>
             <div>{addr.address1 || addr.address || "—"}{addr.address2 ? `, ${addr.address2}` : ""}</div>
@@ -1195,107 +1145,97 @@ export default function AdminShipmentDetail() {
         </div>
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Addresses on this label</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Packages (packed dimensions and gross shipping weight)</h2>
         {/*
-          * Both ends are shown, not just the destination: a booking is refused
-          * when either one is unchecked, and an operator who can only see one of
-          * them is left guessing which end the refusal is about. The pickup
-          * address is the dock's own record — the same row the Pickup locations
-          * page validates — so checking it here checks it there.
-          */}
-        <p style={{ fontSize: "0.72rem", color: "#64748b", margin: "0 0 0.2rem" }}>
-          Booking needs both addresses accepted. A check that could not be performed is not an
-          acceptance: an address the validator never reached blocks the booking the same way a
-          rejected one does, until it is checked or an owner accepts it on the record.
-        </p>
-        {addressGate.pickup ? (
-          <AddressGateCard
-            title="Pickup address"
-            subjectType="PICKUP"
-            subjectId={addressGate.pickupSubjectId ?? ""}
-            status={addressGate.pickup}
-            isOwner={isOwner}
-            editHref="/admin/origins"
-            editLabel="Edit this location's address"
-          />
-        ) : (
-          <p style={{ fontSize: "0.78rem", color: "#b45309", marginTop: "0.8rem" }}>
-            The pickup address could not be resolved, so there is nothing to check and booking is
-            blocked. Map this shipment&apos;s items to a pickup location first.
-          </p>
-        )}
-        <AddressGateCard
-          title="Delivery address"
-          subjectType="DELIVERY"
-          subjectId={order.id}
-          status={addressGate.delivery}
-          isOwner={isOwner}
-        />
-      </div>
+          READ-ONLY, AND RESOLVED THE WAY THE BOOKING RESOLVES THEM.
 
-      <div style={card}>
-        <h2 style={h2}>Packages (packed dimensions and gross shipping weight)</h2>
-        {packages.length === 0 ? (
-          <p style={{ fontSize: "0.78rem", color: "#b45309" }}>No parcel dimensions recorded. Quoting is blocked until every parcel has length, width, height and gross shipping weight.</p>
+          These are the cartons this shipment will actually be labelled with,
+          from `packagesForShipment` — the same call the quote and the booking
+          make — so this card cannot describe a different set of boxes from the
+          one the carrier is asked about. Cartons are found in three places, in
+          order: the rows assigned to THIS box, then the order's own parcel
+          rows, then the packaging stored on the variants and products. There is
+          no add or remove control here on purpose: a parcel typed on a booking
+          screen is a measurement the catalogue does not hold, so the next order
+          for the same item would be quoted without it.
+        */}
+        {bookingParcels.packages.length === 0 ? (
+          <p style={{ fontSize: "0.78rem", color: "#b45309" }}>
+            No cartons could be resolved for this shipment, so quoting and booking are blocked
+            {bookingParcels.missing.length > 0 ? (
+              <>
+                {" "}for: <strong>{bookingParcels.missing.join("; ")}</strong>
+              </>
+            ) : (
+              "."
+            )}{" "}
+            Complete the packaging in the <Link to="/admin/products" style={{ color: "#082a4a" }}>Product Catalog</Link>{" "}
+            or the <Link to="/admin/packaging" style={{ color: "#082a4a" }}>Packaging Library</Link>, then request rates.
+            Nothing on this page can supply the missing measurements.
+          </p>
         ) : (
-          <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.6rem" }}>
-            <thead>
-              {/*
-                * The stored columns are centimetres and kilograms — that is what
-                * a carrier is told and it does not change with the preference —
-                * so the heading and the figures are both read in the unit the
-                * operator is working in, converted for display only.
-                */}
-              <tr><th style={th}>Count</th><th style={th}>Dimensions ({units.dimensionUnit})</th><th style={th}>Weight ({units.weightUnit})</th><th style={th}>Total weight</th><th style={th}></th></tr>
-            </thead>
-            <tbody>
-              {packages.map((p) => (
-                <tr key={p.id} style={{ borderTop: "1px solid #f1f5f9" }}>
-                  <td style={td}>{p.count}</td>
-                  <td style={td}>{convertedDisplay(p.length, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.width, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.height, "cm", units.dimensionUnit, "length")}</td>
-                  <td style={td}>{convertedDisplay(p.weight, "kg", units.weightUnit, "weight")}</td>
-                  <td style={td}>{convertedDisplay(p.weight * p.count, "kg", units.weightUnit, "weight")}</td>
-                  <td style={td}>
-                    {!shipment.providerShipmentId ? (
-                      <Form method="post">
-                        <input type="hidden" name="intent" value="remove_package" />
-                        <input type="hidden" name="packageId" value={p.id} />
-                        <button type="submit" style={btn("#dc2626")}>Remove</button>
-                      </Form>
-                    ) : null}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <>
+            <p style={{ fontSize: "0.78rem", color: "#334155", marginBottom: "0.35rem" }}>
+              Quoting and booking will use{" "}
+              <strong>
+                {bookingParcels.packages.reduce((n, p) => n + p.count, 0)} parcel
+                {bookingParcels.packages.reduce((n, p) => n + p.count, 0) === 1 ? "" : "s"}
+              </strong>
+              , {SHIPMENT_PARCEL_SOURCE[bookingParcels.source]}.
+            </p>
+            <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: "0.6rem" }}>
+              <thead>
+                {/*
+                  * The stored columns are centimetres and kilograms — that is what
+                  * a carrier is told and it does not change with the preference —
+                  * so the heading and the figures are both read in the unit the
+                  * operator is working in, converted for display only.
+                  */}
+                <tr><th style={th}>Count</th><th style={th}>Dimensions ({units.dimensionUnit})</th><th style={th}>Weight ({units.weightUnit})</th><th style={th}>Total weight</th></tr>
+              </thead>
+              <tbody>
+                {bookingParcels.packages.map((p, index) => (
+                  <tr key={index} style={{ borderTop: "1px solid #f1f5f9" }}>
+                    <td style={td}>{p.count}</td>
+                    <td style={td}>{convertedDisplay(p.length, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.width, "cm", units.dimensionUnit, "length")} × {convertedDisplay(p.height, "cm", units.dimensionUnit, "length")}</td>
+                    <td style={td}>{convertedDisplay(p.weight, "kg", units.weightUnit, "weight")}</td>
+                    <td style={td}>{convertedDisplay(p.weight * p.count, "kg", units.weightUnit, "weight")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {bookingParcels.notes.map((note) => (
+              <p key={note} style={{ fontSize: "0.72rem", color: "#b45309", marginBottom: "0.35rem" }} role="status">
+                {note}
+              </p>
+            ))}
+            <p className="mv-readonly-parcel">
+              Read-only. The stored parcel record is centimetres and kilograms; these figures are converted to{" "}
+              {units.phrase} for display only, and booking always sends the stored values. To change what is sent,
+              correct the packaging on the item — there is no parcel entry form on this page.
+            </p>
+          </>
         )}
-        {!shipment.providerShipmentId ? (
-          <Form method="post" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end" }}>
-            <input type="hidden" name="intent" value="add_package" />
-            {/* The unit this form was drawn in. There is no selector beside the
-                fields: the admin has one unit setting and it is on the
-                Settings page, where it says that it applies everywhere. */}
-            <input type="hidden" name="units" value={units.preference} />
-            <label style={label}>Count<br /><input style={{ ...input, width: 70 }} name="count" type="number" defaultValue={1} min={1} /></label>
-            <label style={label}>Length ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="length" type="number" step="0.01" required /></label>
-            <label style={label}>Width ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="width" type="number" step="0.01" required /></label>
-            <label style={label}>Height ({units.dimensionUnit})<br /><input style={{ ...input, width: 80 }} name="height" type="number" step="0.01" required /></label>
-            <label style={label}>Gross weight ({units.weightUnit})<br /><input style={{ ...input, width: 90 }} name="weight" type="number" step="0.01" required /></label>
-            <button type="submit" style={btn("#0369a1")}>Add parcel</button>
-          </Form>
+        {bookingParcels.missing.length > 0 && bookingParcels.packages.length > 0 ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.5rem" }}>
+            These lines have no packaging and would be refused at booking:{" "}
+            <strong>{bookingParcels.missing.join("; ")}</strong>. Complete their packaging in the{" "}
+            <Link to="/admin/products" style={{ color: "#082a4a" }}>Product Catalog</Link> or the{" "}
+            <Link to="/admin/packaging" style={{ color: "#082a4a" }}>Packaging Library</Link>.
+          </p>
         ) : null}
       </div>
 
-      <div style={card}>
+      <div className="mv-panel mv-panel-body">
         {/* The progression links here so a booking retry reaches the one
             confirmation panel rather than a second form. */}
-        <h2 id="book-shipment" style={h2}>Rate comparison</h2>
+        <h2 id="book-shipment" className="mv-panel-title">Rate comparison</h2>
         <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
           eShipper: {eshipper.description} · {eshipper.detail}
         </p>
         <Form method="post" style={{ marginBottom: "0.6rem" }}>
-          <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")} disabled={packages.length === 0}>Get quotes</button>
+          <button type="submit" name="intent" value="get_quotes" style={btn("#0369a1")} disabled={bookingParcels.packages.length === 0}>Get quotes</button>
         </Form>
         {/* Why the quotes are gone, in the place the operator is standing when
             they ask. Recorded on the order at the moment they were withdrawn,
@@ -1317,70 +1257,29 @@ export default function AdminShipmentDetail() {
             requested" from "this is yesterday's page" without re-quoting to find
             out — and the booking, which replays the quote into the provider's
             save step, is buying the price on this row, not a fresh one.
+
+            The choosing itself is the shared dialog, the same one the order page
+            opens, so the two screens cannot price differently: it prints each
+            rate's dock and refuses the ones this shipment cannot book, and its
+            only two endings are Cancel and Confirm — neither spends money.
           */}
           <p style={{ fontSize: "0.75rem", color: "#475569", marginBottom: "0.4rem" }}>
             {quotes.length} price{quotes.length === 1 ? "" : "s"} from the rate request at{" "}
             <strong>{new Date(quotes.reduce((newest, q) => (new Date(q.quotedAt) > newest ? new Date(q.quotedAt) : newest), new Date(quotes[0].quotedAt))).toLocaleString()}</strong>.
             Requesting quotes again replaces this batch and clears any selection made from it.
           </p>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr><th style={th}>Carrier</th><th style={th}>Service</th><th style={th}>Total</th><th style={th}>Base / surcharge / tax</th><th style={th}>Transit</th><th style={th}>Quoted</th><th style={th}>Expires</th><th style={th}></th></tr>
-            </thead>
-            <tbody>
-              {quotes.map((q) => {
-                const raw = q.raw ? (JSON.parse(q.raw) as Record<string, unknown>) : {};
-                return (
-                  <tr key={q.id} style={{ borderTop: "1px solid #f1f5f9", background: q.selected ? "#f0fdf4" : undefined }}>
-                    <td style={td}>{q.carrier}</td>
-                    <td style={td}>
-                      {q.serviceName}
-                      {cheapest?.id === q.id ? " · cheapest" : ""}
-                      {fastest?.id === q.id && q.transitDays !== null ? " · fastest" : ""}
-                    </td>
-                    <td style={td}>{money(q.totalAmount, q.currency)}</td>
-                    <td style={{ ...td, color: "#94a3b8", fontSize: "0.68rem" }}>
-                      {raw.baseCharge != null ? `base ${raw.baseCharge}` : "base n/a"}
-                      {raw.surcharges != null ? ` · surcharges` : ""}
-                      {raw.taxes != null ? ` · taxes` : ""}
-                    </td>
-                    <td style={td}>{q.transitDays === null ? "Estimate unavailable" : `${q.transitDays} day(s)`}</td>
-                    <td style={td}>{new Date(q.quotedAt).toLocaleString()}</td>
-                    <td style={td}>
-                      {q.expiresAt ? (
-                        <span style={{ color: new Date(q.expiresAt).getTime() < Date.now() ? "#b91c1c" : undefined }}>
-                          {new Date(q.expiresAt).toLocaleString()}
-                        </span>
-                      ) : (
-                        // An absent expiry is not an expiry of "now" — the
-                        // provider does not always issue one, and a quote
-                        // without one never expires here.
-                        <span style={{ color: "#64748b" }}>Not stated</span>
-                      )}
-                    </td>
-                    <td style={td}>
-                      <Form method="post">
-                        <input type="hidden" name="intent" value="select_quote" />
-                        <input type="hidden" name="quoteId" value={q.id} />
-                        <button type="submit" style={btn("#082a4a")}>Select</button>
-                      </Form>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <RateSelection quotes={quotes} dockIds={dockIds} now={now} subject="shipment" />
           </>
         )}
 
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Process shipment</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Process shipment</h2>
         <ProcessShipment
           shipment={shipment}
           paid={paid}
-          packages={packages.length}
+          packages={bookingParcels.packages.length}
           selectedQuote={selectedQuote}
           canBook={canBook}
           isOwner={isOwner}
@@ -1413,8 +1312,8 @@ export default function AdminShipmentDetail() {
         />
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Documents</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Documents</h2>
         {/*
           WHAT THE BOOKING ACTUALLY BOUGHT, stated once and in full.
           Every figure here is read back from the shipment row rather than
@@ -1526,8 +1425,8 @@ export default function AdminShipmentDetail() {
         </Form>
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Tracking</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Tracking</h2>
         {/*
           Both words, because they say different things. The bold line is the
           normalized status — one of nine, the set every screen agrees on. The
@@ -1581,26 +1480,64 @@ export default function AdminShipmentDetail() {
         {shipment.providerShipmentId ? (
           <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginBottom: "0.6rem" }}>
             <Form method="post"><button type="submit" name="intent" value="sync_tracking" style={btn("#0369a1")}>Sync tracking</button></Form>
-            {shipment.status !== "CANCELLED" && shipment.status !== "DELIVERED" ? (
-              <Form method="post" style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
-                <input type="hidden" name="intent" value="advance_shipment" />
-                <select name="event" defaultValue="in_transit" style={input}>
-                  {ADVANCE_EVENTS.map((ev) => (
-                    <option key={ev} value={ev}>{ev.replace(/_/g, " ")}</option>
-                  ))}
-                </select>
-                {/*
-                  The answer given on the confirmation screen, shown as this
-                  control's starting position rather than asked again with no
-                  memory of it. Whatever is ticked here is what the push uses —
-                  this is the moment the choice actually takes effect, because
-                  this is the moment the parcel is dispatched.
-                */}
-                <label style={{ fontSize: "0.68rem", color: "#64748b" }} title="Ask Shopify to e-mail the customer when this tracking is pushed">
-                  <input type="checkbox" name="notifyCustomer" defaultChecked={shipment.notifyCustomerOnPush} /> notify
-                </label>
-                <button type="submit" style={btn("#082a4a")}>Record</button>
-              </Form>
+            {/*
+              WHAT AN OPERATOR MAY RECORD HERE, AND NOTHING MORE: this box is
+              packed, and this box was handed to the driver. Those are the two
+              things somebody at the dock sees happen. "Shipped", "in transit",
+              "delivered" and "exception" are the carrier's own scans — they
+              arrive through tracking sync — and typing one here would put a
+              fact on the record nobody here observed and, on handoff, push
+              tracking to Shopify the carrier had not reported.
+            */}
+            {shipment.status !== "CANCELLED" ? (
+              <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
+                {!shipment.packedAt ? (
+                  <Form method="post">
+                    <input type="hidden" name="intent" value="advance_shipment" />
+                    <input type="hidden" name="event" value="packed" />
+                    <button type="submit" style={btn("#082a4a")}>Mark packed</button>
+                  </Form>
+                ) : (
+                  <span style={{ fontSize: "0.72rem", color: "#334155" }}>
+                    Packed {new Date(shipment.packedAt).toLocaleString()}
+                  </span>
+                )}
+                {shipment.packedAt && !shipment.handedToCarrierAt ? (
+                  <Form method="post" style={{ display: "flex", gap: "0.3rem", alignItems: "center" }}>
+                    <input type="hidden" name="intent" value="advance_shipment" />
+                    <input type="hidden" name="event" value="handed_to_carrier" />
+                    {/*
+                      THREE STATES, NOT A CHECKBOX. The first option is the
+                      stored preference — the answer given when the label was
+                      bought — and leaving the select alone uses it. An
+                      unchecked checkbox would silently mean "no" on every
+                      handoff, including the ones where nobody meant to say no;
+                      the explicit options exist for the exceptions.
+                    */}
+                    <select
+                      name="notifyCustomer"
+                      defaultValue=""
+                      style={input}
+                      title="Whether Shopify e-mails the customer when this tracking number is pushed"
+                    >
+                      <option value="">
+                        {shipment.notifyCustomerOnPush
+                          ? "Notify the customer (as booked)"
+                          : "Do not notify the customer (as booked)"}
+                      </option>
+                      <option value="on">Notify the customer</option>
+                      <option value="off">Do not notify the customer</option>
+                    </select>
+                    <button type="submit" style={btn("#082a4a")}>Hand to carrier</button>
+                  </Form>
+                ) : shipment.handedToCarrierAt ? (
+                  <span style={{ fontSize: "0.72rem", color: "#334155" }}>
+                    Handed to the carrier {new Date(shipment.handedToCarrierAt).toLocaleString()}
+                    {shipment.shopifyNotifiedAt ? " · Shopify notified" : ""}
+                    {shipment.notifyCustomerOnPush === false ? " · customer notification declined" : ""}
+                  </span>
+                ) : null}
+              </div>
             ) : null}
           </div>
         ) : null}
@@ -1623,8 +1560,8 @@ export default function AdminShipmentDetail() {
         )}
       </div>
 
-      <div id="pickup" style={card}>
-        <h2 style={h2}>Pickup</h2>
+      <div id="pickup" className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Pickup</h2>
         {/*
           The current pickup state, stated before the form that changes it. "A
           booked shipment does not prove pickup is scheduled" is only useful to
@@ -1637,9 +1574,10 @@ export default function AdminShipmentDetail() {
           one-off request for that dock is how two drivers arrive for one carton.
         */}
         <p style={{ fontSize: "0.78rem", marginBottom: "0.3rem" }}>
-          {shipment.pickupMode
-            ? PICKUP_MODE_LABEL[shipment.pickupMode] ?? `Pickup mode: ${shipment.pickupMode}`
-            : "Pickup mode not recorded — this shipment predates the origin mapping, so confirm with the dock before relying on the state below."}
+          {PICKUP_MODE_LABEL[shipment.resolvedPickupMode] ?? `Pickup mode: ${shipment.resolvedPickupMode}`}
+          {!shipment.pickupMode
+            ? " (The shipment itself does not record a mode; this is what the collection gate applies.)"
+            : ""}
         </p>
         <p style={{ fontSize: "0.78rem", marginBottom: "0.5rem", color: PICKUP_COLOR[shipment.pickupStatus ?? "NONE"] ?? "#64748b" }}>
           {PICKUP_LABEL[shipment.pickupStatus ?? "NONE"] ?? `Pickup state: ${shipment.pickupStatus}`}
@@ -1749,14 +1687,37 @@ export default function AdminShipmentDetail() {
             />
           </label>
           <label style={label}>Notes<br /><input name="notes" style={input} /></label>
+          {shipment.resolvedPickupMode === "REGULAR" ? (
+            /*
+              THE STANDING COLLECTION, AND THE ONE EXCEPTION TO IT. A dock with a
+              regular collection already sees a truck; the service refuses to ask
+              for a second one unless this box is explicitly a one-off, because
+              two requests for one door is how two drivers arrive for one carton.
+              Read as present-or-absent like the calendar override below.
+            */
+            <label style={{ ...label, maxWidth: 320 }}>
+              <input type="checkbox" name="oneOffAtRegularDock" value="true" />{" "}
+              This box misses the dock&apos;s regular collection — request a one-off
+            </label>
+          ) : null}
           <label style={{ ...label, maxWidth: 260 }}>
             <input type="checkbox" name="overrideClosedDay" value="true" />{" "}
             Schedule anyway (confirmed with carrier)
           </label>
-          <button type="submit" style={btn("#0369a1")} disabled={!shipment.providerShipmentId}>
+          <button
+            type="submit"
+            style={btn("#0369a1")}
+            disabled={!shipment.providerShipmentId || shipment.resolvedPickupMode === "DROPOFF"}
+          >
             {shipment.pickupStatus === "SCHEDULED" ? "Schedule another pickup" : "Schedule pickup"}
           </button>
         </Form>
+        {shipment.resolvedPickupMode === "DROPOFF" ? (
+          <p style={{ fontSize: "0.72rem", color: "#b45309", marginTop: "0.35rem" }}>
+            This dock is a drop-off location: parcels are handed in at the carrier&apos;s depot, so
+            there is nothing for the carrier to collect and no pickup can be requested.
+          </p>
+        ) : null}
         <p style={{ fontSize: "0.68rem", color: "#64748b", marginTop: "0.35rem" }}>
           {pickupPlan.caveat}
           {pickupPlan.fromSnapshot
@@ -1778,8 +1739,8 @@ export default function AdminShipmentDetail() {
       </div>
 
       {!shipment.returnOfShipmentId ? (
-        <div id="return" style={card}>
-          <h2 style={h2}>Return authorization</h2>
+        <div id="return" className="mv-panel mv-panel-body">
+          <h2 className="mv-panel-title">Return authorization</h2>
           <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
             Open and approve the RMA first. This record does not buy a label, refund, restock, mark received, or update Shopify.
           </p>
@@ -1864,8 +1825,8 @@ export default function AdminShipmentDetail() {
         </div>
       ) : null}
 
-      <div id="claim" style={card}>
-        <h2 style={h2}>Carrier claim</h2>
+      <div id="claim" className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Carrier claim</h2>
         <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.6rem" }}>
           Open an internal case for loss, damage, shortage, or a delivery problem. MoonVella does not tell the carrier it was submitted until you record the carrier&apos;s claim number.
         </p>
@@ -1882,8 +1843,8 @@ export default function AdminShipmentDetail() {
         </Form>
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Carrier billing and reconciliation</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Carrier billing and reconciliation</h2>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: "0.6rem", marginBottom: "0.6rem" }}>
           {[
             { k: "Seller shipping charge", v: money(billing.sellerShippingCharge, order.currency) },
@@ -1914,8 +1875,8 @@ export default function AdminShipmentDetail() {
         </p>
       </div>
 
-      <div style={card}>
-        <h2 style={h2}>Cancellation</h2>
+      <div className="mv-panel mv-panel-body">
+        <h2 className="mv-panel-title">Cancellation</h2>
         {shipment.status === "CANCELLED" ? (
           <p style={{ fontSize: "0.8rem", color: "#64748b" }}>Cancelled. Cancellation does not by itself guarantee a refund.</p>
         ) : shipment.providerShipmentId ? (
@@ -1931,9 +1892,9 @@ export default function AdminShipmentDetail() {
         </p>
       </div>
 
-      <div style={card}>
+      <div className="mv-panel mv-panel-body">
         {/* Where the tracking push is retried from. */}
-        <h2 id="shipments" style={h2}>Order and Shopify links</h2>
+        <h2 id="shipments" className="mv-panel-title">Order and Shopify links</h2>
         <div style={{ fontSize: "0.78rem", lineHeight: 1.7 }}>
           <div>Shopify fulfillment order: {order.id ? "see order" : "—"}</div>
           <div>Shopify fulfillment id: {shipment.shopifyFulfillmentId || "not pushed"}</div>

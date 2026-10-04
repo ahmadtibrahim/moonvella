@@ -31,20 +31,96 @@ export async function action({ request }: ActionFunctionArgs) {
   } catch (error) { return { error: error instanceof Error ? error.message : "Claim update failed." }; }
 }
 
-const card = { background: "white", border: "1px solid #dbe4ee", borderRadius: 12, padding: "1rem" } as const;
 export default function AdminClaims() {
   const { claims, status } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  return <div style={{ maxWidth: 1180, margin: "0 auto" }}>
-    <ShippingOperationsNav />
-    <h1 style={{ fontSize: "1.5rem", color: "#082a4a", marginBottom: "0.25rem" }}>Carrier claims</h1>
-    <p style={{ color: "#64748b", fontSize: "0.8rem", marginBottom: "1rem" }}>These are internal case files. “Submitted” is available only after the carrier gives you its claim number.</p>
-    {actionData?.error ? <div style={{ ...card, borderColor: "#fecaca", background: "#fef2f2", color: "#991b1b", marginBottom: "0.75rem" }}>{actionData.error}</div> : null}
-    <Form method="get" style={{ marginBottom: "0.75rem" }}><select name="status" defaultValue={status} style={{ padding: "0.5rem", border: "1px solid #cbd5e1", borderRadius: 7 }}><option value="">All statuses</option>{Object.keys(CLAIM_NEXT).map((value) => <option key={value}>{value}</option>)}</select> <button style={{ padding: "0.5rem 0.8rem" }}>Filter</button></Form>
-    <div style={{ display: "grid", gap: "0.75rem" }}>{claims.length === 0 ? <div style={card}>No claims found.</div> : claims.map((claim) => <article key={claim.id} style={card}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}><div><strong style={{ color: "#082a4a" }}>{claim.claimNumber}</strong> · <Link to={`/admin/orders/${claim.shipment.orderId}`}>{claim.shipment.order.shopifyOrderName}</Link> · {claim.shipment.order.seller.storeName}<div style={{ color: "#64748b", fontSize: "0.75rem", marginTop: "0.25rem" }}>{claim.type.replaceAll("_", " ")} — {claim.description}</div></div><strong>{claim.status.replaceAll("_", " ")}</strong></div>
-      <div style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.4rem" }}>Carrier: {claim.shipment.carrier || "—"} · Tracking: {claim.shipment.trackingNumber || "—"} · Requested amount: {claim.amount == null ? "not set" : `${(claim.amount / 100).toFixed(2)} ${claim.currency}`}{claim.carrierClaimNumber ? ` · Carrier claim ${claim.carrierClaimNumber}` : ""}</div>
-      {CLAIM_NEXT[claim.status].length > 0 ? <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "flex-end", flexWrap: "wrap", marginTop: "0.75rem" }}><input type="hidden" name="id" value={claim.id} /><label style={{ fontSize: "0.7rem" }}>Next status<br /><select name="status" style={{ padding: "0.45rem", border: "1px solid #cbd5e1", borderRadius: 7 }}>{CLAIM_NEXT[claim.status].map((next) => <option key={next}>{next}</option>)}</select></label><label style={{ fontSize: "0.7rem" }}>Carrier claim #<br /><input name="carrierClaimNumber" defaultValue={claim.carrierClaimNumber || ""} style={{ padding: "0.45rem", border: "1px solid #cbd5e1", borderRadius: 7 }} /></label><label style={{ fontSize: "0.7rem" }}>Resolution note<br /><input name="resolutionNotes" style={{ padding: "0.45rem", border: "1px solid #cbd5e1", borderRadius: 7 }} /></label><button style={{ padding: "0.48rem 0.75rem", background: "#082a4a", color: "white", border: 0, borderRadius: 7 }}>Update claim</button><Link to={`/admin/shipping/${claim.shipmentId}#claim`} style={{ fontSize: "0.75rem" }}>Open shipment</Link></Form> : null}
-    </article>)}</div>
-  </div>;
+  return (
+    <div className="mv-page-wide">
+      <ShippingOperationsNav />
+
+      <div className="mv-page-header">
+        <div>
+          <h1>Carrier claims</h1>
+          <p>These are internal case files. “Submitted” is available only after the carrier gives you its claim number.</p>
+        </div>
+      </div>
+
+      {actionData?.error ? (
+        <div style={{ background: "#fff0ee", border: "1px solid #fecaca", color: "#b42318", borderRadius: 12, padding: "0.75rem 1rem", marginBottom: "1rem", fontSize: "0.82rem" }}>
+          {actionData.error}
+        </div>
+      ) : null}
+
+      <Form method="get" className="mv-filter-bar">
+        <label className="mv-field">
+          Status
+          <select name="status" defaultValue={status} className="mv-input">
+            <option value="">All statuses</option>
+            {Object.keys(CLAIM_NEXT).map((value) => <option key={value}>{value}</option>)}
+          </select>
+        </label>
+        <button type="submit" className="mv-button mv-button-dark">Filter</button>
+      </Form>
+
+      <section className="mv-panel">
+        <div className="mv-table-wrap">
+          <table className="mv-table">
+            <thead>
+              <tr>
+                <th>Claim</th>
+                <th>Status</th>
+                <th>Shipment</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {claims.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="mv-muted" style={{ padding: "2rem", textAlign: "center" }}>
+                    No claims found.
+                  </td>
+                </tr>
+              ) : claims.map((claim) => (
+                <tr key={claim.id}>
+                  <td>
+                    <strong>{claim.claimNumber}</strong>
+                    <div><Link to={`/admin/orders/${claim.shipment.orderId}`}>{claim.shipment.order.shopifyOrderName}</Link></div>
+                    <div className="mv-muted">{claim.shipment.order.seller.storeName}</div>
+                    <div className="mv-muted">{claim.type.replaceAll("_", " ")} — {claim.description}</div>
+                  </td>
+                  <td><span className="mv-badge">{claim.status.replaceAll("_", " ")}</span></td>
+                  <td>
+                    <span className="mv-muted">
+                      Carrier: {claim.shipment.carrier || "—"} · Tracking: {claim.shipment.trackingNumber || "—"} · Requested amount: {claim.amount == null ? "not set" : `${(claim.amount / 100).toFixed(2)} ${claim.currency}`}
+                      {claim.carrierClaimNumber ? ` · Carrier claim ${claim.carrierClaimNumber}` : ""}
+                    </span>
+                  </td>
+                  <td>
+                    {CLAIM_NEXT[claim.status].length > 0 ? (
+                      <Form method="post" className="mv-actions" style={{ alignItems: "flex-end" }}>
+                        <input type="hidden" name="id" value={claim.id} />
+                        <label className="mv-field">Next status
+                          <select name="status" className="mv-input">
+                            {CLAIM_NEXT[claim.status].map((next) => <option key={next}>{next}</option>)}
+                          </select>
+                        </label>
+                        <label className="mv-field">Carrier claim #
+                          <input name="carrierClaimNumber" defaultValue={claim.carrierClaimNumber || ""} className="mv-input" />
+                        </label>
+                        <label className="mv-field">Resolution note
+                          <input name="resolutionNotes" className="mv-input" />
+                        </label>
+                        <button type="submit" className="mv-button mv-button-dark">Update claim</button>
+                        <Link to={`/admin/shipping/${claim.shipmentId}#claim`} className="mv-button">Open shipment</Link>
+                      </Form>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
 }

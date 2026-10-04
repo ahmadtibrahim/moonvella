@@ -44,14 +44,13 @@ const STATUSES = [
 ] as const;
 const PAGE_SIZE = 25;
 
-const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = [
-  "packed",
-  "handed_to_carrier",
-  "shipped",
-  "in_transit",
-  "delivered",
-  "exception",
-];
+/*
+ * Manual advancement stops at the handover. Everything past it — shipped, in
+ * transit, delivered, exception — is the carrier's own scan, and typing those
+ * in by hand would let this screen disagree with the tracking that is the
+ * record of what actually happened.
+ */
+const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = ["packed", "handed_to_carrier"];
 
 /**
  * The pickup filter's own vocabulary, which is not the column's.
@@ -86,11 +85,11 @@ const PICKUP_STATUS_LABEL: Record<string, string> = {
   UNKNOWN: "Unknown",
 };
 
-const PICKUP_STATUS_COLOR: Record<string, string> = {
-  SCHEDULED: "#059669",
-  FAILED: "#dc2626",
-  MISSED: "#b45309",
-  CANCELLED: "#64748b",
+const PICKUP_STATUS_BADGE: Record<string, string> = {
+  SCHEDULED: "mv-badge-success",
+  FAILED: "mv-badge-danger",
+  MISSED: "mv-badge-warning",
+  CANCELLED: "",
 };
 
 function parseAddress(raw: string | null): Record<string, string> {
@@ -356,40 +355,35 @@ export async function action({ request }: ActionFunctionArgs) {
   return redirect(request.url);
 }
 
-const th: React.CSSProperties = { padding: "0.5rem", fontSize: "0.68rem", color: "#64748b", textAlign: "left" };
-const td: React.CSSProperties = { padding: "0.5rem", fontSize: "0.78rem", verticalAlign: "top" };
-const input: React.CSSProperties = { padding: "0.4rem 0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.75rem", boxSizing: "border-box" };
-const smallBtn = (color: string): React.CSSProperties => ({ padding: "0.2rem 0.45rem", border: `1px solid ${color}`, borderRadius: 4, background: "white", color, fontSize: "0.65rem", fontWeight: 600, cursor: "pointer" });
-
-const statusColor: Record<string, string> = {
-  PENDING: "#b45309",
-  BOOKING: "#0369a1",
-  BOOKING_FAILED: "#dc2626",
-  BOOKING_UNKNOWN: "#b45309",
-  BOOKED: "#059669",
-  CANCELLING: "#64748b",
-  SHIPPED: "#0369a1",
-  DELIVERED: "#059669",
-  EXCEPTION: "#dc2626",
-  CANCELLED: "#64748b",
+const statusBadge: Record<string, string> = {
+  PENDING: "mv-badge-warning",
+  BOOKING: "mv-badge-brand",
+  BOOKING_FAILED: "mv-badge-danger",
+  BOOKING_UNKNOWN: "mv-badge-warning",
+  BOOKED: "mv-badge-success",
+  CANCELLING: "",
+  SHIPPED: "mv-badge-brand",
+  DELIVERED: "mv-badge-success",
+  EXCEPTION: "mv-badge-danger",
+  CANCELLED: "",
 };
 
 /**
  * The nine display words are one vocabulary; this is the other half of it, the
- * colors. Colored from the DISPLAY status rather than from the carrier's raw
+ * badge tone. Chosen from the DISPLAY status rather than from the carrier's raw
  * state, so "Undelivered" and "Exception" cannot come out green and red for the
  * same situation on two adjacent rows.
  */
-const trackingDisplayColor: Record<TrackingDisplayStatus, string> = {
-  BOOKED: "#0369a1",
-  PICKED_UP: "#0369a1",
-  IN_TRANSIT: "#0369a1",
-  OUT_FOR_DELIVERY: "#b45309",
-  DELIVERED: "#059669",
-  EXCEPTION: "#dc2626",
-  CANCELLED: "#64748b",
-  RETURNED: "#b45309",
-  UNKNOWN: "#64748b",
+const trackingDisplayBadge: Record<TrackingDisplayStatus, string> = {
+  BOOKED: "mv-badge-brand",
+  PICKED_UP: "mv-badge-brand",
+  IN_TRANSIT: "mv-badge-brand",
+  OUT_FOR_DELIVERY: "mv-badge-warning",
+  DELIVERED: "mv-badge-success",
+  EXCEPTION: "mv-badge-danger",
+  CANCELLED: "",
+  RETURNED: "mv-badge-warning",
+  UNKNOWN: "",
 };
 
 function money(cents: number | null, currency = "CAD") {
@@ -445,17 +439,17 @@ function shopifySync(shipment: {
   shopifyFulfillmentId: string | null;
   shopifySyncedAt: Date | string | null;
   shopifySyncError: string | null;
-}): { text: string; color: string; title: string | null } {
+}): { text: string; badge: string; title: string | null } {
   if (shipment.shopifyFulfillmentId) {
     const when = shipment.shopifySyncedAt ? new Date(shipment.shopifySyncedAt).toLocaleDateString() : null;
     return {
       text: when ? `Fulfilled ${when}` : "Fulfilled",
-      color: "#059669",
+      badge: "mv-badge-success",
       title: `Shopify fulfillment ${shipment.shopifyFulfillmentId}`,
     };
   }
-  if (shipment.shopifySyncError) return { text: "Sync failed", color: "#dc2626", title: shipment.shopifySyncError };
-  return { text: "Awaiting dispatch", color: "#64748b", title: null };
+  if (shipment.shopifySyncError) return { text: "Sync failed", badge: "mv-badge-danger", title: shipment.shopifySyncError };
+  return { text: "Awaiting dispatch", badge: "", title: null };
 }
 
 export default function AdminShipping() {
@@ -466,83 +460,73 @@ export default function AdminShipping() {
   const loading = navigation.state === "loading";
 
   return (
-    <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+    <div className="mv-page-wide">
       <ShippingOperationsNav />
-      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>Shipments</h1>
-      <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        One row per shipment, so a split order shows each parcel. Parsing, quoting and booking begin from a parcel.
-      </p>
-      <p style={{ fontSize: "0.75rem", marginBottom: "1rem" }}>
-        <Link to="/admin/orders" style={{ color: "#0369a1", fontWeight: 600 }}>
-          {awaitingPrep} order{awaitingPrep === 1 ? "" : "s"} awaiting shipment preparation &rarr;
-        </Link>
-      </p>
+
+      <div className="mv-page-header">
+        <div>
+          <h1>Shipments</h1>
+          <p>One row per shipment, so a split order shows each parcel. Parsing, quoting and booking begin from a parcel.</p>
+          <p style={{ marginTop: "0.4rem", fontSize: "0.75rem" }}>
+            <Link to="/admin/orders">
+              {awaitingPrep} order{awaitingPrep === 1 ? "" : "s"} awaiting shipment preparation &rarr;
+            </Link>
+          </p>
+        </div>
+      </div>
 
       {actionData?.error ? (
-        <div style={{ background: "#fef2f2", border: "1px solid #fecaca", color: "#991b1b", borderRadius: 8, padding: "0.75rem", marginBottom: "1rem", fontSize: "0.82rem" }}>
+        <div style={{ background: "#fff0ee", border: "1px solid #fecaca", color: "#b42318", borderRadius: 12, padding: "0.75rem 1rem", marginBottom: "1rem", fontSize: "0.82rem" }}>
           {actionData.error}
         </div>
       ) : null}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "0.75rem", marginBottom: "1.25rem" }}>
-        {[
-          { label: "Total shipments", value: total, color: "#082a4a" },
-          { label: "Awaiting booking", value: pending, color: "#b45309" },
-          { label: "Delivered", value: delivered, color: "#059669" },
-          { label: "Needs attention", value: exceptions, color: "#dc2626" },
-        ].map((c) => (
-          <div key={c.label} style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: "1rem" }}>
-            <div style={{ fontSize: "0.72rem", color: "#64748b" }}>{c.label}</div>
-            <div style={{ fontSize: "1.6rem", fontWeight: 700, color: c.color }}>{c.value}</div>
-          </div>
-        ))}
+      <div className="mv-stat-grid">
+        <div className="mv-stat"><span>Total shipments</span><strong>{total}</strong></div>
+        <div className="mv-stat"><span>Awaiting booking</span><strong>{pending}</strong></div>
+        <div className="mv-stat"><span>Delivered</span><strong>{delivered}</strong></div>
+        <div className="mv-stat"><span>Needs attention</span><strong>{exceptions}</strong></div>
       </div>
 
-      <Form method="get" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+      <Form method="get" className="mv-filter-bar">
+        <label className="mv-field">
           Search
-          <br />
-          <input name="q" defaultValue={filters.q} placeholder="Order, shipment, tracking, seller" style={{ ...input, width: 240 }} />
+          <input className="mv-input" name="q" defaultValue={filters.q} placeholder="Order, shipment, tracking, seller" style={{ width: 240 }} />
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Status
-          <br />
-          <select name="status" defaultValue={filters.status} style={input}>
+          <select className="mv-input" name="status" defaultValue={filters.status}>
             <option value="">All</option>
             {STATUSES.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Carrier / service
-          <br />
-          <input name="carrier" defaultValue={filters.carrier} placeholder="Any" style={{ ...input, width: 120 }} />
+          <input className="mv-input" name="carrier" defaultValue={filters.carrier} placeholder="Any" style={{ width: 120 }} />
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Seller
-          <br />
-          <select name="seller" defaultValue={filters.seller} style={input}>
+          <select className="mv-input" name="seller" defaultValue={filters.seller}>
             <option value="">All</option>
             {sellers.map((s) => (
               <option key={s.id} value={s.id}>{s.storeName}</option>
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Billing
-          <br />
-          <select name="billing" defaultValue={filters.billing} style={input}>
+          <select className="mv-input" name="billing" defaultValue={filters.billing}>
             <option value="">All</option>
             {["PENDING", "RECONCILED", "VARIANCE", "NEEDS_RECONCILIATION"].map((s) => (
               <option key={s} value={s}>{s.replace(/_/g, " ")}</option>
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Tracking
-          <br />
-          <select name="tracking" defaultValue={filters.tracking} style={input}>
+          <select className="mv-input" name="tracking" defaultValue={filters.tracking}>
             <option value="">All</option>
             {/* The nine words, in movement order. The values are the internal
                 display statuses; the labels are what the rows show. */}
@@ -551,49 +535,44 @@ export default function AdminShipping() {
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Pickup
-          <br />
-          <select name="pickup" defaultValue={filters.pickup} style={input}>
+          <select className="mv-input" name="pickup" defaultValue={filters.pickup}>
             <option value="">All</option>
             {PICKUP_FILTERS.map((p) => (
               <option key={p.value} value={p.value}>{p.label}</option>
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Origin
-          <br />
-          <select name="origin" defaultValue={filters.origin} style={input}>
+          <select className="mv-input" name="origin" defaultValue={filters.origin}>
             <option value="">Any</option>
             {origins.map((o) => (
               <option key={o.id} value={o.id}>{o.code} — {o.name}</option>
             ))}
           </select>
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Destination
-          <br />
-          <input name="destination" defaultValue={filters.destination} placeholder="City, province or ZIP" style={{ ...input, width: 160 }} />
+          <input className="mv-input" name="destination" defaultValue={filters.destination} placeholder="City, province or ZIP" style={{ width: 160 }} />
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           Created from
-          <br />
-          <input type="date" name="from" defaultValue={filters.from} style={input} />
+          <input className="mv-input" type="date" name="from" defaultValue={filters.from} />
         </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
+        <label className="mv-field">
           to
-          <br />
-          <input type="date" name="to" defaultValue={filters.to} style={input} />
+          <input className="mv-input" type="date" name="to" defaultValue={filters.to} />
         </label>
         {/* Unchecked inputs send nothing, which is what "no filter" means; 1 is
             the only value the loader reads. */}
-        <label style={{ fontSize: "0.68rem", color: "#64748b", display: "flex", gap: "0.3rem", alignItems: "center", paddingBottom: "0.4rem" }}>
+        <label className="mv-field" style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: "0.35rem", paddingBottom: "0.4rem" }}>
           <input type="checkbox" name="syncErrors" value="1" defaultChecked={filters.syncErrors === "1"} />
           Sync errors
         </label>
-        <button type="submit" style={{ ...input, background: "#082a4a", color: "white", border: "none", fontWeight: 600, cursor: "pointer" }}>Filter</button>
-        <Link to="/admin/shipping" style={{ fontSize: "0.75rem", color: "#082a4a", paddingBottom: "0.4rem" }}>Reset</Link>
+        <button type="submit" className="mv-button mv-button-dark">Filter</button>
+        <Link to="/admin/shipping" className="mv-button">Reset</Link>
         {/*
           A test host and a live host both used to render as "configured" here.
           The environment and its hostname are the fact; see eshipperStatus.
@@ -610,11 +589,15 @@ export default function AdminShipping() {
         </span>
       </Form>
 
-      <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, overflowX: "auto" }}>
+      <section className="mv-panel">
+        <div className="mv-panel-header">
+          <div><h2>Shipment queue</h2><p>{total} shipments</p></div>
+          <span className="mv-badge">Page {page} of {pageCount}</span>
+        </div>
         {loading ? (
-          <p style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.85rem" }}>Loading shipments…</p>
+          <p className="mv-panel-body mv-muted">Loading shipments…</p>
         ) : shipments.length === 0 ? (
-          <p style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.85rem" }}>
+          <p className="mv-panel-body mv-muted">
             No shipments match. Shipments are created by booking a parcel from an order; none are created to fill this table.
           </p>
         ) : (
@@ -624,23 +607,24 @@ export default function AdminShipping() {
            * a table that hides half of them behind a click is the table this
            * section was written to replace. The container scrolls.
            */
-          <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 1720 }}>
+          <div className="mv-table-wrap">
+            <table className="mv-table" style={{ minWidth: 1720 }}>
             <thead>
-              <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
-                <th style={th}>Shipment</th>
-                <th style={th}>Order / seller</th>
-                <th style={th}>From &rarr; to</th>
-                <th style={th}>Carrier / service</th>
-                <th style={th}>Packages &amp; tracking</th>
-                <th style={th}>Status</th>
-                <th style={th}>Est. delivery</th>
-                <th style={th}>Pickup</th>
-                <th style={th}>Shopify</th>
-                <th style={th}>Last refresh</th>
-                <th style={th}>Seller charge</th>
-                <th style={th}>Carrier cost</th>
-                <th style={th}>Billing</th>
-                <th style={th}>Actions</th>
+              <tr>
+                <th>Shipment</th>
+                <th>Order / seller</th>
+                <th>From &rarr; to</th>
+                <th>Carrier / service</th>
+                <th>Packages &amp; tracking</th>
+                <th>Status</th>
+                <th>Est. delivery</th>
+                <th>Pickup</th>
+                <th>Shopify</th>
+                <th>Last refresh</th>
+                <th>Seller charge</th>
+                <th>Carrier cost</th>
+                <th>Billing</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -653,38 +637,38 @@ export default function AdminShipping() {
                 const latestText = carrierEventText(latest);
                 const sync = shopifySync(s);
                 return (
-                  <tr key={s.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                    <td style={td}>
-                      <Link to={`/admin/shipping/${s.id}`} style={{ fontWeight: 600, color: "#082a4a" }}>
+                  <tr key={s.id}>
+                    <td>
+                      <Link to={`/admin/shipping/${s.id}`}>
                         {s.returnOfShipmentId ? "Return " : ""}{s.id.slice(0, 8)}
                       </Link>
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>{new Date(s.createdAt).toLocaleDateString()}</div>
+                      <div className="mv-muted">{new Date(s.createdAt).toLocaleDateString()}</div>
                     </td>
-                    <td style={td}>
-                      <Link to={`/admin/orders/${s.order.id}`} style={{ color: "#082a4a" }}>{s.order.shopifyOrderName}</Link>
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>{s.order.supplierReference}</div>
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>{s.order.seller.storeName}</div>
+                    <td>
+                      <Link to={`/admin/orders/${s.order.id}`}>{s.order.shopifyOrderName}</Link>
+                      <div className="mv-muted">{s.order.supplierReference}</div>
+                      <div className="mv-muted">{s.order.seller.storeName}</div>
                     </td>
-                    <td style={td}>
-                      <span style={{ fontSize: "0.72rem" }}>{originLabel(s)}</span>
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>&rarr; {dest}</div>
+                    <td>
+                      {originLabel(s)}
+                      <div className="mv-muted">&rarr; {dest}</div>
                     </td>
-                    <td style={td}>
+                    <td>
                       {s.carrier || "—"}
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>{s.serviceName || "—"}</div>
+                      <div className="mv-muted">{s.serviceName || "—"}</div>
                     </td>
-                    <td style={td}>
+                    <td>
                       {s.trackingNumber || "—"}
-                      <div style={{ fontSize: "0.65rem", color: "#94a3b8" }}>
+                      <div className="mv-muted">
                         {s.packageCount != null ? `${s.packageCount} package${s.packageCount === 1 ? "" : "s"}` : "packages not recorded"}
                       </div>
                       {s.trackingUrl ? (
                         <div>
-                          <a href={s.trackingUrl} target="_blank" rel="noreferrer" style={{ fontSize: "0.65rem", color: "#0369a1" }}>Track</a>
+                          <a href={s.trackingUrl} target="_blank" rel="noreferrer">Track</a>
                         </div>
                       ) : null}
                     </td>
-                    <td style={td}>
+                    <td>
                       {/*
                         The normalized word, then the carrier's own. The second
                         line is the shipment's lifecycle status — BOOKING_FAILED
@@ -694,7 +678,7 @@ export default function AdminShipping() {
                         the normalized set flattens survives.
                       */}
                       <span
-                        style={{ color: trackingDisplayColor[display], fontWeight: 600 }}
+                        className={`mv-badge ${trackingDisplayBadge[display] ?? ""}`}
                         // The nine words merge "the carrier tried and failed"
                         // with "the carrier says it cannot be delivered"; the
                         // hover keeps that distinction reachable instead of
@@ -703,72 +687,76 @@ export default function AdminShipping() {
                       >
                         {trackingDisplayLabel(display)}
                       </span>
-                      <div style={{ fontSize: "0.62rem", color: statusColor[s.status] || "#94a3b8" }}>{s.status}</div>
+                      <div style={{ marginTop: "0.25rem" }}>
+                        <span className={`mv-badge ${statusBadge[s.status] ?? ""}`}>{s.status}</span>
+                      </div>
                       {latestText ? (
-                        <div style={{ fontSize: "0.62rem", color: "#64748b" }} title={latestText}>
+                        <div className="mv-muted" title={latestText}>
                           {latestText.length > 60 ? `${latestText.slice(0, 60)}…` : latestText}
                         </div>
                       ) : null}
                       {latest ? (
-                        <div style={{ fontSize: "0.62rem", color: "#94a3b8" }}>
+                        <div className="mv-muted">
                           {latest.location ? `${latest.location} · ` : ""}
                           {new Date(latest.eventAt).toLocaleString()}
                         </div>
                       ) : null}
                     </td>
-                    <td style={td}>{s.estimatedDelivery ? new Date(s.estimatedDelivery).toLocaleDateString() : "—"}</td>
-                    <td style={td}>
+                    <td>{s.estimatedDelivery ? new Date(s.estimatedDelivery).toLocaleDateString() : "—"}</td>
+                    <td>
                       {s.pickupMode ? (
-                        <div style={{ fontSize: "0.68rem" }}>{PICKUP_MODE_LABEL[s.pickupMode] ?? s.pickupMode}</div>
+                        <div>{PICKUP_MODE_LABEL[s.pickupMode] ?? s.pickupMode}</div>
                       ) : (
-                        <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>Not recorded</div>
+                        <div className="mv-muted">Not recorded</div>
                       )}
                       {s.pickupStatus ? (
-                        <div style={{ fontSize: "0.62rem", color: PICKUP_STATUS_COLOR[s.pickupStatus] || "#64748b", fontWeight: 600 }}>
-                          {PICKUP_STATUS_LABEL[s.pickupStatus] ?? s.pickupStatus}
+                        <div style={{ marginTop: "0.2rem" }}>
+                          <span className={`mv-badge ${PICKUP_STATUS_BADGE[s.pickupStatus] ?? ""}`}>
+                            {PICKUP_STATUS_LABEL[s.pickupStatus] ?? s.pickupStatus}
+                          </span>
                         </div>
                       ) : null}
                       {s.pickupScheduledFor ? (
-                        <div style={{ fontSize: "0.62rem", color: "#94a3b8" }}>
-                          {new Date(s.pickupScheduledFor).toLocaleString()}
-                        </div>
+                        <div className="mv-muted">{new Date(s.pickupScheduledFor).toLocaleString()}</div>
                       ) : null}
-                      {s.pickupWindow ? <div style={{ fontSize: "0.62rem", color: "#94a3b8" }}>{s.pickupWindow}</div> : null}
+                      {s.pickupWindow ? <div className="mv-muted">{s.pickupWindow}</div> : null}
                     </td>
-                    <td style={td}>
-                      <span style={{ fontSize: "0.68rem", color: sync.color, fontWeight: sync.text === "Sync failed" ? 600 : 400 }} title={sync.title ?? undefined}>
-                        {sync.text}
-                      </span>
+                    <td>
+                      <span className={`mv-badge ${sync.badge}`} title={sync.title ?? undefined}>{sync.text}</span>
                       {s.shopifyNotifiedAt ? (
-                        <div style={{ fontSize: "0.62rem", color: "#94a3b8" }}>customer told {new Date(s.shopifyNotifiedAt).toLocaleDateString()}</div>
+                        <div className="mv-muted">customer told {new Date(s.shopifyNotifiedAt).toLocaleDateString()}</div>
                       ) : null}
                     </td>
-                    <td style={td}>
+                    <td>
                       {s.lastTrackingSyncAt ? new Date(s.lastTrackingSyncAt).toLocaleString() : "—"}
                       {s.trackingSyncFailures > 0 ? (
-                        <div style={{ fontSize: "0.62rem", color: "#b45309" }}>
-                          {s.trackingSyncFailures} failed {s.trackingSyncFailures === 1 ? "attempt" : "attempts"}
+                        <div style={{ marginTop: "0.2rem" }}>
+                          <span className="mv-badge mv-badge-warning">
+                            {s.trackingSyncFailures} failed {s.trackingSyncFailures === 1 ? "attempt" : "attempts"}
+                          </span>
                         </div>
                       ) : null}
                       {s.lastTrackingError ? (
-                        <div style={{ fontSize: "0.62rem", color: "#dc2626" }} title={s.lastTrackingError}>sync error</div>
+                        <div style={{ marginTop: "0.2rem" }}>
+                          <span className="mv-badge mv-badge-danger" title={s.lastTrackingError}>sync error</span>
+                        </div>
                       ) : null}
                     </td>
-                    <td style={td}>{money(s.sellerShippingCharge, s.order.currency)}</td>
-                    <td style={td}>
+                    <td>{money(s.sellerShippingCharge, s.order.currency)}</td>
+                    <td>
                       {money(carrierCost, s.order.currency)}
                       {s.quotedCarrierCost != null && s.bookedCost != null && s.quotedCarrierCost !== s.bookedCost ? (
-                        <div style={{ fontSize: "0.62rem", color: "#b45309" }}>quoted {money(s.quotedCarrierCost)}</div>
+                        <div className="mv-muted">quoted {money(s.quotedCarrierCost)}</div>
                       ) : null}
                     </td>
-                    <td style={td}>
-                      <span style={{ fontSize: "0.68rem", color: s.billingStatus === "RECONCILED" ? "#059669" : s.billingStatus === "VARIANCE" ? "#b45309" : "#64748b" }}>
+                    <td>
+                      <span className={`mv-badge ${s.billingStatus === "RECONCILED" ? "mv-badge-success" : s.billingStatus === "VARIANCE" ? "mv-badge-warning" : ""}`}>
                         {s.billingStatus.replace(/_/g, " ")}
                       </span>
                     </td>
-                    <td style={td}>
-                      <div style={{ display: "flex", gap: "0.25rem", flexWrap: "wrap" }}>
-                        <Link to={`/admin/shipping/${s.id}`} style={{ ...smallBtn("#082a4a"), textDecoration: "none" }}>Open</Link>
+                    <td>
+                      <div className="mv-actions" style={{ gap: "0.25rem" }}>
+                        <Link to={`/admin/shipping/${s.id}`} className="mv-button">Open</Link>
                         {/*
                           Keyed on the provider shipment id, which is what these
                           two actions actually need, rather than on PENDING.
@@ -783,25 +771,25 @@ export default function AdminShipping() {
                             <Form method="post">
                               <input type="hidden" name="intent" value="sync_tracking" />
                               <input type="hidden" name="shipmentId" value={s.id} />
-                              <button type="submit" style={smallBtn("#0369a1")}>Sync</button>
+                              <button type="submit" className="mv-button">Sync</button>
                             </Form>
                             <Form method="post">
                               <input type="hidden" name="intent" value="cancel_shipment" />
                               <input type="hidden" name="shipmentId" value={s.id} />
-                              <button type="submit" style={smallBtn("#dc2626")}>Cancel</button>
+                              <button type="submit" className="mv-button mv-button-danger">Cancel</button>
                             </Form>
                           </>
                         ) : null}
                         {s.status === "BOOKED" || s.status === "SHIPPED" || s.status === "EXCEPTION" ? (
-                          <Form method="post" style={{ display: "flex", gap: "0.2rem", alignItems: "center" }}>
+                          <Form method="post" className="mv-actions" style={{ gap: "0.25rem" }}>
                             <input type="hidden" name="intent" value="advance_shipment" />
                             <input type="hidden" name="shipmentId" value={s.id} />
-                            <select name="event" defaultValue="in_transit" style={{ ...input, padding: "0.15rem 0.25rem", fontSize: "0.62rem" }}>
+                            <select name="event" defaultValue="packed" className="mv-input" style={{ padding: "0.15rem 0.25rem", fontSize: "0.62rem", minHeight: "auto" }}>
                               {ADVANCE_EVENTS.map((ev) => (
                                 <option key={ev} value={ev}>{ev.replace(/_/g, " ")}</option>
                               ))}
                             </select>
-                            <button type="submit" style={smallBtn("#082a4a")}>Go</button>
+                            <button type="submit" className="mv-button mv-button-dark">Go</button>
                           </Form>
                         ) : null}
                       </div>
@@ -810,18 +798,19 @@ export default function AdminShipping() {
                 );
               })}
             </tbody>
-          </table>
+            </table>
+          </div>
         )}
-      </div>
+      </section>
 
       {pageCount > 1 ? (
-        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "1rem", fontSize: "0.78rem" }}>
+        <div className="mv-actions" style={{ marginTop: "1rem" }}>
           {page > 1 ? (
-            <Link to={`?${new URLSearchParams({ ...filters, page: String(page - 1) } as Record<string, string>).toString()}`} style={{ color: "#082a4a" }}>&larr; Previous</Link>
+            <Link to={`?${new URLSearchParams({ ...filters, page: String(page - 1) } as Record<string, string>).toString()}`} className="mv-button">&larr; Previous</Link>
           ) : null}
-          <span style={{ color: "#64748b" }}>Page {page} of {pageCount}</span>
+          <span className="mv-muted" style={{ fontSize: "0.78rem" }}>Page {page} of {pageCount}</span>
           {page < pageCount ? (
-            <Link to={`?${new URLSearchParams({ ...filters, page: String(page + 1) } as Record<string, string>).toString()}`} style={{ color: "#082a4a" }}>Next &rarr;</Link>
+            <Link to={`?${new URLSearchParams({ ...filters, page: String(page + 1) } as Record<string, string>).toString()}`} className="mv-button">Next &rarr;</Link>
           ) : null}
         </div>
       ) : null}

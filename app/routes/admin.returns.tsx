@@ -31,21 +31,87 @@ export async function action({ request }: ActionFunctionArgs) {
   } catch (error) { return { error: error instanceof Error ? error.message : "Return update failed." }; }
 }
 
-const card = { background: "white", border: "1px solid #dbe4ee", borderRadius: 12, padding: "1rem" } as const;
 export default function AdminReturns() {
   const { requests, status } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
-  return <div style={{ maxWidth: 1180, margin: "0 auto" }}>
-    <ShippingOperationsNav />
-    <h1 style={{ fontSize: "1.5rem", color: "#082a4a", marginBottom: "0.25rem" }}>Return authorizations</h1>
-    <p style={{ color: "#64748b", fontSize: "0.8rem", marginBottom: "1rem" }}>A return request is an approval record. It does not buy a label, refund, restock, or update Shopify.</p>
-    {actionData?.error ? <div style={{ ...card, borderColor: "#fecaca", background: "#fef2f2", color: "#991b1b", marginBottom: "0.75rem" }}>{actionData.error}</div> : null}
-    <Form method="get" style={{ marginBottom: "0.75rem" }}><select name="status" defaultValue={status} style={{ padding: "0.5rem", border: "1px solid #cbd5e1", borderRadius: 7 }}><option value="">All statuses</option>{Object.keys(RETURN_NEXT).map((value) => <option key={value}>{value}</option>)}</select> <button style={{ padding: "0.5rem 0.8rem" }}>Filter</button></Form>
-    <div style={{ display: "grid", gap: "0.75rem" }}>{requests.length === 0 ? <div style={card}>No return requests found.</div> : requests.map((item) => <article key={item.id} style={card}>
-      <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}><div><strong style={{ color: "#082a4a" }}>{item.rmaNumber}</strong> · <Link to={`/admin/orders/${item.orderId}`}>{item.order.shopifyOrderName}</Link> · {item.order.seller.storeName}<div style={{ color: "#64748b", fontSize: "0.75rem", marginTop: "0.25rem" }}>{item.reason}</div></div><strong>{item.status.replaceAll("_", " ")}</strong></div>
-      <div style={{ fontSize: "0.75rem", marginTop: "0.6rem" }}>{item.items.map((line) => `${line.quantity} × ${line.orderItem.name} (${line.orderItem.sku})`).join(" · ")}</div>
-      <div style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.35rem" }}>Return shipping payer: {item.shippingPayer.replaceAll("_", " ")} · Opened by {item.createdByName || item.createdById}</div>
-      {RETURN_NEXT[item.status].length > 0 ? <Form method="post" style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.75rem" }}><input type="hidden" name="id" value={item.id} /><select name="status" style={{ padding: "0.45rem", border: "1px solid #cbd5e1", borderRadius: 7 }}>{RETURN_NEXT[item.status].map((next) => <option key={next}>{next}</option>)}</select><button style={{ padding: "0.45rem 0.75rem", background: "#082a4a", color: "white", border: 0, borderRadius: 7 }}>Update status</button><Link to={`/admin/shipping/${item.originalShipmentId}#return`} style={{ fontSize: "0.75rem" }}>Open shipment</Link></Form> : null}
-    </article>)}</div>
-  </div>;
+  return (
+    <div className="mv-page-wide">
+      <ShippingOperationsNav />
+
+      <div className="mv-page-header">
+        <div>
+          <h1>Return authorizations</h1>
+          <p>A return request is an approval record. It does not buy a label, refund, restock, or update Shopify.</p>
+        </div>
+      </div>
+
+      {actionData?.error ? (
+        <div style={{ background: "#fff0ee", border: "1px solid #fecaca", color: "#b42318", borderRadius: 12, padding: "0.75rem 1rem", marginBottom: "1rem", fontSize: "0.82rem" }}>
+          {actionData.error}
+        </div>
+      ) : null}
+
+      <Form method="get" className="mv-filter-bar">
+        <label className="mv-field">
+          Status
+          <select name="status" defaultValue={status} className="mv-input">
+            <option value="">All statuses</option>
+            {Object.keys(RETURN_NEXT).map((value) => <option key={value}>{value}</option>)}
+          </select>
+        </label>
+        <button type="submit" className="mv-button mv-button-dark">Filter</button>
+      </Form>
+
+      <section className="mv-panel">
+        <div className="mv-table-wrap">
+          <table className="mv-table">
+            <thead>
+              <tr>
+                <th>Return</th>
+                <th>Status</th>
+                <th>Items</th>
+                <th>Return shipping payer</th>
+                <th>Opened by</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {requests.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="mv-muted" style={{ padding: "2rem", textAlign: "center" }}>
+                    No return requests found.
+                  </td>
+                </tr>
+              ) : requests.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    <strong>{item.rmaNumber}</strong>
+                    <div><Link to={`/admin/orders/${item.orderId}`}>{item.order.shopifyOrderName}</Link></div>
+                    <div className="mv-muted">{item.order.seller.storeName}</div>
+                    <div className="mv-muted">{item.reason}</div>
+                  </td>
+                  <td><span className="mv-badge">{item.status.replaceAll("_", " ")}</span></td>
+                  <td>{item.items.map((line) => `${line.quantity} × ${line.orderItem.name} (${line.orderItem.sku})`).join(" · ")}</td>
+                  <td><span className="mv-muted">{item.shippingPayer.replaceAll("_", " ")}</span></td>
+                  <td><span className="mv-muted">{item.createdByName || item.createdById}</span></td>
+                  <td>
+                    {RETURN_NEXT[item.status].length > 0 ? (
+                      <Form method="post" className="mv-actions">
+                        <input type="hidden" name="id" value={item.id} />
+                        <select name="status" className="mv-input">
+                          {RETURN_NEXT[item.status].map((next) => <option key={next}>{next}</option>)}
+                        </select>
+                        <button type="submit" className="mv-button mv-button-dark">Update status</button>
+                        <Link to={`/admin/shipping/${item.originalShipmentId}#return`} className="mv-button">Open shipment</Link>
+                      </Form>
+                    ) : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
 }

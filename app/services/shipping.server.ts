@@ -3067,7 +3067,7 @@ export async function schedulePickupForShipment(
       action: "shipping.pickup_failed",
       entityType: AUDIT_ENTITY.SHIPMENT,
       entityId: shipmentId,
-      afterData: { message, requestedDate: data.pickupDate, window: data.pickupTimeWindow },
+      afterData: { message, requestedDate: data.pickupDate, window },
       ipAddress: actor.ipAddress,
       userAgent: actor.userAgent,
     });
@@ -3086,7 +3086,16 @@ export async function schedulePickupForShipment(
       pickupStatus: "SCHEDULED",
       providerPickupId: booking.pickupId,
       pickupScheduledFor: Number.isNaN(scheduledFor.getTime()) ? null : scheduledFor,
-      pickupWindow: data.pickupTimeWindow || null,
+      /*
+       * THE WINDOW THE CARRIER WAS TOLD, not the one the form happened to post.
+       *
+       * `window` above is the request's own answer: the operator's window when
+       * they gave one, the dock's recorded hours when they did not. Storing
+       * `data.pickupTimeWindow` here would store null in the second case and the
+       * page would then say no window was agreed while a driver holds one — the
+       * page and the carrier disagreeing about when a truck is coming.
+       */
+      pickupWindow: window,
       pickupConfirmation: booking.confirmationNumber ?? null,
       pickupLastError: null,
       pickupCancelledAt: null,

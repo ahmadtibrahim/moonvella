@@ -374,7 +374,7 @@ export function classifyRefusal(message: string): FulfillmentSetupBlocked {
   }
   if (text.includes("access scope") || text.includes("access denied")) {
     return new FulfillmentSetupBlocked(
-      `${message} — the app needs the write_fulfillments and write_locations scopes granted by a reinstall.`,
+      `${message} — this store's installation predates the write_fulfillments and write_locations permissions; approve the newly required scopes from the MoonVella admin.`,
       "SCOPE"
     );
   }

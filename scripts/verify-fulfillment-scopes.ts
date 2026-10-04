@@ -492,12 +492,15 @@ function main() {
   /* ------------------------------------------------------------------ *
    * G. The configuration that makes the ask legal.
    *
-   * A scope requested at runtime through the Scopes API must be declared as an
-   * OPTIONAL scope in the app config. Required scopes are granted once, by the
-   * install screen; asking for one at runtime is asking Shopify to grant, on
-   * demand, something it believes it already granted. Both of these lived in
-   * `scopes` while the app asked for them at runtime — a second defect behind
-   * the 401, and invisible until the 401 stopped hiding it.
+   * Both scopes are REQUIRED installation scopes: the workflow cannot finish
+   * an order without them, so a new installation is asked for them on the
+   * install screen, and they are deliberately NOT duplicated as optional — a
+   * scope declared in both places is ambiguous, and an optional declaration
+   * would describe them as permissions the merchant may decline. Stores
+   * installed before this became the shape hold a grant without them, and
+   * Shopify does not widen an existing grant when an app's required list
+   * grows; those older installations are what the in-app repair path in
+   * section F exists for.
    * ------------------------------------------------------------------ */
 
   const toml = readFileSync(join(process.cwd(), "shopify.app.toml"), "utf8");
@@ -526,27 +529,26 @@ function main() {
 
   check(
     28,
-    "Both scopes are declared as optional_scopes in the app configuration",
-    FULFILLMENT_SCOPES.every((scope) => optional.includes(scope)),
-    `optional_scopes = ${optional.join(", ") || "(absent)"}`
+    "Both scopes are declared as required installation scopes in the app configuration",
+    FULFILLMENT_SCOPES.every((scope) => required.includes(scope)),
+    `${required.length} required scope(s)`
   );
 
   check(
     29,
-    "Neither is still declared as a required scope",
-    !FULFILLMENT_SCOPES.some((scope) => required.includes(scope)),
-    `${required.length} required scope(s)`
+    "Neither is duplicated as an optional scope",
+    !FULFILLMENT_SCOPES.some((scope) => optional.includes(scope)),
+    `optional_scopes = ${optional.join(", ") || "(absent)"}`
   );
 
   /*
-   * The read half stays required and that is not an oversight: `read_locations`
-   * is granted, the catalog uses it to know where stock is, and only the WRITE
-   * half is being asked for. Shopify also refuses an optional scope that is an
-   * implicit required one, so this pair is the shape that deploys.
+   * `read_locations` stays required and that is not an oversight: the catalog
+   * uses it to know where stock is. It is the READ half of the location
+   * permissions, and it was never the half that went missing.
    */
   check(
     30,
-    "read_locations stays required — only the write half became optional",
+    "read_locations stays required — the read half never changed",
     required.includes("read_locations"),
     required.includes("read_locations") ? "read_locations required" : "read_locations MISSING"
   );

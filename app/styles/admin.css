@@ -580,3 +580,5 @@ body {
   .mv-order-overview,
   .mv-address-grid { grid-template-columns: 1fr; }
 }
+
+.mv-panel-title { margin: 0 0 0.6rem; color: var(--mv-admin-text); font-size: 0.9rem; }

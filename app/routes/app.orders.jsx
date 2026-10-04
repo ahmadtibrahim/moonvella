@@ -935,9 +935,10 @@ export default function OrdersPage() {
           MoonVella needs two more Shopify permissions
         </h3>
         <p style={{ margin: "0 0 1rem", color: "#92400e" }}>
-          Shopify has not granted MoonVella the{" "}
+          This store was installed before MoonVella required the{" "}
           <strong>{missingScopes.join(" and ")}</strong>{" "}
-          {missingScopes.length === 1 ? "permission" : "permissions"}. Until it does, MoonVella
+          {missingScopes.length === 1 ? "permission" : "permissions"}, and Shopify does not widen an
+          existing grant on its own. Until the newly required permissions are approved, MoonVella
           cannot create the location its stock ships from or send a fulfillment, so orders cannot be
           completed. Shopify will ask you to approve them on its own page.
         </p>

@@ -24,30 +24,30 @@ name = "MoonVella"
 # NOT requested: write_orders (not required by fulfillmentCreate), read_all_orders (separate approval; 60-day
 #   window only until granted).
 #
-# THE TWO FULFILLMENT SCOPES ARE OPTIONAL, NOT REQUIRED, AND THAT IS NOT A
-# PREFERENCE — IT IS WHAT MAKES THEM REQUESTABLE AT ALL.
+# THE TWO FULFILLMENT SCOPES ARE REQUIRED INSTALLATION SCOPES.
 #
 # write_fulfillments and write_locations create the fulfillment service and the
-# location MoonVella ships its own stock from. They started life in `scopes`
-# above, on the reasoning that the app cannot do its job without them. Shopify's
-# rule is the other way round: a scope asked for at runtime through the Scopes
-# API — `scopes.request()`, which is the only way an app can ask after install —
-# MUST be declared here as an optional scope. Required scopes are granted once,
-# at install, by the merchant accepting the install screen, and there is no
-# runtime request for them. Asking for a required scope as an optional one is
-# asking Shopify to grant, on demand, something it believes it already granted.
+# location MoonVella ships its own stock from. The advertised workflow cannot
+# finish an order without them, so every NEW installation is asked for them on
+# the install screen, next to everything else in `scopes`. They are deliberately
+# not repeated in `optional_scopes`: a scope declared in both places is
+# ambiguous, and an optional declaration would tell the merchant these are
+# permissions they may decline — which for the shipping workflow they are not.
 #
-# Declared here they are still asked for, on the same screen, by the same
-# button — but through the path Shopify provides for it. A merchant may decline,
-# and the app is built for that: the banner stays, the button stays, and orders
-# are read normally; what does not happen is fulfillment, which is exactly what
-# the missing permission means.
+# Stores installed BEFORE these two became required hold a grant that does not
+# include them; Shopify does not widen an existing grant when an app's required
+# list grows. Those older installations are repaired in-app: the orders screen
+# reads the live grant (`scopes.query()`), a banner names the missing
+# permissions, and its button requests them through the Scopes API, falling
+# back to a full reauthorization whose approval screen lists the newly required
+# permissions. A merchant may decline; the banner stays, orders are read
+# normally, and what does not happen is fulfillment — which is exactly what the
+# missing permission means.
 #
-# Ordered the way the grant screen reads them. `read_locations` stays in
-# `scopes`: it is granted, and it is what the catalog needs to know where stock
-# is — only the WRITE half is optional.
-scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,write_inventory,read_locations,write_files,read_reports"
-optional_scopes = ["write_fulfillments", "write_locations"]
+# `read_locations` stays in `scopes` for the same reason it always was: the
+# catalog needs to know where stock is.
+scopes = "write_products,write_metaobjects,write_metaobject_definitions,read_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_assigned_fulfillment_orders,write_assigned_fulfillment_orders,write_inventory,read_locations,write_files,read_reports,write_fulfillments,write_locations"
+optional_scopes = []
 
 [product.metafields.app.demo_info]
 type = "single_line_text_field"

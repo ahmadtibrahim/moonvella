@@ -24,9 +24,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
   if (states.includes(state as OrderState)) where.state = state as OrderState;
   if (sellerId) where.sellerId = sellerId;
   /*
-   * "Paid" is the wholesale side — the seller's own customer paying their store
-   * is the other column and a different question. The pair is deliberately not
-   * collapsed into one control: an order whose customer has paid and whose
+   * "Seller payment" is the wholesale side — the store's customer paying the
+   * store is the other column and a different question. The pair is deliberately
+   * not collapsed into one control: an order whose customer has paid and whose
    * seller has not is exactly the row somebody is looking for.
    */
   if (payment === "succeeded") where.wholesalePaymentStatus = "SUCCEEDED";
@@ -44,18 +44,36 @@ export async function loader({ request }: LoaderFunctionArgs) {
         currency: true,
         moonvellaTotal: true,
         customerName: true,
+        customerEmail: true,
         paymentStatus: true,
         wholesalePaymentStatus: true,
         fulfillmentStatus: true,
         state: true,
         createdAt: true,
         seller: { select: { storeName: true } },
+        // The newest shipment is the one every "where is this order" question
+        // is about: a cancelled label is replaced by a new shipment row, so the
+        // latest row is the live one without having to filter by status.
+        shipments: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          select: {
+            id: true,
+            status: true,
+            carrier: true,
+            serviceName: true,
+            trackingNumber: true,
+            trackingUrl: true,
+            packedAt: true,
+            handedToCarrierAt: true,
+            deliveredAt: true,
+          },
+        },
         // The amount actually charged, beside the status. A status alone cannot
         // answer "how much is this order worth to us", and a second query per
         // row to find out is how a list page becomes slow enough to stop being
         // read.
         wholesalePayment: { select: { amount: true, currency: true, status: true } },
-        _count: { select: { items: true, shipments: true } },
       },
     }),
     prisma.seller.findMany({ select: { id: true, storeName: true }, orderBy: { storeName: "asc" } }),
@@ -73,152 +91,227 @@ function money(cents: number, currency = "CAD") {
   return `${(cents / 100).toFixed(2)} ${currency}`;
 }
 
-/**
- * Where an order is in the pipeline, as a colour an eye can sort by.
- *
- * Colored from the pipeline state and not from `fulfillmentStatus`, because the
- * two disagree in exactly the case that matters: an order whose parcels are all
- * PENDING and whose seller has not paid looks identical to one that is merely
- * waiting on a label. The state is the column that knows the difference.
- */
-const STATE_COLOR: Record<string, string> = {
-  RECEIVED: "#64748b",
-  AWAITING_SELLER_PAYMENT: "#b45309",
-  PAYMENT_PROCESSING: "#0369a1",
-  PAYMENT_ACTION_REQUIRED: "#b45309",
-  PAYMENT_FAILED: "#dc2626",
-  PAID: "#0369a1",
-  READY_FOR_FULFILLMENT: "#059669",
-  FULFILLMENT_REQUESTED: "#059669",
-  IN_FULFILLMENT: "#059669",
-  SHIPPED: "#0369a1",
-  DELIVERED: "#059669",
-  CANCELLED: "#64748b",
-  REFUND_REVIEW: "#dc2626",
-};
+type QueueOrder = Awaited<ReturnType<typeof loader>>["orders"][number];
 
-const th: React.CSSProperties = { textAlign: "left", padding: "0.5rem", fontSize: "0.68rem", color: "#64748b" };
-const td: React.CSSProperties = { padding: "0.5rem", fontSize: "0.8rem" };
-const input: React.CSSProperties = { padding: "0.4rem 0.5rem", border: "1px solid #cbd5e1", borderRadius: 6, fontSize: "0.75rem", boxSizing: "border-box" };
+type NextAction = { label: string; tone: "brand" | "warning" | "success" | "danger" | "muted" };
+
+/**
+ * The one thing to do next, derived from what is stored on the order.
+ *
+ * Every branch reads a column that already exists — the seller's payment
+ * status, the newest shipment's status and its packed/handed timestamps, the
+ * tracking number — so the answer cannot disagree with the order page, and it
+ * updates the moment a carrier event or a booking lands. Nothing is inferred
+ * from `fulfillmentStatus`, which is Shopify's view and lags MoonVella's own
+ * booking by design.
+ */
+function nextActionFor(order: QueueOrder): NextAction {
+  if (order.state === "CANCELLED") return { label: "Cancelled", tone: "muted" };
+
+  const shipment = order.shipments[0] ?? null;
+
+  if (order.state === "DELIVERED" || shipment?.deliveredAt || shipment?.status === "DELIVERED") {
+    return { label: "Delivered", tone: "success" };
+  }
+
+  // Seller payment comes first: nothing may be booked until MoonVella has been
+  // paid, so pointing anywhere else would point past the actual blocker.
+  if (order.wholesalePaymentStatus !== "SUCCEEDED") {
+    return { label: "Collect seller payment", tone: "warning" };
+  }
+
+  if (
+    !shipment ||
+    shipment.status === "CANCELLED" ||
+    shipment.status === "PENDING" ||
+    shipment.status === "BOOKING" ||
+    shipment.status === "BOOKING_FAILED"
+  ) {
+    return { label: "Select rate / book label", tone: "brand" };
+  }
+
+  if (shipment.status === "BOOKING_UNKNOWN") {
+    // A booking attempt whose outcome is unknown. Re-booking is blocked until
+    // it is reconciled, so "book a label" would point at a door that does not
+    // open; the reconcile control is on the order page this row links to.
+    return { label: "Reconcile booking", tone: "danger" };
+  }
+
+  if (shipment.status === "BOOKED") {
+    if (!shipment.packedAt) return { label: "Pack order", tone: "brand" };
+    if (!shipment.handedToCarrierAt) return { label: "Hand to carrier", tone: "brand" };
+  }
+
+  // SHIPPED and EXCEPTION are carrier-side now: the carrier's own scans drive
+  // the rest, and the operator's job is to watch them.
+  if (
+    shipment.trackingNumber ||
+    shipment.status === "SHIPPED" ||
+    shipment.status === "EXCEPTION"
+  ) {
+    return { label: "Carrier tracking", tone: "brand" };
+  }
+
+  return { label: "Select rate / book label", tone: "brand" };
+}
+
+const NEXT_ACTION_CLASS: Record<NextAction["tone"], string> = {
+  brand: "mv-badge mv-badge-brand",
+  warning: "mv-badge mv-badge-warning",
+  success: "mv-badge mv-badge-success",
+  danger: "mv-badge mv-badge-danger",
+  muted: "mv-badge",
+};
 
 export default function AdminOrders() {
   const { orders, sellers, states, filters } = useLoaderData<typeof loader>();
 
   return (
-    <div style={{ maxWidth: 1200, margin: "0 auto" }}>
-      <h1 style={{ fontSize: "1.75rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-        Orders
-      </h1>
-      <p style={{ color: "#64748b", fontSize: "0.875rem", marginBottom: "1rem" }}>
-        MoonVella supplier orders created from verified Shopify order webhooks.
-      </p>
-      <p style={{ fontSize: "0.78rem", marginBottom: "1rem" }}>
-        <Link to="/admin/fulfillment" style={{ color: "#0369a1", fontWeight: 600 }}>
-          Fulfillment queue &rarr;
-        </Link>
-      </p>
+    <div className="mv-page-wide">
+      <div className="mv-page-header">
+        <div>
+          <h1>Orders</h1>
+          <p className="mv-muted">
+            MoonVella supplier orders created from verified Shopify order webhooks. The newest 100
+            are shown.
+          </p>
+        </div>
+        <div className="mv-actions">
+          <Link to="/admin/fulfillment" className="mv-button">
+            Fulfillment queue
+          </Link>
+        </div>
+      </div>
 
       {/* A GET form, so a filtered list is a URL somebody can send to somebody
           else. The order-desk question "what is stuck waiting for money" is
           asked over and over, and it should not have to be re-clicked. */}
-      <Form method="get" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "flex-end", marginBottom: "1rem" }}>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
-          State
-          <br />
-          <select name="state" defaultValue={filters.state} style={input}>
+      <Form method="get" className="mv-filter-bar">
+        <div className="mv-field">
+          <label htmlFor="filter-state">Order state</label>
+          <select id="filter-state" name="state" defaultValue={filters.state} className="mv-input">
             <option value="">All</option>
             {states.map((s) => (
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
-        </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
-          Seller
-          <br />
-          <select name="seller" defaultValue={filters.seller} style={input}>
+        </div>
+        <div className="mv-field">
+          <label htmlFor="filter-seller">Seller</label>
+          <select id="filter-seller" name="seller" defaultValue={filters.seller} className="mv-input">
             <option value="">All</option>
             {sellers.map((s) => (
               <option key={s.id} value={s.id}>{s.storeName}</option>
             ))}
           </select>
-        </label>
-        <label style={{ fontSize: "0.68rem", color: "#64748b" }}>
-          Wholesale payment
-          <br />
-          <select name="payment" defaultValue={filters.payment} style={input}>
+        </div>
+        <div className="mv-field">
+          <label htmlFor="filter-payment">Seller payment</label>
+          <select id="filter-payment" name="payment" defaultValue={filters.payment} className="mv-input">
             <option value="">All</option>
             <option value="succeeded">Paid by the seller</option>
             <option value="outstanding">Not paid by the seller</option>
           </select>
-        </label>
-        <button type="submit" style={{ padding: "0.45rem 0.85rem", border: "1px solid #082a4a", borderRadius: 6, background: "white", color: "#082a4a", fontSize: "0.72rem", fontWeight: 600, cursor: "pointer" }}>
-          Filter
-        </button>
-        <Link to="/admin/orders" style={{ fontSize: "0.72rem", color: "#64748b" }}>Clear</Link>
+        </div>
+        <button type="submit" className="mv-button mv-button-dark">Filter</button>
+        <Link to="/admin/orders" className="mv-muted">Clear</Link>
       </Form>
 
-      <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: 12, overflow: "hidden" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
-              <th style={th}>Order</th>
-              <th style={th}>Seller</th>
-              <th style={th}>Items</th>
-              <th style={th}>MoonVella total</th>
-              <th style={th}>State</th>
-              <th style={th}>Customer paid</th>
-              <th style={th}>Wholesale payment</th>
-              <th style={th}>Paid</th>
-              <th style={th}>Fulfillment</th>
-            </tr>
-          </thead>
-          <tbody>
-            {orders.length === 0 ? (
+      <div className="mv-panel">
+        <div className="mv-table-wrap">
+          <table className="mv-table">
+            <thead>
               <tr>
-                <td colSpan={9} style={{ padding: "2rem", textAlign: "center", color: "#64748b", fontSize: "0.85rem" }}>
-                  No supplier orders match. They are created when a verified Shopify order contains an imported MoonVella product.
-                </td>
+                <th>Order</th>
+                <th>Seller</th>
+                <th>Customer</th>
+                <th>Seller payment</th>
+                <th>Next action</th>
+                <th>Shipping</th>
+                <th>Open</th>
               </tr>
-            ) : (
-              orders.map((o) => (
-                <tr key={o.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                  <td style={td}>
-                    <Link to={`/admin/orders/${o.id}`} style={{ fontWeight: 600, color: "#082a4a" }}>
-                      {o.shopifyOrderName}
-                    </Link>
-                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>{o.supplierReference}</div>
-                  </td>
-                  <td style={td}>{o.seller?.storeName}</td>
-                  <td style={td}>{o._count.items}</td>
-                  <td style={td}>{money(o.moonvellaTotal, o.currency)}</td>
-                  <td style={{ ...td, color: STATE_COLOR[o.state] ?? "#334155", fontWeight: 600 }}>{o.state}</td>
-                  <td style={td}>{o.paymentStatus}</td>
-                  <td style={td}>
-                    <span style={{ color: o.wholesalePayment?.status === "SUCCEEDED" ? "#059669" : "#b45309", fontWeight: 600 }}>
-                      {o.wholesalePayment?.status ?? o.wholesalePaymentStatus}
-                    </span>
-                    {o.wholesalePayment ? (
-                      <div style={{ fontSize: "0.7rem", color: "#64748b" }}>
-                        {money(o.wholesalePayment.amount, o.wholesalePayment.currency)}
-                      </div>
-                    ) : null}
-                  </td>
-                  {/* The one-word answer, spelled out. "Whether payment
-                      succeeded" is the question the fulfillment queue is
-                      filtered on, and an operator should be able to see the
-                      same verdict here without knowing that SUCCEEDED is the
-                      word for it. */}
-                  <td style={{ ...td, color: o.wholesalePaymentStatus === "SUCCEEDED" ? "#059669" : "#dc2626", fontWeight: 600 }}>
-                    {o.wholesalePaymentStatus === "SUCCEEDED" ? "Yes" : "No"}
-                  </td>
-                  <td style={td}>
-                    {o.fulfillmentStatus} {o._count.shipments > 0 ? `(${o._count.shipments} shipment)` : ""}
+            </thead>
+            <tbody>
+              {orders.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="mv-muted" style={{ padding: "2rem", textAlign: "center" }}>
+                    No supplier orders match. They are created when a verified Shopify order
+                    contains an imported MoonVella product.
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                orders.map((o) => {
+                  const next = nextActionFor(o);
+                  const shipment = o.shipments[0] ?? null;
+                  const sellerPaid = o.wholesalePaymentStatus === "SUCCEEDED";
+                  return (
+                    <tr key={o.id}>
+                      <td>
+                        <Link to={`/admin/orders/${o.id}`} style={{ fontWeight: 600 }}>
+                          {o.shopifyOrderName}
+                        </Link>
+                        <div className="mv-muted">{o.supplierReference}</div>
+                      </td>
+                      <td>{o.seller?.storeName ?? <span className="mv-muted">—</span>}</td>
+                      <td>
+                        <div>{o.customerName ?? <span className="mv-muted">—</span>}</div>
+                        {/* The store's customer, and what THEY paid the STORE —
+                            a different question from the seller's payment to
+                            MoonVella beside it, and labelled so it cannot be
+                            misread as the same thing. */}
+                        <div className="mv-muted">Shopify: {o.paymentStatus}</div>
+                      </td>
+                      <td>
+                        <span className={`mv-badge mv-badge-${sellerPaid ? "success" : "warning"}`}>
+                          {o.wholesalePayment?.status ?? o.wholesalePaymentStatus}
+                        </span>
+                        {o.wholesalePayment ? (
+                          <div className="mv-muted">
+                            {money(o.wholesalePayment.amount, o.wholesalePayment.currency)}
+                          </div>
+                        ) : null}
+                      </td>
+                      <td>
+                        <span className={NEXT_ACTION_CLASS[next.tone]}>{next.label}</span>
+                      </td>
+                      <td>
+                        {shipment ? (
+                          <>
+                            <div>
+                              {shipment.carrier
+                                ? [shipment.carrier, shipment.serviceName].filter(Boolean).join(" ")
+                                : shipment.status}
+                            </div>
+                            <div className="mv-muted">
+                              {shipment.trackingNumber ? (
+                                shipment.trackingUrl ? (
+                                  <a href={shipment.trackingUrl} target="_blank" rel="noreferrer">
+                                    {shipment.trackingNumber}
+                                  </a>
+                                ) : (
+                                  shipment.trackingNumber
+                                )
+                              ) : (
+                                shipment.status
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          <span className="mv-muted">No shipment yet</span>
+                        )}
+                      </td>
+                      <td>
+                        <Link to={`/admin/orders/${o.id}`} className="mv-button mv-button-dark">
+                          Open
+                        </Link>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </div>
   );
