@@ -309,9 +309,15 @@ async function main() {
    * `{shipmentId, carrier, labelUrl, cost}` object that resembles nothing the
    * provider sends, which is why a reader looking for those names passed here
    * and recorded an empty shipment at zero cost in production.
+   *
+   * The id inside `order` is `id` — measured on a live booking, and the shape
+   * the fixture below previously lacked: `order.orderId` belongs to the
+   * CANCELLATION request schema the Swagger mis-points `ShippingReply.order` at
+   * (see `readShippingReply`). This fixture carried the cancel shape's
+   * `orderId` plus its `trackingId`, which no booking reply contains.
    */
   const shippingReply = {
-    order: { orderId: "8000000029608", trackingId: "TRK1", message: null },
+    order: { id: "8000000029608", message: null },
     carrier: { carrierName: "Canada Post", serviceName: "Expedited Parcel", carrierLogoPath: "/logo.png" },
     trackingNumber: "TRK1",
     trackingUrl: "https://track/TRK1",

@@ -1509,40 +1509,66 @@ async function finalizeBooking(
  * reason its timeout is not retried internally.
  *
  * If it answers with nothing, that is recorded and NOTHING ELSE CHANGES. An
- * empty answer is not proof that no label exists: the lookup is by the quote id
+ * empty answer is not proof that no label exists: the lookup is by a reference
  * the provider was given before the call went quiet, and a provider that
- * indexes nothing under that reference would answer empty whether or not a
- * label was purchased. Turning that into BOOKING_FAILED would hand the operator
- * a re-book button on the strength of a lookup that cannot support the claim,
- * so a person decides through resolveUnknownBooking once they have checked the
+ * indexes nothing under it would answer empty whether or not a label was
+ * purchased. Turning that into BOOKING_FAILED would hand the operator a
+ * re-book button on the strength of a lookup that cannot support the claim, so
+ * a person decides through resolveUnknownBooking once they have checked the
  * provider's own portal.
+ *
+ * TWO STATES ARE RECONCILABLE, AND THE SECOND ONE IS WHY THIS LOOKUP FALLS BACK
+ * TO THE SAVED QUOTE.
+ *
+ *   1. BOOKING_UNKNOWN — the purchase call never returned. Asked by the
+ *      shipping order id if the row somehow has one.
+ *   2. BOOKED with an empty provider id — a real booking whose id was lost on
+ *      the way in. This is not hypothetical: the booking reply nests the id at
+ *      `order.id` and the reader asked for `order.orderId`, so order #1004 on
+ *      the staging host was recorded BOOKED at cost, with tracking, tracking
+ *      URL and its label document, and a provider id of "". These rows can be
+ *      asked about by the saved-quote id, and that is not a guess. MEASURED on
+ *      that host: `PUT /api/v2/quote` returns the very id that `POST
+ *      /api/v2/ship/{id}` consumes, and afterwards `GET /api/v2/ship/{id}`
+ *      answers with THIS booking (same tracking number, same label, same
+ *      price) while `GET /api/v2/quote/{id}` 404s — the saved quote and the
+ *      shipping order are one record under one number, which is also why the
+ *      saved id is written onto the row beside a successful booking
+ *      (finalizeBooking). A previous version of this comment claimed the two
+ *      were separate number spaces; that claim is the defect this lookup fixes.
+ *
+ * The fallback applies ONLY to state 2, and the restriction is deliberate. A
+ * BOOKING_UNKNOWN row's quote column still holds the RATE uuid — the timeout
+ * happens before the save's id can be learned — and a rate uuid is not an
+ * order the provider indexes, so asking with it would produce a not-found that
+ * explains nothing. That gap is real and reported: a timed-out booking cannot
+ * be reconciled this way, and the way out of it stays a person reading the
+ * provider's portal (resolveUnknownBooking).
  */
 export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) {
   const shipment = await prisma.shipment.findUnique({ where: { id: shipmentId } });
   if (!shipment) throw new Error("Shipment not found.");
-  if (shipment.status !== "BOOKING_UNKNOWN") {
+  const bookedWithoutId = shipment.status === "BOOKED" && !shipment.providerShipmentId;
+  if (shipment.status !== "BOOKING_UNKNOWN" && !bookedWithoutId) {
     throw new Error(
       shipment.status === "BOOKED"
         ? "This shipment is already booked."
-        : `Only a shipment awaiting an unknown booking outcome can be reconciled (this is ${shipment.status}).`
+        : `Only a shipment whose booking outcome is unknown — or a booked shipment whose provider id was never ` +
+          `recorded — can be reconciled (this is ${shipment.status}).`
     );
   }
+
   /*
-   * Asked by SHIPPING ORDER id, and by nothing else.
-   *
-   * This used to ask by quote id, which cannot work: `GET /api/v2/ship/{orderId}`
-   * is keyed on the shipping order, a different number space from the quote that
-   * was saved to create it. A quote number that happened to collide with some
-   * other order's would have adopted a STRANGER'S shipment onto this row —
-   * someone else's tracking number, someone else's label. Refusing is the only
-   * safe answer when the order id is not known, and the operator is told to
-   * check the provider's portal, which is where the truth actually is.
+   * Which reference is asked, and why it is this shipment's own key either way:
+   * the shipping order id when the row has one, otherwise (state 2 only, per
+   * the header) the saved-quote id the booking was bought under.
    */
-  if (!shipment.providerShipmentId) {
+  const lookupId = shipment.providerShipmentId || (bookedWithoutId ? shipment.providerQuoteId ?? "" : "");
+  if (!lookupId) {
     throw new Error(
-      "A booking that never returned leaves no provider shipment id, and the provider cannot be asked what it " +
-        "holds without one — its lookup is keyed on the shipping order, not the saved quote. Check the provider's " +
-        "portal and record the outcome instead."
+      "A booking that never returned leaves no provider id to ask about: the id that a purchase consumes is " +
+        "issued by the save call only to the attempt that made it, and this row never learned it. Check the " +
+        "provider's portal and record the outcome instead."
     );
   }
 
@@ -1554,15 +1580,20 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
     );
   }
 
-  const found = await getShipment(shipment.providerShipmentId);
+  const found = await getShipment(lookupId);
   await recordAudit({
-    actorType: "ADMIN_USER",
+    actorType: actor.actorType ?? "ADMIN_USER",
     actorId: actor.actorId,
     actorName: actor.actorName,
     action: "shipping.booking_reconciled",
     entityType: AUDIT_ENTITY.SHIPMENT,
     entityId: shipmentId,
-    afterData: { found: Boolean(found), providerShipmentId: shipment.providerShipmentId },
+    afterData: {
+      found: Boolean(found),
+      lookupId,
+      lookupSource: shipment.providerShipmentId ? "shipping_order" : "saved_quote",
+      providerShipmentId: found?.providerShipmentId ?? null,
+    },
     ipAddress: actor.ipAddress,
     userAgent: actor.userAgent,
   });
@@ -1572,16 +1603,18 @@ export async function reconcileBookingOutcome(shipmentId: string, actor: Actor) 
       where: { id: shipmentId },
       data: {
         lastBookingError:
-          `Reconciled: the provider returned no shipment for order ${shipment.providerShipmentId}. ` +
+          `Reconciled: the provider returned no shipment for ${lookupId}. ` +
           `This is not proof that no label exists — check the provider's portal.`,
       },
     });
     return {
       adopted: false as const,
       providerShipmentId: shipment.providerShipmentId,
-      message:
-        "The provider holds no shipment under this order id. That is not proof nothing was purchased, " +
-        "so this shipment stays unknown until someone checks the provider's portal and records the outcome.",
+      message: bookedWithoutId
+        ? `The provider holds no shipment under ${lookupId}, and this row still reads as booked with no provider id. ` +
+          `That is not proof nothing was purchased — check the provider's portal before packing or booking anything.`
+        : "The provider holds no shipment under this order id. That is not proof nothing was purchased, " +
+          "so this shipment stays unknown until someone checks the provider's portal and records the outcome.",
     };
   }
 

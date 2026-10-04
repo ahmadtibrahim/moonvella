@@ -783,10 +783,12 @@ export function isPackableState(status: string): boolean {
 /**
  * Whether the provider's own record of this shipment exists on the row.
  *
- * The reply reader can produce an empty string when a booking response carries
- * no `order.orderId`, and an empty string is not an identifier — so the rule is
- * a trimmed, non-empty value, in ONE place, read by the refusal and available
- * to any page that needs to ask the same question.
+ * The reply reader can produce an empty string when a booking reply fails to
+ * name its shipping order — which is not hypothetical: a mis-read id key
+ * (`order.orderId`, where the reply carries `order.id`) recorded a live booking
+ * with a provider id of "". An empty string is not an identifier — so the rule
+ * is a trimmed, non-empty value, in ONE place, read by the refusal and
+ * available to any page that needs to ask the same question.
  */
 export function hasProviderShipmentId(facts: { providerShipmentId: string | null }): boolean {
   return Boolean(facts.providerShipmentId && facts.providerShipmentId.trim());

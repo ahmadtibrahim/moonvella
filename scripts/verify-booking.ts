@@ -56,6 +56,7 @@ import {
   recordValidation,
 } from "../app/services/addressValidation.server";
 import { acceptBookingAddresses, recordVerdict } from "./verify-address-fixtures";
+import { hasProviderShipmentId } from "../app/services/shippingLogic";
 import { intakeOrder } from "../app/services/orderIntake.server";
 import { packingListFor, packingStatusLine, parseAddressLines, renderPackingList, renderPackingSlipPdf } from "../app/services/packingList.server";
 import { orderProgress, shipmentProgress } from "../app/services/orderProgress.server";
@@ -556,8 +557,8 @@ async function createBookableOrder(
  *
  * Derived from the tag rather than random so a block can name it twice — once
  * when it answers and once when it asserts — and get the same value, and
- * NUMERIC because the provider types it that way: `order.orderId` is an integer
- * in a string's clothing, and the follow-up GETs read it as a number.
+ * NUMERIC because the provider types it that way: `order.id` is an integer in a
+ * string's clothing, and the follow-up GETs read it as a number.
  */
 const orderIdFor = (tag: string) =>
   String(
@@ -566,8 +567,8 @@ const orderIdFor = (tag: string) =>
   );
 
 /*
- * What the provider answers when a label is bought, in the shape the documented
- * `ShippingReply` actually has.
+ * What the provider answers when a label is bought, in the shape a real
+ * `ShippingReply` has.
  *
  * EVERY id used to sit at the TOP level here — `shipmentId`, `cost`,
  * `labelUrl` — and not one of those keys exists in the reply. The provider
@@ -575,14 +576,22 @@ const orderIdFor = (tag: string) =>
  * `quote`, and the label under `labelData.label[]`. So this fixture and the
  * reader that consumed it were the same invention agreeing with itself: a real
  * booking would have been recorded as an empty provider id at zero cost, and
- * the suite would have passed. The nesting below is the documented one, and it
- * is what the adapter's own contract suite pins.
+ * the suite would have passed.
+ *
+ * AND THE ID INSIDE `order` HAD THE SAME PROBLEM ONE LEVEL DOWN. It was
+ * `order.orderId` — the name the Swagger's mis-pointed schema uses (it points
+ * `ShippingReply.order` at the cancellation request, `{trackingId, orderId,
+ * message}`) — and a real booking reply carries no such key: measured on the
+ * staging host, the reply's `order` is `{id, message}`, and reading `orderId`
+ * recorded order #1004 as BOOKED at cost with tracking and its label, and a
+ * provider id of "". The fixture now writes the measured name, and the reader
+ * prefers it (keeping `order.orderId` only as a second name).
  *
  * There is no `labelUrl` anywhere in `ShippingReply`: the label arrives as the
  * document itself, `{type, data}`.
  */
 const BOOKED_BODY = (tag: string) => ({
-  order: { orderId: orderIdFor(tag) },
+  order: { id: orderIdFor(tag), message: "" },
   carrier: { carrierName: "Purolator", serviceName: "Purolator Express" },
   trackingNumber: `TRK-${tag}-${suffix}`,
   trackingUrl: "https://example.invalid/track",
@@ -1470,29 +1479,21 @@ async function bookingOutcomeChecks() {
     );
 
     /*
-     * RECONCILING CANNOT RUN HERE, AND REFUSING IS THE CORRECT ANSWER.
+     * RECONCILING A TIMED-OUT BOOKING IS REFUSED, AND THAT IS STILL CORRECT —
+     * BUT NOT FOR THE REASON THIS COMMENT USED TO GIVE.
      *
-     * This block used to reconcile a timed-out booking by asking the provider
-     * what it held under the QUOTE id, and to assert that an existing shipment
-     * was adopted from the answer. That lookup cannot work: `GET
-     * /api/v2/ship/{orderId}` is keyed on the SHIPPING ORDER, a different
-     * number space from the quote — and a booking that times out on the
-     * purchase never produces one, because the shipping order is IN the reply
-     * that went missing. Asking by quote id means a quote number that happened
-     * to collide with another order's would adopt a STRANGER'S shipment onto
-     * this row: someone else's tracking number, someone else's label.
+     * It claimed `GET /api/v2/ship/{orderId}` is "a different number space"
+     * from the quote. That is disproven, and a live booking proved it: the id
+     * `PUT /api/v2/quote` issues IS the path segment the purchase consumes and
+     * the id the follow-up GETs answer under (see `reconcileBookingOutcome`).
+     * What actually strands this row is narrower: a timed-out purchase never
+     * recorded the SAVED id — the row still holds the RATE uuid, which is not
+     * an order the provider indexes — so there is genuinely nothing to ask
+     * about, and the refusal below is the honest answer.
      *
-     * So the assertion that survives is the refusal, which is what protects the
-     * order. The way out of this state is a person reading the provider's
-     * portal and recording what they find — the next block, and the only path
-     * the provider's own endpoints leave open.
-     *
-     * NOTE for whoever reads this next: `reconcileBookingOutcome`'s lookup
-     * branch is now unreachable — a shipment only reaches BOOKING_UNKNOWN from
-     * a timed-out purchase, which by definition has no shipping order id. It is
-     * kept because it is the only place that knows what to do with an id if one
-     * ever exists, but it has no coverage here and cannot be given any until
-     * the provider offers a lookup by quote.
+     * The adopt branch is NOT unreachable, either: a BOOKED row whose provider
+     * id was lost to the reply-parsing defect is recovered through it, and the
+     * block after this one exercises exactly that.
      */
     responder = () => ({ status: 200, body: BOOKED_BODY("RECOVERED") });
     providerCalls = [];
@@ -1516,6 +1517,61 @@ async function bookingOutcomeChecks() {
       "...and no provider shipment id was invented for it",
       (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === null
     );
+  }
+
+  /* --- a real booking that lost its provider id is recovered ------------- */
+  /*
+   * THE ORDER #1004 FINGERPRINT. A booking that SUCCEEDED under the old reader
+   * was recorded BOOKED at cost, with tracking number, tracking URL and its
+   * label document — and a provider id of "". The packing page refuses to pack
+   * a BOOKED shipment with no provider id, so a bought label sat unusable. The
+   * row below is driven to that exact shape (the id blanked the way the defect
+   * blanked it) and reconcile must fill it back in from the provider's own
+   * copy, asking under the saved-quote id the booking was bought with.
+   */
+  {
+    const { shipment, quote } = await createBookableOrder(seller.id, "recover");
+    responder = () => ({ status: 200, body: BOOKED_BODY("RECOVER") });
+    await bookPreparedShipment(shipment.id, quote.id, ACTOR);
+    const fresh = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check(
+      "a successful booking records the provider's own id",
+      fresh.providerShipmentId === orderIdFor("RECOVER"),
+      fresh.providerShipmentId ?? "(null)"
+    );
+
+    // The defect's fingerprint: everything a booking records, except the id.
+    await prisma.shipment.update({ where: { id: shipment.id }, data: { providerShipmentId: "" } });
+    check("the recovery fixture starts from the defect's empty id", (await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } })).providerShipmentId === "");
+
+    providerCalls = [];
+    const outcome = await reconcileBookingOutcome(shipment.id, ACTOR);
+    const recovered = await prisma.shipment.findUniqueOrThrow({ where: { id: shipment.id } });
+    check("a booked shipment whose provider id was lost is reconciled, not refused", outcome.adopted === true, JSON.stringify(outcome).slice(0, 200));
+    check(
+      "...asking under the saved-quote id the booking was bought with",
+      apiCalls().length === 1 && apiCalls()[0].url.endsWith(`/api/v2/ship/${lastSavedQuoteId()}`),
+      apiCalls().map((c) => c.url).join(", ")
+    );
+    check("...and nothing is bought by recovering", purchaseCalls().length === 0, `purchases=${purchaseCalls().length}`);
+    check("...and the provider id is restored from the provider's own copy", recovered.providerShipmentId === orderIdFor("RECOVER"), recovered.providerShipmentId ?? "(null)");
+    check("...and the booking's other facts are kept", recovered.trackingNumber === `TRK-RECOVER-${suffix}`, recovered.trackingNumber ?? "(null)");
+    check("...and it stays BOOKED", recovered.status === "BOOKED", recovered.status);
+    check("...and it is now packable", hasProviderShipmentId(recovered));
+    const state = await prisma.integrationState.findUnique({ where: { key: "eshipper" } });
+    check("...and the integration state is healthy again", state?.status === "HEALTHY", state?.status ?? "(none)");
+
+    // An intact booked row is still refused — recovery must not become a
+    // general-purpose re-ask of the provider for anything already booked.
+    providerCalls = [];
+    let alreadyBookedRefusal = "";
+    try {
+      await reconcileBookingOutcome(shipment.id, ACTOR);
+    } catch (error) {
+      alreadyBookedRefusal = error instanceof Error ? error.message : String(error);
+    }
+    check("reconciling an intact booked shipment is still refused", /already booked/i.test(alreadyBookedRefusal), alreadyBookedRefusal.slice(0, 200));
+    check("...without asking the provider anything", apiCalls().length === 0, `calls=${apiCalls().length}`);
   }
 
   /* --- a person resolves what reconcile could not ------------------------ */

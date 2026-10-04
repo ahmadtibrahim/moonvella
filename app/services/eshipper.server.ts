@@ -93,7 +93,11 @@ export interface RateQuote {
 
 export interface BookingResult {
   /**
-   * `ShippingReply.order.orderId`, kept as the provider typed it — a string.
+   * `ShippingReply.order.id`, kept as the provider typed it — a string.
+   *
+   * (The key is `id`, measured on a real booking; the Swagger points
+   * `ShippingReply.order` at the cancellation-request schema, whose `orderId`
+   * does not appear in a booking reply at all. See `readShippingReply`.)
    *
    * The follow-up calls (`GET /api/v2/ship/{orderId}`, `/label`, `/track-order`)
    * declare that path segment `integer/int64`, so this value is a number in
@@ -124,10 +128,19 @@ export interface BookingResult {
   /**
    * The saved-quote id this booking was bought from, when it was issued.
    *
-   * Carried out so the caller can persist it BEFORE the purchase, which is the
-   * only handle that exists if the ship call never returns: the rate uuid is not
-   * an order, and a timed-out booking leaves no order id to look up. It is
-   * transient by nature — it names a draft that becomes an order on success.
+   * It is the only handle that exists if the ship call never returns: the rate
+   * uuid is not an order, and a timed-out booking leaves no order id to look
+   * up. It is transient by nature — it names a draft that becomes an order on
+   * success.
+   *
+   * KNOWN GAP: this call holds the id from the moment the save answers — one
+   * await BEFORE the purchase — but hands it to the caller only alongside the
+   * purchase's outcome, so a ship call that never returns takes the id with it.
+   * Nothing persists it in between (no hook exists between save and purchase),
+   * which is why a timed-out booking cannot be reconciled by quote and stays a
+   * person's job (`resolveUnknownBooking`). Persisting it before the purchase
+   * is the fix; until then, the doc of `reconcileBookingOutcome` describes
+   * exactly which states the lookup can and cannot repair.
    */
   savedQuoteId?: number | null;
   bookedCost: number;
@@ -224,7 +237,7 @@ export interface ReturnQuote {
 
 export interface ReturnBookingResult {
   /**
-   * `ShippingReply.order.orderId` — the SHIPPING ORDER, shared with outbound.
+   * `ShippingReply.order.id` — the SHIPPING ORDER, shared with outbound.
    *
    * `POST /api/v2/returns/create/{quoteId}` answers with the same
    * `ShippingReply` an outbound booking does, so this is the same id space and
@@ -1525,7 +1538,7 @@ export function labelToHref(label: { type: string; data: string } | null | undef
 }
 
 /**
- * Read the provider's booking answer by its documented names.
+ * Read the provider's booking answer by the names the provider actually uses.
  *
  * `ShippingReply` nests everything: the ids under `order`, the carrier under
  * `carrier`, and the money under `quote` — where `quote.totalCharge` is what was
@@ -1536,6 +1549,21 @@ export function labelToHref(label: { type: string; data: string } | null | undef
  *
  * The label arrives inline as `labelData.label[]` of `{type, data}` rather than
  * as a URL — there is no `labelUrl` anywhere in the reply.
+ *
+ * THE ORDER IDENTIFIER IS `order.id`, AND THAT IS MEASURED, NOT DOCUMENTED.
+ * This read `order.orderId` and a real booking on the staging host (order
+ * #1004, 2026-10-04) was recorded BOOKED at cost with tracking, tracking URL
+ * and the label document all intact — and an EMPTY provider id, because the
+ * reply's `order` is `{id, message}` and carries no `orderId` at all. The
+ * Swagger points `ShippingReply.order` at a schema called `Order` that is
+ * actually the shipment-CANCELLATION request ({trackingId, orderId, message}),
+ * which is where the wrong name came from and why no fixture caught it: every
+ * fixture here had been written from the same document.
+ *
+ * `orderId` is kept as a second name rather than deleted — it IS a
+ * shipping-order number in the cancellation schema — but the observed name
+ * comes first, because an id read from the wrong key is an id lost, and every
+ * follow-up call (`/ship/{id}`, `/label`, `/track/{id}`, cancel) is keyed on it.
  */
 function readShippingReply(
   reply: Record<string, unknown>,
@@ -1547,10 +1575,11 @@ function readShippingReply(
   const labels = ((reply.labelData ?? {}) as Record<string, unknown>).label;
   const first = Array.isArray(labels) ? (labels[0] as Record<string, unknown> | undefined) : undefined;
   return {
-    // A STRING here, and that is not an oversight: the reply types it as such.
-    // The numeric shipping order id the follow-up GETs want is this value read
-    // as a number, which is why it is kept verbatim rather than coerced.
-    providerShipmentId: String(order.orderId ?? ""),
+    // A STRING here, and that is not an oversight: the follow-up GETs declare
+    // this path segment integer/int64, and the provider answers with the id as
+    // a string, so it is kept verbatim rather than coerced — a coerced NaN
+    // would be indistinguishable from "no id".
+    providerShipmentId: String(order.id ?? order.orderId ?? ""),
     carrier: String(carrier.carrierName ?? fallback.carrier),
     serviceName: String(carrier.serviceName ?? fallback.serviceName),
     trackingNumber: String(reply.trackingNumber ?? ""),
@@ -1588,10 +1617,16 @@ export async function updateShipment(data: Record<string, unknown>): Promise<Boo
  * Used to resolve a booking whose call never returned: if the provider has a
  * shipment under this id, the booking exists and is adopted rather than repeated.
  *
- * The id is `ShippingReply.order.orderId` — the SHIPPING ORDER, numeric in a
- * string's clothing. It is NOT the quote. Until a booking succeeds there is no
- * such id, which is exactly why a booking that times out cannot be reconciled by
- * quote: see the note on `bookShipment`'s saved-quote id.
+ * The id is `ShippingReply.order.id` — the SHIPPING ORDER, numeric in a string's
+ * clothing. It is ALSO the number the quote save hands back: measured on the
+ * staging host, `PUT /api/v2/quote` issues the very value `POST
+ * /api/v2/ship/{id}` consumes and this GET reads back (and `GET
+ * /api/v2/quote/{id}` 404s afterwards — the record IS the shipping order once
+ * it is bought). That identity is what lets `reconcileBookingOutcome` recover a
+ * booked row whose reply lost the id. A booking that TIMED OUT still cannot be
+ * reconciled from the row's stored quote reference, because the row never
+ * learned the saved id — it holds the rate uuid: see the note on
+ * `bookShipment`'s saved-quote id.
  */
 export async function getShipment(orderId: string): Promise<BookingResult | null> {
   if (!(await eshipperConfigured())) return null;

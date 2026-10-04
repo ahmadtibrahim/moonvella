@@ -869,6 +869,7 @@ interface ProcessProps {
     bookingOutcomeUnknownAt: string | Date | null;
     lastBookingError: string | null;
     quotedCarrierCost: number | null;
+    bookedCost: number | null;
     pickupStatus: string | null;
   };
   paid: boolean;
@@ -973,6 +974,46 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
               Only an owner can record what the provider&apos;s portal shows. Ask one to reconcile and decide.
             </p>
           )}
+        </>
+      );
+    }
+
+    /*
+     * BOOKED WITH NO PROVIDER ID — the fingerprint of the reply-parsing defect
+     * (the booking reply nests the id at `order.id`; the reader asked for
+     * `order.orderId`). Everything a booking proves is on the row — cost,
+     * tracking number, tracking URL, the label document — and the one thing
+     * every follow-up call is keyed on is empty, so the packing page refuses to
+     * pack. This block is the only control that repairs such a row: it asks the
+     * provider what it holds under the saved-quote id the booking was bought
+     * with and adopts the provider's own copy. Asking buys nothing.
+     *
+     * Placed BEFORE the `providerShipmentId` branch below, because a row in this
+     * state must not fall through to the booking form — it already owns a label,
+     * and booking again is how an order ends up with two.
+     */
+    if (shipment.status === "BOOKED" && !shipment.providerShipmentId) {
+      return (
+        <>
+          <p style={{ fontSize: "0.78rem", color: "#b45309", marginBottom: "0.3rem", fontWeight: 600 }}>
+            This shipment reads as booked but records no carrier shipment identifier, so there is no bought label to pack
+            against.
+          </p>
+          <p style={{ fontSize: "0.72rem", color: "#64748b", marginBottom: "0.5rem" }}>
+            The label was bought: {shipment.carrier} {shipment.serviceName}
+            {shipment.trackingNumber ? ` · tracking ${shipment.trackingNumber}` : ""}
+            {shipment.bookedCost != null ? ` · ${money(shipment.bookedCost)}` : ""}. What is missing is the provider&apos;s own
+            shipment id. Recovering it asks the provider to confirm the booking it already holds and records its answer; asking
+            buys nothing.
+          </p>
+          <Form method="post" style={{ marginBottom: "0.6rem" }}>
+            <input type="hidden" name="intent" value="reconcile_booking" />
+            <button type="submit" style={btn("#0369a1")}>Recover the provider shipment id</button>
+          </Form>
+          <p style={{ fontSize: "0.7rem", color: "#94a3b8" }}>
+            If the provider holds nothing under this booking&apos;s reference, nothing is changed and it says so — check the
+            provider&apos;s portal before packing or booking anything.
+          </p>
         </>
       );
     }

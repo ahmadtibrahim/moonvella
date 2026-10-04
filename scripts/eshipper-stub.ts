@@ -137,11 +137,16 @@ function responseFor(
      * `labelData.label[]`. A stub written to the old invention agreed with the
      * old reader, so both looked correct while a real booking would have been
      * recorded as an empty provider id at zero cost.
+     *
+     * The shipping order id is `order.id` — measured live. `order.orderId` (the
+     * name this stub used) belongs to the cancellation-request schema the
+     * Swagger mis-points `ShippingReply.order` at, and reading it recorded a
+     * real booking with an empty provider id.
      */
     return {
       status: 200,
       body: {
-        order: { orderId: "STUB-SHIP-1" },
+        order: { id: "STUB-SHIP-1", message: "" },
         carrier: { carrierName: "UPS", serviceName: "Standard" },
         trackingNumber: "STUBTRACK1",
         trackingUrl: "https://track.invalid/STUBTRACK1",
