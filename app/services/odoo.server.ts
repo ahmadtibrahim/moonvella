@@ -589,6 +589,12 @@ const READ_METHODS = new Set([
   "fields_get",
   "name_get",
   "name_search",
+  // A pure computation on a recordset the caller already holds: it writes
+  // nothing, and the alternative — reimplementing tax arithmetic (groups,
+  // included-in-price, rounding) in this connector — is exactly the kind of
+  // guessing the rest of this file refuses to do. It is called with the
+  // product's own tax ids and never with anything the caller did not read.
+  "compute_all",
 ]);
 
 /**
@@ -671,6 +677,7 @@ const SALE_ORDER_TEMPLATE_MODEL = "sale.order.template";
 const ACCOUNT_MOVE_MODEL = "account.move";
 const JOURNAL_MODEL = "account.journal";
 const MAIL_TEMPLATE_MODEL = "mail.template";
+const TAX_MODEL = "account.tax";
 /** Transient wizard that exposes the public Create-Invoice operation. */
 const INVOICE_WIZARD_MODEL = "sale.advance.payment.inv";
 
@@ -1376,6 +1383,12 @@ export interface OdooProductMatch {
   default_code: string | false;
   name: string;
   invoice_policy: string | false;
+  /** The product's customer taxes, as ids. Empty means the line it produces
+   * will carry no tax at all — a fiscal position cannot add one to a product
+   * that has none (`sale.order.line._compute_tax_id` skips the mapping when
+   * the product's tax set is empty), which is why the caller treats "empty"
+   * as a fact and everything else as something to check. */
+  taxes_id: number[];
 }
 
 /**
@@ -1391,6 +1404,9 @@ export interface OdooProductMatch {
  * at. Goods default to "order" (the template compute forces it for
  * `type == 'consu'`), but the field is manually overridable, so the caller
  * checks rather than assumes.
+ *
+ * `taxes_id` is requested for the same reason: the caller checks that the
+ * product's taxes cannot raise the line above the price the seller paid.
  */
 export async function resolveProductIdsBySku(
   skus: string[],
@@ -1400,9 +1416,56 @@ export async function resolveProductIdsBySku(
   return searchRead<OdooProductMatch>(
     PRODUCT_MODEL,
     [["default_code", "in", cleaned]],
-    ["id", "default_code", "name", "invoice_policy"],
+    ["id", "default_code", "name", "invoice_policy", "taxes_id"],
     { limit: cleaned.length * 2 },
   );
+}
+
+export interface OdooPaymentTaxTotals {
+  totalExcluded: number;
+  totalIncluded: number;
+}
+
+/**
+ * What a set of taxes does to a price, answered by Odoo's own tax engine.
+ *
+ * `compute_all` is the function behind every line total in the books, and it
+ * is what makes this check exact instead of a reimplementation: it resolves
+ * tax groups into their children, honours "included in price", and applies
+ * the same rounding the invoice line will. `totalIncluded` above
+ * `priceUnit * quantity` means the customer pays more than the price — the
+ * one outcome the wholesale pipeline cannot bill, because the seller has
+ * already paid exactly the price.
+ *
+ * A read, not a computation the connector does itself: nothing is written,
+ * and `account.tax` is asked rather than told.
+ */
+export async function computeTaxTotals(
+  taxIds: number[],
+  priceUnit: number,
+  quantity: number,
+): Promise<OdooPaymentTaxTotals> {
+  const result = await executeKw<{ total_excluded: number; total_included: number }>(
+    TAX_MODEL,
+    "compute_all",
+    [taxIds, priceUnit, null, quantity],
+  );
+  return {
+    totalExcluded: result.total_excluded,
+    totalIncluded: result.total_included,
+  };
+}
+
+export interface OdooTaxRef {
+  id: number;
+  name: string;
+}
+
+/** Tax ids to names, for error messages that must name the offending tax. */
+export async function findTaxesByIds(ids: number[]): Promise<OdooTaxRef[]> {
+  const cleaned = Array.from(new Set(ids.filter((id) => Number.isInteger(id))));
+  if (cleaned.length === 0) return [];
+  return searchRead<OdooTaxRef>(TAX_MODEL, [["id", "in", cleaned]], ["id", "name"]);
 }
 
 export interface OdooSaleOrderTemplateRef {

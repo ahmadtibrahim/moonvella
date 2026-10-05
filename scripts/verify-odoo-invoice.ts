@@ -45,7 +45,7 @@ import {
 } from "../app/services/odoo.server";
 import { PermanentJobError } from "../app/services/jobs.server";
 import { forbidProviderCalls, providerGuardActive } from "./provider-guard";
-import { installOdooJsonRpcStub, type OdooStubCall } from "./odoo-jsonrpc-stub";
+import { installOdooJsonRpcStub, isOdooWrite, type OdooStubCall } from "./odoo-jsonrpc-stub";
 
 const prisma = new PrismaClient();
 const SHOP = "odoo-invoice-verify.myshopify.com";
@@ -474,9 +474,8 @@ async function main() {
     const mailSends = stub.callsTo("mail.template", "send_mail");
     check(
       "one email was queued through the template, for the invoice",
-      mailSends.length === 1 &&
-        JSON.stringify(mailSends[0].args[0]) === "[[88]]" &&
-        mailSends[0].args[1] === 1001,
+      // The full record-method shape: the ids list first, the res_id second.
+      mailSends.length === 1 && JSON.stringify(mailSends[0].args) === "[[88],1001]",
       JSON.stringify(mailSends[0]?.args ?? []),
     );
     check(
@@ -614,6 +613,145 @@ async function main() {
       JSON.stringify(stub3b.writes().map((call) => `${call.model}.${call.method}`)),
     );
     stub3b.restore();
+
+    /* ------------------------------------------------------------------ */
+    /* 3c. The catalogue's taxes. The seller paid the snapshot price, so   */
+    /*     a tax that would raise the invoice above it is refused BEFORE   */
+    /*     any document exists — and the tax is never silently overridden. */
+    /* ------------------------------------------------------------------ */
+    const stub3c = installOdooJsonRpcStub({
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [7] }] },
+    });
+    await configureOdoo();
+    const order3c = await makeOrder(seller.id);
+    const error3c = await catchError(() => createOdooInvoiceForOrder(order3c.id, JOB_ACTOR));
+    const message3c = error3c instanceof Error ? error3c.message : String(error3c);
+    check(
+      "a sale tax that adds to the wholesale price is a PERMANENT failure naming the tax",
+      error3c instanceof PermanentJobError &&
+        message3c.includes(LINE_PILLOW.sku) &&
+        message3c.includes("13% HST"),
+      describe(error3c),
+    );
+    check(
+      "the refusal shows what the tax would do and both ways to fix the catalogue",
+      message3c.includes("38.97") &&
+        message3c.includes("44.04") &&
+        message3c.includes("no sale tax") &&
+        message3c.includes("included in the price"),
+      message3c,
+    );
+    check(
+      "the taxed order is refused before ANY write: no sale order, no invoice",
+      stub3c.writes().length === 0,
+      JSON.stringify(stub3c.writes().map((call) => `${call.model}.${call.method}`)),
+    );
+    check(
+      "Odoo answered the question itself — one compute_all read, and only for the taxed SKU",
+      stub3c.callsTo("account.tax", "compute_all").length === 1 &&
+        !isOdooWrite(stub3c.callsTo("account.tax", "compute_all")[0]),
+      JSON.stringify({
+        calls: stub3c.callsTo("account.tax", "compute_all").length,
+        lines: 2,
+      }),
+    );
+    check(
+      "the refusal reached the order, not just the job",
+      ((await readLink(order3c.id))?.odooInvoiceError ?? "").includes("13% HST"),
+    );
+    stub3c.restore();
+
+    /* ------------------------------------------------------------------ */
+    /* 3d. Taxes that do NOT raise the price are accepted: included in it, */
+    /*     or zero-rated. A tax GROUP that adds is refused by its effect,  */
+    /*     not by the group's own rate.                                    */
+    /* ------------------------------------------------------------------ */
+    const stub3d = installOdooJsonRpcStub({
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [69] }] },
+    });
+    await configureOdoo();
+    const order3d = await makeOrder(seller.id);
+    const outcome3d = await createOdooInvoiceForOrder(order3d.id, JOB_ACTOR);
+    check(
+      "a tax configured as included in the price is accepted — the invoice bills the captured amount",
+      outcome3d.status === "CREATED" && outcome3d.invoice?.amountTotal === TOTAL_MAJOR,
+      JSON.stringify({ status: outcome3d.status, total: outcome3d.invoice?.amountTotal }),
+    );
+    const saleOrder3d = payloadOf(stub3d.callsTo("sale.order", "create")[0]);
+    check(
+      "the line carries no tax instruction at all — the catalogue's tax is Odoo's to apply, never the app's to set or clear",
+      JSON.stringify(saleOrder3d).includes("order_line") &&
+        !JSON.stringify(saleOrder3d).includes("tax"),
+      JSON.stringify(saleOrder3d.order_line),
+    );
+    stub3d.restore();
+
+    const stub3d2 = installOdooJsonRpcStub({
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [15] }] },
+    });
+    await configureOdoo();
+    const order3d2 = await makeOrder(seller.id);
+    const outcome3d2 = await createOdooInvoiceForOrder(order3d2.id, JOB_ACTOR);
+    check(
+      "a zero-rated sale tax is accepted",
+      outcome3d2.status === "CREATED",
+      outcome3d2.status,
+    );
+    stub3d2.restore();
+
+    const stub3d3 = installOdooJsonRpcStub({
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [10] }] },
+    });
+    await configureOdoo();
+    const order3d3 = await makeOrder(seller.id);
+    const error3d3 = await catchError(() => createOdooInvoiceForOrder(order3d3.id, JOB_ACTOR));
+    check(
+      "a tax GROUP that adds is refused by its effect, not by its own (100) rate",
+      error3d3 instanceof PermanentJobError &&
+        (error3d3 as Error).message.includes("11% GST+PST SK") &&
+        stub3d3.writes().length === 0,
+      describe(error3d3),
+    );
+    stub3d3.restore();
+
+    /* ------------------------------------------------------------------ */
+    /* 3e. The last line of defence: an invoice whose total disagrees with */
+    /*     the charge is refused BEFORE it is posted — the second layer,   */
+    /*     for anything the catalogue check above cannot see.              */
+    /* ------------------------------------------------------------------ */
+    const stub3e = installOdooJsonRpcStub({
+      invoiceTotalOverride: Math.round((TOTAL_MAJOR + 13) * 100) / 100,
+    });
+    await configureOdoo();
+    const order3e = await makeOrder(seller.id);
+    const error3e = await catchError(() => createOdooInvoiceForOrder(order3e.id, JOB_ACTOR));
+    const message3e = error3e instanceof Error ? error3e.message : String(error3e);
+    check(
+      "an invoice that does not total the captured amount is refused, naming both",
+      error3e instanceof PermanentJobError &&
+        message3e.includes("157.47") &&
+        message3e.includes("144.47") &&
+        message3e.includes("a draft, unposted"),
+      describe(error3e),
+    );
+    check(
+      "the disagreeing invoice was NOT posted",
+      stub3e.callsTo("account.move", "action_post").length === 0,
+      JSON.stringify(stub3e.callsTo("account.move", "action_post").length),
+    );
+    check(
+      "no payment was registered and no email was sent for it",
+      stub3e.callsTo("account.payment.register", "create").length === 0 &&
+        stub3e.callsTo("mail.template", "send_mail").length === 0,
+    );
+    const link3e = await readLink(order3e.id);
+    check(
+      "the order records the failure and stays unlinked",
+      link3e?.odooInvoiceId === null &&
+        (link3e?.odooInvoiceError ?? "").includes("157.47"),
+      JSON.stringify({ id: link3e?.odooInvoiceId, error: link3e?.odooInvoiceError }),
+    );
+    stub3e.restore();
 
     /* ------------------------------------------------------------------ */
     /* 4. The journal: a missing one is permanent; a repaired one resumes  */
@@ -888,6 +1026,30 @@ async function main() {
     check(
       "action_post disables the abnormal-invoice wizard",
       connectorSource.includes("disable_abnormal_invoice_detection"),
+    );
+    check(
+      "the catalogue's tax question goes to Odoo's own arithmetic, not a reimplementation",
+      connectorSource.includes('"compute_all"') &&
+        connectorSource.includes("TAX_MODEL"),
+    );
+    check(
+      "the product lookup reads the taxes the check rests on",
+      connectorSource.includes('"invoice_policy", "taxes_id"'),
+    );
+    check(
+      "the orchestrator checks the tax and never overrides it with a tax_id of its own",
+      invoiceSource.includes("computeTaxTotals") &&
+        invoiceSource.includes("findTaxesByIds") &&
+        !/tax_id\s*:/.test(invoiceSource),
+    );
+    check(
+      "the total/currency guard runs on the draft BEFORE posting, and again at payment time",
+      invoiceSource.includes(
+        "assertInvoiceMatchesPayment(invoiceId, state, input.payment)",
+      ) &&
+        invoiceSource.includes(
+          "assertInvoiceMatchesPayment(input.invoiceId, state, payment)",
+        ),
     );
 
     const fieldsSource = readStripped("app/services/integrationFields.ts");

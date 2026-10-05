@@ -41,7 +41,64 @@ const READ_METHODS = new Set([
   "fields_get",
   "name_get",
   "name_search",
+  "compute_all",
 ]);
+
+/**
+ * The taxes scenarios can attach to a product, with the three shapes the
+ * pipeline has to tell apart: one that adds to the price, one included in it,
+ * one that is zero, and a group standing for the sum of its children.
+ *
+ * `computeAll` below is a deliberately small model of
+ * `account.tax.compute_all` — leaves and single-level groups, included vs
+ * excluded, nothing else. The real semantics (rounding, sequences,
+ * affect-base) live in Odoo and are exercised against a real database by the
+ * stage2 probe; what these suites need is a stub that answers the same way
+ * for the configurations under test, and that fails loudly for anything it
+ * does not model.
+ */
+const STUB_TAXES: Record<
+  number,
+  { name: string; amount: number; priceInclude: boolean; children?: number[] }
+> = {
+  7: { name: "13% HST", amount: 13, priceInclude: false },
+  69: { name: "13% HST Included", amount: 13, priceInclude: true },
+  15: { name: "0% Exempt", amount: 0, priceInclude: false },
+  10: { name: "11% GST+PST SK", amount: 100, priceInclude: false, children: [1, 3] },
+  1: { name: "5% GST", amount: 5, priceInclude: false },
+  3: { name: "6% PST SK", amount: 6, priceInclude: false },
+};
+
+/** Every leaf under a tax id: a group is its children, applied in order. */
+function taxLeaves(taxId: number): number[] {
+  const tax = STUB_TAXES[taxId];
+  if (!tax) throw new Error(`the stub does not model tax #${taxId}`);
+  return tax.children ?? [taxId];
+}
+
+/**
+ * What a set of taxes does to a price, modelled on Odoo's own answer:
+ * excluded taxes add their rate on top, included taxes are extracted from the
+ * price and leave it alone. Returns the same keys `compute_all` returns.
+ */
+function computeAll(
+  taxIds: number[],
+  priceUnit: number,
+  quantity: number,
+): { total_excluded: number; total_included: number } {
+  const leaves = taxIds.flatMap(taxLeaves).map((id) => STUB_TAXES[id]);
+  const base = priceUnit * quantity;
+  const rate = (wanted: boolean) =>
+    leaves
+      .filter((tax) => tax.priceInclude === wanted)
+      .reduce((sum, tax) => sum + tax.amount, 0) / 100;
+  const round = (value: number) => Math.round(value * 100) / 100;
+  const includedRate = rate(true);
+  return {
+    total_included: round(base * (1 + rate(false))),
+    total_excluded: includedRate > 0 ? round(base / (1 + includedRate)) : base,
+  };
+}
 
 export interface OdooStubCall {
   url: string;
@@ -62,6 +119,11 @@ export interface OdooStubScenario {
     missing?: string[];
     ambiguous?: string[];
     deliveryPolicy?: string[];
+    /** Sale taxes per SKU, by stub tax id (see STUB_TAXES). Unlisted SKUs
+     * carry none, which is what most scenarios want: a product without a
+     * sale tax produces a line without one, whatever fiscal position the
+     * customer matches. */
+    taxes?: { sku: string; taxIds: number[] }[];
   };
   /** The "MoonVella B2B Wholesale" quotation template. */
   template?: "ok" | "missing" | "unstamped" | "ambiguous";
@@ -89,6 +151,12 @@ export interface OdooStubScenario {
     currency?: string;
     companyId?: number;
   } | null;
+  /**
+   * Force the total of every invoice this stub creates or reports, whatever
+   * the lines it was sent add up to. Models the one thing the pipeline must
+   * never post: a document whose total disagrees with the charge behind it.
+   */
+  invoiceTotalOverride?: number;
 }
 
 export interface OdooJsonRpcStub {
@@ -228,6 +296,9 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
 
   /** Odoo's own arithmetic: the invoice totals the order's lines. */
   function totalOf(order: StoredSaleOrder | undefined): number {
+    if (typeof scenario.invoiceTotalOverride === "number") {
+      return scenario.invoiceTotalOverride;
+    }
     const sum = (order?.lines ?? []).reduce(
       (acc, line) => acc + line.quantity * line.priceUnit,
       0,
@@ -296,9 +367,11 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
           if (facts.missing?.includes(code)) continue;
           const id = productIdFor(code);
           const invoice_policy = facts.deliveryPolicy?.includes(code) ? "delivery" : "order";
-          rows.push({ id, default_code: code, name: `Verify product ${code}`, invoice_policy });
+          const taxes_id =
+            facts.taxes?.find((entry) => entry.sku === code)?.taxIds ?? [];
+          rows.push({ id, default_code: code, name: `Verify product ${code}`, invoice_policy, taxes_id });
           if (facts.ambiguous?.includes(code)) {
-            rows.push({ id: id + 10000, default_code: code, name: `Verify product ${code} (duplicate)`, invoice_policy });
+            rows.push({ id: id + 10000, default_code: code, name: `Verify product ${code} (duplicate)`, invoice_policy, taxes_id });
           }
         }
         return { result: applyLimit(rows, limit) };
@@ -349,6 +422,21 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
         return { result: applyLimit(rows, limit) };
       }
 
+      if (model === "account.tax") {
+        // The id→name lookup that feeds the catalogue-check error messages.
+        // (`compute_all`, the other call the connector makes on this model, is
+        // a computation rather than a search, so it is answered below.)
+        const ids = predicateValue(domain, "id");
+        const wanted = Array.isArray(ids)
+          ? ids.filter((id): id is number => typeof id === "number")
+          : [];
+        return {
+          result: wanted
+            .filter((id) => STUB_TAXES[id])
+            .map((id) => ({ id, name: STUB_TAXES[id].name })),
+        };
+      }
+
       if (model === "account.journal") {
         const name = predicateValue(domain, "name");
         const row = (id: number) => ({ id, name, type: "bank", company_id: COMPANY });
@@ -373,6 +461,21 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
         }
         return { result: [{ id: 88, name, model_id: [2, "account.move"] }] };
       }
+    }
+
+    if (model === "account.tax" && method === "compute_all") {
+      // `compute_all` is called on a recordset the caller already holds, so the
+      // tax ids are args[0]; the signature is
+      // (ids, price_unit, currency_id, quantity). Answering it here — rather
+      // than letting the caller reimplement tax arithmetic — is the point: the
+      // suite asserts the app asked Odoo what the catalogue actually does.
+      const ids = args[0];
+      const taxIds = Array.isArray(ids)
+        ? ids.filter((id): id is number => typeof id === "number")
+        : [];
+      const priceUnit = typeof args[1] === "number" ? args[1] : 0;
+      const quantity = typeof args[3] === "number" ? args[3] : 1;
+      return { result: computeAll(taxIds, priceUnit, quantity) };
     }
 
     if (model === "res.partner" && method === "create") {
@@ -557,7 +660,15 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       kwargs: service === "object" ? ((args[6] ?? {}) as Record<string, unknown>) : {},
     });
 
-    const outcome = respond(request);
+    // A handler that throws (an unmodelled tax id, a malformed argument) becomes
+    // an ordinary JSON-RPC error, so the app exercises its own error path
+    // instead of seeing an opaque rejected fetch.
+    let outcome: { result?: unknown; error?: string };
+    try {
+      outcome = respond(request);
+    } catch (cause) {
+      outcome = { error: cause instanceof Error ? cause.message : String(cause) };
+    }
     const body =
       outcome.error === undefined
         ? { jsonrpc: "2.0", id: request.id, result: outcome.result }

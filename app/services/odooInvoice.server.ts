@@ -42,6 +42,7 @@ import { chooseBusinessEmail, financialActionHold } from "./odooContacts.server"
 import { getCredentials } from "./credentials.server";
 import {
   OdooError,
+  computeTaxTotals,
   confirmSaleOrder,
   createInvoiceFromSaleOrder,
   createPartner,
@@ -53,6 +54,7 @@ import {
   findPartnerByEmail,
   findSaleOrderByClientOrderRef,
   findSaleOrderTemplateByName,
+  findTaxesByIds,
   getInvoiceState,
   postInvoice,
   registerPayment,
@@ -373,11 +375,15 @@ async function createFreshInvoice(
     );
   }
 
-  const partner = await resolveBillingPartner(order, billing.email);
+  // Everything that can refuse on the catalogue — the template's brand/channel
+  // stamps and the SKU/tax resolution — is settled BEFORE the first write, so a
+  // refusal leaves no half-made customer behind in Odoo for the operator to
+  // clean up. These are reads; the order they run in costs nothing.
   const template = await resolveQuotationTemplate();
-
   const { lines, source } = invoiceLinesFrom(order);
   const saleOrderLines = await resolveInvoiceLines(lines, order);
+
+  const partner = await resolveBillingPartner(order, billing.email);
 
   const created = expectWrite(
     await createSaleOrder(
@@ -466,6 +472,9 @@ async function settleInvoice(input: SettleInput): Promise<OdooInvoiceOutcome> {
   let state = await readLiveInvoice(invoiceId);
 
   if (state.state !== "posted") {
+    // Before the invoice reaches the books: it must be for the captured
+    // amount. A draft that disagrees is left a draft.
+    assertInvoiceMatchesPayment(invoiceId, state, input.payment);
     expectWrite(
       await postInvoice(invoiceId, { confirm: true }),
       `Posting Odoo invoice ${invoiceId}`,
@@ -585,15 +594,47 @@ async function readLiveInvoice(invoiceId: number): Promise<OdooInvoiceState> {
 }
 
 /**
- * Register the ledger entry recording the captured charge, unless the invoice
- * is already paid. Two guards run first, because this is the step that writes
- * money numbers into the books:
+ * The two numbers that must agree before the books are touched: the invoice
+ * must be for exactly the amount that was captured, in the same currency.
  *
- * - the invoice total must equal the captured amount (to the cent), so a sale
- *   order whose price drifted from the charge cannot be "paid" by a payment
- *   that does not match it;
- * - the currencies must be the same, or "equal amounts" would compare two
- *   different things.
+ * Called twice on purpose. Once on the draft, before it is posted, so a
+ * catalogue that prices the order differently from the charge leaves a draft
+ * that never reached the books rather than a posted invoice that has to be
+ * explained; and once on the state the payment step actually found, because
+ * an invoice adopted from an earlier run may already be posted and the draft
+ * check never sees it.
+ */
+function assertInvoiceMatchesPayment(
+  invoiceId: number,
+  state: OdooInvoiceState,
+  payment: CapturedPayment,
+): void {
+  const label = state.name === false ? invoiceId : state.name;
+  const expected = payment.amount / 100;
+
+  const invoiceCurrency = m2oName(state.currency_id);
+  if (invoiceCurrency && invoiceCurrency !== payment.currency) {
+    throw new PermanentJobError(
+      `Odoo invoice ${label} is in ${invoiceCurrency} but the captured wholesale ` +
+        `payment is in ${payment.currency}. Registering one as a payment of the ` +
+        `other would misstate both ledgers — reconcile by hand.`,
+    );
+  }
+  if (Math.abs(state.amount_total - expected) > 0.005) {
+    throw new PermanentJobError(
+      `Odoo invoice ${label} totals ${state.amount_total.toFixed(2)} but the ` +
+        `captured wholesale payment is ${expected.toFixed(2)} ${payment.currency}. ` +
+        `The sale order and the charge disagree, and reconciling them is a human ` +
+        `decision — the invoice was left ` +
+        `${state.state === "posted" ? "unpaid" : "a draft, unposted"}.`,
+    );
+  }
+}
+
+/**
+ * Register the ledger entry recording the captured charge, unless the invoice
+ * is already paid. `assertInvoiceMatchesPayment` runs first, because this is
+ * the step that writes money numbers into the books.
  */
 async function ensurePaymentRegistered(
   input: SettleInput,
@@ -606,25 +647,7 @@ async function ensurePaymentRegistered(
 
   const { payment } = input;
   const expected = payment.amount / 100;
-
-  const invoiceCurrency = m2oName(state.currency_id);
-  if (invoiceCurrency && invoiceCurrency !== payment.currency) {
-    throw new PermanentJobError(
-      `Odoo invoice ${state.name === false ? input.invoiceId : state.name} is in ` +
-        `${invoiceCurrency} but the captured wholesale payment is in ` +
-        `${payment.currency}. Registering one as a payment of the other would ` +
-        `misstate both ledgers — reconcile by hand.`,
-    );
-  }
-  if (Math.abs(state.amount_total - expected) > 0.005) {
-    throw new PermanentJobError(
-      `Odoo invoice ${state.name === false ? input.invoiceId : state.name} totals ` +
-        `${state.amount_total.toFixed(2)} but the captured wholesale payment is ` +
-        `${expected.toFixed(2)} ${payment.currency}. The invoice is not marked paid ` +
-        `— the sale order and the charge disagree, and reconciling them is a ` +
-        `human decision.`,
-    );
-  }
+  assertInvoiceMatchesPayment(input.invoiceId, state, payment);
 
   const journal = await resolvePaymentJournal();
   const paymentDate = (payment.capturedAt ?? new Date()).toISOString().slice(0, 10);
@@ -780,6 +803,13 @@ async function resolveInvoiceLines(
   const ambiguous: string[] = [];
   const wrongPolicy: string[] = [];
   const resolved: { productId: number; quantity: number; priceUnit: number }[] = [];
+  /** Resolved lines whose product carries a sale tax — put to Odoo below. */
+  const taxedProducts: {
+    sku: string;
+    quantity: number;
+    priceUnit: number;
+    taxIds: number[];
+  }[] = [];
 
   for (const line of lines) {
     const matches = bySku.get(line.sku) ?? [];
@@ -796,14 +826,54 @@ async function resolveInvoiceLines(
       wrongPolicy.push(`${line.sku} (${product.invoice_policy || "blank"})`);
       continue;
     }
+    const priceUnit = line.unitPriceMinor / 100;
+    const taxIds = Array.isArray(product.taxes_id) ? product.taxes_id : [];
+    if (taxIds.length > 0) {
+      taxedProducts.push({ sku: line.sku, quantity: line.quantity, priceUnit, taxIds });
+    }
     resolved.push({
       productId: product.id,
       quantity: line.quantity,
-      priceUnit: line.unitPriceMinor / 100,
+      priceUnit,
     });
   }
 
-  if (missing.length || ambiguous.length || wrongPolicy.length) {
+  // The seller paid the snapshot price and nothing on top of it, so the
+  // invoice has to come to exactly that or the payment cannot settle it
+  // (`ensurePaymentRegistered` is the final authority on that). Whether the
+  // catalogue's taxes respect it is Odoo's answer to give, not this file's to
+  // assume: the product's own taxes go to `account.tax.compute_all` — the
+  // engine behind every line total in the books — and a tax that lifts the
+  // line above the price is refused HERE, before a sale order or an invoice
+  // exists to abandon. Refused rather than overridden with `tax_id: []`: the
+  // tax treatment of a sale is the books' business and the owner's to state,
+  // exactly like the invoicing policy above. A product with no tax on it
+  // stays untaxed on the line whatever fiscal position the customer matches
+  // (`sale.order.line._compute_tax_id` skips the mapping for an empty tax
+  // set), which is why only tax-carrying products are put to the test.
+  const taxed: string[] = [];
+  if (taxedProducts.length > 0) {
+    const taxNames = new Map(
+      (await findTaxesByIds(taxedProducts.flatMap((line) => line.taxIds))).map(
+        (tax) => [tax.id, tax.name],
+      ),
+    );
+    for (const line of taxedProducts) {
+      const paid = line.priceUnit * line.quantity;
+      const totals = await computeTaxTotals(line.taxIds, line.priceUnit, line.quantity);
+      if (totals.totalIncluded > paid + 0.005) {
+        const names = line.taxIds
+          .map((id) => taxNames.get(id) ?? `tax #${id}`)
+          .join(", ");
+        taxed.push(
+          `${line.sku} (tax ${names} raises a ${paid.toFixed(2)} line to ` +
+            `${totals.totalIncluded.toFixed(2)})`,
+        );
+      }
+    }
+  }
+
+  if (missing.length || ambiguous.length || wrongPolicy.length || taxed.length) {
     const reasons = [
       missing.length
         ? `no Odoo product carries the SKU(s) ${missing.join(", ")} — a free-text ` +
@@ -816,6 +886,14 @@ async function resolveInvoiceLines(
         ? `the product(s) ${wrongPolicy.join(", ")} have an Invoicing Policy other ` +
           `than "Ordered quantities", which the automatic invoice requires (it has ` +
           `no delivery to invoice against)`
+        : null,
+      taxed.length
+        ? `the product(s) ${taxed.join("; ")} carry a sale tax that takes the ` +
+          `invoice above the amount the seller paid. This invoice bills the ` +
+          `captured wholesale price only — tax and shipping are already inside ` +
+          `it — so the catalogue has to bill the same way: give the MoonVella ` +
+          `wholesale products no sale tax, or a tax configured as included in ` +
+          `the price`
         : null,
     ].filter((reason): reason is string => reason !== null);
 
