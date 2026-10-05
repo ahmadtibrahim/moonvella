@@ -121,6 +121,20 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
     });
   }
 
+  /*
+   * The same handoff milestone as `advanceShipment`'s: a manual shipment is
+   * created already dispatched, so the seller's paid invoice is written from
+   * here too — queued (never inline), and keyed per order so a later box or a
+   * manual Retry collapses into the one job.
+   */
+  await enqueueJob({
+    kind: JOB_KIND.ODOO_INVOICE_SYNC,
+    idempotencyKey: jobKey(JOB_KIND.ODOO_INVOICE_SYNC, order.sellerId, order.id),
+    sellerId: order.sellerId,
+    sellerAccessVersion: order.seller.accessVersion,
+    payload: { orderId: order.id },
+  });
+
   return { shipment, shopify };
 }
 
@@ -237,15 +251,17 @@ export async function advanceShipment(
       // dispatched is looking at the real thing and may know better.
       notifyCustomer: opts?.notifyCustomer ?? shipment.notifyCustomerOnPush,
     });
+    // Read once for both queues below: the seller and their access version are
+    // each job's attribution, and the invoice job needs the order id.
+    const order = await prisma.order.findUniqueOrThrow({
+      where: { id: shipment.orderId },
+      select: { id: true, sellerId: true, seller: { select: { accessVersion: true } } },
+    });
     // Queued only when there is something to retry, and keyed per shipment so a
     // second dispatch of the same parcel collapses into the same job. A
     // successful push queues nothing — Shopify has been told, and a second
     // fulfillmentCreate is an error rather than a no-op.
     if (!sync.pushed && sync.reason !== "no_fulfillment_order_id") {
-      const order = await prisma.order.findUniqueOrThrow({
-        where: { id: shipment.orderId },
-        select: { sellerId: true, seller: { select: { accessVersion: true } } },
-      });
       await enqueueJob({
         kind: JOB_KIND.SHOPIFY_FULFILLMENT_SYNC,
         idempotencyKey: jobKey(JOB_KIND.SHOPIFY_FULFILLMENT_SYNC, order.sellerId, shipmentId),
@@ -254,6 +270,22 @@ export async function advanceShipment(
         payload: { shipmentId },
       });
     }
+    /*
+     * THE INVOICE MILESTONE rides the same moment, UNCONDITIONALLY — unlike the
+     * Shopify push above, there is no "already done" case to check here, and
+     * the work is queued rather than run inline so an unreachable Odoo cannot
+     * fail a handoff that has already physically happened. Keyed per ORDER,
+     * not per shipment: a second box on the same order and the manual Retry on
+     * the order page collapse into the one job, and the work itself adopts the
+     * invoice already linked instead of making a second one.
+     */
+    await enqueueJob({
+      kind: JOB_KIND.ODOO_INVOICE_SYNC,
+      idempotencyKey: jobKey(JOB_KIND.ODOO_INVOICE_SYNC, order.sellerId, order.id),
+      sellerId: order.sellerId,
+      sellerAccessVersion: order.seller.accessVersion,
+      payload: { orderId: order.id },
+    });
   }
 
   return shipment;

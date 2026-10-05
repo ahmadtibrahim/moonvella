@@ -450,6 +450,29 @@ async function main() {
     );
 
     /* ---------------------------------------------------------------- */
+    /* 8b. The handoff-invoice writes exist and are shaped the way Odoo  */
+    /*     18 requires — the record-method argument order, the queued    */
+    /*     mail, and the context key that keeps action_post from         */
+    /*     answering with a validation wizard instead of posting.        */
+    /* ---------------------------------------------------------------- */
+    check(
+      "posting and emailing are guarded write operations of their own",
+      source.includes('"invoice.post"') && source.includes('"invoice.email"'),
+    );
+    check(
+      "send_mail is called in Odoo's record-method shape, with one template id",
+      source.includes("[[templateId], invoiceId]"),
+    );
+    check(
+      "the invoice email is queued rather than sent inline",
+      source.includes("force_send: false"),
+    );
+    check(
+      "action_post disables the abnormal-invoice detection wizard",
+      source.includes("disable_abnormal_invoice_detection"),
+    );
+
+    /* ---------------------------------------------------------------- */
     /* 9. Settings credentials actually reach the connector.              */
     /*    This is the wiring that the previous version lacked: the form    */
     /*    saved rows the connector never read.                            */

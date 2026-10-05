@@ -180,6 +180,20 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
         placeholder: "warehouse name or numeric id",
         hint: "“Premafirm Inc.” — the warehouse at 994 Westport Cres, Unit 7A, Mississauga. Stock is counted across its locations for every owner (company-owned and consigned alike, less reservations), and its Odoo address becomes the pickup address of every outbound shipment. There is no separate consignment owner to set: adding a vendor never means changing a global.",
       },
+      {
+        // Where the paid B2B invoice's payment is recorded. The journal is an
+        // accounting decision made in Odoo, so the app stores only its NAME
+        // and resolves it at invoice time: a journal renamed in Odoo is a
+        // one-field edit here, and a name matching no bank/cash journal fails
+        // the invoice with an error naming this setting — the app never picks
+        // a journal on its own. Nothing is ever charged to it: the Stripe
+        // charge already happened, and the journal entry only records it.
+        name: "ODOO_INVOICE_JOURNAL",
+        label: "Invoice payment journal",
+        secret: false,
+        placeholder: "MoonVella Stripe",
+        hint: "The name of the bank or cash journal in Odoo the wholesale invoice's payment is recorded in. Resolved by name at invoice time; if no bank/cash journal matches, the invoice is not created and the order page names this setting. Leave empty to use “MoonVella Stripe” — the journal must exist in Odoo either way.",
+      },
     ],
   },
   google: {

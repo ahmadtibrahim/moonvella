@@ -936,6 +936,23 @@ model Order {
   /// quote cannot be booked by remembering its id.
   quotesInvalidatedAt       DateTime?
   quoteInvalidationReason   String?
+
+  /// The seller's PAID Odoo customer invoice for this order.
+  ///
+  /// Created at the carrier-handoff milestone (and repairable by hand from the
+  /// order page). `odooInvoiceId` is the idempotency guard: the job, the manual
+  /// retry and any re-run all treat a set id as "already done" — an invoice is
+  /// a financial record, so the second attempt must find the first one rather
+  /// than make another. `odooInvoiceEmailSentAt` is separate because the email
+  /// is the last step of the sequence and can fail after the invoice exists; a
+  /// retry then sends only the email. `odooInvoiceError` is the order-page
+  /// surface for the last failure, cleared on success.
+  odooInvoiceId             Int?
+  odooInvoiceName           String?
+  odooSaleOrderId           Int?
+  odooInvoiceSyncedAt       DateTime?
+  odooInvoiceEmailSentAt    DateTime?
+  odooInvoiceError          String?
   createdAt                 DateTime               @default(now())
   updatedAt                 DateTime               @updatedAt
 
@@ -954,6 +971,7 @@ model Order {
   @@index([state])
   @@index([shopifyCreatedAt])
   @@index([processedAt])
+  @@index([odooInvoiceId])
 }
 
 /// WHERE A MOONVELLA ORDER HAS GOT TO.

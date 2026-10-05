@@ -356,6 +356,14 @@ const CHECKS = [
   // verify-credentials for the same reason that suite runs after stripe-sandbox:
   // it must not run while another suite holds a swapped credential in place.
   { name: "odoo", kind: "ts", file: "scripts/verify-odoo.ts" },
+  // The automatic paid Odoo invoice created at carrier handoff. Runs the real
+  // pipeline against an in-process Odoo stub (scripts/odoo-jsonrpc-stub.ts) and
+  // asserts the RPC payloads themselves — the template, the product ids behind
+  // the ordered SKUs, the journal, the queued mail — plus the retry/no-duplicate
+  // and guard behaviour. Makes no external call; the stub answers only the
+  // model.method pairs the pipeline is known to use, and anything else is an
+  // error rather than a guess.
+  { name: "odoo-invoice", kind: "ts", file: "scripts/verify-odoo-invoice.ts" },
   { name: "e2e", kind: "ts", file: "scripts/verify-e2e.ts", env: SIMULATED_STRIPE },
   // The product/variant/media/document/marketing system. Last because it is
   // the longest, and it publishes a product of its own rather than depending on

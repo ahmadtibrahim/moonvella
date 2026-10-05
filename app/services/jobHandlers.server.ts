@@ -25,6 +25,7 @@ import {
 } from "./shopifyFulfillment.server";
 import { ensureOrderWebhookSubscriptions, ensureAppWebhookSubscriptions } from "./shopifyWebhooks.server";
 import { transitionOrder, MONEY_CLEARED } from "./orderState.server";
+import { createOdooInvoiceForOrder } from "./odooInvoice.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
 
@@ -338,6 +339,64 @@ export const jobHandlers: Record<string, JobHandler> = {
     return {
       summary: `Tracking pushed to Shopify (fulfillment ${result.shopifyFulfillmentId}).`,
       detail: { shipmentId, shopifyFulfillmentId: result.shopifyFulfillmentId },
+    };
+  },
+
+  /**
+   * Write (or adopt) the order's paid Odoo invoice and email it.
+   *
+   * Idempotent through the order row, not through this handler: the early
+   * return below is only the cheap path, and the real guard is the invoice
+   * link inside `createOdooInvoiceForOrder` — a linked invoice is adopted and
+   * a linked-and-emailed one is reported, so a job that runs twice (a worker
+   * died holding a lease) cannot produce a second invoice or a second email.
+   *
+   * A linked-but-unemailed order is deliberately NOT skipped here: the email
+   * is the last step of the sequence and can fail after the invoice exists, so
+   * that state goes back into the pipeline, which resumes at the email.
+   */
+  [JOB_KIND.ODOO_INVOICE_SYNC]: async (job) => {
+    const orderId = (job.payload as { orderId?: unknown } | null)?.orderId;
+    if (typeof orderId !== "string" || !orderId) {
+      throw new PermanentJobError(
+        `Job ${job.id} (${job.kind}) carries no orderId, so there is nothing to invoice.`,
+      );
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        odooInvoiceId: true,
+        odooInvoiceName: true,
+        odooInvoiceEmailSentAt: true,
+      },
+    });
+    if (!order) {
+      throw new PermanentJobError(`Order ${orderId} no longer exists.`);
+    }
+    if (order.odooInvoiceId && order.odooInvoiceEmailSentAt) {
+      return {
+        summary: `Odoo invoice ${
+          order.odooInvoiceName ?? order.odooInvoiceId
+        } already created and emailed; nothing done.`,
+        detail: { orderId, odooInvoiceId: order.odooInvoiceId, skipped: true },
+      };
+    }
+
+    const outcome = await createOdooInvoiceForOrder(orderId, {
+      actorType: "SYSTEM",
+      actorId: `job:${job.id}`,
+      actorName: "Background job (Odoo invoice sync)",
+    });
+
+    const name = outcome.odooInvoiceName ?? String(outcome.odooInvoiceId);
+    return {
+      summary:
+        outcome.status === "ALREADY_CREATED"
+          ? `Odoo invoice ${name} already exists; nothing done.`
+          : `Odoo invoice ${name} created${outcome.email ? " and emailed" : ""}.`,
+      detail: { ...outcome },
     };
   },
 

@@ -34,6 +34,7 @@ import { advanceRefusal, availableWarehouseEvents, orderBookingGate } from "~/se
 import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
+import { createOdooInvoiceForOrder } from "~/services/odooInvoice.server";
 import {
   acceptFulfillmentRequest,
   rejectFulfillmentRequest,
@@ -417,6 +418,17 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await selectQuote(orderId, String(form.get("quoteId")), actor);
     } else if (intent === "create_payment") {
       await createOrReuseWholesalePayment(orderId);
+    } else if (intent === "create_odoo_invoice") {
+      /*
+       * The manual repair/retry for the automatic handoff invoice (the
+       * ordinary path is the ODOO_INVOICE_SYNC job the carrier handoff
+       * queues). Safe to press at any point because the pipeline is
+       * idempotent: an uninvoiced order gets its invoice, a linked one is
+       * reported as already created, and a failed one resumes from wherever
+       * the failure left off.
+       */
+      const result = await createOdooInvoiceForOrder(orderId, actor);
+      return { odooInvoice: result };
     } else if (intent === "simulate_paid") {
       const payment = await prisma.wholesalePayment.findUnique({ where: { orderId } });
       if (!payment || !String(payment.providerPaymentIntentId || "").startsWith("sim_")) {
@@ -1289,6 +1301,70 @@ export default function AdminOrderDetail() {
             </>
           )}
         </div>
+      </div>
+
+      {/*
+        THE ODOO CUSTOMER INVOICE — deliberately its own panel, apart from the
+        Stripe one above. That panel is the money coming IN from the seller;
+        this one is the financial record written in the ERP once the goods are
+        handed to the carrier, and the two are never mixed: Odoo is never asked
+        to charge anything, and nothing below can move money in either system.
+
+        The automatic path is the ODOO_INVOICE_SYNC job the handoff milestone
+        queues; the button here is the work order's repair/retry action, and it
+        is safe to press at any point because the pipeline adopts whatever the
+        order already links to instead of creating a second invoice.
+      */}
+      <div className="mv-panel mv-panel-body" style={{ marginBottom: "1.5rem", marginTop: 0 }}>
+        <h2 className="mv-panel-title">Odoo customer invoice</h2>
+        {order.odooInvoiceId ? (
+          <div style={{ fontSize: "0.85rem", lineHeight: 1.7, marginBottom: "0.4rem" }}>
+            <div>
+              Invoice: <strong>{order.odooInvoiceName ?? `id ${order.odooInvoiceId}`}</strong>
+              <span style={{ color: "#94a3b8" }}> (Odoo id {order.odooInvoiceId})</span>
+            </div>
+            <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
+              Created {order.odooInvoiceSyncedAt ? formatDateTime(order.odooInvoiceSyncedAt) : "—"} ·{" "}
+              {order.odooInvoiceEmailSentAt
+                ? `emailed to the seller ${formatDateTime(order.odooInvoiceEmailSentAt)}`
+                : "not emailed yet"}
+              {order.odooSaleOrderId ? ` · Odoo sale order id ${order.odooSaleOrderId}` : ""}
+            </div>
+          </div>
+        ) : (
+          <p style={{ fontSize: "0.82rem", color: "#64748b", marginBottom: "0.4rem" }}>
+            The paid invoice is created in Odoo automatically when the shipment is handed to the carrier — from the
+            “MoonVella B2B Wholesale” quotation template, with the ordered Odoo products — and emailed to the seller.
+            Nothing is created before that milestone, there is no free-text line, and nothing here ever charges Stripe
+            again.
+          </p>
+        )}
+        {order.odooInvoiceError ? (
+          <p style={{ fontSize: "0.8rem", color: "#dc2626", marginBottom: "0.4rem" }} role="status">
+            Last Odoo invoice error: {order.odooInvoiceError}
+          </p>
+        ) : null}
+        {order.odooInvoiceId && order.odooInvoiceEmailSentAt && !order.odooInvoiceError ? (
+          <p style={{ fontSize: "0.75rem", color: "#059669" }} role="status">
+            Invoice created and emailed — nothing left to retry.
+          </p>
+        ) : (
+          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
+            <Form method="post">
+              <button type="submit" name="intent" value="create_odoo_invoice" style={btn("#0369a1")}>
+                {order.odooInvoiceId ? "Retry the Odoo invoice" : "Create the Odoo invoice now"}
+              </button>
+            </Form>
+          </div>
+        )}
+        {actionData?.odooInvoice ? (
+          <p style={{ fontSize: "0.75rem", color: "#059669", marginTop: "0.4rem" }} role="status">
+            Odoo invoice {actionData.odooInvoice.odooInvoiceName ?? actionData.odooInvoice.odooInvoiceId}:{" "}
+            {actionData.odooInvoice.status === "ALREADY_CREATED"
+              ? "already created — nothing was duplicated."
+              : `created and linked${actionData.odooInvoice.email ? ", and emailed to the seller" : ""}.`}
+          </p>
+        ) : null}
       </div>
 
       <div className="mv-panel mv-panel-body" style={{ marginBottom: "1.5rem", marginTop: 0 }}>

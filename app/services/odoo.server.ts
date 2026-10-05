@@ -667,7 +667,10 @@ export async function searchCount(model: string, domain: Domain): Promise<number
 const PARTNER_MODEL = "res.partner";
 const PRODUCT_MODEL = "product.product";
 const SALE_ORDER_MODEL = "sale.order";
+const SALE_ORDER_TEMPLATE_MODEL = "sale.order.template";
 const ACCOUNT_MOVE_MODEL = "account.move";
+const JOURNAL_MODEL = "account.journal";
+const MAIL_TEMPLATE_MODEL = "mail.template";
 /** Transient wizard that exposes the public Create-Invoice operation. */
 const INVOICE_WIZARD_MODEL = "sale.advance.payment.inv";
 
@@ -985,13 +988,31 @@ export interface SaleOrderLine {
   name?: string;
 }
 
+/**
+ * Creates a quotation. `templateId` names the quotation template the order is
+ * created from — and that is what stamps the brand and the sales channel:
+ * `sale.order.create()` overrides in the MoonVella modules resolve both fields
+ * from `sale_order_template_id` when the caller does not set them (on the
+ * record, so it works over RPC where onchanges never run). See the handoff
+ * pipeline note below for why the literals are deliberately not sent here.
+ *
+ * Note: there is no `invoice_policy` on the payload because `sale.order` has
+ * no such field in Odoo 18 — invoiceability follows the PRODUCT's
+ * `invoice_policy`, and the pipeline checks it per product instead.
+ */
 export async function createSaleOrder(
-  input: { partnerId: number; lines: SaleOrderLine[]; clientOrderRef?: string },
+  input: {
+    partnerId: number;
+    lines: SaleOrderLine[];
+    clientOrderRef?: string;
+    templateId?: number;
+  },
   options: { confirm?: boolean } = {},
 ): Promise<{ id: number } | OdooWritePreview> {
   const payload = {
     partner_id: input.partnerId,
     ...(input.clientOrderRef ? { client_order_ref: input.clientOrderRef } : {}),
+    ...(input.templateId ? { sale_order_template_id: input.templateId } : {}),
     order_line: input.lines.map((line) => [
       0,
       0,
@@ -1220,7 +1241,12 @@ export interface OdooInvoiceState {
   payment_state: string | false;
   amount_total: number;
   amount_residual: number;
-  currency: string | false;
+  /**
+   * Many2one tuples, as `search_read` returns them — the name is the second
+   * element. (`res.currency`'s display name is its ISO code, e.g. "CAD".)
+   */
+  currency_id: [number, string] | false;
+  company_id: [number, string] | false;
 }
 
 /** Read-only invoice status lookup, keyed by the Odoo invoice id. */
@@ -1238,6 +1264,7 @@ export async function getInvoiceState(
       "amount_total",
       "amount_residual",
       "currency_id",
+      "company_id",
     ],
     { limit: 1 },
   );
@@ -1291,6 +1318,231 @@ export async function registerPayment(
       );
       return { id: wizardId };
     },
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* The handoff invoice pipeline                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The lookups and writes behind the paid customer invoice the app creates when
+ * a MoonVella shipment is handed to its carrier.
+ *
+ * The chain is: partner → sale order (created from the "MoonVella B2B
+ * Wholesale" quotation template) → confirm → invoice (public wizard) → post →
+ * payment (a ledger entry in a dedicated journal) → branded email.
+ *
+ * Branding note: the app deliberately does NOT send `prema_operating_brand` or
+ * `prema_sales_channel` in the create payload. Both are resolved by
+ * `sale.order.create()` overrides in the MoonVella modules from the
+ * `sale_order_template_id` the caller passes — the same path the modules' own
+ * tests cover. Sending the literals here would duplicate module constants in a
+ * third place and still leave a mis-stamped template producing the wrong
+ * document, so the pipeline asserts the template carries the right brand and
+ * channel instead, and fails loudly when it does not.
+ *
+ * The name lookups below return up to two rows so a caller that needs ONE can
+ * see ambiguity instead of silently taking the first. A payment registered in
+ * a same-named journal, or an invoice for a same-named template, is a
+ * bookkeeping error someone unwinds by hand.
+ */
+
+export interface OdooSaleOrderRef extends SaleOrderLink {
+  state: string;
+}
+
+/**
+ * Sale orders that carry a MoonVella order's reference. The reference
+ * (`supplierReference`, `${shop}#${orderId}`) is the identity the app wrote on
+ * create — but it is free text on Odoo's side, so a second row with the same
+ * reference is reported rather than resolved.
+ */
+export async function findSaleOrderByClientOrderRef(
+  clientOrderRef: string,
+): Promise<OdooSaleOrderRef[]> {
+  const trimmed = clientOrderRef.trim();
+  if (!trimmed) return [];
+  return searchRead<OdooSaleOrderRef>(
+    SALE_ORDER_MODEL,
+    [["client_order_ref", "=", trimmed]],
+    ["id", "name", "company_id", "client_order_ref", "partner_id", "state"],
+    { limit: 2 },
+  );
+}
+
+export interface OdooProductMatch {
+  id: number;
+  default_code: string | false;
+  name: string;
+  invoice_policy: string | false;
+}
+
+/**
+ * Resolve ordered SKUs to Odoo products. The caller must treat a missing SKU
+ * as an error: the invoice has to carry the matching Odoo product, never a
+ * free-text line — a line that merely *spells* the SKU is not the product, and
+ * substituting one would put the invoice outside the catalogue.
+ *
+ * `invoice_policy` is requested because the invoiceability of a confirmed sale
+ * order line follows it: `qty_to_invoice` is ordered-minus-invoiced for
+ * "order" but delivered-minus-invoiced for "delivery" (`sale.order.line`,
+ * `_compute_qty_to_invoice`), and the automatic flow has no delivery to point
+ * at. Goods default to "order" (the template compute forces it for
+ * `type == 'consu'`), but the field is manually overridable, so the caller
+ * checks rather than assumes.
+ */
+export async function resolveProductIdsBySku(
+  skus: string[],
+): Promise<OdooProductMatch[]> {
+  const cleaned = Array.from(new Set(skus.map((sku) => sku.trim()).filter(Boolean)));
+  if (cleaned.length === 0) return [];
+  return searchRead<OdooProductMatch>(
+    PRODUCT_MODEL,
+    [["default_code", "in", cleaned]],
+    ["id", "default_code", "name", "invoice_policy"],
+    { limit: cleaned.length * 2 },
+  );
+}
+
+export interface OdooSaleOrderTemplateRef {
+  id: number;
+  name: string;
+  company_id: [number, string] | false;
+  prema_operating_brand: string | false;
+  prema_sales_channel: string | false;
+}
+
+/** Quotation templates matching an exact name — up to two, for ambiguity. */
+export async function findSaleOrderTemplateByName(
+  name: string,
+): Promise<OdooSaleOrderTemplateRef[]> {
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  return searchRead<OdooSaleOrderTemplateRef>(
+    SALE_ORDER_TEMPLATE_MODEL,
+    [["name", "=", trimmed]],
+    ["id", "name", "company_id", "prema_operating_brand", "prema_sales_channel"],
+    { limit: 2 },
+  );
+}
+
+export interface OdooJournalRef {
+  id: number;
+  name: string;
+  type: string;
+  company_id: [number, string] | false;
+}
+
+/**
+ * Journals matching an exact name. Resolved BY NAME because the payment
+ * journal is an accounting decision the owner makes in Odoo, not an app
+ * setting: the app stores which name to use and must never guess among
+ * several.
+ */
+export async function findJournalByName(name: string): Promise<OdooJournalRef[]> {
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  return searchRead<OdooJournalRef>(
+    JOURNAL_MODEL,
+    [["name", "=", trimmed]],
+    ["id", "name", "type", "company_id"],
+    { limit: 2 },
+  );
+}
+
+export interface OdooMailTemplateRef {
+  id: number;
+  name: string;
+  model_id: [number, string] | false;
+}
+
+/** Mail templates matching an exact name — up to two, for ambiguity. */
+export async function findMailTemplateByName(
+  name: string,
+): Promise<OdooMailTemplateRef[]> {
+  const trimmed = name.trim();
+  if (!trimmed) return [];
+  return searchRead<OdooMailTemplateRef>(
+    MAIL_TEMPLATE_MODEL,
+    [["name", "=", trimmed]],
+    ["id", "name", "model_id"],
+    { limit: 2 },
+  );
+}
+
+/**
+ * Posts a draft invoice. This is what gives the invoice its number.
+ *
+ * `action_post` can answer with a validation-wizard action instead of posting
+ * when the abnormal-invoice warning fires; a caller that read "no exception"
+ * as "posted" would then link a numberless draft. The posted state is
+ * verified after the call, and `disable_abnormal_invoice_detection` is passed
+ * explicitly so the wizard path cannot fire at all for a flow with no operator
+ * to click it (Odoo's default for the context key already keeps automated
+ * flows out of it — passing it says so on purpose).
+ */
+export async function postInvoice(
+  invoiceId: number,
+  options: { confirm?: boolean } = {},
+): Promise<{ posted: true } | OdooWritePreview> {
+  return guardedWrite(
+    "invoice.post",
+    ACCOUNT_MOVE_MODEL,
+    "action_post",
+    { id: invoiceId },
+    options.confirm === true,
+    async (permit) => {
+      await executeKw(
+        ACCOUNT_MOVE_MODEL,
+        "action_post",
+        [[invoiceId]],
+        { context: { disable_abnormal_invoice_detection: true } },
+        permit,
+      );
+      const state = await getInvoiceState(invoiceId);
+      if (state?.state !== "posted") {
+        throw new OdooError(
+          `Invoice ${invoiceId} did not reach the posted state after action_post ` +
+            `(state: ${state?.state ?? "not found"}).`,
+          "INVOICE_NOT_POSTED",
+        );
+      }
+      return { posted: true as const };
+    },
+  );
+}
+
+/**
+ * Sends the branded paid-invoice email for one invoice, through Odoo.
+ *
+ * `mail.template.send_mail` is a record method, so over JSON-RPC its arguments
+ * are `[[templateId], resId]` — the ids list first, then the method's own
+ * parameters. `force_send: false` is deliberate: Odoo's docstring recommends
+ * the mail queue, invoice creation is then decoupled from SMTP health, and the
+ * queued `mail.mail` row stays inspectable (the stage2 probe reads it as
+ * evidence).
+ */
+export async function sendInvoiceEmail(
+  templateId: number,
+  invoiceId: number,
+  options: { confirm?: boolean } = {},
+): Promise<{ mailId: number } | OdooWritePreview> {
+  return guardedWrite(
+    "invoice.email",
+    MAIL_TEMPLATE_MODEL,
+    "send_mail",
+    { templateId, invoiceId, forceSend: false },
+    options.confirm === true,
+    async (permit) => ({
+      mailId: await executeKw<number>(
+        MAIL_TEMPLATE_MODEL,
+        "send_mail",
+        [[templateId], invoiceId],
+        { force_send: false },
+        permit,
+      ),
+    }),
   );
 }
 

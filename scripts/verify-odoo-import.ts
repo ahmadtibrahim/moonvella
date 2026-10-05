@@ -786,6 +786,8 @@ async function main() {
     "confirmSaleOrder",
     "createInvoiceFromSaleOrder",
     "registerPayment",
+    "postInvoice",
+    "sendInvoiceEmail",
     "assertWriteAllowed",
   ].filter((name) => new RegExp(`\\b${name}\\b`).test(source));
   check(

@@ -64,6 +64,19 @@ export const JOB_KIND = {
    */
   SHOPIFY_FULFILLMENT_SYNC: "SHOPIFY_FULFILLMENT_SYNC",
   /**
+   * Write the seller's paid Odoo invoice for an order and email it.
+   *
+   * Queued at the carrier-handoff milestone, ALONGSIDE the Shopify push and
+   * never instead of it: handing the goods over must not wait on Odoo being
+   * reachable, and an Odoo outage must not turn a completed handoff into a
+   * failed operation. The order's own link columns are the idempotency guard
+   * inside the work — a linked invoice is adopted, never duplicated — and the
+   * per-order key collapses the second shipment's handoff and the manual
+   * Retry into one row. Failure is visible on the order page (and repairable
+   * there) rather than anywhere the operator would have to go looking.
+   */
+  ODOO_INVOICE_SYNC: "ODOO_INVOICE_SYNC",
+  /**
    * Poll the carriers for every shipment whose turn it is.
    *
    * §7: "Browser refresh must not be required for tracking updates." Before
