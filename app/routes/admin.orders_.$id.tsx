@@ -35,6 +35,7 @@ import { resolveFulfillmentOrders } from "~/services/shopifyFulfillment.server";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
 import { advanceShipment, type ShipmentAdvanceEvent } from "~/services/fulfillment.server";
 import { createOdooInvoiceForOrder } from "~/services/odooInvoice.server";
+import { odooWebBaseUrl } from "~/services/odoo.server";
 import {
   acceptFulfillmentRequest,
   rejectFulfillmentRequest,
@@ -379,6 +380,13 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
      */
     progress: await orderProgress(order.id),
     eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
+    /*
+     * WHERE "OPEN IN ODOO" POINTS. The configured Odoo's own address, read
+     * here because it comes from the credential store (a `.server` module the
+     * client bundle cannot import); null when no Odoo is configured, and the
+     * panel then shows no link rather than a dead one.
+     */
+    odooBaseUrl: await odooWebBaseUrl(),
     billing: {
       mode: billing.mode,
       autoPayEnabled: billing.autoPayEnabled,
@@ -420,12 +428,13 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await createOrReuseWholesalePayment(orderId);
     } else if (intent === "create_odoo_invoice") {
       /*
-       * The manual repair/retry for the automatic handoff invoice (the
-       * ordinary path is the ODOO_INVOICE_SYNC job the carrier handoff
-       * queues). Safe to press at any point because the pipeline is
-       * idempotent: an uninvoiced order gets its invoice, a linked one is
-       * reported as already created, and a failed one resumes from wherever
-       * the failure left off.
+       * The manual create/refresh for the handoff DRAFT invoice (the ordinary
+       * path is the ODOO_INVOICE_SYNC job the carrier handoff queues). Safe to
+       * press at any point because the pipeline is idempotent through the
+       * order's link columns: an uninvoiced order gets its draft, a linked
+       * draft is refreshed in place with the shipment's facts, and an invoice
+       * a person has already posted in Odoo is reported and left untouched.
+       * Nothing here posts, pays or emails anything.
        */
       const result = await createOdooInvoiceForOrder(orderId, actor);
       return { odooInvoice: result };
@@ -914,7 +923,7 @@ function importantDetail(raw: string | null): string | null {
 }
 
 export default function AdminOrderDetail() {
-  const { order, shipmentOrigins, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress } =
+  const { order, shipmentOrigins, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress, odooBaseUrl } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1311,9 +1320,15 @@ export default function AdminOrderDetail() {
         to charge anything, and nothing below can move money in either system.
 
         The automatic path is the ODOO_INVOICE_SYNC job the handoff milestone
-        queues; the button here is the work order's repair/retry action, and it
-        is safe to press at any point because the pipeline adopts whatever the
-        order already links to instead of creating a second invoice.
+        queues; the button here is the repair/retry action, and it is safe to
+        press at any point because the pipeline adopts whatever the order
+        already links to instead of creating a second invoice.
+
+        Draft-only, by the owner's instruction (2026-10-05): the handoff writes
+        a DRAFT, and posting, paying and emailing it is done by hand in Odoo.
+        The status below is therefore what the LAST SYNC observed, labelled
+        "as of" because a change made in Odoo shows up here only on the next
+        sync (the job, or the button).
       */}
       <div className="mv-panel mv-panel-body" style={{ marginBottom: "1.5rem", marginTop: 0 }}>
         <h2 className="mv-panel-title">Odoo customer invoice</h2>
@@ -1322,21 +1337,47 @@ export default function AdminOrderDetail() {
             <div>
               Invoice: <strong>{order.odooInvoiceName ?? `id ${order.odooInvoiceId}`}</strong>
               <span style={{ color: "#94a3b8" }}> (Odoo id {order.odooInvoiceId})</span>
+              {odooBaseUrl ? (
+                <>
+                  {" · "}
+                  <a
+                    href={`${odooBaseUrl}/web#id=${order.odooInvoiceId}&model=account.move&view_type=form`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{ color: "#0369a1", fontWeight: 600 }}
+                  >
+                    Open in Odoo ↗
+                  </a>
+                </>
+              ) : null}
+            </div>
+            <div>
+              Status:{" "}
+              <strong>
+                {order.odooInvoiceState === "posted"
+                  ? "Posted in Odoo"
+                  : order.odooInvoiceState === "draft"
+                    ? "Draft"
+                    : "unknown"}
+              </strong>
+              <span style={{ color: "#94a3b8" }}>
+                {" "}
+                (as of the last sync
+                {order.odooInvoiceSyncedAt ? `, ${formatDateTime(order.odooInvoiceSyncedAt)}` : ""})
+              </span>
             </div>
             <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
-              Created {order.odooInvoiceSyncedAt ? formatDateTime(order.odooInvoiceSyncedAt) : "—"} ·{" "}
-              {order.odooInvoiceEmailSentAt
-                ? `emailed to the seller ${formatDateTime(order.odooInvoiceEmailSentAt)}`
-                : "not emailed yet"}
+              Posting, payment and emailing are done by hand in Odoo
               {order.odooSaleOrderId ? ` · Odoo sale order id ${order.odooSaleOrderId}` : ""}
             </div>
           </div>
         ) : (
           <p style={{ fontSize: "0.82rem", color: "#64748b", marginBottom: "0.4rem" }}>
-            The paid invoice is created in Odoo automatically when the shipment is handed to the carrier — from the
-            “MoonVella B2B Wholesale” quotation template, with the ordered Odoo products — and emailed to the seller.
-            Nothing is created before that milestone, there is no free-text line, and nothing here ever charges Stripe
-            again.
+            A DRAFT invoice is created in Odoo automatically when the shipment is handed to the carrier — from the
+            “MoonVella B2B Wholesale” quotation template, with the ordered Odoo products, no added tax, and the carrier
+            and tracking details on it. Nothing is posted, paid or emailed from here; that is done by hand in Odoo.
+            Nothing is created before the handoff milestone, there is no free-text line, and nothing here ever charges
+            Stripe again.
           </p>
         )}
         {order.odooInvoiceError ? (
@@ -1344,25 +1385,28 @@ export default function AdminOrderDetail() {
             Last Odoo invoice error: {order.odooInvoiceError}
           </p>
         ) : null}
-        {order.odooInvoiceId && order.odooInvoiceEmailSentAt && !order.odooInvoiceError ? (
-          <p style={{ fontSize: "0.75rem", color: "#059669" }} role="status">
-            Invoice created and emailed — nothing left to retry.
-          </p>
-        ) : (
-          <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
-            <Form method="post">
-              <button type="submit" name="intent" value="create_odoo_invoice" style={btn("#0369a1")}>
-                {order.odooInvoiceId ? "Retry the Odoo invoice" : "Create the Odoo invoice now"}
-              </button>
-            </Form>
-          </div>
-        )}
+        <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.4rem" }}>
+          <Form method="post">
+            <button type="submit" name="intent" value="create_odoo_invoice" style={btn("#0369a1")}>
+              {order.odooInvoiceId ? "Re-sync the Odoo invoice" : "Create the Odoo draft invoice now"}
+            </button>
+          </Form>
+        </div>
         {actionData?.odooInvoice ? (
-          <p style={{ fontSize: "0.75rem", color: "#059669", marginTop: "0.4rem" }} role="status">
+          <p
+            style={{
+              fontSize: "0.75rem",
+              color: actionData.odooInvoice.status === "POSTED" ? "#475569" : "#059669",
+              marginTop: "0.4rem",
+            }}
+            role="status"
+          >
             Odoo invoice {actionData.odooInvoice.odooInvoiceName ?? actionData.odooInvoice.odooInvoiceId}:{" "}
-            {actionData.odooInvoice.status === "ALREADY_CREATED"
-              ? "already created — nothing was duplicated."
-              : `created and linked${actionData.odooInvoice.email ? ", and emailed to the seller" : ""}.`}
+            {actionData.odooInvoice.status === "CREATED"
+              ? "draft created and linked."
+              : actionData.odooInvoice.status === "UPDATED"
+                ? "already existed as a draft — the shipment details were refreshed, nothing was duplicated."
+                : "is already posted in Odoo — it was left untouched."}
           </p>
         ) : null}
       </div>

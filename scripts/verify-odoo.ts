@@ -444,16 +444,31 @@ async function main() {
       "two different orders produce different domains (it cannot match another order)",
       JSON.stringify(domainA) !== JSON.stringify(domainB),
     );
+    // Scoped to the invoice-selection function rather than the whole file: the
+    // connector DOES legitimately read a chatter note by recency (mail.message,
+    // newest first, limit 5) to find its own shipment note, and that is a
+    // message lookup, not an invoice one. What must never exist is a recency
+    // ordering inside the lookup that decides WHICH INVOICE an order gets.
+    const invoiceLookupStart = source.indexOf("export async function findInvoicesForSaleOrder");
+    const invoiceLookupEnd = source.indexOf("export async function", invoiceLookupStart + 1);
+    const invoiceLookup =
+      invoiceLookupStart === -1
+        ? ""
+        : source.slice(invoiceLookupStart, invoiceLookupEnd === -1 ? undefined : invoiceLookupEnd);
     check(
       "the connector contains no order-by-recency fallback",
-      !/order:\s*["']id desc["']/.test(source),
+      invoiceLookup.length > 0 && !/order:\s*["']id desc["']/.test(invoiceLookup),
     );
 
     /* ---------------------------------------------------------------- */
-    /* 8b. The handoff-invoice writes exist and are shaped the way Odoo  */
-    /*     18 requires — the record-method argument order, the queued    */
-    /*     mail, and the context key that keeps action_post from         */
-    /*     answering with a validation wizard instead of posting.        */
+    /* 8b. The RETAINED posting/email library is still shaped the way     */
+    /*     Odoo 18 requires — the record-method argument order, the       */
+    /*     queued mail, and the context key that keeps action_post from   */
+    /*     answering with a validation wizard instead of posting. It is   */
+    /*     DORMANT under the draft-only flow: the handoff pipeline never  */
+    /*     calls any of it (verify-odoo-invoice proves that), but         */
+    /*     switching automatic recording back on must not land on a       */
+    /*     shape that no longer posts.                                    */
     /* ---------------------------------------------------------------- */
     check(
       "posting and emailing are guarded write operations of their own",

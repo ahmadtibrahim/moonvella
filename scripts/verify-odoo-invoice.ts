@@ -1,29 +1,40 @@
 /**
- * The automatic Odoo invoice at carrier handoff.
+ * The DRAFT Odoo invoice at carrier handoff.
  *
  * This suite runs the REAL pipeline (`createOdooInvoiceForOrder`) against a
  * stubbed Odoo and asserts both outcomes and the exact RPC payloads — the
- * quotation-template id, the product ids behind the ordered SKUs, the journal
- * the payment is registered in, and the mail arguments. The stub's invoice
- * total is computed from the lines the pipeline sent, so the pipeline's own
- * money gate (invoice total vs the captured Stripe amount) is load-bearing
- * here rather than bypassed.
+ * quotation-template id, the product ids behind the ordered SKUs, the empty
+ * tax set stated on every line, the tracking write, and the chatter note. The
+ * stub's invoice totals are computed from the lines the pipeline sent (through
+ * the same tax model `compute_all` implements), so the pipeline's own money
+ * gate — invoice total vs the captured Stripe amount, and no tax — is
+ * load-bearing here rather than bypassed.
  *
  * What it proves, in the work order's terms:
  *
- *   • the invoice is created from the existing "MoonVella B2B Wholesale"
- *     template, and a template missing its MoonVella brand/channel stamps
- *     fails loudly instead of producing the wrong document;
+ *   • the invoice is created as a DRAFT from the existing "MoonVella B2B
+ *     Wholesale" template, and a template missing its MoonVella brand/channel
+ *     stamps fails loudly instead of producing the wrong document;
  *   • lines are Odoo PRODUCTS resolved from the ordered SKUs — never a
  *     free-text line — and a SKU with no product is a named failure;
- *   • a retry never creates a second sale order, a second invoice, or a second
- *     payment, in the linked case AND in the crash-recovered case;
- *   • the payment is a ledger entry in the configured journal — the suite
- *     installs the provider guard, so a Stripe call anywhere in this run would
- *     throw rather than be stubbed;
- *   • the email is queued through the branded template, remembered on the
- *     order, and resumed (only it) when an earlier attempt reached the invoice
- *     but not the send;
+ *   • no tax is added: every line is created with an explicit empty tax set,
+ *     and even when Odoo applies the product's own taxes anyway (the stub's
+ *     "ignore" scenario, both the adds-to-price and included-in-price shapes)
+ *     the invoice's lines are cleared and RE-VERIFIED before the draft is
+ *     linked, so it totals the captured charge with zero tax;
+ *   • posting, payment registration and emailing never happen: the stub does
+ *     not model `action_post`, `account.payment.register` or
+ *     `mail.template.send_mail` at all, so a pipeline that reached for one
+ *     would fail this run — and the payload assertions pin that none was
+ *     called;
+ *   • the shipment's carrier, service, tracking number and provider reference
+ *     are written onto the draft (tracking into the module's own field, the
+ *     whole block as one internal note carrying a stable marker), and a retry
+ *     does not duplicate the note (the stub stores it as Odoo does — HTML —
+ *     so the comparison is exercised against the real wrapped shape);
+ *   • a retry never creates a second sale order or invoice: a linked DRAFT is
+ *     refreshed in place (even when a person has edited its totals), and a
+ *     linked POSTED invoice is reported and left completely untouched;
  *   • the guard ladder holds: readonly refuses the first write with no write
  *     reaching Odoo at all, `Prod-db` is refused before a single byte is sent,
  *     and an unconfigured connector never calls out.
@@ -45,7 +56,7 @@ import {
 } from "../app/services/odoo.server";
 import { PermanentJobError } from "../app/services/jobs.server";
 import { forbidProviderCalls, providerGuardActive } from "./provider-guard";
-import { installOdooJsonRpcStub, isOdooWrite, type OdooStubCall } from "./odoo-jsonrpc-stub";
+import { installOdooJsonRpcStub, type OdooStubCall } from "./odoo-jsonrpc-stub";
 
 const prisma = new PrismaClient();
 const SHOP = "odoo-invoice-verify.myshopify.com";
@@ -72,9 +83,17 @@ const TOTAL_MINOR =
   LINE_PILLOW.quantity * LINE_PILLOW.unitPriceMinor +
   LINE_DUVET.quantity * LINE_DUVET.unitPriceMinor; // 14447
 const TOTAL_MAJOR = TOTAL_MINOR / 100; // 144.47
-/** The captured date the payment ledger entry must carry. */
+/** The captured date the payment record carries (no ledger entry is written). */
 const CAPTURED_AT = new Date("2026-10-03T14:30:00Z");
-const CAPTURED_DATE = "2026-10-03";
+
+/** The shipment fixture's facts — what must land on the draft. */
+const CARRIER = "Purolator";
+const SERVICE = "Purolator Ground";
+const TRACKING = "MV123456789CA";
+const PROVIDER_REF = "ESHP-9001";
+const NOTE_BODY =
+  `[MoonVella shipment] Carrier: ${CARRIER} · Service: ${SERVICE} · ` +
+  `Tracking: ${TRACKING} · Provider ref: ${PROVIDER_REF}`;
 
 const ODOO_ENV_KEYS = [
   "ODOO_URL",
@@ -113,6 +132,11 @@ async function catchError(run: () => Promise<unknown>): Promise<unknown> {
   }
 }
 
+/** The values argument of a `write` call — `args[0]` is the id list there. */
+function writeValuesOf(call: OdooStubCall): Record<string, unknown> {
+  return (call.args[1] ?? {}) as Record<string, unknown>;
+}
+
 function payloadOf(call: OdooStubCall): Record<string, unknown> {
   return (call.args[0] ?? {}) as Record<string, unknown>;
 }
@@ -135,12 +159,15 @@ async function makeOrder(
     lines?: { sku: string; name: string; quantity: number; unitPriceMinor: number }[];
     paymentStatus?: "SUCCEEDED" | "REQUIRES_PAYMENT" | "REFUNDED";
     snapshot?: boolean;
+    /** A shipment to describe on the draft; on by default (handoff implies one). */
+    shipment?: boolean;
   } = {},
 ) {
   seq += 1;
   const lines = options.lines ?? [LINE_PILLOW, LINE_DUVET];
   const amount = lines.reduce((sum, line) => sum + line.quantity * line.unitPriceMinor, 0);
   const withSnapshot = options.snapshot ?? true;
+  const withShipment = options.shipment ?? true;
 
   return prisma.order.create({
     data: {
@@ -215,8 +242,30 @@ async function makeOrder(
             : {}),
         },
       },
+      ...(withShipment
+        ? {
+            shipments: {
+              create: {
+                status: "SHIPPED",
+                carrier: CARRIER,
+                serviceName: SERVICE,
+                serviceCode: "PUR-GRD",
+                trackingNumber: TRACKING,
+                providerShipmentId: PROVIDER_REF,
+                providerQuoteId: "QUOTE-7001",
+                handedToCarrierAt: CAPTURED_AT,
+              },
+            },
+          }
+        : {}),
     },
   });
+}
+
+async function shipmentIdFor(orderId: string): Promise<string> {
+  const shipment = await prisma.shipment.findFirst({ where: { orderId } });
+  if (!shipment) throw new Error(`fixture: order ${orderId} has no shipment`);
+  return shipment.id;
 }
 
 const linkSelect = {
@@ -224,7 +273,7 @@ const linkSelect = {
   odooInvoiceName: true,
   odooSaleOrderId: true,
   odooInvoiceSyncedAt: true,
-  odooInvoiceEmailSentAt: true,
+  odooInvoiceState: true,
   odooInvoiceError: true,
 } as const;
 
@@ -241,6 +290,7 @@ async function cleanup() {
     });
     const ids = orders.map((order) => order.id);
     await prisma.wholesalePayment.deleteMany({ where: { sellerId: seller.id } });
+    await prisma.shipment.deleteMany({ where: { orderId: { in: ids } } });
     await prisma.orderItem.deleteMany({ where: { orderId: { in: ids } } });
     await prisma.order.deleteMany({ where: { sellerId: seller.id } });
     await prisma.externalContactMapping.deleteMany({ where: { sellerId: seller.id } });
@@ -313,7 +363,7 @@ async function main() {
     });
     // A FAILED COMPANY mapping with no partner id: the state the repair path
     // exists for, and the state that puts a financial hold on the seller. The
-    // hold must be RECORDED and must not strand the invoice.
+    // hold must be RECORDED and must not strand the draft.
     await prisma.externalContactMapping.create({
       data: {
         sellerId: seller.id,
@@ -328,7 +378,8 @@ async function main() {
     });
 
     /* ------------------------------------------------------------------ */
-    /* 1. Happy path: the whole chain, every payload asserted.             */
+    /* 1. Happy path: a DRAFT, every payload asserted, nothing posted,     */
+    /*    paid or emailed.                                                 */
     /* ------------------------------------------------------------------ */
     const stub = installOdooJsonRpcStub();
     await configureOdoo();
@@ -336,16 +387,17 @@ async function main() {
 
     const outcome = await createOdooInvoiceForOrder(order1.id, JOB_ACTOR);
 
-    check("happy path: the invoice was created", outcome.status === "CREATED", outcome.status);
+    check("happy path: the draft invoice was created", outcome.status === "CREATED", outcome.status);
     check(
-      "happy path: the invoice is posted and paid in Odoo",
-      outcome.invoice.state === "posted" && outcome.invoice.paymentState === "paid",
+      "happy path: the invoice is a DRAFT and unpaid in Odoo — nothing was posted or paid",
+      outcome.invoice.state === "draft" && outcome.invoice.paymentState === false,
       `${outcome.invoice.state}/${String(outcome.invoice.paymentState)}`,
     );
     check(
-      "happy path: the invoice totals the captured charge",
-      Math.abs(outcome.invoice.amountTotal - TOTAL_MAJOR) < 0.005,
-      `${outcome.invoice.amountTotal} vs ${TOTAL_MAJOR}`,
+      "happy path: the invoice totals the captured charge with ZERO tax",
+      Math.abs(outcome.invoice.amountTotal - TOTAL_MAJOR) < 0.005 &&
+        Math.abs(outcome.invoice.amountTax) < 0.005,
+      `${outcome.invoice.amountTotal} / tax ${outcome.invoice.amountTax}`,
     );
     check(
       "happy path: the customer contact was created from the application's legal name",
@@ -355,32 +407,29 @@ async function main() {
       JSON.stringify(outcome.partner),
     );
     check(
-      "happy path: the payment ledger entry names the default journal and the captured date",
-      outcome.payment?.journalId === 77 &&
-        outcome.payment.journalName === "MoonVella Stripe" &&
-        Math.abs(outcome.payment.amount - TOTAL_MAJOR) < 0.005 &&
-        outcome.payment.paymentDate === CAPTURED_DATE,
-      JSON.stringify(outcome.payment),
-    );
-    check(
-      "happy path: the branded mail template was the one sent",
-      outcome.email?.templateId === 88 && outcome.email.mailId === 990,
-      JSON.stringify(outcome.email),
+      "happy path: the shipment facts are ON the draft — tracking ref written, note posted",
+      outcome.shipment?.carrier === CARRIER &&
+        outcome.shipment.service === SERVICE &&
+        outcome.shipment.trackingNumber === TRACKING &&
+        outcome.shipment.providerReference === PROVIDER_REF &&
+        outcome.shipment.trackingRefWritten === true &&
+        outcome.shipment.notePosted === true,
+      JSON.stringify(outcome.shipment),
     );
 
     const link1 = await readLink(order1.id);
     check(
-      "happy path: the order is linked to the Odoo invoice id and number",
+      "happy path: the order is linked to the Odoo draft (id, state, sale order)",
       link1?.odooInvoiceId === 1001 &&
-        link1.odooInvoiceName === "INV/2026/00001" &&
-        link1.odooSaleOrderId === 900,
+        link1.odooInvoiceName === null && // a draft has no number yet ("/")
+        link1.odooSaleOrderId === 900 &&
+        link1.odooInvoiceState === "draft" &&
+        link1.odooInvoiceError === null,
       JSON.stringify(link1),
     );
     check(
-      "happy path: link timestamps recorded, no error left behind",
-      link1?.odooInvoiceSyncedAt !== null &&
-        link1?.odooInvoiceEmailSentAt !== null &&
-        link1?.odooInvoiceError === null,
+      "happy path: the sync timestamp was recorded",
+      link1?.odooInvoiceSyncedAt !== null,
     );
 
     const saleOrderCreates = stub.callsTo("sale.order", "create");
@@ -418,6 +467,12 @@ async function main() {
         lineValues[1]?.price_unit === 105.5,
       JSON.stringify(lineValues),
     );
+    check(
+      "every line states an EXPLICIT EMPTY tax set — the 'no tax added' rule at the source",
+      lineValues.length === 2 &&
+        lineValues.every((line) => JSON.stringify(line.tax_id) === "[[6,0,[]]]"),
+      JSON.stringify(lineValues.map((line) => line.tax_id)),
+    );
 
     const templateSearches = stub.callsTo("sale.order.template", "search_read");
     check(
@@ -427,60 +482,37 @@ async function main() {
       String(templateSearches.length ? searchedValue(templateSearches[0], "name") : "no search"),
     );
 
-    const posts = stub.callsTo("account.move", "action_post");
+    const trackingWrites = stub.callsTo("account.move", "write");
     check(
-      "the invoice was posted once, with the abnormal-invoice wizard suppressed",
-      posts.length === 1 &&
-        (posts[0].kwargs.context as Record<string, unknown> | undefined)
-          ?.disable_abnormal_invoice_detection === true,
-      JSON.stringify(posts[0]?.kwargs ?? {}),
+      "the tracking number was written ONCE, into the module's own field",
+      trackingWrites.length === 1 &&
+        JSON.stringify(writeValuesOf(trackingWrites[0])) ===
+          JSON.stringify({ mv_shipping_tracking_ref: TRACKING }),
+      JSON.stringify(trackingWrites.map((call) => writeValuesOf(call))),
     );
 
-    const registerCreates = stub.callsTo("account.payment.register", "create");
-    const registerPayload = registerCreates.length ? payloadOf(registerCreates[0]) : {};
+    const notePosts = stub.callsTo("account.move", "message_post");
     check(
-      "the payment was registered in the journal, for the captured amount and date",
-      registerCreates.length === 1 &&
-        registerPayload.journal_id === 77 &&
-        registerPayload.amount === TOTAL_MAJOR &&
-        registerPayload.payment_date === CAPTURED_DATE,
-      JSON.stringify(registerPayload),
-    );
-    check(
-      "the payment wizard names the invoice through its context",
-      (registerCreates[0]?.kwargs.context as { active_ids?: number[] } | undefined)
-        ?.active_ids?.[0] === 1001,
+      "the shipment block was posted ONCE as an internal note carrying the marker",
+      notePosts.length === 1 &&
+        notePosts[0].kwargs.subtype_xmlid === "mail.mt_note" &&
+        notePosts[0].kwargs.body === NOTE_BODY,
+      JSON.stringify(notePosts.map((call) => call.kwargs)),
     );
 
-    const journalSearches = stub.callsTo("account.journal", "search_read");
     check(
-      "the journal search used the default name, nothing was guessed",
-      journalSearches.length === 1 &&
-        searchedValue(journalSearches[0], "name") === "MoonVella Stripe",
-      String(journalSearches.length ? searchedValue(journalSearches[0], "name") : "no search"),
+      "no tax clear was needed — the invoice was born tax-free, so no line write happened",
+      stub.callsTo("account.move.line", "write").length === 0,
     );
 
-    const mailTemplateSearches = stub.callsTo("mail.template", "search_read");
     check(
-      "the mail template was found by its exact MoonVella name",
-      mailTemplateSearches.length === 1 &&
-        searchedValue(mailTemplateSearches[0], "name") ===
-          "MoonVella — B2B Wholesale Paid Invoice",
-      String(
-        mailTemplateSearches.length ? searchedValue(mailTemplateSearches[0], "name") : "no search",
-      ),
-    );
-
-    const mailSends = stub.callsTo("mail.template", "send_mail");
-    check(
-      "one email was queued through the template, for the invoice",
-      // The full record-method shape: the ids list first, the res_id second.
-      mailSends.length === 1 && JSON.stringify(mailSends[0].args) === "[[88],1001]",
-      JSON.stringify(mailSends[0]?.args ?? []),
-    );
-    check(
-      "the email was queued (not sent inline), so invoice creation is decoupled from SMTP",
-      mailSends[0]?.kwargs.force_send === false,
+      "NOTHING was posted, paid or emailed — the draft-only rule, proven by the call log",
+      stub.callsTo("account.move", "action_post").length === 0 &&
+        stub.callsTo("account.payment.register", "create").length === 0 &&
+        stub.calls.filter((call) => call.model === "mail.template").length === 0 &&
+        stub.calls.filter((call) => call.model === "account.payment").length === 0 &&
+        stub.calls.filter((call) => call.model === "account.journal").length === 0,
+      JSON.stringify(stub.writes().map((call) => `${call.model}.${call.method}`)),
     );
 
     const partnerCreates = stub.callsTo("res.partner", "create");
@@ -508,16 +540,19 @@ async function main() {
       audit?.afterData && typeof audit.afterData === "string"
         ? (JSON.parse(audit.afterData) as Record<string, unknown>)
         : null;
-    check("the invoice was audited against the order", audit !== null);
+    check("the draft was audited against the order", audit !== null);
     check(
-      "the financial hold was RECORDED on the audit and did not stop the invoice",
-      typeof auditAfter?.financialHold === "string",
-      JSON.stringify(auditAfter?.financialHold),
+      "the audit records the CREATED status, the company and the currency",
+      auditAfter?.status === "CREATED" &&
+        auditAfter?.companyId === 1 &&
+        auditAfter?.currency === "CAD" &&
+        auditAfter?.invoiceState === "draft",
+      JSON.stringify({ status: auditAfter?.status, companyId: auditAfter?.companyId }),
     );
     check(
-      "the audit names the issuing company and the invoice currency",
-      auditAfter?.companyId === 1 && auditAfter?.currency === "CAD",
-      JSON.stringify({ companyId: auditAfter?.companyId, currency: auditAfter?.currency }),
+      "the financial hold was RECORDED on the audit and did not stop the draft",
+      typeof auditAfter?.financialHold === "string",
+      JSON.stringify(auditAfter?.financialHold),
     );
 
     const mapping = await prisma.externalContactMapping.findUnique({
@@ -540,29 +575,129 @@ async function main() {
     );
 
     /* ------------------------------------------------------------------ */
-    /* 2. Idempotency: a second run writes nothing at all.                 */
+    /* 2. Idempotency: a second run refreshes, duplicates nothing, and     */
+    /*    performs no write at all (the note is already there, compared    */
+    /*    through Odoo's HTML storage).                                    */
     /* ------------------------------------------------------------------ */
     const writesBefore = stub.writes().length;
     const second = await createOdooInvoiceForOrder(order1.id, JOB_ACTOR);
     const link2 = await readLink(order1.id);
-    check("a second run reports ALREADY_CREATED", second.status === "ALREADY_CREATED", second.status);
+    check("a second run reports UPDATED (the draft already existed)", second.status === "UPDATED", second.status);
     check(
-      "a second run performs no write of any kind",
+      "a second run performs no write of any kind — no duplicate note, no duplicate ref write",
       stub.writes().length === writesBefore,
       `${stub.writes().length} vs ${writesBefore}`,
     );
     check(
-      "there is still exactly one sale order, one invoice and one email",
+      "there is still exactly one sale order, one invoice, one tracking write and one note",
       stub.callsTo("sale.order", "create").length === 1 &&
         stub.callsTo("sale.advance.payment.inv", "create_invoices").length === 1 &&
-        stub.callsTo("account.move", "action_post").length === 1 &&
-        stub.callsTo("mail.template", "send_mail").length === 1,
+        stub.callsTo("account.move", "write").length === 1 &&
+        stub.callsTo("account.move", "message_post").length === 1,
     );
     check(
-      "the email timestamp was not rewritten",
-      link2?.odooInvoiceEmailSentAt?.getTime() === link1?.odooInvoiceEmailSentAt?.getTime(),
+      "the link still points at the same draft, error-free",
+      link2?.odooInvoiceId === 1001 &&
+        link2.odooInvoiceState === "draft" &&
+        link2.odooInvoiceError === null,
+      JSON.stringify(link2),
+    );
+
+    /* ------------------------------------------------------------------ */
+    /* 2b. A tracking change on the shipment refreshes the SAME draft.     */
+    /* ------------------------------------------------------------------ */
+    const NEW_TRACKING = "MV999999999CA";
+    await prisma.shipment.update({
+      where: { id: await shipmentIdFor(order1.id) },
+      data: { trackingNumber: NEW_TRACKING },
+    });
+    const refreshed = await createOdooInvoiceForOrder(order1.id, JOB_ACTOR);
+    check(
+      "a tracking change refreshes the draft in place — UPDATED, not a second invoice",
+      refreshed.status === "UPDATED" &&
+        refreshed.odooInvoiceId === 1001 &&
+        refreshed.shipment?.trackingRefWritten === true &&
+        refreshed.shipment?.notePosted === true,
+      JSON.stringify({ status: refreshed.status, shipment: refreshed.shipment }),
+    );
+    const newTrackingWrites = stub.callsTo("account.move", "write");
+    check(
+      "the new tracking number was written to the field and the new note carries it",
+      newTrackingWrites.length === 2 &&
+        JSON.stringify(writeValuesOf(newTrackingWrites[1])) ===
+          JSON.stringify({ mv_shipping_tracking_ref: NEW_TRACKING }) &&
+        String(stub.callsTo("account.move", "message_post")[1]?.kwargs.body ?? "").includes(NEW_TRACKING),
+      JSON.stringify(newTrackingWrites.map((call) => writeValuesOf(call))),
+    );
+    check(
+      "still exactly one invoice was ever created from the sale order",
+      stub.callsTo("sale.advance.payment.inv", "create_invoices").length === 1,
     );
     stub.restore();
+
+    /* ------------------------------------------------------------------ */
+    /* 2c. A linked invoice a person has POSTED is reported and left       */
+    /*     completely untouched — no field, no note, no write at all.      */
+    /* ------------------------------------------------------------------ */
+    const stub2c = installOdooJsonRpcStub({
+      existingInvoice: {
+        id: 1002,
+        state: "posted",
+        paymentState: "not_paid",
+        name: "INV/2026/00042",
+        amountTotal: TOTAL_MAJOR,
+        amountUntaxed: TOTAL_MAJOR,
+        amountTax: 0,
+        amountResidual: TOTAL_MAJOR,
+      },
+    });
+    await configureOdoo();
+    const order2c = await makeOrder(seller.id);
+    await prisma.order.update({
+      where: { id: order2c.id },
+      data: {
+        odooInvoiceId: 1002,
+        odooInvoiceName: "INV/2026/00042",
+        odooSaleOrderId: 902,
+        odooInvoiceState: "draft",
+        odooInvoiceError: "an earlier run stopped before the shipment facts",
+      },
+    });
+    const outcome2c = await createOdooInvoiceForOrder(order2c.id, JOB_ACTOR);
+    const link2c = await readLink(order2c.id);
+    check(
+      "a posted invoice is reported as POSTED, not re-created",
+      outcome2c.status === "POSTED" &&
+        outcome2c.odooInvoiceId === 1002 &&
+        outcome2c.invoice.state === "posted",
+      JSON.stringify({ status: outcome2c.status, state: outcome2c.invoice.state }),
+    );
+    check(
+      "not one write reached a posted invoice — no ref, no note, nothing",
+      stub2c.writes().length === 0,
+      JSON.stringify(stub2c.writes().map((call) => `${call.model}.${call.method}`)),
+    );
+    check(
+      "the link now records the observed state and clears the stale error",
+      link2c?.odooInvoiceState === "posted" &&
+        link2c.odooInvoiceName === "INV/2026/00042" &&
+        link2c.odooInvoiceError === null,
+      JSON.stringify(link2c),
+    );
+    const audit2c = await prisma.auditLog.findFirst({
+      where: { action: "order.odoo_invoice_updated", entityId: order2c.id },
+      orderBy: { createdAt: "desc" },
+    });
+    const audit2cAfter =
+      audit2c?.afterData && typeof audit2c.afterData === "string"
+        ? (JSON.parse(audit2c.afterData) as Record<string, unknown>)
+        : null;
+    check(
+      "the POSTED outcome is audited as such",
+      audit2cAfter?.status === "POSTED",
+      JSON.stringify(audit2cAfter?.status),
+    );
+    stub2c.restore();
 
     /* ------------------------------------------------------------------ */
     /* 3. A SKU with no Odoo product: named failure, no free-text line.    */
@@ -596,128 +731,83 @@ async function main() {
     stub3.restore();
 
     /* ------------------------------------------------------------------ */
-    /* 3b. A payment that is not SUCCEEDED: a PAID invoice is not created. */
+    /* 3b. A payment that is not SUCCEEDED: no draft is created at all.    */
     /* ------------------------------------------------------------------ */
     const stub3b = installOdooJsonRpcStub();
     const order3b = await makeOrder(seller.id, { paymentStatus: "REFUNDED" });
     const error3b = await catchError(() => createOdooInvoiceForOrder(order3b.id, JOB_ACTOR));
     check(
-      "a refunded (not SUCCEEDED) wholesale payment creates no paid invoice",
+      "a refunded (not SUCCEEDED) wholesale payment creates no invoice draft",
       error3b instanceof PermanentJobError &&
-        (error3b as Error).message.includes("REFUNDED"),
+        (error3b as Error).message.includes("REFUNDED") &&
+        (error3b as Error).message.includes("no invoice draft"),
       describe(error3b),
     );
     check(
-      "nothing at all was written for the un-charged order",
-      stub3b.writes().length === 0,
-      JSON.stringify(stub3b.writes().map((call) => `${call.model}.${call.method}`)),
+      "nothing at all was sent to Odoo for the un-charged order — not even a read",
+      stub3b.calls.length === 0,
+      JSON.stringify(stub3b.calls.map((call) => `${call.model}.${call.method}`)),
     );
     stub3b.restore();
 
     /* ------------------------------------------------------------------ */
-    /* 3c. The catalogue's taxes. The seller paid the snapshot price, so   */
-    /*     a tax that would raise the invoice above it is refused BEFORE   */
-    /*     any document exists — and the tax is never silently overridden. */
+    /* 3c. The catalogue's taxes DON'T ride onto the draft. Even when      */
+    /*     Odoo applies them anyway (the stub's "ignore" scenario), the    */
+    /*     invoice's own lines are cleared and RE-VERIFIED, so the draft   */
+    /*     totals the captured charge with zero tax.                       */
     /* ------------------------------------------------------------------ */
     const stub3c = installOdooJsonRpcStub({
-      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [7] }] },
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [7] }] }, // 13% HST, adds to price
+      saleOrderLineTax: "ignore", // Odoo applies the product tax despite the empty set
     });
     await configureOdoo();
     const order3c = await makeOrder(seller.id);
-    const error3c = await catchError(() => createOdooInvoiceForOrder(order3c.id, JOB_ACTOR));
-    const message3c = error3c instanceof Error ? error3c.message : String(error3c);
+    const outcome3c = await createOdooInvoiceForOrder(order3c.id, JOB_ACTOR);
     check(
-      "a sale tax that adds to the wholesale price is a PERMANENT failure naming the tax",
-      error3c instanceof PermanentJobError &&
-        message3c.includes(LINE_PILLOW.sku) &&
-        message3c.includes("13% HST"),
-      describe(error3c),
+      "even when Odoo taxes the lines anyway, the linked draft is tax-free and totals the charge",
+      outcome3c.status === "CREATED" &&
+        Math.abs(outcome3c.invoice.amountTax) < 0.005 &&
+        Math.abs(outcome3c.invoice.amountTotal - TOTAL_MAJOR) < 0.005,
+      JSON.stringify(outcome3c.invoice),
+    );
+    const lineWrites3c = stub3c.callsTo("account.move.line", "write");
+    check(
+      "the taxed line was cleared to the empty tax set — one write, only the taxed line",
+      lineWrites3c.length === 1 &&
+        JSON.stringify(lineWrites3c[0].args[1]) === JSON.stringify({ tax_ids: [[6, 0, []]] }) &&
+        Array.isArray(lineWrites3c[0].args[0]) &&
+        (lineWrites3c[0].args[0] as unknown[]).length === 1,
+      JSON.stringify(lineWrites3c.map((call) => call.args)),
     );
     check(
-      "the refusal shows what the tax would do and both ways to fix the catalogue",
-      message3c.includes("38.97") &&
-        message3c.includes("44.04") &&
-        message3c.includes("no sale tax") &&
-        message3c.includes("included in the price"),
-      message3c,
-    );
-    check(
-      "the taxed order is refused before ANY write: no sale order, no invoice",
-      stub3c.writes().length === 0,
-      JSON.stringify(stub3c.writes().map((call) => `${call.model}.${call.method}`)),
-    );
-    check(
-      "Odoo answered the question itself — one compute_all read, and only for the taxed SKU",
-      stub3c.callsTo("account.tax", "compute_all").length === 1 &&
-        !isOdooWrite(stub3c.callsTo("account.tax", "compute_all")[0]),
-      JSON.stringify({
-        calls: stub3c.callsTo("account.tax", "compute_all").length,
-        lines: 2,
-      }),
-    );
-    check(
-      "the refusal reached the order, not just the job",
-      ((await readLink(order3c.id))?.odooInvoiceError ?? "").includes("13% HST"),
+      "the draft is linked as a draft, not left half-made",
+      (await readLink(order3c.id))?.odooInvoiceState === "draft" &&
+        (await readLink(order3c.id))?.odooInvoiceError === null,
+      JSON.stringify(await readLink(order3c.id)),
     );
     stub3c.restore();
 
-    /* ------------------------------------------------------------------ */
-    /* 3d. Taxes that do NOT raise the price are accepted: included in it, */
-    /*     or zero-rated. A tax GROUP that adds is refused by its effect,  */
-    /*     not by the group's own rate.                                    */
-    /* ------------------------------------------------------------------ */
     const stub3d = installOdooJsonRpcStub({
-      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [69] }] },
+      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [69] }] }, // 13% HST, included in price
+      saleOrderLineTax: "ignore",
     });
     await configureOdoo();
     const order3d = await makeOrder(seller.id);
     const outcome3d = await createOdooInvoiceForOrder(order3d.id, JOB_ACTOR);
     check(
-      "a tax configured as included in the price is accepted — the invoice bills the captured amount",
-      outcome3d.status === "CREATED" && outcome3d.invoice?.amountTotal === TOTAL_MAJOR,
-      JSON.stringify({ status: outcome3d.status, total: outcome3d.invoice?.amountTotal }),
-    );
-    const saleOrder3d = payloadOf(stub3d.callsTo("sale.order", "create")[0]);
-    check(
-      "the line carries no tax instruction at all — the catalogue's tax is Odoo's to apply, never the app's to set or clear",
-      JSON.stringify(saleOrder3d).includes("order_line") &&
-        !JSON.stringify(saleOrder3d).includes("tax"),
-      JSON.stringify(saleOrder3d.order_line),
+      "the included-in-price tax shape is cleared too — zero tax, exact total",
+      outcome3d.status === "CREATED" &&
+        Math.abs(outcome3d.invoice.amountTax) < 0.005 &&
+        Math.abs(outcome3d.invoice.amountTotal - TOTAL_MAJOR) < 0.005 &&
+        stub3d.callsTo("account.move.line", "write").length === 1,
+      JSON.stringify(outcome3d.invoice),
     );
     stub3d.restore();
 
-    const stub3d2 = installOdooJsonRpcStub({
-      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [15] }] },
-    });
-    await configureOdoo();
-    const order3d2 = await makeOrder(seller.id);
-    const outcome3d2 = await createOdooInvoiceForOrder(order3d2.id, JOB_ACTOR);
-    check(
-      "a zero-rated sale tax is accepted",
-      outcome3d2.status === "CREATED",
-      outcome3d2.status,
-    );
-    stub3d2.restore();
-
-    const stub3d3 = installOdooJsonRpcStub({
-      products: { taxes: [{ sku: LINE_PILLOW.sku, taxIds: [10] }] },
-    });
-    await configureOdoo();
-    const order3d3 = await makeOrder(seller.id);
-    const error3d3 = await catchError(() => createOdooInvoiceForOrder(order3d3.id, JOB_ACTOR));
-    check(
-      "a tax GROUP that adds is refused by its effect, not by its own (100) rate",
-      error3d3 instanceof PermanentJobError &&
-        (error3d3 as Error).message.includes("11% GST+PST SK") &&
-        stub3d3.writes().length === 0,
-      describe(error3d3),
-    );
-    stub3d3.restore();
-
     /* ------------------------------------------------------------------ */
-    /* 3e. The last line of defence: an invoice whose total disagrees with */
-    /*     the charge is refused BEFORE it is posted — the second layer,   */
-    /*     for anything the catalogue check above cannot see.              */
+    /* 3e. The money gate: an invoice whose total disagrees with the       */
+    /*     charge is refused before it is linked — and nothing was posted, */
+    /*     paid or emailed on the way.                                     */
     /* ------------------------------------------------------------------ */
     const stub3e = installOdooJsonRpcStub({
       invoiceTotalOverride: Math.round((TOTAL_MAJOR + 13) * 100) / 100,
@@ -731,18 +821,19 @@ async function main() {
       error3e instanceof PermanentJobError &&
         message3e.includes("157.47") &&
         message3e.includes("144.47") &&
-        message3e.includes("a draft, unposted"),
+        message3e.includes("left unlinked"),
       describe(error3e),
     );
     check(
-      "the disagreeing invoice was NOT posted",
-      stub3e.callsTo("account.move", "action_post").length === 0,
-      JSON.stringify(stub3e.callsTo("account.move", "action_post").length),
+      "the disagreeing draft was not posted, paid or emailed",
+      stub3e.callsTo("account.move", "action_post").length === 0 &&
+        stub3e.callsTo("account.payment.register", "create").length === 0 &&
+        stub3e.calls.filter((call) => call.model === "mail.template").length === 0,
     );
     check(
-      "no payment was registered and no email was sent for it",
-      stub3e.callsTo("account.payment.register", "create").length === 0 &&
-        stub3e.callsTo("mail.template", "send_mail").length === 0,
+      "no shipment note decorates a draft that failed the money gate",
+      stub3e.callsTo("account.move", "write").length === 0 &&
+        stub3e.callsTo("account.move", "message_post").length === 0,
     );
     const link3e = await readLink(order3e.id);
     check(
@@ -752,150 +843,6 @@ async function main() {
       JSON.stringify({ id: link3e?.odooInvoiceId, error: link3e?.odooInvoiceError }),
     );
     stub3e.restore();
-
-    /* ------------------------------------------------------------------ */
-    /* 4. The journal: a missing one is permanent; a repaired one resumes  */
-    /*    from the SAME invoice (no duplicate on retry).                   */
-    /* ------------------------------------------------------------------ */
-    const stub4 = installOdooJsonRpcStub({ journal: "none" });
-    await configureOdoo();
-    const order4 = await makeOrder(seller.id);
-    const error4 = await catchError(() => createOdooInvoiceForOrder(order4.id, JOB_ACTOR));
-    const error4Message = error4 instanceof Error ? error4.message : String(error4);
-    check(
-      "a missing journal is a PERMANENT failure naming the setting and the name",
-      error4 instanceof PermanentJobError &&
-        error4Message.includes("ODOO_INVOICE_JOURNAL") &&
-        error4Message.includes("MoonVella Stripe"),
-      describe(error4),
-    );
-    check(
-      "no payment is registered when no journal matches",
-      stub4.callsTo("account.payment.register", "create").length === 0,
-    );
-    check(
-      "the invoice itself was posted before the stop, so a retry can adopt it",
-      stub4.callsTo("account.move", "action_post").length === 1,
-    );
-
-    // The owner creates the journal in Odoo; the retry is the same call.
-    stub4.scenario.journal = "ok";
-    const retry4 = await createOdooInvoiceForOrder(order4.id, JOB_ACTOR);
-    check(
-      "after the journal exists, the retry completes from the SAME invoice",
-      retry4.status === "CREATED" && retry4.odooInvoiceId === 1001,
-      JSON.stringify({ status: retry4.status, id: retry4.odooInvoiceId }),
-    );
-    check(
-      "the retry created no second sale order, invoice or post",
-      stub4.callsTo("sale.order", "create").length === 1 &&
-        stub4.callsTo("sale.advance.payment.inv", "create_invoices").length === 1 &&
-        stub4.callsTo("account.move", "action_post").length === 1,
-      JSON.stringify({
-        saleOrders: stub4.callsTo("sale.order", "create").length,
-        invoices: stub4.callsTo("sale.advance.payment.inv", "create_invoices").length,
-        posts: stub4.callsTo("account.move", "action_post").length,
-      }),
-    );
-    stub4.restore();
-
-    /* ------------------------------------------------------------------ */
-    /* 4b. A configured journal name is the one resolved and used.         */
-    /* ------------------------------------------------------------------ */
-    const stub4b = installOdooJsonRpcStub();
-    await configureOdoo({ ODOO_INVOICE_JOURNAL: "Custom Settlement Co" });
-    const order4b = await makeOrder(seller.id);
-    const outcome4b = await createOdooInvoiceForOrder(order4b.id, JOB_ACTOR);
-    const journalSearches4b = stub4b.callsTo("account.journal", "search_read");
-    check(
-      "the configured journal name — not the default — is the one searched and used",
-      journalSearches4b.length === 1 &&
-        searchedValue(journalSearches4b[0], "name") === "Custom Settlement Co" &&
-        outcome4b.payment?.journalName === "Custom Settlement Co",
-      JSON.stringify({
-        searched: journalSearches4b.length
-          ? searchedValue(journalSearches4b[0], "name")
-          : null,
-        used: outcome4b.payment?.journalName,
-      }),
-    );
-    stub4b.restore();
-
-    /* ------------------------------------------------------------------ */
-    /* 4c. A registered payment that settled NOTHING is a failure, not a   */
-    /*     success. Odoo 18 skips the journal entry for a payment whose    */
-    /*     journal's payment method line has no outstanding account, and   */
-    /*     the invoice then reads "in_payment" with the full residual      */
-    /*     still outstanding — observed on stage2, where the pipeline had  */
-    /*     reported the invoice paid.                                      */
-    /* ------------------------------------------------------------------ */
-    const stub4c = installOdooJsonRpcStub({ paymentSettlement: "unsettled" });
-    await configureOdoo();
-    const order4c = await makeOrder(seller.id);
-    const error4c = await catchError(() => createOdooInvoiceForOrder(order4c.id, JOB_ACTOR));
-    const error4cMessage = error4c instanceof Error ? error4c.message : String(error4c);
-    check(
-      "a payment that left the invoice unsettled is a PERMANENT failure naming the fix",
-      error4c instanceof PermanentJobError &&
-        error4cMessage.includes("outstanding") &&
-        error4cMessage.includes("payment method line"),
-      describe(error4c),
-    );
-    check(
-      "the unsettled invoice is not emailed as paid",
-      stub4c.callsTo("mail.template", "send_mail").length === 0,
-    );
-    check(
-      "the unsettled failure is recorded on the order for the repair action",
-      ((await readLink(order4c.id))?.odooInvoiceError ?? "").includes("outstanding"),
-      JSON.stringify(await readLink(order4c.id)),
-    );
-
-    /* 4d. The retry after the operator fixes the journal: the invoice reads
-     *     "in_payment" on the ghost, so the resume must look past the payment
-     *     state, see that nothing reached the books, and register the payment
-     *     — not skip it and link an unpaid invoice as settled. */
-    stub4c.scenario.paymentSettlement = "ok";
-    const retry4c = await createOdooInvoiceForOrder(order4c.id, JOB_ACTOR);
-    check(
-      "with the journal fixed, the retry registers the payment and settles the invoice",
-      retry4c.status === "CREATED" && retry4c.payment !== null,
-      JSON.stringify({ status: retry4c.status, payment: retry4c.payment }),
-    );
-    check(
-      "the retry registered exactly one more payment — the ghost settled nothing",
-      stub4c.callsTo("account.payment.register", "create").length === 2,
-      String(stub4c.callsTo("account.payment.register", "create").length),
-    );
-    stub4c.restore();
-
-    /* 4e. A POSTED payment with the invoice still open is money that already
-     *     exists: the retry must refuse rather than pay twice. */
-    const stub4e = installOdooJsonRpcStub({ paymentSettlement: "unsettled-real" });
-    await configureOdoo();
-    const order4e = await makeOrder(seller.id);
-    const first4e = await catchError(() => createOdooInvoiceForOrder(order4e.id, JOB_ACTOR));
-    check(
-      "a posted payment that leaves the residual open still fails the settlement check",
-      first4e instanceof PermanentJobError &&
-        (first4e as Error).message.includes("outstanding"),
-      describe(first4e),
-    );
-    const error4e = await catchError(() => createOdooInvoiceForOrder(order4e.id, JOB_ACTOR));
-    const error4eMessage = error4e instanceof Error ? error4e.message : String(error4e);
-    check(
-      "the retry finds the posted payment and refuses a second one, naming it",
-      error4e instanceof PermanentJobError &&
-        error4eMessage.includes("posted payment") &&
-        error4eMessage.includes("PAY/"),
-      describe(error4e),
-    );
-    check(
-      "no second payment was registered on top of real money",
-      stub4e.callsTo("account.payment.register", "create").length === 1,
-      String(stub4e.callsTo("account.payment.register", "create").length),
-    );
-    stub4e.restore();
 
     /* ------------------------------------------------------------------ */
     /* 5. The template: missing, or present but not stamped MoonVella.     */
@@ -931,29 +878,6 @@ async function main() {
       stub5b.callsTo("sale.order", "create").length === 0,
     );
     stub5b.restore();
-
-    /* ------------------------------------------------------------------ */
-    /* 5d. The mail template's model is compared by its TECHNICAL name.    */
-    /*     Odoo 18 renders account.move's ir.model display name as         */
-    /*     "Journal Entry", and the stub now answers exactly that — so the */
-    /*     happy path above proves the correct template is accepted, and   */
-    /*     this proves a genuinely wrong model is still refused.           */
-    /* ------------------------------------------------------------------ */
-    const stub5d = installOdooJsonRpcStub({ mailTemplate: "wrong-model" });
-    await configureOdoo();
-    const order5d = await makeOrder(seller.id);
-    const error5d = await catchError(() => createOdooInvoiceForOrder(order5d.id, JOB_ACTOR));
-    check(
-      "a mail template attached to another model is refused, naming that model",
-      error5d instanceof PermanentJobError &&
-        (error5d as Error).message.includes("res.partner"),
-      describe(error5d),
-    );
-    check(
-      "no mail is sent through a template bound to another model",
-      stub5d.callsTo("mail.template", "send_mail").length === 0,
-    );
-    stub5d.restore();
 
     /* ------------------------------------------------------------------ */
     /* 5c. A sale order already carrying the reference is ADOPTED, never   */
@@ -993,9 +917,15 @@ async function main() {
       stub5c.callsTo("sale.order", "action_confirm").length === 1,
     );
     check(
-      "the adopted sale order still yields exactly one invoice and one payment",
+      "the adopted sale order still yields exactly one invoice, posted and paid by nobody",
       stub5c.callsTo("sale.advance.payment.inv", "create_invoices").length === 1 &&
-        stub5c.callsTo("account.payment.register", "create").length === 1,
+        stub5c.callsTo("account.payment.register", "create").length === 0 &&
+        stub5c.callsTo("account.move", "action_post").length === 0,
+    );
+    check(
+      "the adopted draft still gets the shipment facts",
+      stub5c.callsTo("account.move", "write").length === 1 &&
+        stub5c.callsTo("account.move", "message_post").length === 1,
     );
     const mapping5c = await prisma.externalContactMapping.findUnique({
       where: { sellerId_role: { sellerId: seller.id, role: "COMPANY" } },
@@ -1008,52 +938,58 @@ async function main() {
     stub5c.restore();
 
     /* ------------------------------------------------------------------ */
-    /* 6. Linked but not emailed: the resume sends ONLY the email.         */
+    /* 6. A linked DRAFT is refreshed in place — and its amounts are NOT   */
+    /*    re-asserted: once it exists, the draft is a person's workspace   */
+    /*    in Odoo, and a shipment-fact refresh must not fail on an edit    */
+    /*    they made on purpose.                                            */
     /* ------------------------------------------------------------------ */
     const stub6 = installOdooJsonRpcStub({
       existingInvoice: {
-        id: 1001,
-        state: "posted",
-        paymentState: "paid",
-        name: "INV/2026/00001",
-        amountTotal: TOTAL_MAJOR,
-        // A paid invoice has nothing outstanding; the guard now checks this,
-        // because a payment that settled nothing also reads "in_payment".
-        amountResidual: 0,
+        id: 1003,
+        state: "draft",
+        name: "/",
+        // Deliberately NOT the captured total: a person edited this draft.
+        amountTotal: TOTAL_MAJOR + 5,
+        amountUntaxed: TOTAL_MAJOR + 5,
+        amountTax: 0,
+        amountResidual: TOTAL_MAJOR + 5,
+        trackingRef: false,
       },
     });
     await configureOdoo();
     const order6 = await makeOrder(seller.id);
-    const syncedAt = new Date("2026-10-03T15:00:00Z");
     await prisma.order.update({
       where: { id: order6.id },
       data: {
-        odooInvoiceId: 1001,
-        odooInvoiceName: "INV/2026/00001",
-        odooSaleOrderId: 900,
-        odooInvoiceSyncedAt: syncedAt,
-        odooInvoiceError: "an earlier run stopped before the email",
+        odooInvoiceId: 1003,
+        odooSaleOrderId: 903,
+        odooInvoiceState: "draft",
+        odooInvoiceError: "an earlier run stopped before the shipment facts",
       },
     });
     const outcome6 = await createOdooInvoiceForOrder(order6.id, JOB_ACTOR);
     const link6 = await readLink(order6.id);
     check(
-      "a linked-but-unemailed order resumes and sends only the email",
-      outcome6.status === "CREATED" &&
-        stub6.writes().length === 1 &&
-        stub6.writes()[0].method === "send_mail",
+      "a linked draft is refreshed — UPDATED, and its edited total is NOT re-asserted",
+      outcome6.status === "UPDATED" && outcome6.odooInvoiceId === 1003,
+      JSON.stringify({
+        status: outcome6.status,
+        total: outcome6.invoice.amountTotal,
+      }),
+    );
+    check(
+      "the refresh wrote exactly the tracking ref and the note — no tax clear, no amount write",
+      stub6.callsTo("account.move", "write").length === 1 &&
+        stub6.callsTo("account.move", "message_post").length === 1 &&
+        stub6.callsTo("account.move.line", "write").length === 0,
       JSON.stringify(stub6.writes().map((call) => `${call.model}.${call.method}`)),
     );
     check(
-      "the resume neither re-posted nor re-paid the invoice",
-      stub6.callsTo("account.move", "action_post").length === 0 &&
-        stub6.callsTo("account.payment.register", "create").length === 0,
-    );
-    check(
-      "the resume cleared the recorded error and kept the original sync time",
-      link6?.odooInvoiceError === null &&
-        link6?.odooInvoiceSyncedAt?.getTime() === syncedAt.getTime() &&
-        link6?.odooInvoiceEmailSentAt !== null,
+      "the draft's numberless state was stored honestly — no '/' as a name",
+      link6?.odooInvoiceName === null &&
+        link6.odooInvoiceState === "draft" &&
+        link6.odooInvoiceError === null,
+      JSON.stringify(link6),
     );
     stub6.restore();
 
@@ -1106,6 +1042,7 @@ async function main() {
     /* 8. Static couplings that a refactor could silently break.           */
     /* ------------------------------------------------------------------ */
     const invoiceSource = readStripped("app/services/odooInvoice.server.ts");
+    const connectorSource = readStripped("app/services/odoo.server.ts");
     check(
       "the orchestrator uses only the connector's public surface",
       !/\b(executeKw|guardedWrite|callOdoo|assertWriteAllowed)\b/.test(invoiceSource),
@@ -1118,47 +1055,50 @@ async function main() {
       "the orchestrator imports no payment module — Odoo is not a payment rail",
       !/from\s+["'][^"']*(stripe|payments\.server|sellerBilling)[^"']*["']/i.test(invoiceSource),
     );
-
-    const connectorSource = readStripped("app/services/odoo.server.ts");
     check(
-      "the connector sends send_mail in Odoo's record-method shape, queued",
-      connectorSource.includes("[[templateId], invoiceId]") &&
-        connectorSource.includes("force_send: false"),
-    );
-    check(
-      "action_post disables the abnormal-invoice wizard",
-      connectorSource.includes("disable_abnormal_invoice_detection"),
-    );
-    check(
-      "the catalogue's tax question goes to Odoo's own arithmetic, not a reimplementation",
-      connectorSource.includes('"compute_all"') &&
-        connectorSource.includes("TAX_MODEL"),
-    );
-    check(
-      "the product lookup reads the taxes the check rests on",
-      connectorSource.includes('"invoice_policy", "taxes_id"'),
-    );
-    check(
-      "the orchestrator checks the tax and never overrides it with a tax_id of its own",
-      invoiceSource.includes("computeTaxTotals") &&
-        invoiceSource.includes("findTaxesByIds") &&
-        !/tax_id\s*:/.test(invoiceSource),
-    );
-    check(
-      "the total/currency guard runs on the draft BEFORE posting, and again at payment time",
-      invoiceSource.includes(
-        "assertInvoiceMatchesPayment(invoiceId, state, input.payment)",
+      "the draft-only rule is structural: the orchestrator cannot post, pay or email",
+      !/\b(postInvoice|sendInvoiceEmail|registerPayment|findPaymentsByIds|computeTaxTotals|findTaxesByIds|findJournalByName|findMailTemplateByName)\b/.test(
+        invoiceSource,
       ) &&
-        invoiceSource.includes(
-          "assertInvoiceMatchesPayment(input.invoiceId, state, payment)",
-        ),
+        !/action_post|send_mail|account\.payment\.register/.test(invoiceSource),
+    );
+    check(
+      "the orchestrator states an explicit empty tax set on every line it creates",
+      invoiceSource.includes("taxIds: []"),
+    );
+    check(
+      "a linked draft is refreshed in place and a posted one is reported untouched",
+      invoiceSource.includes("applyShipmentToDraft") &&
+        invoiceSource.includes('status: "POSTED"'),
+    );
+
+    check(
+      "the tracking write targets the module's own field and nothing else",
+      connectorSource.includes("mv_shipping_tracking_ref") &&
+        connectorSource.includes('"invoice.tracking_ref"'),
+    );
+    check(
+      "the tax clear writes the empty triple and skips a tax-free invoice with NO write",
+      connectorSource.includes("tax_ids: [[6, 0, []]]") &&
+        connectorSource.includes("return { cleared: 0 }"),
+    );
+    check(
+      "the shipment note is posted as an internal note, never an emailing comment",
+      connectorSource.includes('"mail.mt_note"'),
+    );
+
+    const stubSource = readStripped("scripts/odoo-jsonrpc-stub.ts");
+    check(
+      "the stub cannot serve a post, a payment registration or an email — reaching for one fails the suite",
+      !/method === "action_post"/.test(stubSource) &&
+        !/model === "account\.payment\.register"/.test(stubSource) &&
+        !/model === "mail\.template"/.test(stubSource),
     );
 
     const fieldsSource = readStripped("app/services/integrationFields.ts");
     check(
-      "the journal setting name is the same string on both sides",
-      fieldsSource.includes('name: "ODOO_INVOICE_JOURNAL"') &&
-        invoiceSource.includes("ODOO_INVOICE_JOURNAL"),
+      "the journal setting is kept (dormant), so its stored value survives the draft-only change",
+      fieldsSource.includes('name: "ODOO_INVOICE_JOURNAL"'),
     );
 
     const jobsSource = readStripped("app/services/jobs.server.ts");
@@ -1168,6 +1108,10 @@ async function main() {
       /\bODOO_INVOICE_SYNC\b/.test(jobsSource) &&
         handlersSource.includes("createOdooInvoiceForOrder") &&
         handlersSource.includes("JOB_KIND.ODOO_INVOICE_SYNC"),
+    );
+    check(
+      "the handler has no early return — a linked order must reach the refresh path",
+      !handlersSource.includes("odooInvoiceEmailSentAt"),
     );
 
     const fulfillmentSource = readStripped("app/services/fulfillment.server.ts");
@@ -1185,9 +1129,20 @@ async function main() {
 
     const routeSource = readStripped("app/routes/admin.orders_.$id.tsx");
     check(
-      "the order page offers the manual repair/retry action",
+      "the order page offers the manual create/refresh action",
       routeSource.includes('"create_odoo_invoice"') &&
         routeSource.includes("createOdooInvoiceForOrder"),
+    );
+    check(
+      "the order page shows the last-synced state and links out to Odoo",
+      routeSource.includes("odooInvoiceState") &&
+        routeSource.includes("Open in Odoo") &&
+        routeSource.includes("odooWebBaseUrl"),
+    );
+    check(
+      "the page no longer claims anything is posted, paid or emailed automatically",
+      !routeSource.includes("emailed to the seller") &&
+        !routeSource.includes("odooInvoiceEmailSentAt"),
     );
     check(
       "the Stripe 'Create invoice' action is untouched alongside it",

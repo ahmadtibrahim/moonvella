@@ -153,6 +153,18 @@ export async function maskedOdooConnection(): Promise<{
   };
 }
 
+/**
+ * The address of the configured Odoo, for links OUT of the app — the order
+ * page's "Open in Odoo". Only the address, never a credential, and null when
+ * none is configured, so a link built from it cannot point into a half-set
+ * integration. Trailing slashes are trimmed so callers can append a path.
+ */
+export async function odooWebBaseUrl(): Promise<string | null> {
+  const values = await getCredentials("odoo");
+  const url = values.ODOO_URL?.trim();
+  return url ? url.replace(/\/+$/, "") : null;
+}
+
 export interface OdooModeInput {
   configured: boolean;
   /** Resolved ODOO_MODE, from the store or the environment. */
@@ -676,6 +688,14 @@ const SALE_ORDER_MODEL = "sale.order";
 const SALE_ORDER_TEMPLATE_MODEL = "sale.order.template";
 const ACCOUNT_MOVE_MODEL = "account.move";
 const ACCOUNT_PAYMENT_MODEL = "account.payment";
+/** The invoice's own lines — the rows the draft path reads and clears taxes on. */
+const ACCOUNT_MOVE_LINE_MODEL = "account.move.line";
+/**
+ * Chatter messages. The draft path records the shipment facts (carrier,
+ * service, tracking, provider reference) as an internal note on the invoice;
+ * `mv_shipping_tracking_ref` alone cannot carry all four.
+ */
+const MAIL_MESSAGE_MODEL = "mail.message";
 const JOURNAL_MODEL = "account.journal";
 const MAIL_TEMPLATE_MODEL = "mail.template";
 const TAX_MODEL = "account.tax";
@@ -994,6 +1014,17 @@ export interface SaleOrderLine {
   quantity: number;
   priceUnit: number;
   name?: string;
+  /**
+   * The sale taxes the line must carry, when the caller wants to state them.
+   * Omitted entirely (the field is simply absent from the payload) means
+   * "let Odoo apply the product's own taxes", which is what every caller
+   * other than the B2B draft does. The draft path sends `[]` — the owner's
+   * "no tax added" rule — and the invoice's lines are verified tax-free
+   * afterwards regardless, because a product's taxes are applied by Odoo
+   * when this value is absent and this module does not rely on which of the
+   * two mechanisms won.
+   */
+  taxIds?: number[];
 }
 
 /**
@@ -1029,6 +1060,7 @@ export async function createSaleOrder(
         product_uom_qty: line.quantity,
         price_unit: line.priceUnit,
         ...(line.name ? { name: line.name } : {}),
+        ...(line.taxIds ? { tax_id: [[6, 0, line.taxIds]] } : {}),
       },
     ]),
   };
@@ -1248,6 +1280,8 @@ export interface OdooInvoiceState {
   state: string;
   payment_state: string | false;
   amount_total: number;
+  amount_untaxed: number;
+  amount_tax: number;
   amount_residual: number;
   /**
    * Many2one tuples, as `search_read` returns them — the name is the second
@@ -1263,6 +1297,12 @@ export interface OdooInvoiceState {
    * "in_payment"), so it settles nothing and the residual stays.
    */
   matched_payment_ids: number[] | false;
+  /**
+   * The parcel's tracking number, when this pipeline wrote one. The field
+   * ships with `prema_moonvella_documents`; it is read back so a retry can
+   * skip a write that would change nothing.
+   */
+  mv_shipping_tracking_ref: string | false;
 }
 
 /** A payment as `account.payment` holds it — enough to tell a ledger entry from a row. */
@@ -1297,10 +1337,13 @@ export async function getInvoiceState(
       "state",
       "payment_state",
       "amount_total",
+      "amount_untaxed",
+      "amount_tax",
       "amount_residual",
       "currency_id",
       "company_id",
       "matched_payment_ids",
+      "mv_shipping_tracking_ref",
     ],
     { limit: 1 },
   );
@@ -1412,11 +1455,9 @@ export interface OdooProductMatch {
   default_code: string | false;
   name: string;
   invoice_policy: string | false;
-  /** The product's customer taxes, as ids. Empty means the line it produces
-   * will carry no tax at all — a fiscal position cannot add one to a product
-   * that has none (`sale.order.line._compute_tax_id` skips the mapping when
-   * the product's tax set is empty), which is why the caller treats "empty"
-   * as a fact and everything else as something to check. */
+  /** The product's customer taxes, as ids. Read as a catalogue fact; the
+   * draft path states its own (empty) tax set on every line and re-verifies
+   * the invoice afterwards, so nothing downstream depends on this value. */
   taxes_id: number[];
 }
 
@@ -1434,8 +1475,11 @@ export interface OdooProductMatch {
  * `type == 'consu'`), but the field is manually overridable, so the caller
  * checks rather than assumes.
  *
- * `taxes_id` is requested for the same reason: the caller checks that the
- * product's taxes cannot raise the line above the price the seller paid.
+ * `taxes_id` is requested because a product's tax set is part of what "this
+ * SKU maps to a product" means — but the draft invoice path does not have to
+ * trust it: every line is created with an explicit empty tax set and the
+ * invoice's own lines are then cleared and verified tax-free, so the outcome
+ * is the same whether a product carries taxes or not.
  */
 export async function resolveProductIdsBySku(
   skus: string[],
@@ -1637,6 +1681,153 @@ export async function sendInvoiceEmail(
         "send_mail",
         [[templateId], invoiceId],
         { force_send: false },
+        permit,
+      ),
+    }),
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* The draft invoice's metadata (draft-only flow, owner instruction 2026-10-05)*/
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Clears every sale tax from the invoice's own product lines.
+ *
+ * The rule for the B2B draft is "no tax added": the seller already paid the
+ * whole wholesale price, and the draft is a review document that must not
+ * total more than that charge. A product's taxes would otherwise ride onto
+ * the invoice from the catalogue — and from any fiscal position Odoo applies
+ * to the customer — so the lines are read first and only the taxed ones are
+ * written. An already tax-free invoice performs NO write at all, which is
+ * what lets a retry be a true no-op.
+ *
+ * This writes `tax_ids = [(6, 0, [])]`, and it runs only on a draft this
+ * pipeline itself just created. Nothing here touches taxes anywhere else, and
+ * a draft a person has edited is never re-cleared — the orchestrator decides
+ * that, and `clearInvoiceLineTaxes` is only ever called on the fresh path.
+ */
+export async function clearInvoiceLineTaxes(
+  invoiceId: number,
+  options: { confirm?: boolean } = {},
+): Promise<{ cleared: number } | OdooWritePreview> {
+  return guardedWrite(
+    "invoice.clear_tax",
+    ACCOUNT_MOVE_LINE_MODEL,
+    "write",
+    { invoiceId },
+    options.confirm === true,
+    async (permit) => {
+      const lines = await searchRead<{ id: number }>(
+        ACCOUNT_MOVE_LINE_MODEL,
+        [
+          ["move_id", "=", invoiceId],
+          ["display_type", "=", "product"],
+          ["tax_ids", "!=", false],
+        ],
+        ["id"],
+      );
+      if (lines.length === 0) return { cleared: 0 };
+      await executeKw(
+        ACCOUNT_MOVE_LINE_MODEL,
+        "write",
+        [[...lines.map((line) => line.id)], { tax_ids: [[6, 0, []]] }],
+        {},
+        permit,
+      );
+      return { cleared: lines.length };
+    },
+  );
+}
+
+/**
+ * Writes the parcel's tracking number onto the invoice's own field.
+ *
+ * Only `mv_shipping_tracking_ref` goes here — it is the field the
+ * `prema_moonvella_documents` module ships for exactly this fact. Carrier,
+ * service and provider reference have no field on the invoice, so the whole
+ * block is recorded as a chatter note (`postInvoiceNote`) and this write is
+ * skipped when the field already holds the value.
+ */
+export async function writeInvoiceTrackingRef(
+  invoiceId: number,
+  trackingRef: string,
+  options: { confirm?: boolean } = {},
+): Promise<{ written: true } | OdooWritePreview> {
+  return guardedWrite(
+    "invoice.tracking_ref",
+    ACCOUNT_MOVE_MODEL,
+    "write",
+    { invoiceId, trackingRef },
+    options.confirm === true,
+    async (permit) => {
+      await executeKw(
+        ACCOUNT_MOVE_MODEL,
+        "write",
+        [[invoiceId], { mv_shipping_tracking_ref: trackingRef }],
+        {},
+        permit,
+      );
+      return { written: true as const };
+    },
+  );
+}
+
+/** One chatter message, as `mail.message` holds it. */
+export interface OdooNoteRef {
+  id: number;
+  body: string | false;
+}
+
+/**
+ * The notes already on an invoice that carry `marker`.
+ *
+ * Found by the caller's own stable marker (the `[MoonVella shipment]` prefix)
+ * rather than by recency, so a person's comment on the invoice can never be
+ * mistaken for this pipeline's note and silently "refreshed" away.
+ */
+export async function findInvoiceNotes(
+  invoiceId: number,
+  marker: string,
+): Promise<OdooNoteRef[]> {
+  return searchRead<OdooNoteRef>(
+    MAIL_MESSAGE_MODEL,
+    [
+      ["model", "=", ACCOUNT_MOVE_MODEL],
+      ["res_id", "=", invoiceId],
+      ["body", "like", marker],
+    ],
+    ["id", "body"],
+    { order: "id desc", limit: 5 },
+  );
+}
+
+/**
+ * Posts an internal note on the invoice.
+ *
+ * `subtype_xmlid: mail.mt_note` is load-bearing, not cosmetic: a note reaches
+ * the chatter WITHOUT notifying followers, whereas a comment (mt_comment)
+ * sends an email — and the one thing this pipeline must never do is mail the
+ * seller on its own. The subtype is spelled here, once, so no caller can pick
+ * another by accident.
+ */
+export async function postInvoiceNote(
+  invoiceId: number,
+  body: string,
+  options: { confirm?: boolean } = {},
+): Promise<{ messageId: number } | OdooWritePreview> {
+  return guardedWrite(
+    "invoice.note",
+    ACCOUNT_MOVE_MODEL,
+    "message_post",
+    { invoiceId, body },
+    options.confirm === true,
+    async (permit) => ({
+      messageId: await executeKw<number>(
+        ACCOUNT_MOVE_MODEL,
+        "message_post",
+        [[invoiceId]],
+        { body, subtype_xmlid: "mail.mt_note" },
         permit,
       ),
     }),

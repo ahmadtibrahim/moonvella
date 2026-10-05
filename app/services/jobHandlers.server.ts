@@ -343,17 +343,13 @@ export const jobHandlers: Record<string, JobHandler> = {
   },
 
   /**
-   * Write (or adopt) the order's paid Odoo invoice and email it.
+   * Create — or refresh — the order's DRAFT Odoo invoice.
    *
-   * Idempotent through the order row, not through this handler: the early
-   * return below is only the cheap path, and the real guard is the invoice
-   * link inside `createOdooInvoiceForOrder` — a linked invoice is adopted and
-   * a linked-and-emailed one is reported, so a job that runs twice (a worker
-   * died holding a lease) cannot produce a second invoice or a second email.
-   *
-   * A linked-but-unemailed order is deliberately NOT skipped here: the email
-   * is the last step of the sequence and can fail after the invoice exists, so
-   * that state goes back into the pipeline, which resumes at the email.
+   * There is no early return here on purpose. The pipeline's own link guard is
+   * the whole idempotency story: a linked DRAFT gets the shipment's facts
+   * refreshed in place (a retry after a tracking update must reach that path),
+   * and a linked invoice a person has already posted is reported and left
+   * untouched. Skipping a "linked" order here would silently drop the refresh.
    */
   [JOB_KIND.ODOO_INVOICE_SYNC]: async (job) => {
     const orderId = (job.payload as { orderId?: unknown } | null)?.orderId;
@@ -365,23 +361,10 @@ export const jobHandlers: Record<string, JobHandler> = {
 
     const order = await prisma.order.findUnique({
       where: { id: orderId },
-      select: {
-        id: true,
-        odooInvoiceId: true,
-        odooInvoiceName: true,
-        odooInvoiceEmailSentAt: true,
-      },
+      select: { id: true },
     });
     if (!order) {
       throw new PermanentJobError(`Order ${orderId} no longer exists.`);
-    }
-    if (order.odooInvoiceId && order.odooInvoiceEmailSentAt) {
-      return {
-        summary: `Odoo invoice ${
-          order.odooInvoiceName ?? order.odooInvoiceId
-        } already created and emailed; nothing done.`,
-        detail: { orderId, odooInvoiceId: order.odooInvoiceId, skipped: true },
-      };
     }
 
     const outcome = await createOdooInvoiceForOrder(orderId, {
@@ -391,13 +374,13 @@ export const jobHandlers: Record<string, JobHandler> = {
     });
 
     const name = outcome.odooInvoiceName ?? String(outcome.odooInvoiceId);
-    return {
-      summary:
-        outcome.status === "ALREADY_CREATED"
-          ? `Odoo invoice ${name} already exists; nothing done.`
-          : `Odoo invoice ${name} created${outcome.email ? " and emailed" : ""}.`,
-      detail: { ...outcome },
-    };
+    const summary =
+      outcome.status === "CREATED"
+        ? `Odoo draft invoice ${name} created${outcome.shipment ? " with the shipment's details" : ""}.`
+        : outcome.status === "UPDATED"
+          ? `Odoo draft invoice ${name} already existed; the shipment's details were refreshed.`
+          : `Odoo invoice ${name} is already posted in Odoo; left untouched.`;
+    return { summary, detail: { ...outcome } };
   },
 
   /**

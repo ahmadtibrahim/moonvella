@@ -2,29 +2,38 @@
  * A deterministic Odoo, in-process, for the handoff-invoice suite.
  *
  * The pipeline under test is a chain of guarded writes against a real ERP:
- * partner → sale order → invoice → post → payment → email. Pointing a
- * verification run at a real Odoo would be a live write to live books, so this
- * suite installs this instead. It wraps `globalThis.fetch`, answers Odoo's
- * JSON-RPC endpoint itself, and DELIBERATELY delegates every other URL to the
- * fetch it replaced — which in this suite is the provider guard, so Stripe,
- * eShipper and Google remain refused rather than stubbed.
+ * partner → sale order → DRAFT invoice → taxes cleared → shipment facts on the
+ * invoice → link. Pointing a verification run at a real Odoo would be a live
+ * write to live books, so this suite installs this instead. It wraps
+ * `globalThis.fetch`, answers Odoo's JSON-RPC endpoint itself, and DELIBERATELY
+ * delegates every other URL to the fetch it replaced — which in this suite is
+ * the provider guard, so Stripe, eShipper and Google remain refused rather
+ * than stubbed.
  *
- * Two properties matter more than breadth of fidelity:
+ * Three properties matter more than breadth of fidelity:
  *
  * - **A call the stub does not model is an ERROR, not a guess.** The stub knows
  *   the exact set of model.method pairs this pipeline may use. Anything else
  *   answers with a JSON-RPC error envelope, so a call the pipeline should not
  *   be making fails the suite loudly. There is no "return something plausible"
- *   branch anywhere below.
- * - **The invoice total is COMPUTED from the sale-order lines the pipeline
- *   sent**, exactly as Odoo computes it, rather than being a fixed number. That
- *   makes the pipeline's own money gate — invoice total vs the captured Stripe
- *   amount — load-bearing inside the suite: lines built from the wrong numbers
- *   fail the run instead of being papered over by the stub.
+ *   branch anywhere below — and posting (`action_post`), payment registration
+ *   (`account.payment.register`) and emailing (`mail.template.send_mail`) are
+ *   deliberately among the unmodelled calls: under the draft-only owner
+ *   instruction, the pipeline that calls one of them must fail this suite, not
+ *   be quietly served.
+ * - **The invoice totals are COMPUTED from the lines the pipeline sent**,
+ *   exactly as Odoo computes them (per line, via the same `compute_all` model
+ *   the connector asks Odoo for), rather than being fixed numbers. That makes
+ *   the pipeline's money gate — invoice total vs the captured Stripe amount,
+ *   no tax — load-bearing inside the suite.
+ * - **The chatter note is stored the way Odoo stores it** — as HTML
+ *   (`<p>…</p>`, entities escaped) — so the retry's "is my note already
+ *   there?" comparison is exercised against the wrapped shape it will really
+ *   read, not against the plain text it wrote.
  *
  * The call log records method args as Odoo receives them (for `execute_kw`,
  * that is the args list after database/uid/api-key), so the suite asserts the
- * payloads — the template id, the journal, the mail arguments — and not only
+ * payloads — the template id, the tax triple, the note body — and not only
  * the outcomes.
  *
  * This file is verification scaffolding. Nothing in `app/` imports it.
@@ -45,17 +54,17 @@ const READ_METHODS = new Set([
 ]);
 
 /**
- * The taxes scenarios can attach to a product, with the three shapes the
- * pipeline has to tell apart: one that adds to the price, one included in it,
- * one that is zero, and a group standing for the sum of its children.
+ * The taxes scenarios can attach to a product, with the three shapes that
+ * matter here: one that adds to the price, one included in it, one that is
+ * zero, and a group standing for the sum of its children.
  *
  * `computeAll` below is a deliberately small model of
  * `account.tax.compute_all` — leaves and single-level groups, included vs
  * excluded, nothing else. The real semantics (rounding, sequences,
  * affect-base) live in Odoo and are exercised against a real database by the
- * stage2 probe; what these suites need is a stub that answers the same way
- * for the configurations under test, and that fails loudly for anything it
- * does not model.
+ * stage2 probe; what this suite needs is a stub that answers the same way for
+ * the configurations under test, and that fails loudly for anything it does
+ * not model.
  */
 const STUB_TAXES: Record<
   number,
@@ -100,6 +109,38 @@ function computeAll(
   };
 }
 
+/** The `=` value of the first domain clause on `field`, whatever the operator. */
+function predicateValue(domain: unknown, field: string): unknown {
+  if (!Array.isArray(domain)) return undefined;
+  for (const clause of domain) {
+    if (Array.isArray(clause) && clause[0] === field) return clause[2];
+  }
+  return undefined;
+}
+
+function applyLimit<T>(rows: T[], limit: unknown): T[] {
+  return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
+}
+
+/** `[[6, 0, [ids]]]` → ids, or null when the value is not that triple. */
+function parseTaxIdTriple(value: unknown): number[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const first = value[0];
+  if (!Array.isArray(first) || first[0] !== 6) return null;
+  if (!Array.isArray(first[2])) return null;
+  return first[2].filter((id): id is number => typeof id === "number");
+}
+
+/** What Odoo's HTML field stores for a plain-text body. */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export interface OdooStubCall {
   url: string;
   service: "common" | "object";
@@ -127,19 +168,16 @@ export interface OdooStubScenario {
   };
   /** The "MoonVella B2B Wholesale" quotation template. */
   template?: "ok" | "missing" | "unstamped" | "ambiguous";
-  /** The branded invoice mail template. */
-  mailTemplate?: "ok" | "missing" | "wrong-model" | "ambiguous";
-  /** The payment journal named by the settings/default. */
-  journal?: "ok" | "none" | "ambiguous";
   /**
-   * What registering the payment does to the invoice. `"unsettled"` models
-   * Odoo 18 with a journal whose payment method line has no outstanding
-   * account configured: the wizard creates the payment row and matches it to
-   * the invoice (payment_state "in_payment"), but `_generate_journal_entry`
-   * skips payments without an outstanding account, so no journal entry exists
-   * and the residual never moves. Observed on stage2, not invented.
+   * What creating a sale-order LINE does with the tax set the pipeline sent.
+   *
+   * Odoo honours an explicit `tax_id` set, so `"honor"` (the default) is what
+   * the real ERP does: the pipeline's `[]` produces a tax-free line. `"ignore"`
+   * models the worst case the pipeline is built to survive — Odoo applying the
+   * PRODUCT's own taxes anyway — after which the invoice's own lines must be
+   * cleared and re-verified before the draft can pass the money gate.
    */
-  paymentSettlement?: "ok" | "unsettled" | "unsettled-real";
+  saleOrderLineTax?: "honor" | "ignore";
   /** A sale order already carrying the order's reference (the crash-recovery path). */
   existingSaleOrder?: {
     id: number;
@@ -147,30 +185,34 @@ export interface OdooStubScenario {
     clientOrderRef: string;
     partnerId?: number;
     partnerName?: string;
-    lines?: { productId: number; quantity: number; priceUnit: number }[];
+    lines?: { productId: number; quantity: number; priceUnit: number; taxIds?: number[] }[];
   } | null;
-  /** An invoice the order row already links to (the email-resume path). */
+  /** An invoice the order row already links to (the draft-update / posted paths). */
   existingInvoice?: {
     id: number;
     state: string;
     paymentState?: string | false;
     name?: string | false;
     amountTotal: number;
+    amountUntaxed?: number;
+    amountTax?: number;
     amountResidual?: number;
     currency?: string;
     companyId?: number;
+    /** The tracking ref the invoice's field already holds, when it holds one. */
+    trackingRef?: string | false;
   } | null;
   /**
    * Force the total of every invoice this stub creates or reports, whatever
    * the lines it was sent add up to. Models the one thing the pipeline must
-   * never post: a document whose total disagrees with the charge behind it.
+   * never link: a document whose total disagrees with the charge behind it.
    */
   invoiceTotalOverride?: number;
 }
 
 export interface OdooJsonRpcStub {
   calls: OdooStubCall[];
-  /** Mutable, so a scenario can be repaired mid-suite (a missing journal created). */
+  /** Mutable, so a scenario can be repaired mid-suite (a missing SKU created). */
   scenario: OdooStubScenario;
   callsTo(model: string, method: string): OdooStubCall[];
   writes(): OdooStubCall[];
@@ -180,6 +222,14 @@ export interface OdooJsonRpcStub {
 const COMPANY: [number, string] = [1, "PremaFirm Inc."];
 const CURRENCY: [number, string] = [1, "CAD"];
 
+interface StoredSaleOrderLine {
+  productId: number;
+  quantity: number;
+  priceUnit: number;
+  /** The taxes the line actually carries — what Odoo resolved at create. */
+  taxIds: number[];
+}
+
 interface StoredSaleOrder {
   id: number;
   name: string;
@@ -187,7 +237,15 @@ interface StoredSaleOrder {
   client_order_ref: string | false;
   partner_id: [number, string] | false;
   companyId: number;
-  lines: { productId: number; quantity: number; priceUnit: number }[];
+  lines: StoredSaleOrderLine[];
+}
+
+interface StoredInvoiceLine {
+  id: number;
+  productId: number;
+  quantity: number;
+  priceUnit: number;
+  taxIds: number[];
 }
 
 interface StoredInvoice {
@@ -196,6 +254,8 @@ interface StoredInvoice {
   state: string;
   payment_state: string | false;
   amount_total: number;
+  amount_untaxed: number;
+  amount_tax: number;
   amount_residual: number;
   invoice_origin: string | false;
   saleOrderId: number | null;
@@ -203,28 +263,16 @@ interface StoredInvoice {
   companyId: number;
   /** Ids of the account.payment rows Odoo matched to this invoice. */
   matchedPaymentIds: number[];
+  lines: StoredInvoiceLine[];
+  mv_shipping_tracking_ref: string | false;
 }
 
-interface StoredPayment {
+interface StoredMessage {
   id: number;
-  name: string;
-  state: string;
-  /** The journal entry's id+name, or false for a row Odoo never posted. */
-  move: [number, string] | false;
-  amount: number;
-}
-
-/** The `=` value of the first domain clause on `field`, whatever the operator. */
-function predicateValue(domain: unknown, field: string): unknown {
-  if (!Array.isArray(domain)) return undefined;
-  for (const clause of domain) {
-    if (Array.isArray(clause) && clause[0] === field) return clause[2];
-  }
-  return undefined;
-}
-
-function applyLimit<T>(rows: T[], limit: unknown): T[] {
-  return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
+  model: string;
+  res_id: number;
+  /** Stored as Odoo stores it: HTML, not the plain text the caller sent. */
+  body: string;
 }
 
 export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJsonRpcStub {
@@ -232,26 +280,24 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
   const real = globalThis.fetch;
 
   const productIdBySku = new Map<string, number>();
+  /** The taxes each product carries, recorded when the catalogue is served. */
+  const productTaxIdsById = new Map<number, number[]>();
   /** Names for partners the stub itself created, so sale orders show a name. */
   const partnerNames = new Map<number, string>();
   const saleOrders = new Map<number, StoredSaleOrder>();
   const saleOrderIdByRef = new Map<string, number>();
   const invoices = new Map<number, StoredInvoice>();
-  const payments = new Map<number, StoredPayment>();
+  const messages: StoredMessage[] = [];
   /** Wizard id → the sale order it will invoice. */
   const invoiceWizards = new Map<number, number>();
-  /** Wizard id → the invoice it will pay. */
-  const paymentWizards = new Map<number, number>();
 
   let nextProductId = 300;
   let nextSaleOrderId = 900;
   let nextInvoiceId = 1001;
+  let nextInvoiceLineId = 8001;
   let nextWizardId = 550;
-  let nextPaymentWizardId = 600;
   let nextPartnerId = 700;
-  let nextMailId = 990;
-  let nextPaymentId = 5001;
-  let postedCount = 0;
+  let nextMessageId = 770;
 
   const productIdFor = (sku: string): number => {
     const existing = productIdBySku.get(sku);
@@ -270,7 +316,12 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       client_order_ref: seed.clientOrderRef,
       partner_id: [seed.partnerId ?? 705, seed.partnerName ?? "Reused Verify Customer"],
       companyId: 1,
-      lines: seed.lines ?? [],
+      lines: (seed.lines ?? []).map((line) => ({
+        productId: line.productId,
+        quantity: line.quantity,
+        priceUnit: line.priceUnit,
+        taxIds: line.taxIds ?? [],
+      })),
     });
     saleOrderIdByRef.set(seed.clientOrderRef, seed.id);
   }
@@ -283,12 +334,16 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       state: seed.state,
       payment_state: seed.paymentState ?? false,
       amount_total: seed.amountTotal,
+      amount_untaxed: seed.amountUntaxed ?? 0,
+      amount_tax: seed.amountTax ?? 0,
       amount_residual: seed.amountResidual ?? seed.amountTotal,
       invoice_origin: false,
       saleOrderId: null,
       currency: seed.currency ?? "CAD",
       companyId: seed.companyId ?? 1,
       matchedPaymentIds: [],
+      lines: [],
+      mv_shipping_tracking_ref: seed.trackingRef ?? false,
     });
   }
 
@@ -299,11 +354,14 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       state: invoice.state,
       payment_state: invoice.payment_state,
       amount_total: invoice.amount_total,
+      amount_untaxed: invoice.amount_untaxed,
+      amount_tax: invoice.amount_tax,
       amount_residual: invoice.amount_residual,
       invoice_origin: invoice.invoice_origin,
       currency_id: CURRENCY,
       company_id: COMPANY,
       matched_payment_ids: invoice.matchedPaymentIds,
+      mv_shipping_tracking_ref: invoice.mv_shipping_tracking_ref,
     };
   }
 
@@ -318,57 +376,60 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
     };
   }
 
-  /** Odoo's own arithmetic: the invoice totals the order's lines. */
-  function totalOf(order: StoredSaleOrder | undefined): number {
-    if (typeof scenario.invoiceTotalOverride === "number") {
-      return scenario.invoiceTotalOverride;
-    }
-    const sum = (order?.lines ?? []).reduce(
-      (acc, line) => acc + line.quantity * line.priceUnit,
-      0,
-    );
-    return Math.round(sum * 100) / 100;
+  /**
+   * Odoo's own arithmetic: the invoice totals its lines, per line and through
+   * the same tax model `compute_all` implements. `invoiceTotalOverride` — the
+   * deliberate disagreement scenario — wins over the computed total, exactly
+   * as a document whose lines and total disagree would read.
+   */
+  function recomputeInvoice(invoice: StoredInvoice): void {
+    const untaxed = invoice.lines.reduce((sum, line) => {
+      return sum + computeAll(line.taxIds, line.priceUnit, line.quantity).total_excluded;
+    }, 0);
+    const taxed = invoice.lines.reduce((sum, line) => {
+      return sum + computeAll(line.taxIds, line.priceUnit, line.quantity).total_included;
+    }, 0);
+    const round = (value: number) => Math.round(value * 100) / 100;
+    invoice.amount_untaxed = round(untaxed);
+    invoice.amount_tax = round(taxed - untaxed);
+    invoice.amount_total =
+      typeof scenario.invoiceTotalOverride === "number"
+        ? scenario.invoiceTotalOverride
+        : round(taxed);
+    invoice.amount_residual = invoice.amount_total;
   }
 
   function createInvoiceForSaleOrder(saleOrderId: number): number {
     const order = saleOrders.get(saleOrderId);
-    const total = totalOf(order);
     const id = nextInvoiceId++;
-    invoices.set(id, {
+    const invoice: StoredInvoice = {
       id,
       name: false,
       state: "draft",
       payment_state: false,
-      amount_total: total,
-      amount_residual: total,
+      amount_total: 0,
+      amount_untaxed: 0,
+      amount_tax: 0,
+      amount_residual: 0,
       invoice_origin: order?.name ?? false,
       saleOrderId,
       currency: "CAD",
       companyId: order?.companyId ?? 1,
       matchedPaymentIds: [],
-    });
-    return id;
-  }
-
-  /**
-   * The payment the register-payment wizard produces. Odoo 18 generates the
-   * journal entry only for a payment whose `outstanding_account_id` is set
-   * (`account.payment._generate_journal_entry`), so with the journal's payment
-   * method line unconfigured the row appears, gets matched to the invoice, and
-   * no entry exists — the `"unsettled"` scenario, observed on stage2.
-   */
-  function createPaymentFor(invoice: StoredInvoice, hasMove: boolean): StoredPayment {
-    const id = nextPaymentId++;
-    const payment: StoredPayment = {
-      id,
-      name: `PAY/${String(id).padStart(5, "0")}`,
-      state: "in_process",
-      move: hasMove ? [9000 + id, `MISC/${id}`] : false,
-      amount: invoice.amount_total,
+      // Odoo copies the order's lines onto the invoice; the tax each line
+      // carries is the one the SALE ORDER LINE resolved to.
+      lines: (order?.lines ?? []).map((line) => ({
+        id: nextInvoiceLineId++,
+        productId: line.productId,
+        quantity: line.quantity,
+        priceUnit: line.priceUnit,
+        taxIds: [...line.taxIds],
+      })),
+      mv_shipping_tracking_ref: false,
     };
-    payments.set(id, payment);
-    invoice.matchedPaymentIds.push(id);
-    return payment;
+    recomputeInvoice(invoice);
+    invoices.set(id, invoice);
+    return id;
   }
 
   /** The stub's answer to one execute_kw, before it becomes an envelope. */
@@ -409,15 +470,19 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
         const list = Array.isArray(codes) ? codes.filter((c): c is string => typeof c === "string") : [];
         const facts = scenario.products ?? {};
         const rows: unknown[] = [];
+        const record = (id: number, code: string, invoice_policy: string, taxes_id: number[]) => {
+          productTaxIdsById.set(id, taxes_id);
+          rows.push({ id, default_code: code, name: `Verify product ${code}`, invoice_policy, taxes_id });
+        };
         for (const code of list) {
           if (facts.missing?.includes(code)) continue;
           const id = productIdFor(code);
           const invoice_policy = facts.deliveryPolicy?.includes(code) ? "delivery" : "order";
           const taxes_id =
             facts.taxes?.find((entry) => entry.sku === code)?.taxIds ?? [];
-          rows.push({ id, default_code: code, name: `Verify product ${code}`, invoice_policy, taxes_id });
+          record(id, code, invoice_policy, taxes_id);
           if (facts.ambiguous?.includes(code)) {
-            rows.push({ id: id + 10000, default_code: code, name: `Verify product ${code} (duplicate)`, invoice_policy, taxes_id });
+            record(id + 10000, code, invoice_policy, taxes_id);
           }
         }
         return { result: applyLimit(rows, limit) };
@@ -468,87 +533,44 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
         return { result: applyLimit(rows, limit) };
       }
 
-      if (model === "account.tax") {
-        // The id→name lookup that feeds the catalogue-check error messages.
-        // (`compute_all`, the other call the connector makes on this model, is
-        // a computation rather than a search, so it is answered below.)
-        const ids = predicateValue(domain, "id");
-        const wanted = Array.isArray(ids)
-          ? ids.filter((id): id is number => typeof id === "number")
-          : [];
-        return {
-          result: wanted
-            .filter((id) => STUB_TAXES[id])
-            .map((id) => ({ id, name: STUB_TAXES[id].name })),
-        };
+      if (model === "account.move.line") {
+        // The one read the draft pipeline makes on invoice lines: the taxed
+        // product lines of ONE invoice (`tax_ids != false`). Any other shape
+        // of domain here is answered with no rows rather than half-guessed —
+        // the caller's own domain is what decides which lines come back.
+        const moveId = predicateValue(domain, "move_id");
+        const invoice = typeof moveId === "number" ? invoices.get(moveId) : undefined;
+        if (!invoice) return { result: [] };
+        const wantsTaxedOnly =
+          Array.isArray(domain) &&
+          (domain as unknown[][]).some(
+            (clause) =>
+              Array.isArray(clause) &&
+              clause[0] === "tax_ids" &&
+              clause[1] === "!=" &&
+              clause[2] === false,
+          );
+        const rows = invoice.lines
+          .filter((line) => !wantsTaxedOnly || line.taxIds.length > 0)
+          .map((line) => ({
+            id: line.id,
+            move_id: [invoice.id, invoice.name || "/"],
+            display_type: "product",
+            tax_ids: line.taxIds,
+          }));
+        return { result: applyLimit(rows, limit) };
       }
 
-      if (model === "account.payment") {
-        const ids = predicateValue(domain, "id");
-        const wanted = Array.isArray(ids)
-          ? ids.filter((id): id is number => typeof id === "number")
-          : [];
-        return {
-          result: wanted
-            .map((id) => payments.get(id))
-            .filter((payment): payment is StoredPayment => Boolean(payment))
-            .map((payment) => ({
-              id: payment.id,
-              name: payment.name,
-              state: payment.state,
-              move_id: payment.move,
-              amount: payment.amount,
-            })),
-        };
+      if (model === "mail.message") {
+        const resId = predicateValue(domain, "res_id");
+        const like = predicateValue(domain, "body");
+        const rows = messages
+          .filter((message) => message.model === "account.move" && message.res_id === resId)
+          .filter((message) => typeof like !== "string" || message.body.includes(like))
+          .sort((a, b) => b.id - a.id)
+          .map((message) => ({ id: message.id, body: message.body }));
+        return { result: applyLimit(rows, limit) };
       }
-
-      if (model === "account.journal") {
-        const name = predicateValue(domain, "name");
-        const row = (id: number) => ({ id, name, type: "bank", company_id: COMPANY });
-        if (scenario.journal === "none") return { result: [] };
-        if (scenario.journal === "ambiguous") return { result: [row(77), row(78)] };
-        return { result: [row(77)] };
-      }
-
-      if (model === "mail.template") {
-        const name = predicateValue(domain, "name");
-        /* `model` is the technical name; `model_id` renders as the ir.model
-         * DISPLAY name, which Odoo 18 sets to "Journal Entry" for
-         * account.move. Modelling the display name as "account.move" once let
-         * a real defect through (the app compared the display name), so the
-         * stub answers exactly what Odoo answers. */
-        const onAccountMove = (id: number) => ({
-          id,
-          name,
-          model: "account.move",
-          model_id: [2, "Journal Entry"],
-        });
-        if (scenario.mailTemplate === "missing") return { result: [] };
-        if (scenario.mailTemplate === "wrong-model") {
-          return {
-            result: [{ id: 88, name, model: "res.partner", model_id: [3, "Contact"] }],
-          };
-        }
-        if (scenario.mailTemplate === "ambiguous") {
-          return { result: [onAccountMove(88), onAccountMove(89)] };
-        }
-        return { result: [onAccountMove(88)] };
-      }
-    }
-
-    if (model === "account.tax" && method === "compute_all") {
-      // `compute_all` is called on a recordset the caller already holds, so the
-      // tax ids are args[0]; the signature is
-      // (ids, price_unit, currency_id, quantity). Answering it here — rather
-      // than letting the caller reimplement tax arithmetic — is the point: the
-      // suite asserts the app asked Odoo what the catalogue actually does.
-      const ids = args[0];
-      const taxIds = Array.isArray(ids)
-        ? ids.filter((id): id is number => typeof id === "number")
-        : [];
-      const priceUnit = typeof args[1] === "number" ? args[1] : 0;
-      const quantity = typeof args[3] === "number" ? args[3] : 1;
-      return { result: computeAll(taxIds, priceUnit, quantity) };
     }
 
     if (model === "res.partner" && method === "create") {
@@ -562,12 +584,25 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       const values = (args[0] ?? {}) as Record<string, unknown>;
       const id = nextSaleOrderId++;
       const rawLines = Array.isArray(values.order_line) ? values.order_line : [];
-      const lines = rawLines.map((entry) => {
+      const lines: StoredSaleOrderLine[] = rawLines.map((entry) => {
         const triple = Array.isArray(entry) ? (entry[2] as Record<string, unknown>) : {};
+        const productId = typeof triple.product_id === "number" ? triple.product_id : 0;
+        const productTaxes = productTaxIdsById.get(productId) ?? [];
+        const provided = parseTaxIdTriple(triple.tax_id);
+        // What Odoo does at line create: an explicit `tax_id` set wins
+        // ("honor"); without one the product's own taxes apply. The
+        // "ignore" scenario models Odoo discarding the explicit set and
+        // applying the product's taxes anyway — the worst case the invoice's
+        // own tax-clear step exists to survive.
+        const taxIds =
+          scenario.saleOrderLineTax === "ignore"
+            ? productTaxes
+            : provided ?? productTaxes;
         return {
-          productId: typeof triple.product_id === "number" ? triple.product_id : 0,
+          productId,
           quantity: typeof triple.product_uom_qty === "number" ? triple.product_uom_qty : 0,
           priceUnit: typeof triple.price_unit === "number" ? triple.price_unit : 0,
+          taxIds,
         };
       });
       const partnerId = typeof values.partner_id === "number" ? values.partner_id : 0;
@@ -619,74 +654,96 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       return { result: true };
     }
 
-    if (model === "account.move" && method === "action_post") {
-      const id = Array.isArray(args[0]) ? (args[0][0] as number) : NaN;
-      const invoice = invoices.get(id);
-      if (!invoice) return { error: `The stub has no invoice ${String(id)} to post.` };
-      invoice.state = "posted";
-      postedCount += 1;
-      invoice.name = `INV/2026/${String(postedCount).padStart(5, "0")}`;
-      return { result: true };
-    }
-
-    if (model === "account.payment.register" && method === "create") {
-      const context = (kwargs.context ?? {}) as { active_ids?: unknown };
-      const invoiceId = Array.isArray(context.active_ids)
-        ? (context.active_ids[0] as number)
-        : NaN;
-      if (!invoices.has(invoiceId)) {
-        return { error: `The payment wizard names invoice ${String(invoiceId)}, which the stub does not have.` };
-      }
-      const wizardId = nextPaymentWizardId++;
-      paymentWizards.set(wizardId, invoiceId);
-      return { result: wizardId };
-    }
-
-    if (model === "account.payment.register" && method === "action_create_payments") {
-      const wizardId = Array.isArray(args[0]) ? (args[0][0] as number) : NaN;
-      const invoiceId = paymentWizards.get(wizardId);
-      if (invoiceId === undefined) {
-        return { error: `The stub has no payment wizard ${String(wizardId)}.` };
-      }
-      const invoice = invoices.get(invoiceId);
-      if (!invoice) return { error: `The stub has no invoice ${String(invoiceId)}.` };
-      if (scenario.paymentSettlement === "unsettled") {
-        // A row with no journal entry: Odoo matches it, reports "in_payment",
-        // and the residual never moves.
-        createPaymentFor(invoice, false);
-        invoice.payment_state = "in_payment";
-        return { result: true };
-      }
-      if (scenario.paymentSettlement === "unsettled-real") {
-        // A posted payment in the books that still leaves the invoice open —
-        // money exists, so registering another one is not the app's call.
-        createPaymentFor(invoice, true);
-        invoice.payment_state = "in_payment";
-        return { result: true };
-      }
-      createPaymentFor(invoice, true);
-      invoice.payment_state = "paid";
-      invoice.amount_residual = 0;
-      return { result: true };
-    }
-
-    if (model === "mail.template" && method === "send_mail") {
-      const templateIds = Array.isArray(args[0]) ? args[0] : [];
-      const invoiceId = args[1];
-      if (templateIds.length !== 1 || typeof invoiceId !== "number") {
+    if (model === "account.move" && method === "write") {
+      // The ONLY field the draft-only pipeline may write on an invoice. A
+      // write carrying anything else is a pipeline defect and must fail here
+      // rather than be silently accepted.
+      const ids = Array.isArray(args[0])
+        ? args[0].filter((id): id is number => typeof id === "number")
+        : [];
+      const vals = (args[1] ?? {}) as Record<string, unknown>;
+      const keys = Object.keys(vals);
+      if (keys.length !== 1 || keys[0] !== "mv_shipping_tracking_ref") {
         return {
           error:
-            "The stub only models the record-method shape send_mail([[templateId]], resId); " +
-            `it received ${JSON.stringify(args)}.`,
+            `The stub only models writing mv_shipping_tracking_ref on account.move; it ` +
+            `received ${JSON.stringify(vals)}. The draft pipeline writes nothing else to an invoice.`,
         };
       }
-      return { result: nextMailId++ };
+      const trackingRef = String(vals.mv_shipping_tracking_ref ?? "");
+      for (const id of ids) {
+        const invoice = invoices.get(id);
+        if (!invoice) return { error: `The stub has no invoice ${String(id)} to write to.` };
+        invoice.mv_shipping_tracking_ref = trackingRef;
+      }
+      return { result: true };
+    }
+
+    if (model === "account.move.line" && method === "write") {
+      // The tax clear: `tax_ids = [(6, 0, [])]` on named lines of one draft.
+      // Any other value or field fails the suite.
+      const ids = Array.isArray(args[0])
+        ? args[0].filter((id): id is number => typeof id === "number")
+        : [];
+      const vals = (args[1] ?? {}) as Record<string, unknown>;
+      const keys = Object.keys(vals);
+      if (keys.length !== 1 || keys[0] !== "tax_ids") {
+        return {
+          error: `The stub only models clearing tax_ids on account.move.line; it received ${JSON.stringify(vals)}.`,
+        };
+      }
+      const cleared = parseTaxIdTriple(vals.tax_ids);
+      if (!cleared || cleared.length !== 0) {
+        return {
+          error: `The stub only models clearing a line's taxes to none ([(6, 0, [])]); it received ${JSON.stringify(vals.tax_ids)}.`,
+        };
+      }
+      const touched = new Set<StoredInvoice>();
+      for (const id of ids) {
+        let found = false;
+        for (const invoice of invoices.values()) {
+          const line = invoice.lines.find((candidate) => candidate.id === id);
+          if (!line) continue;
+          line.taxIds = [];
+          touched.add(invoice);
+          found = true;
+          break;
+        }
+        if (!found) return { error: `The stub has no account.move.line ${String(id)} to write to.` };
+      }
+      // Odoo recomputes the invoice's totals from its lines on write.
+      for (const invoice of touched) recomputeInvoice(invoice);
+      return { result: true };
+    }
+
+    if (model === "account.move" && method === "message_post") {
+      // An internal note and nothing else. A comment (mt_comment) would email
+      // the seller, which the draft-only pipeline must never do, so any other
+      // subtype fails the suite here.
+      const ids = Array.isArray(args[0]) ? args[0] : [];
+      const invoiceId = ids[0];
+      if (typeof invoiceId !== "number" || !invoices.has(invoiceId)) {
+        return { error: `The stub has no invoice ${String(invoiceId)} to post a note on.` };
+      }
+      if (kwargs.subtype_xmlid !== "mail.mt_note") {
+        return {
+          error:
+            `The stub models only internal notes (subtype_xmlid "mail.mt_note"); it ` +
+            `received ${JSON.stringify(kwargs.subtype_xmlid)}. Anything else could notify the seller.`,
+        };
+      }
+      const body = typeof kwargs.body === "string" ? kwargs.body : "";
+      const id = nextMessageId++;
+      messages.push({ id, model: "account.move", res_id: invoiceId, body: `<p>${escapeHtml(body)}</p>` });
+      return { result: id };
     }
 
     return {
       error:
         `The Odoo stub does not model ${model}.${method}. This suite answers only the calls the ` +
-        `handoff-invoice pipeline is known to make; an unmodelled call is either a new call that ` +
+        `draft-invoice pipeline is known to make — deliberately NOT posting (action_post), ` +
+        `payment registration (account.payment.register) or emailing (mail.template.send_mail), ` +
+        `which the draft-only behaviour forbids. An unmodelled call is either a new call that ` +
         `needs a deliberate answer here, or a call this pipeline should not be making.`,
     };
   }
