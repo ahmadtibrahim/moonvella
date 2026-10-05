@@ -1517,6 +1517,11 @@ export async function findJournalByName(name: string): Promise<OdooJournalRef[]>
 export interface OdooMailTemplateRef {
   id: number;
   name: string;
+  /** The technical model name, e.g. `account.move`. This is the field to
+   *  compare against: `model_id` is the `ir.model` display name, and Odoo 18
+   *  calls `account.move` "Journal Entry" there — a caller matching on the
+   *  display name would refuse a perfectly correct template. */
+  model: string | false;
   model_id: [number, string] | false;
 }
 
@@ -1529,7 +1534,7 @@ export async function findMailTemplateByName(
   return searchRead<OdooMailTemplateRef>(
     MAIL_TEMPLATE_MODEL,
     [["name", "=", trimmed]],
-    ["id", "name", "model_id"],
+    ["id", "name", "model", "model_id"],
     { limit: 2 },
   );
 }

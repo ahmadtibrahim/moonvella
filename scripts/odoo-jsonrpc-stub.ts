@@ -447,19 +447,27 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
 
       if (model === "mail.template") {
         const name = predicateValue(domain, "name");
+        /* `model` is the technical name; `model_id` renders as the ir.model
+         * DISPLAY name, which Odoo 18 sets to "Journal Entry" for
+         * account.move. Modelling the display name as "account.move" once let
+         * a real defect through (the app compared the display name), so the
+         * stub answers exactly what Odoo answers. */
+        const onAccountMove = (id: number) => ({
+          id,
+          name,
+          model: "account.move",
+          model_id: [2, "Journal Entry"],
+        });
         if (scenario.mailTemplate === "missing") return { result: [] };
         if (scenario.mailTemplate === "wrong-model") {
-          return { result: [{ id: 88, name, model_id: [3, "res.partner"] }] };
-        }
-        if (scenario.mailTemplate === "ambiguous") {
           return {
-            result: [
-              { id: 88, name, model_id: [2, "account.move"] },
-              { id: 89, name, model_id: [2, "account.move"] },
-            ],
+            result: [{ id: 88, name, model: "res.partner", model_id: [3, "Contact"] }],
           };
         }
-        return { result: [{ id: 88, name, model_id: [2, "account.move"] }] };
+        if (scenario.mailTemplate === "ambiguous") {
+          return { result: [onAccountMove(88), onAccountMove(89)] };
+        }
+        return { result: [onAccountMove(88)] };
       }
     }
 

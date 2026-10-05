@@ -1042,7 +1042,11 @@ async function resolveInvoiceMailTemplate(): Promise<OdooMailTemplateRef> {
   }
 
   const template = templates[0];
-  const model = Array.isArray(template.model_id) ? template.model_id[1] : "";
+  /* Compare the TECHNICAL model name. `model_id` is the `ir.model` record, and
+   * its display name for `account.move` is "Journal Entry" in Odoo 18 — a
+   * check against that string would reject the very template the module ships
+   * (it did, once; the stage2 end-to-end caught it). */
+  const model = typeof template.model === "string" ? template.model : "";
   if (model !== "account.move") {
     throw new PermanentJobError(
       `Mail template "${B2B_INVOICE_MAIL_TEMPLATE_NAME}" is attached to model ` +

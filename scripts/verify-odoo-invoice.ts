@@ -857,6 +857,29 @@ async function main() {
     stub5b.restore();
 
     /* ------------------------------------------------------------------ */
+    /* 5d. The mail template's model is compared by its TECHNICAL name.    */
+    /*     Odoo 18 renders account.move's ir.model display name as         */
+    /*     "Journal Entry", and the stub now answers exactly that — so the */
+    /*     happy path above proves the correct template is accepted, and   */
+    /*     this proves a genuinely wrong model is still refused.           */
+    /* ------------------------------------------------------------------ */
+    const stub5d = installOdooJsonRpcStub({ mailTemplate: "wrong-model" });
+    await configureOdoo();
+    const order5d = await makeOrder(seller.id);
+    const error5d = await catchError(() => createOdooInvoiceForOrder(order5d.id, JOB_ACTOR));
+    check(
+      "a mail template attached to another model is refused, naming that model",
+      error5d instanceof PermanentJobError &&
+        (error5d as Error).message.includes("res.partner"),
+      describe(error5d),
+    );
+    check(
+      "no mail is sent through a template bound to another model",
+      stub5d.callsTo("mail.template", "send_mail").length === 0,
+    );
+    stub5d.restore();
+
+    /* ------------------------------------------------------------------ */
     /* 5c. A sale order already carrying the reference is ADOPTED, never   */
     /*     duplicated (the crash-between-create-and-link recovery).        */
     /* ------------------------------------------------------------------ */
