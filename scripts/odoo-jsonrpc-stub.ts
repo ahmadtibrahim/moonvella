@@ -131,6 +131,15 @@ export interface OdooStubScenario {
   mailTemplate?: "ok" | "missing" | "wrong-model" | "ambiguous";
   /** The payment journal named by the settings/default. */
   journal?: "ok" | "none" | "ambiguous";
+  /**
+   * What registering the payment does to the invoice. `"unsettled"` models
+   * Odoo 18 with a journal whose payment method line has no outstanding
+   * account configured: the wizard creates the payment row and matches it to
+   * the invoice (payment_state "in_payment"), but `_generate_journal_entry`
+   * skips payments without an outstanding account, so no journal entry exists
+   * and the residual never moves. Observed on stage2, not invented.
+   */
+  paymentSettlement?: "ok" | "unsettled" | "unsettled-real";
   /** A sale order already carrying the order's reference (the crash-recovery path). */
   existingSaleOrder?: {
     id: number;
@@ -192,6 +201,17 @@ interface StoredInvoice {
   saleOrderId: number | null;
   currency: string;
   companyId: number;
+  /** Ids of the account.payment rows Odoo matched to this invoice. */
+  matchedPaymentIds: number[];
+}
+
+interface StoredPayment {
+  id: number;
+  name: string;
+  state: string;
+  /** The journal entry's id+name, or false for a row Odoo never posted. */
+  move: [number, string] | false;
+  amount: number;
 }
 
 /** The `=` value of the first domain clause on `field`, whatever the operator. */
@@ -217,6 +237,7 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
   const saleOrders = new Map<number, StoredSaleOrder>();
   const saleOrderIdByRef = new Map<string, number>();
   const invoices = new Map<number, StoredInvoice>();
+  const payments = new Map<number, StoredPayment>();
   /** Wizard id → the sale order it will invoice. */
   const invoiceWizards = new Map<number, number>();
   /** Wizard id → the invoice it will pay. */
@@ -229,6 +250,7 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
   let nextPaymentWizardId = 600;
   let nextPartnerId = 700;
   let nextMailId = 990;
+  let nextPaymentId = 5001;
   let postedCount = 0;
 
   const productIdFor = (sku: string): number => {
@@ -266,6 +288,7 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       saleOrderId: null,
       currency: seed.currency ?? "CAD",
       companyId: seed.companyId ?? 1,
+      matchedPaymentIds: [],
     });
   }
 
@@ -280,6 +303,7 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       invoice_origin: invoice.invoice_origin,
       currency_id: CURRENCY,
       company_id: COMPANY,
+      matched_payment_ids: invoice.matchedPaymentIds,
     };
   }
 
@@ -321,8 +345,30 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       saleOrderId,
       currency: "CAD",
       companyId: order?.companyId ?? 1,
+      matchedPaymentIds: [],
     });
     return id;
+  }
+
+  /**
+   * The payment the register-payment wizard produces. Odoo 18 generates the
+   * journal entry only for a payment whose `outstanding_account_id` is set
+   * (`account.payment._generate_journal_entry`), so with the journal's payment
+   * method line unconfigured the row appears, gets matched to the invoice, and
+   * no entry exists — the `"unsettled"` scenario, observed on stage2.
+   */
+  function createPaymentFor(invoice: StoredInvoice, hasMove: boolean): StoredPayment {
+    const id = nextPaymentId++;
+    const payment: StoredPayment = {
+      id,
+      name: `PAY/${String(id).padStart(5, "0")}`,
+      state: "in_process",
+      move: hasMove ? [9000 + id, `MISC/${id}`] : false,
+      amount: invoice.amount_total,
+    };
+    payments.set(id, payment);
+    invoice.matchedPaymentIds.push(id);
+    return payment;
   }
 
   /** The stub's answer to one execute_kw, before it becomes an envelope. */
@@ -434,6 +480,25 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
           result: wanted
             .filter((id) => STUB_TAXES[id])
             .map((id) => ({ id, name: STUB_TAXES[id].name })),
+        };
+      }
+
+      if (model === "account.payment") {
+        const ids = predicateValue(domain, "id");
+        const wanted = Array.isArray(ids)
+          ? ids.filter((id): id is number => typeof id === "number")
+          : [];
+        return {
+          result: wanted
+            .map((id) => payments.get(id))
+            .filter((payment): payment is StoredPayment => Boolean(payment))
+            .map((payment) => ({
+              id: payment.id,
+              name: payment.name,
+              state: payment.state,
+              move_id: payment.move,
+              amount: payment.amount,
+            })),
         };
       }
 
@@ -585,6 +650,21 @@ export function installOdooJsonRpcStub(scenario: OdooStubScenario = {}): OdooJso
       }
       const invoice = invoices.get(invoiceId);
       if (!invoice) return { error: `The stub has no invoice ${String(invoiceId)}.` };
+      if (scenario.paymentSettlement === "unsettled") {
+        // A row with no journal entry: Odoo matches it, reports "in_payment",
+        // and the residual never moves.
+        createPaymentFor(invoice, false);
+        invoice.payment_state = "in_payment";
+        return { result: true };
+      }
+      if (scenario.paymentSettlement === "unsettled-real") {
+        // A posted payment in the books that still leaves the invoice open —
+        // money exists, so registering another one is not the app's call.
+        createPaymentFor(invoice, true);
+        invoice.payment_state = "in_payment";
+        return { result: true };
+      }
+      createPaymentFor(invoice, true);
       invoice.payment_state = "paid";
       invoice.amount_residual = 0;
       return { result: true };

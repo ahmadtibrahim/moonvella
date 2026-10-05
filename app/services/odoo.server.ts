@@ -675,6 +675,7 @@ const PRODUCT_MODEL = "product.product";
 const SALE_ORDER_MODEL = "sale.order";
 const SALE_ORDER_TEMPLATE_MODEL = "sale.order.template";
 const ACCOUNT_MOVE_MODEL = "account.move";
+const ACCOUNT_PAYMENT_MODEL = "account.payment";
 const JOURNAL_MODEL = "account.journal";
 const MAIL_TEMPLATE_MODEL = "mail.template";
 const TAX_MODEL = "account.tax";
@@ -1254,6 +1255,33 @@ export interface OdooInvoiceState {
    */
   currency_id: [number, string] | false;
   company_id: [number, string] | false;
+  /**
+   * The payments Odoo matched to this invoice. A matched payment whose
+   * `move_id` is false exists only as a row: no journal entry was generated
+   * for it (Odoo 18's own `_compute_payment_state` singles this case out —
+   * `not p.move_id and p.state == 'in_process'` — and still reports
+   * "in_payment"), so it settles nothing and the residual stays.
+   */
+  matched_payment_ids: number[] | false;
+}
+
+/** A payment as `account.payment` holds it — enough to tell a ledger entry from a row. */
+export interface OdooPaymentRef {
+  id: number;
+  name: string | false;
+  state: string | false;
+  move_id: [number, string] | false;
+  amount: number;
+}
+
+/** Reads payments by id — used to tell a real payment from a matched-only row. */
+export async function findPaymentsByIds(ids: number[]): Promise<OdooPaymentRef[]> {
+  if (ids.length === 0) return [];
+  return searchRead<OdooPaymentRef>(
+    ACCOUNT_PAYMENT_MODEL,
+    [["id", "in", ids]],
+    ["id", "name", "state", "move_id", "amount"],
+  );
 }
 
 /** Read-only invoice status lookup, keyed by the Odoo invoice id. */
@@ -1272,6 +1300,7 @@ export async function getInvoiceState(
       "amount_residual",
       "currency_id",
       "company_id",
+      "matched_payment_ids",
     ],
     { limit: 1 },
   );

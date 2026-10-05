@@ -822,6 +822,82 @@ async function main() {
     stub4b.restore();
 
     /* ------------------------------------------------------------------ */
+    /* 4c. A registered payment that settled NOTHING is a failure, not a   */
+    /*     success. Odoo 18 skips the journal entry for a payment whose    */
+    /*     journal's payment method line has no outstanding account, and   */
+    /*     the invoice then reads "in_payment" with the full residual      */
+    /*     still outstanding — observed on stage2, where the pipeline had  */
+    /*     reported the invoice paid.                                      */
+    /* ------------------------------------------------------------------ */
+    const stub4c = installOdooJsonRpcStub({ paymentSettlement: "unsettled" });
+    await configureOdoo();
+    const order4c = await makeOrder(seller.id);
+    const error4c = await catchError(() => createOdooInvoiceForOrder(order4c.id, JOB_ACTOR));
+    const error4cMessage = error4c instanceof Error ? error4c.message : String(error4c);
+    check(
+      "a payment that left the invoice unsettled is a PERMANENT failure naming the fix",
+      error4c instanceof PermanentJobError &&
+        error4cMessage.includes("outstanding") &&
+        error4cMessage.includes("payment method line"),
+      describe(error4c),
+    );
+    check(
+      "the unsettled invoice is not emailed as paid",
+      stub4c.callsTo("mail.template", "send_mail").length === 0,
+    );
+    check(
+      "the unsettled failure is recorded on the order for the repair action",
+      ((await readLink(order4c.id))?.odooInvoiceError ?? "").includes("outstanding"),
+      JSON.stringify(await readLink(order4c.id)),
+    );
+
+    /* 4d. The retry after the operator fixes the journal: the invoice reads
+     *     "in_payment" on the ghost, so the resume must look past the payment
+     *     state, see that nothing reached the books, and register the payment
+     *     — not skip it and link an unpaid invoice as settled. */
+    stub4c.scenario.paymentSettlement = "ok";
+    const retry4c = await createOdooInvoiceForOrder(order4c.id, JOB_ACTOR);
+    check(
+      "with the journal fixed, the retry registers the payment and settles the invoice",
+      retry4c.status === "CREATED" && retry4c.payment !== null,
+      JSON.stringify({ status: retry4c.status, payment: retry4c.payment }),
+    );
+    check(
+      "the retry registered exactly one more payment — the ghost settled nothing",
+      stub4c.callsTo("account.payment.register", "create").length === 2,
+      String(stub4c.callsTo("account.payment.register", "create").length),
+    );
+    stub4c.restore();
+
+    /* 4e. A POSTED payment with the invoice still open is money that already
+     *     exists: the retry must refuse rather than pay twice. */
+    const stub4e = installOdooJsonRpcStub({ paymentSettlement: "unsettled-real" });
+    await configureOdoo();
+    const order4e = await makeOrder(seller.id);
+    const first4e = await catchError(() => createOdooInvoiceForOrder(order4e.id, JOB_ACTOR));
+    check(
+      "a posted payment that leaves the residual open still fails the settlement check",
+      first4e instanceof PermanentJobError &&
+        (first4e as Error).message.includes("outstanding"),
+      describe(first4e),
+    );
+    const error4e = await catchError(() => createOdooInvoiceForOrder(order4e.id, JOB_ACTOR));
+    const error4eMessage = error4e instanceof Error ? error4e.message : String(error4e);
+    check(
+      "the retry finds the posted payment and refuses a second one, naming it",
+      error4e instanceof PermanentJobError &&
+        error4eMessage.includes("posted payment") &&
+        error4eMessage.includes("PAY/"),
+      describe(error4e),
+    );
+    check(
+      "no second payment was registered on top of real money",
+      stub4e.callsTo("account.payment.register", "create").length === 1,
+      String(stub4e.callsTo("account.payment.register", "create").length),
+    );
+    stub4e.restore();
+
+    /* ------------------------------------------------------------------ */
     /* 5. The template: missing, or present but not stamped MoonVella.     */
     /* ------------------------------------------------------------------ */
     const stub5 = installOdooJsonRpcStub({ template: "missing" });
@@ -941,6 +1017,9 @@ async function main() {
         paymentState: "paid",
         name: "INV/2026/00001",
         amountTotal: TOTAL_MAJOR,
+        // A paid invoice has nothing outstanding; the guard now checks this,
+        // because a payment that settled nothing also reads "in_payment".
+        amountResidual: 0,
       },
     });
     await configureOdoo();

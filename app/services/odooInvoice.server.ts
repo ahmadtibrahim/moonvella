@@ -52,6 +52,7 @@ import {
   findJournalByName,
   findMailTemplateByName,
   findPartnerByEmail,
+  findPaymentsByIds,
   findSaleOrderByClientOrderRef,
   findSaleOrderTemplateByName,
   findTaxesByIds,
@@ -63,6 +64,7 @@ import {
   type OdooInvoiceState,
   type OdooJournalRef,
   type OdooMailTemplateRef,
+  type OdooPaymentRef,
   type OdooSaleOrderTemplateRef,
   type OdooWritePreview,
 } from "./odoo.server";
@@ -632,9 +634,75 @@ function assertInvoiceMatchesPayment(
 }
 
 /**
- * Register the ledger entry recording the captured charge, unless the invoice
- * is already paid. `assertInvoiceMatchesPayment` runs first, because this is
- * the step that writes money numbers into the books.
+ * What the invoice's own books say about the payment, split into the two
+ * things that look identical from `payment_state` alone:
+ *
+ *  - a REAL payment has a journal entry (`move_id`), so money is in the books;
+ *  - a GHOST payment exists only as an `account.payment` row. Odoo 18's
+ *    `_generate_journal_entry` silently skips any payment without an
+ *    `outstanding_account_id`, and `_compute_payment_state` then still reports
+ *    "in_payment" for it (`not p.move_id and p.state == 'in_process'`) while
+ *    the residual stays put. Observed on stage2, where the pipeline had
+ *    reported such an invoice as paid.
+ */
+async function inspectInvoicePayments(invoiceId: number): Promise<{
+  state: OdooInvoiceState | null;
+  settled: boolean;
+  real: OdooPaymentRef[];
+  ghosts: OdooPaymentRef[];
+}> {
+  const state = await getInvoiceState(invoiceId);
+  if (!state) return { state: null, settled: false, real: [], ghosts: [] };
+  const ids = Array.isArray(state.matched_payment_ids) ? state.matched_payment_ids : [];
+  const payments = await findPaymentsByIds(ids);
+  const real = payments.filter((p) => Boolean(p.move_id));
+  const ghosts = payments.filter((p) => !p.move_id);
+  const settled = Math.abs(state.amount_residual) <= 0.005;
+  return { state, settled, real, ghosts };
+}
+
+/**
+ * The invoice must end up with nothing left to pay, and the check runs after
+ * the write — never assumed. The message names the Odoo configuration that
+ * causes the silent skip, because that is the whole repair.
+ */
+async function assertInvoiceSettled(
+  invoiceId: number,
+  context: string,
+): Promise<OdooInvoiceState> {
+  const { state, settled } = await inspectInvoicePayments(invoiceId);
+  if (!state) {
+    throw new PermanentJobError(
+      `Odoo invoice ${invoiceId} could not be re-read after ${context}.`,
+    );
+  }
+  if (!settled) {
+    const label = state.name === false ? invoiceId : state.name;
+    throw new PermanentJobError(
+      `Odoo invoice ${label} still shows ${state.amount_residual.toFixed(2)} ` +
+        `outstanding after ${context} (payment state "${state.payment_state}"). ` +
+        `In Odoo 18 a registered payment settles nothing when its journal's ` +
+        `payment method line has no outstanding account: the payment row exists, ` +
+        `but no journal entry is generated for it. Open that journal in Odoo, set ` +
+        `an outstanding account on its payment method line (a journal created ` +
+        `from the standard chart already has one), then retry — the retry adopts ` +
+        `the same invoice.`,
+    );
+  }
+  return state;
+}
+
+/**
+ * Register the ledger entry recording the captured charge unless the invoice
+ * is genuinely settled. `assertInvoiceMatchesPayment` runs first, because this
+ * is the step that writes money numbers into the books.
+ *
+ * "Already paid" is a claim about the books, so it is verified, not believed:
+ * a `payment_state` of "in_payment" can rest on payments that generated no
+ * journal entry at all. Ghosts settle nothing, so a payment is registered
+ * (the retry after the operator fixes the journal is exactly this path); a
+ * POSTED payment with a residual still open is money that already exists —
+ * overpaying is not the pipeline's call, and it refuses.
  */
 async function ensurePaymentRegistered(
   input: SettleInput,
@@ -643,7 +711,35 @@ async function ensurePaymentRegistered(
   const alreadyPaid = ["paid", "in_payment", "partial"].includes(
     state.payment_state || "",
   );
-  if (alreadyPaid) return null;
+  let needsPayment = !alreadyPaid;
+
+  if (alreadyPaid) {
+    const inspection = await inspectInvoicePayments(input.invoiceId);
+    if (!inspection.state) {
+      throw new PermanentJobError(
+        `Odoo invoice ${input.invoiceId} could not be re-read while checking ` +
+          `whether it is already paid.`,
+      );
+    }
+    if (!inspection.settled) {
+      if (inspection.real.length > 0) {
+        const label =
+          inspection.state.name === false ? input.invoiceId : inspection.state.name;
+        throw new PermanentJobError(
+          `Odoo invoice ${label} shows ${inspection.state.amount_residual.toFixed(2)} ` +
+            `outstanding even though ${inspection.real.length} posted payment(s) are ` +
+            `matched to it (${inspection.real
+              .map((p) => (p.name === false ? `#${p.id}` : p.name))
+              .join(", ")}). Reconciling that by hand is a human decision — the ` +
+            `pipeline will not register a second payment on top of it.`,
+        );
+      }
+      // Only ghost payments: nothing reached the books, so registering the
+      // payment now both settles the invoice and is the repair.
+      needsPayment = true;
+    }
+  }
+  if (!needsPayment) return null;
 
   const { payment } = input;
   const expected = payment.amount / 100;
@@ -663,6 +759,7 @@ async function ensurePaymentRegistered(
     ),
     `Registering the payment for Odoo invoice ${input.invoiceId}`,
   );
+  await assertInvoiceSettled(input.invoiceId, "registering the payment");
 
   return {
     journalId: journal.id,
