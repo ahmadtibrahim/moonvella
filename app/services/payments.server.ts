@@ -744,6 +744,46 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
     }
   }
 
+  /*
+   * A CONFIRMED REFUND SETTLES A CANCELLATION'S PENDING OUTCOME.
+   *
+   * The cancellation row records a refund as PENDING the moment it is
+   * requested, because a refund the provider has accepted is not money that has
+   * arrived. This is where it stops being pending: the provider's own event is
+   * the authority, and without this the row would say PENDING forever and an
+   * operator would have no way to tell a settled refund from a stuck one.
+   *
+   * Written OUTSIDE the transaction above and never allowed to throw into it —
+   * the money record is the thing that must not be lost, and a cancellation row
+   * that failed to update is recoverable by `resumeCancellation`, which
+   * reconciles against this same charge.
+   */
+  if (refundedAmount !== null && payment?.orderId) {
+    try {
+      const cancellation = await prisma.orderCancellation.findUnique({
+        where: { orderId: payment.orderId },
+        select: { id: true, paymentOutcome: true, stripeRefundId: true },
+      });
+      if (cancellation && cancellation.paymentOutcome === "PENDING") {
+        const settled = refundedAmount >= payment.amount && payment.amount > 0;
+        await prisma.orderCancellation.update({
+          where: { id: cancellation.id },
+          data: {
+            // SUCCEEDED only when the whole charge is back. A partial refund is
+            // still a refund in progress, and saying otherwise would mark a
+            // cancellation finished with money outstanding.
+            paymentOutcome: settled ? "SUCCEEDED" : "PENDING",
+            paymentNote: settled
+              ? "The provider confirmed the refund."
+              : `Partially refunded: ${refundedAmount} of ${payment.amount}.`,
+          },
+        });
+      }
+    } catch {
+      // Recoverable: `resumeCancellation` reconciles against the charge itself.
+    }
+  }
+
   await setIntegrationState("stripe", {
     status: "HEALTHY",
     detail: `Processed Stripe event ${event.type}.`,

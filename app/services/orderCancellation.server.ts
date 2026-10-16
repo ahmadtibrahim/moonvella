@@ -417,6 +417,178 @@ export async function cancelOrder(
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* Resuming, and reconciling an outcome nobody answered                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Finish a cancellation that was interrupted.
+ *
+ * WHY A UNIQUE `orderId` IS NOT ENOUGH, which is the point the review makes and
+ * the reason this function exists. The unique index proves that ONE cancellation
+ * row exists; it proves nothing about whether the work behind it finished. A
+ * crash between the row and the refund leaves a row saying PROCESSING with money
+ * taken and nothing returned, and a row that says "cancelled" while that is true
+ * is the most expensive lie this module could tell.
+ *
+ * So every side is retried here, and each retry is decided by looking at what
+ * the PROVIDER and the LEDGER say rather than at what this row last wrote:
+ *
+ *   • inventory — releasing is conditional on the row still being HELD, so a
+ *     resume releases nothing the first attempt already released.
+ *   • payment   — `reconcilePayment` reads the charge's own refunded amount,
+ *     which the webhook maintains. A refund that succeeded while our request
+ *     timed out is therefore FOUND, not repeated.
+ *   • invoice   — a credit note already issued for this cancellation is adopted
+ *     by its recorded id rather than issued twice.
+ *
+ * It is safe to call at any time, including on a healthy cancellation: every
+ * side that is already terminal is skipped.
+ */
+export async function resumeCancellation(orderId: string, actor: CancellationActor) {
+  const row = await prisma.orderCancellation.findUnique({ where: { orderId } });
+  if (!row) throw new Error("This order has no cancellation to resume.");
+  if (row.status === "CANCELLED" && row.paymentOutcome !== "PENDING" && row.paymentOutcome !== "FAILED") {
+    return { resumed: false, reason: "already complete" as const, row };
+  }
+
+  const preview = await cancellationPreview(orderId);
+  let inventoryOutcome = row.inventoryOutcome as string;
+  let paymentOutcome = row.paymentOutcome as string;
+  let invoiceOutcome = row.invoiceOutcome as string;
+  let stripeRefundId = row.stripeRefundId;
+  let paymentNote = row.paymentNote;
+  let creditNoteId = row.creditNoteId;
+
+  if (inventoryOutcome !== "SUCCEEDED") {
+    try {
+      const released = await prisma.$transaction((tx) =>
+        releaseHoldsForOrder(tx, orderId, "Order cancelled (resumed).")
+      );
+      inventoryOutcome = released.released.length > 0 ? "SUCCEEDED" : "NOT_APPLICABLE";
+    } catch (error) {
+      inventoryOutcome = "FAILED";
+      await note(row.id, "inventoryOutcome", inventoryOutcome, error);
+    }
+  }
+
+  if (paymentOutcome !== "SUCCEEDED" && paymentOutcome !== "NOT_APPLICABLE") {
+    const reconciled = await reconcilePayment(orderId, preview.payment.action);
+    if (reconciled.done) {
+      paymentOutcome = "SUCCEEDED";
+      paymentNote = reconciled.note;
+    } else if (reconciled.retryable) {
+      try {
+        const refund = await refundSellerCharge({
+          orderId,
+          reason: `Order cancelled: ${reasonLabel(row.reason)}`,
+          actor: { actorType: "ADMIN_USER", actorId: actor.id, actorName: actor.name ?? null },
+        });
+        stripeRefundId = (refund as { refundId?: string })?.refundId ?? stripeRefundId;
+        paymentOutcome = "PENDING";
+        paymentNote = "Refund initiated with the provider; awaiting confirmation.";
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "The refund could not be started.";
+        // A refusal that says the charge is ALREADY refunded is success arriving
+        // late, not a failure to report.
+        if (/already|nothing left to refund/i.test(message)) {
+          paymentOutcome = "SUCCEEDED";
+          paymentNote = "The charge was already refunded.";
+        } else {
+          paymentOutcome = "FAILED";
+          paymentNote = message;
+          await note(row.id, "paymentOutcome", paymentOutcome, error, message);
+        }
+      }
+    } else {
+      paymentOutcome = reconciled.outcome;
+      paymentNote = reconciled.note;
+    }
+  }
+
+  if (invoiceOutcome !== "SUCCEEDED" && preview.invoice.number && preview.invoice.balance > 0) {
+    if (creditNoteId) {
+      invoiceOutcome = "SUCCEEDED";
+    } else {
+      try {
+        const invoice = await prisma.invoice.findUniqueOrThrow({ where: { orderId }, select: { id: true } });
+        const credit = await issueCreditNote(
+          {
+            invoiceId: invoice.id,
+            amount: preview.invoice.balance,
+            reason: `Order cancelled: ${reasonLabel(row.reason)}`,
+          },
+          actor
+        );
+        creditNoteId = credit.credit.id;
+        invoiceOutcome = "SUCCEEDED";
+      } catch (error) {
+        invoiceOutcome = "FAILED";
+        await note(row.id, "invoiceOutcome", invoiceOutcome, error);
+      }
+    }
+  }
+
+  const status =
+    paymentOutcome === "FAILED" || inventoryOutcome === "FAILED" || invoiceOutcome === "FAILED"
+      ? "NEEDS_ATTENTION"
+      : "CANCELLED";
+
+  const updated = await prisma.orderCancellation.update({
+    where: { id: row.id },
+    data: {
+      status,
+      paymentOutcome: paymentOutcome as never,
+      inventoryOutcome: inventoryOutcome as never,
+      invoiceOutcome: invoiceOutcome as never,
+      stripeRefundId,
+      paymentNote,
+      creditNoteId,
+      completedAt: new Date(),
+    },
+  });
+
+  return { resumed: true, reason: status === "CANCELLED" ? ("complete" as const) : ("attention" as const), row: updated };
+}
+
+/**
+ * Ask the provider what actually happened, before doing anything again.
+ *
+ * A refund request that timed out is the case this exists for: our row does not
+ * know whether Stripe created the refund, and retrying blind is how a seller is
+ * refunded twice. The charge's own `refundedAmount` is maintained by the webhook,
+ * which is the provider's word rather than our request's, so it decides.
+ */
+export async function reconcilePayment(
+  orderId: string,
+  expectedAction: string
+): Promise<{ done: boolean; retryable: boolean; outcome: string; note: string }> {
+  const payment = await prisma.wholesalePayment.findUnique({
+    where: { orderId },
+    select: { amount: true, refundedAmount: true, status: true, capturedAt: true },
+  });
+  if (!payment) {
+    return { done: true, retryable: false, outcome: "NOT_APPLICABLE", note: "No charge was recorded for this order." };
+  }
+
+  if (expectedAction === "REFUND_CAPTURED" || Boolean(payment.capturedAt)) {
+    if (payment.refundedAmount >= payment.amount && payment.amount > 0) {
+      return { done: true, retryable: false, outcome: "SUCCEEDED", note: "The provider confirms the charge was refunded." };
+    }
+    if (payment.refundedAmount > 0) {
+      return {
+        done: false,
+        retryable: true,
+        outcome: "PENDING",
+        note: `A partial refund of ${payment.refundedAmount} is recorded; the remainder is being requested.`,
+      };
+    }
+    return { done: false, retryable: true, outcome: "PENDING", note: "No refund is recorded yet; requesting it." };
+  }
+
+  return { done: true, retryable: false, outcome: "SUCCEEDED", note: "No money had been taken, so none is returned." };
+}
+
 /** Record a failure on the row without losing the outcomes that did succeed. */
 async function note(
   id: string,

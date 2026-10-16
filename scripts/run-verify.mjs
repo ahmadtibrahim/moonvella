@@ -294,6 +294,15 @@ const CHECKS = [
   // so they are asserted rather than eyeballed. It builds its own seller, orders
   // and charge, and removes them. No provider is contacted.
   { name: "accounting", kind: "ts", file: "scripts/verify-accounting.ts" },
+  // Admin cancellation, and the seller shipping settings it replaced.
+  //
+  // It is registered because every way cancellation goes wrong is silent — a
+  // refund requested twice, a reservation released twice, a credit note
+  // reported as a refund, an order cancelled while a label is live — so the
+  // properties are asserted rather than eyeballed. It builds its own seller,
+  // orders, charge and reservations, touches no provider and never goes near
+  // #1005.
+  { name: "cancellation", kind: "ts", file: "scripts/verify-cancellation.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox
