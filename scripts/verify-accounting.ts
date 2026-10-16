@@ -27,6 +27,8 @@
  * and removes them.
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import {
   allocationKey,
@@ -636,7 +638,57 @@ async function main() {
   );
 
   /* ------------------------------------------------------------------ */
-  /* 9. Tenant isolation                                                 */
+  /* 9. The PDF is SERVED, not returned from an action                    */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * THE DEFECT THIS EXISTS FOR, WHICH NOTHING ABOVE COULD SEE.
+   *
+   * The invoice PDF was first returned from the page's `action` — a POST
+   * producing `Content-Disposition: attachment`. React Router treats an action's
+   * return value as DATA for the document it is about to re-render rather than
+   * as the response itself, so the file was built, written, and then consumed as
+   * page data, and the render threw: **a 500 on the deployed endpoint** while
+   * every check above passed, because they call `renderInvoicePdf` directly and
+   * the defect lived entirely in how the route was wired.
+   *
+   * A service-level test cannot reach that, so the assertion is about the wiring:
+   * the PDF is a RESOURCE ROUTE — a loader and no component — and the page links
+   * to it rather than posting for it.
+   */
+  const invoicePdfRoute = readFileSync(join(process.cwd(), "app/routes/admin.invoices_.$id_.pdf.tsx"), "utf8");
+  check(
+    "the invoice PDF is served by a resource route with a loader",
+    invoicePdfRoute.includes("export async function loader") &&
+      !invoicePdfRoute.includes("export async function action")
+  );
+  check(
+    "and that route requires the finance permission the page does",
+    /requirePermission\(request, "finance\.view"\)/.test(invoicePdfRoute)
+  );
+  check(
+    "and it sets the filename from the invoice number, never from the request",
+    /Content-Disposition": `attachment; filename="\$\{invoice\.number\}\.pdf/.test(invoicePdfRoute)
+  );
+
+  const invoicePage = readFileSync(join(process.cwd(), "app/routes/admin.invoices_.$id.tsx"), "utf8");
+  check(
+    "the invoice page LINKS to the PDF rather than POSTing for it",
+    invoicePage.includes("/pdf`}") && !invoicePage.includes('intent" value="pdf"')
+  );
+
+  const statementRoute = readFileSync(
+    join(process.cwd(), "app/routes/admin.customers_.$id_.statement[.]pdf.tsx"),
+    "utf8"
+  );
+  check(
+    "the statement PDF is a resource route too, for the same reason",
+    statementRoute.includes("export async function loader") &&
+      !statementRoute.includes("export async function action")
+  );
+
+  /* ------------------------------------------------------------------ */
+  /* 10. Tenant isolation                                                */
   /* ------------------------------------------------------------------ */
 
   const otherShop = `verify-accounting-other-${SUFFIX}.myshopify.com`;
@@ -659,7 +711,7 @@ async function main() {
   await prisma.seller.delete({ where: { id: other.id } });
 
   /* ------------------------------------------------------------------ */
-  /* 10. What an invoice costs the customer to read                       */
+  /* 11. What an invoice costs the customer to read                       */
   /* ------------------------------------------------------------------ */
 
   const billTo = await billToFor(prisma, seller.id);

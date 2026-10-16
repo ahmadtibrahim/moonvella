@@ -27,7 +27,6 @@ import {
   voidInvoice,
 } from "~/services/invoicing.server";
 import { money } from "~/utils/money";
-import { renderInvoicePdf } from "~/services/invoicePdf.server";
 import { formatDate, formatDateTime } from "~/utils/dates";
 
 export async function loader({ request, params }: LoaderFunctionArgs) {
@@ -176,24 +175,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
       return { ok: `${voided.number} voided.` };
     }
 
-    if (intent === "pdf") {
-      const loaded = await prisma.invoice.findUnique({
-        where: { id: invoiceId },
-        include: { lines: { orderBy: { sortOrder: "asc" } }, allocations: true, credits: true },
-      });
-      if (!loaded) return { error: "Invoice not found." };
-      const position = invoicePosition(loaded, loaded.allocations, loaded.credits);
-      const pdf = await renderInvoicePdf({ invoice: loaded, lines: loaded.lines, position, kind: "invoice" });
-      return new Response(new Uint8Array(pdf), {
-        headers: {
-          "Content-Type": "application/pdf",
-          "Content-Disposition": `attachment; filename="${loaded.number}.pdf"`,
-          // A billing document must not sit in a shared cache.
-          "Cache-Control": "private, no-store",
-        },
-      });
-    }
-
     return { error: "Unknown action." };
   } catch (error) {
     return { error: error instanceof Error ? error.message : "That action failed." };
@@ -264,12 +245,15 @@ export default function AdminInvoiceDetail() {
             {invoice.dueDate ? ` · due ${formatDate(invoice.dueDate)}` : " · no payment term agreed"}
           </p>
         </div>
-        <Form method="post">
-          <input type="hidden" name="intent" value="pdf" />
-          <button type="submit" className="mv-button mv-button-dark" disabled={busy}>
-            Download PDF
-          </button>
-        </Form>
+        {/*
+          A LINK, NOT A FORM. The PDF is served by its own resource route — see
+          `admin.invoices_.$id_.pdf.tsx` for why returning it from this page's
+          action produced a 500 — so this navigates rather than posting, and the
+          browser handles the download.
+        */}
+        <a className="mv-button mv-button-dark" href={`/admin/invoices/${invoice.id}/pdf`}>
+          Download PDF
+        </a>
       </div>
 
       {actionData && "error" in actionData && actionData.error ? (
