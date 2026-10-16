@@ -90,7 +90,26 @@ const ALLOWED: Record<OrderState, readonly OrderState[]> = {
     "CANCELLED",
     "REFUND_REVIEW",
   ],
-  PAYMENT_FAILED: ["PAYMENT_PROCESSING", "PAID", "PAYMENT_ACTION_REQUIRED", "CANCELLED"],
+  /*
+   * PAYMENT_FAILED IS NOT A DEAD END, AND "WAITING FOR THE SELLER AGAIN" IS A
+   * REAL PLACE TO GO BACK TO.
+   *
+   * The edge to AWAITING_SELLER_PAYMENT is what lets a failure be CLEARED once
+   * it is understood. Without it there was no way to say "that attempt was not
+   * a failure at all" — which is exactly what happened to order #1005, where a
+   * store's manual-payment policy was recorded as a decline and the order could
+   * not then be returned to the state that was true. An operator clearing a
+   * failure and a correction of a mis-recorded one both need this edge, and
+   * both should reach it through `transitionOrder` rather than by writing the
+   * column, so the move leaves a transition row and an audit entry behind.
+   */
+  PAYMENT_FAILED: [
+    "PAYMENT_PROCESSING",
+    "PAID",
+    "PAYMENT_ACTION_REQUIRED",
+    "AWAITING_SELLER_PAYMENT",
+    "CANCELLED",
+  ],
   PAID: ["READY_FOR_FULFILLMENT", "CANCELLED", "REFUND_REVIEW"],
   READY_FOR_FULFILLMENT: ["FULFILLMENT_REQUESTED", "IN_FULFILLMENT", "CANCELLED", "REFUND_REVIEW"],
   FULFILLMENT_REQUESTED: ["IN_FULFILLMENT", "CANCELLED", "REFUND_REVIEW"],
