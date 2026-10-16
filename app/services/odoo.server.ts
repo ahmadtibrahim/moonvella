@@ -289,6 +289,25 @@ export class OdooWriteBlockedError extends OdooError {
 }
 
 /**
+ * The connection is switched off, so nothing was sent — not even a read.
+ *
+ * A distinct error from `OdooNotConfiguredError` because the repair is
+ * different: one is "there is nothing to connect with", this is "you switched
+ * this off". An operator who saw "not configured" would re-enter credentials
+ * that are already stored and still be switched off.
+ */
+export class OdooDisabledError extends OdooError {
+  constructor() {
+    super(
+      "The Odoo connection is switched off, so no request was sent. " +
+        "The saved credentials are kept; set the mode to readonly or live on the Integrations page to use them.",
+      "DISABLED",
+    );
+    this.name = "OdooDisabledError";
+  }
+}
+
+/**
  * Guard 1. Called before authentication on every request path, so an
  * accidental Prod-db configuration fails before a single byte is sent.
  */
@@ -364,6 +383,31 @@ async function callOdoo(
   args: unknown[],
   config: OdooConfig,
 ): Promise<unknown> {
+  /*
+   * DISABLED MEANS NO CALLS AT ALL — NOT "NO WRITES".
+   *
+   * This is the only place in the app that sends an Odoo request: `executeKw`,
+   * the authentication and version probes and the health check all funnel
+   * through here. So this is the one place that has to be right, and gating it
+   * here rather than in each caller is what makes "disabled" checkable rather
+   * than a claim.
+   *
+   * WHAT IT USED TO MEAN. The mode gated the WRITE permit only, so a
+   * switched-off connection still ran `search_read` against the ERP — the
+   * catalogue sync, the import and the health probe all kept reading a
+   * production database while the owner's screen said the connection was off.
+   * The owner's instruction is explicit: disabled makes no Odoo network calls,
+   * reads and health checks included.
+   *
+   * The mode is re-resolved rather than passed in, deliberately. A caller that
+   * holds a stale config — one resolved before an operator switched the mode
+   * off — must not be able to send on it, and this is the last moment at which
+   * that can be decided.
+   */
+
+  const mode = await odooMode();
+  if (mode === "disabled") throw new OdooDisabledError();
+
   const envelope: JsonRpcEnvelope = {
     jsonrpc: "2.0",
     method: "call",

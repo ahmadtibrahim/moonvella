@@ -655,6 +655,64 @@ async function main() {
     } finally {
       globalThis.fetch = rpcFetch;
     }
+
+    /* ---------------------------------------------------------------- */
+    /* 13. DISABLED MEANS NO ODOO REQUEST AT ALL.                         */
+    /*                                                                    */
+    /* The mode used to gate the WRITE permit only, so a switched-off      */
+    /* connection still ran `search_read` against the ERP — the catalogue  */
+    /* sync, the import and the health probe all kept reading a production */
+    /* database while the owner's screen said the connection was off. That */
+    /* was a sentence about the deployment, not a property of it.          */
+    /*                                                                    */
+    /* This is the check that makes it a property. `fetch` is replaced by  */
+    /* one that COUNTS and then throws, so a request that should not have  */
+    /* been sent cannot be mistaken for one that succeeded, and the final  */
+    /* assertion is about the count rather than about any outcome — the    */
+    /* only way to prove a negative is to watch the wire.                  */
+    /* ---------------------------------------------------------------- */
+    await clearOdooStore();
+    configureOdoo({ ODOO_URL: "https://odoo.invalid", ODOO_MODE: "disabled" });
+
+    let sent = 0;
+    const countingFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      sent += 1;
+      throw new Error("An Odoo request was sent while the connection is disabled.");
+    }) as typeof globalThis.fetch;
+    try {
+      let readRefusedLocally = false;
+      try {
+        await odoo.searchRead("res.partner", [], ["id"]);
+      } catch (error) {
+        readRefusedLocally =
+          error instanceof Error && /switched off|disabled/i.test(error.message);
+      }
+      check(
+        "a READ is refused locally while disabled",
+        readRefusedLocally,
+        readRefusedLocally ? "" : "the read did not report a disabled connection",
+      );
+
+      const probe = await odoo.testOdooConnection();
+      check("the connection probe reports not-ok while disabled", probe.ok === false);
+
+      const { checkIntegration: health2 } = await import("~/services/integrationHealth.server");
+      const disabledHealth = await health2("odoo");
+      check(
+        "the health check reports DISABLED without calling out",
+        disabledHealth.status === "DISABLED",
+        `status=${disabledHealth.status}`,
+      );
+
+      check(
+        "NOT ONE Odoo request was sent while disabled",
+        sent === 0,
+        `requests sent=${sent}`,
+      );
+    } finally {
+      globalThis.fetch = countingFetch;
+    }
   } finally {
     /* ------------------------------------------------------------------ */
     /* Restore whatever the clone had before this suite ran.               */

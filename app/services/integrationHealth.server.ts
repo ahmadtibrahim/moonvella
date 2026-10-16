@@ -560,42 +560,55 @@ export async function checkIntegration(
       };
     }
     case "odoo": {
-      // A real authentication, matching how Stripe and eShipper are probed. It
-      // reads no record and posts nothing: `common.authenticate` and
-      // `common.version` are the only calls it makes. "The four fields are set"
-      // is a much weaker fact than "Odoo accepted them", and only the second may
-      // be shown as Connected.
-      const { testOdooConnection } = await import("./odoo.server");
-      const result = await testOdooConnection();
+      /*
+       * THE MODE IS READ BEFORE ANY PROBE, BECAUSE "DISABLED" MEANS THE PROBE
+       * MUST NOT HAPPEN EITHER.
+       *
+       * The health check used to authenticate unconditionally, so a connection
+       * the owner had switched off was still being called every time this row
+       * was drawn. Reading the mode first is what makes "no Odoo network calls"
+       * true of the health check as well as of the workflows, and it is why
+       * this branch does not simply call `testOdooConnection` and inspect the
+       * answer — by then the request has already gone out.
+       */
+      const { odooMode, odooConfigured, testOdooConnection } = await import("./odoo.server");
+      const [mode, configured] = await Promise.all([odooMode(), odooConfigured()]);
+
+      if (!configured) {
+        return { status: "NOT_CONFIGURED", detail: DEFAULTS.odoo.message, error: null };
+      }
 
       /*
        * A SWITCHED-OFF CONNECTION IS NOT "CONNECTED — VERIFIED".
        *
-       * `result.ok` answers "did Odoo accept the credentials", and it is set
-       * from the authentication call alone. The mode was written into the
-       * sentence below but never gated the status, so an integration the owner
-       * had deliberately switched off still reported HEALTHY — and HEALTHY is
-       * what the badge renders as "CONNECTED — VERIFIED". The row said
-       * "MoonVella is in disabled mode" and the badge beside it said Connected,
-       * about the same integration, on the same screen.
+       * The status used to come from the authentication result alone, so an
+       * integration the owner had deliberately switched off reported HEALTHY —
+       * and HEALTHY is what the badge renders as "CONNECTED — VERIFIED". The row
+       * said "MoonVella is in disabled mode" and the badge beside it said
+       * Connected, about the same integration, on the same screen.
        *
        * The credentials surviving is not a contradiction and must not be
-       * presented as one: they are kept on purpose, the connection is still
-       * verifiable, and the mode is the thing that changed. So the status
-       * reports the mode, and the detail says which half is off.
+       * presented as one: they are kept on purpose and the mode is the thing
+       * that changed. So the status reports the mode, and the detail says which
+       * half is off — and says nothing was sent, which is now true.
        */
-      if (result.ok && result.mode === "disabled") {
+      if (mode === "disabled") {
         return {
           status: "DISABLED",
           detail: [
-            `The Odoo connection is switched off. Credentials for "${result.database}" are still saved`,
-            "and are kept deliberately; nothing is written to the ERP.",
-            "Writes are refused because the mode is disabled — this is a choice, not a configuration gap.",
+            "The Odoo connection is switched off, so no request was sent — not even a read.",
+            "The saved credentials are kept deliberately; this is a setting, not a configuration gap.",
             "To use Odoo again, set the mode on the Integrations page.",
           ].join(" "),
           error: null,
         };
       }
+
+      // Only now, with the mode permitting calls, is the provider probed. A real
+      // authentication, matching how Stripe and eShipper are probed: it reads no
+      // record and posts nothing, and "the four fields are set" is a much weaker
+      // fact than "Odoo accepted them".
+      const result = await testOdooConnection();
 
       if (result.ok) {
         return {
