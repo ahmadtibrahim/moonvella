@@ -728,6 +728,35 @@ async function refusalsAgainstRows() {
   const order = await prisma.order.findUniqueOrThrow({ where: { id: handedRow.orderId } });
   check("...and the order follows to SHIPPED", order.fulfillmentStatus === "SHIPPED", order.fulfillmentStatus);
 
+  /*
+   * THE HANDOFF SCHEDULES NO ACCOUNTING WORK.
+   *
+   * The carrier handoff used to queue an ODOO_INVOICE_SYNC job as well as the
+   * Shopify push, so a parcel leaving the dock created an ERP invoice. That is
+   * gone: MoonVella keeps customer accounting in app-owned records. Asserted
+   * against the JOBS TABLE rather than against the source, because the failure
+   * this guards is a job being queued by some other path — a source check would
+   * stay green while a second enqueue site did the write.
+   *
+   * The Shopify push is asserted to still be queued beside it, so this cannot
+   * pass by the handoff having stopped queueing anything at all.
+   */
+  const jobsAfterHandoff = await prisma.backgroundJob.findMany({
+    where: { sellerId: order.sellerId },
+    select: { kind: true },
+  });
+  const kinds = jobsAfterHandoff.map((j) => j.kind);
+  check(
+    "the handoff schedules NO Odoo accounting job",
+    !kinds.some((k) => k.startsWith("ODOO_")),
+    kinds.filter((k) => k.startsWith("ODOO_")).join(", ") || "none",
+  );
+  check(
+    "…while the Shopify push it is still responsible for IS queued",
+    kinds.includes("SHOPIFY_FULFILLMENT_SYNC"),
+    kinds.join(", "),
+  );
+
   let secondHandoff = "";
   try {
     await advanceShipment(booked.id, "handed_to_carrier", ACTOR);

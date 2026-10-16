@@ -40,18 +40,6 @@ async function shiftAccess(tx: Tx, sellerId: string, reason: string) {
   await cancelPendingJobsForSeller(sellerId, reason, tx);
 }
 
-/** Queue the Odoo contact sync for a seller whose access is (again) approved. */
-async function queueContactSync(tx: Tx, sellerId: string, accessVersion: number) {
-  await enqueueJob({
-    kind: JOB_KIND.ODOO_CONTACT_SYNC,
-    idempotencyKey: jobKey(JOB_KIND.ODOO_CONTACT_SYNC, sellerId),
-    sellerId,
-    sellerAccessVersion: accessVersion,
-    payload: { sellerId },
-    db: tx,
-  });
-}
-
 function sellerDataFromApplication(application: {
   shopDomain: string;
   storeName: string;
@@ -152,12 +140,10 @@ export async function approveApplication(
       },
     });
 
-    // The seller's access has just changed, so work queued under the old
-    // version is cleared and the sync that an approved store needs is queued
-    // under the new one — in the same transaction that granted the access, so
-    // there is no window in which the store is approved with nothing queued.
+    // The seller's access has changed, so work queued under the old version is
+    // cleared. Nothing accounting-shaped is queued in its place: approving a
+    // store used to also create an ERP customer record, and that write is gone.
     await shiftAccess(tx, seller.id, "The application was approved again.");
-    await queueContactSync(tx, seller.id, seller.accessVersion);
 
     await recordAudit(
       {
@@ -472,9 +458,6 @@ export async function unblockSeller(sellerId: string, actor: ActorInput) {
     // from their own tools, not something a status change performs.
     await shiftAccess(tx, seller.id, "The store was unblocked.");
 
-    if (restored === "APPROVED") {
-      await queueContactSync(tx, seller.id, seller.accessVersion);
-    }
 
     if (seller.applicationId) {
       await tx.merchantApplication.update({
@@ -637,7 +620,6 @@ export async function reactivateSeller(sellerId: string, actor: ActorInput) {
     });
 
     await shiftAccess(tx, seller.id, "The seller was reactivated.");
-    await queueContactSync(tx, seller.id, seller.accessVersion);
 
     if (seller.applicationId) {
       await tx.merchantApplication.update({

@@ -2,7 +2,6 @@ import { useLoaderData, useActionData, useNavigation, Link, Form } from "react-r
 import { requireMerchantAccess, withMerchantAccess, AccessError } from "../services/seller.server";
 import { prisma } from "../db.server";
 import { recordAudit, AUDIT_ENTITY } from "../services/audit.server";
-import { JOB_KIND, enqueueJob, jobKey } from "../services/jobs.server";
 import { AUTO_SYNC_DESCRIPTION } from "../utils/inventorySync";
 
 export const loader = async ({ request }) =>
@@ -146,33 +145,10 @@ async function saveContactDetails(context, form) {
     afterData: { name, email, phone: phone || null, urgentName: urgentName || null, urgentPhone: urgentPhone || null },
   });
 
-  // The Odoo contact is only written for a store that has been approved, so
-  // the queue entry is only useful there. Before approval the change is simply
-  // recorded; approval queues a sync that reads the current values, so nothing
-  // is lost by not queueing one now. Queueing one for a pending store would
-  // have the runner create an Odoo partner for a company nobody has approved.
-  let queued = false;
-  if (seller.status === "APPROVED") {
-    const current = await prisma.seller.findUnique({
-      where: { id: seller.id },
-      select: { accessVersion: true },
-    });
-    await enqueueJob({
-      kind: JOB_KIND.ODOO_CONTACT_SYNC,
-      idempotencyKey: jobKey(JOB_KIND.ODOO_CONTACT_SYNC, seller.id),
-      sellerId: seller.id,
-      sellerAccessVersion: current?.accessVersion ?? 1,
-      payload: { sellerId: seller.id },
-    });
-    queued = true;
-  }
-
-  return {
-    ok: true,
-    message: queued
-      ? "Contact details saved. The Odoo contact will be updated shortly."
-      : "Contact details saved.",
-  };
+  // A contact change is recorded here and nowhere else. It used to also queue
+  // an ERP customer update; there is no ERP customer any more, so the saved
+  // values are the record and the audit row above is the history of them.
+  return { ok: true, message: "Contact details saved." };
 }
 
 export const action = async ({ request }) => {

@@ -106,8 +106,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
       await unblockSeller(id, actor);
     } else if (intent === "deactivate") {
       await deactivateSeller(id, actor, reason || "Deactivated by owner");
-    } else if (intent === "retry-contact-sync") {
-      await retryContactSync(id);
     } else if (intent === "retry-archives") {
       await retryArchives(id);
     } else {
@@ -118,30 +116,6 @@ export async function action({ request, params }: ActionFunctionArgs) {
   }
 
   return redirect(`/admin/stores/${id}?done=${intent}`);
-}
-
-/**
- * Queue the contact sync again, at the owner's request.
- *
- * The job carries the seller's CURRENT access version. Queueing it with a stale
- * one would be self-defeating: the runner cancels jobs whose version no longer
- * matches, so the retry would be refused before it ran and look like the button
- * does nothing.
- */
-async function retryContactSync(sellerId: string) {
-  const seller = await prisma.seller.findUnique({
-    where: { id: sellerId },
-    select: { accessVersion: true },
-  });
-  if (!seller) throw new Error("Seller not found");
-
-  await enqueueJob({
-    kind: JOB_KIND.ODOO_CONTACT_SYNC,
-    idempotencyKey: jobKey(JOB_KIND.ODOO_CONTACT_SYNC, sellerId),
-    sellerId,
-    sellerAccessVersion: seller.accessVersion,
-    payload: { sellerId },
-  });
 }
 
 /** Re-queue the archives that failed, then let the runner pick them up. */
@@ -169,7 +143,6 @@ const DONE_MESSAGES: Record<string, string> = {
   suspend: "Store suspended. It keeps its history and its orders are unaffected.",
   deactivate:
     "Store deactivated. Approved access is revoked, the application is shown to the store again, and its orders and accounting history are untouched.",
-  "retry-contact-sync": "Contact sync queued. It will run on the next tick of the job runner.",
   "retry-archives": "Failed archives queued again. They will run on the next tick of the job runner.",
   reactivate: "Store activated. It can sign in and order again.",
   block:
@@ -824,11 +797,6 @@ export default function AdminStoreDetail() {
           </div>
         ) : null}
 
-        <Form method="post">
-          <button type="submit" name="intent" value="retry-contact-sync" style={btn("#1d4ed8")}>
-            Sync contact now
-          </button>
-        </Form>
       </div>
 
       <div style={card}>

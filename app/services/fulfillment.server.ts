@@ -122,18 +122,11 @@ export async function addManualShipment(orderId: string, input: ShipmentInput, a
   }
 
   /*
-   * The same handoff milestone as `advanceShipment`'s: a manual shipment is
-   * created already dispatched, so the seller's paid invoice is written from
-   * here too — queued (never inline), and keyed per order so a later box or a
-   * manual Retry collapses into the one job.
+   * NO ACCOUNTING DOCUMENT IS CREATED BY A HANDOVER. Customer accounting is
+   * MoonVella's own, kept in app-owned records; nothing is written to the ERP
+   * when a parcel leaves, and no job is queued to do so later. A handover is a
+   * physical event and must never depend on, or wait for, accounting.
    */
-  await enqueueJob({
-    kind: JOB_KIND.ODOO_INVOICE_SYNC,
-    idempotencyKey: jobKey(JOB_KIND.ODOO_INVOICE_SYNC, order.sellerId, order.id),
-    sellerId: order.sellerId,
-    sellerAccessVersion: order.seller.accessVersion,
-    payload: { orderId: order.id },
-  });
 
   return { shipment, shopify };
 }
@@ -271,21 +264,10 @@ export async function advanceShipment(
       });
     }
     /*
-     * THE INVOICE MILESTONE rides the same moment, UNCONDITIONALLY — unlike the
-     * Shopify push above, there is no "already done" case to check here, and
-     * the work is queued rather than run inline so an unreachable Odoo cannot
-     * fail a handoff that has already physically happened. Keyed per ORDER,
-     * not per shipment: a second box on the same order and the manual Retry on
-     * the order page collapse into the one job, and the work itself adopts the
-     * invoice already linked instead of making a second one.
+     * NO ACCOUNTING DOCUMENT IS CREATED BY A HANDOVER. See the note on the
+     * manual-shipment path above: the handover queues the Shopify push and
+     * nothing else.
      */
-    await enqueueJob({
-      kind: JOB_KIND.ODOO_INVOICE_SYNC,
-      idempotencyKey: jobKey(JOB_KIND.ODOO_INVOICE_SYNC, order.sellerId, order.id),
-      sellerId: order.sellerId,
-      sellerAccessVersion: order.seller.accessVersion,
-      payload: { orderId: order.id },
-    });
   }
 
   return shipment;

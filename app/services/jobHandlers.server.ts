@@ -9,7 +9,6 @@
  */
 
 import { JOB_KIND, PermanentJobError, type JobHandler } from "./jobs.server";
-import { runContactSyncJob } from "./odooContacts.server";
 import { archiveSellerProducts } from "./productArchive.server";
 import { importOdooProducts } from "./odooImport.server";
 import { syncOdooCatalog } from "./odooSync.server";
@@ -25,7 +24,6 @@ import {
 } from "./shopifyFulfillment.server";
 import { ensureOrderWebhookSubscriptions, ensureAppWebhookSubscriptions } from "./shopifyWebhooks.server";
 import { transitionOrder, MONEY_CLEARED } from "./orderState.server";
-import { createOdooInvoiceForOrder } from "./odooInvoice.server";
 import { prisma } from "~/db.server";
 import type { BackgroundJob } from "@prisma/client";
 
@@ -52,26 +50,27 @@ export const jobHandlers: Record<string, JobHandler> = {
    * than deciding identity again; and each payload's fingerprint is compared
    * with the last one written, so an unchanged re-run issues no write at all.
    */
+  /*
+   * THE CONTACT SYNC IS NO LONGER PART OF THE ACTIVE WORKFLOW.
+   *
+   * Approving, unblocking or reactivating a store used to queue this job, which
+   * created an ERP customer record. Those enqueue sites are gone, and this
+   * refusal is the other half of the same removal: a job that was already
+   * queued, a retry an operator triggered before the deploy, or a replay can
+   * still arrive here, and none of them may restore a write the workflow no
+   * longer performs.
+   *
+   * A PermanentJobError rather than a plain throw, deliberately. A transient
+   * failure would be retried to the attempt limit and would read as a provider
+   * problem; this is a conclusion, so it is recorded once on the job, with the
+   * reason, and never retried.
+   */
   [JOB_KIND.ODOO_CONTACT_SYNC]: async (job) => {
-    const sellerId = sellerIdFor(job);
-    // A failure that needs a person arrives as a ContactSyncBlockedError, which
-    // the runner recognises as final: the reason it carries is stored on the job
-    // and shown to the owner, so the queue is never the only place it exists.
-    const result = await runContactSyncJob(sellerId);
-    return {
-      summary:
-        `Odoo contact ${result.companyOutcome.toLowerCase()} (partner ${result.companyPartnerId})` +
-        (result.contactPartnerId ? `, contact ${result.contactPartnerId}` : ", no contact person") +
-        (result.urgentPartnerId ? `, urgent contact ${result.urgentPartnerId}` : ""),
-      detail: {
-        companyPartnerId: result.companyPartnerId,
-        companyOutcome: result.companyOutcome,
-        contactPartnerId: result.contactPartnerId,
-        urgentPartnerId: result.urgentPartnerId,
-        tagId: result.tagId,
-        unresolved: result.unresolved,
-      },
-    };
+    throw new PermanentJobError(
+      "Job " + job.id + " (" + job.kind + ") refused: MoonVella no longer writes " +
+        "customer records to Odoo. Accounting is app-owned; this job is kept as " +
+        "history and will not run."
+    );
   },
 
   /**
@@ -342,45 +341,26 @@ export const jobHandlers: Record<string, JobHandler> = {
     };
   },
 
-  /**
-   * Create — or refresh — the order's DRAFT Odoo invoice.
+  /*
+   * THE HANDOFF INVOICE IS REMOVED FROM THE ACTIVE WORKFLOW.
    *
-   * There is no early return here on purpose. The pipeline's own link guard is
-   * the whole idempotency story: a linked DRAFT gets the shipment's facts
-   * refreshed in place (a retry after a tracking update must reach that path),
-   * and a linked invoice a person has already posted is reported and left
-   * untouched. Skipping a "linked" order here would silently drop the refresh.
+   * Carrier handoff used to queue this job, and the order page carried a button
+   * that queued the same work by hand. Both are gone: MoonVella keeps customer
+   * accounting in app-owned records, and no individual store invoice is written
+   * to the ERP.
+   *
+   * `odooInvoice.server.ts` is left in place, unreferenced by the workflow, so
+   * the pipeline's own behaviour stays covered by its suite rather than being
+   * deleted along with its callers. What cannot happen is this handler running:
+   * a job left over from before the deploy, an operator retry, or a replay all
+   * arrive here and are refused, permanently, with the reason recorded.
    */
   [JOB_KIND.ODOO_INVOICE_SYNC]: async (job) => {
-    const orderId = (job.payload as { orderId?: unknown } | null)?.orderId;
-    if (typeof orderId !== "string" || !orderId) {
-      throw new PermanentJobError(
-        `Job ${job.id} (${job.kind}) carries no orderId, so there is nothing to invoice.`,
-      );
-    }
-
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      select: { id: true },
-    });
-    if (!order) {
-      throw new PermanentJobError(`Order ${orderId} no longer exists.`);
-    }
-
-    const outcome = await createOdooInvoiceForOrder(orderId, {
-      actorType: "SYSTEM",
-      actorId: `job:${job.id}`,
-      actorName: "Background job (Odoo invoice sync)",
-    });
-
-    const name = outcome.odooInvoiceName ?? String(outcome.odooInvoiceId);
-    const summary =
-      outcome.status === "CREATED"
-        ? `Odoo draft invoice ${name} created${outcome.shipment ? " with the shipment's details" : ""}.`
-        : outcome.status === "UPDATED"
-          ? `Odoo draft invoice ${name} already existed; the shipment's details were refreshed.`
-          : `Odoo invoice ${name} is already posted in Odoo; left untouched.`;
-    return { summary, detail: { ...outcome } };
+    throw new PermanentJobError(
+      "Job " + job.id + " (" + job.kind + ") refused: MoonVella no longer writes " +
+        "invoices to Odoo and no handoff queues one. This job is kept as history " +
+        "and will not run."
+    );
   },
 
   /**

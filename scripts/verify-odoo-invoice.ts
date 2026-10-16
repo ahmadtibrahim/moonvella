@@ -1103,41 +1103,67 @@ async function main() {
 
     const jobsSource = readStripped("app/services/jobs.server.ts");
     const handlersSource = readStripped("app/services/jobHandlers.server.ts");
+    /*
+     * THE WIRING IS NOW ASSERTED AS SEVERED, WHICH IS THE SAME COVERAGE READ
+     * THE OTHER WAY.
+     *
+     * The pipeline itself is still exercised above, against the stub — that is
+     * why `odooInvoice.server.ts` is kept rather than deleted. What these
+     * checks are for is the part that decides whether it ever RUNS, and the
+     * answer must now be no from every direction: no enqueue site, no handler
+     * that reaches it, no control on the page that asks for it. A suite that
+     * only tested the pipeline would stay green while the workflow was quietly
+     * reconnected, which is exactly the failure mode this guards.
+     */
     check(
-      "the ODOO_INVOICE_SYNC job kind exists and its handler calls the pipeline",
+      "the ODOO_INVOICE_SYNC handler exists but REFUSES rather than calling the pipeline",
       /\bODOO_INVOICE_SYNC\b/.test(jobsSource) &&
-        handlersSource.includes("createOdooInvoiceForOrder") &&
-        handlersSource.includes("JOB_KIND.ODOO_INVOICE_SYNC"),
-    );
-    check(
-      "the handler has no early return — a linked order must reach the refresh path",
-      !handlersSource.includes("odooInvoiceEmailSentAt"),
+        handlersSource.includes("JOB_KIND.ODOO_INVOICE_SYNC") &&
+        !handlersSource.includes("createOdooInvoiceForOrder") &&
+        /PermanentJobError/.test(handlersSource),
     );
 
     const fulfillmentSource = readStripped("app/services/fulfillment.server.ts");
-    // One enqueue per handoff path: the fulfillment milestone and a manually
-    // added shipment. Counted as enqueue sites rather than as raw occurrences,
-    // because each site names the kind twice (kind + idempotency key).
+    // Counted as enqueue sites rather than as raw occurrences, because a site
+    // would name the kind twice (kind + idempotency key).
     const invoiceEnqueueSites = fulfillmentSource
       .split("enqueueJob(")
       .filter((segment) => segment.includes("ODOO_INVOICE_SYNC")).length;
     check(
-      "both handoff paths queue the invoice job (milestone and manual shipment)",
-      invoiceEnqueueSites === 2,
+      "NO handoff path queues an accounting job",
+      invoiceEnqueueSites === 0,
       `${invoiceEnqueueSites} enqueue site(s)`,
+    );
+    check(
+      "…and no handoff path queues an Odoo customer sync either",
+      !fulfillmentSource.includes("ODOO_CONTACT_SYNC"),
+    );
+
+    const appSource = readStripped("app/services/application.server.ts");
+    check(
+      "approving, unblocking and reactivating a store queue no Odoo contact sync",
+      !appSource.includes("ODOO_CONTACT_SYNC"),
     );
 
     const routeSource = readStripped("app/routes/admin.orders_.$id.tsx");
     check(
-      "the order page offers the manual create/refresh action",
-      routeSource.includes('"create_odoo_invoice"') &&
-        routeSource.includes("createOdooInvoiceForOrder"),
+      "the order page no longer offers the manual create/refresh action",
+      !routeSource.includes("create_odoo_invoice") &&
+        !routeSource.includes("createOdooInvoiceForOrder"),
     );
     check(
-      "the order page shows the last-synced state and links out to Odoo",
-      routeSource.includes("odooInvoiceState") &&
-        routeSource.includes("Open in Odoo") &&
-        routeSource.includes("odooWebBaseUrl"),
+      "the order page no longer shows an Odoo invoice panel or links out to Odoo",
+      !routeSource.includes("odooInvoiceState") &&
+        !routeSource.includes("Open in Odoo") &&
+        !routeSource.includes("odooWebBaseUrl"),
+    );
+    check(
+      "the retailer's contact-save no longer queues an Odoo update",
+      !readStripped("app/routes/app.settings.jsx").includes("ODOO_CONTACT_SYNC"),
+    );
+    check(
+      "the owner's store page no longer offers a contact-sync button",
+      !readStripped("app/routes/admin.stores_.$id.tsx").includes("retry-contact-sync"),
     );
     check(
       "the page no longer claims anything is posted, paid or emailed automatically",
