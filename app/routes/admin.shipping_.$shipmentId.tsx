@@ -264,7 +264,37 @@ const PICKUP_MODE_LABEL: Record<string, string> = {
 const RETURN_PAYERS: ReturnShippingPayer[] = ["UNDECIDED", "MOONVELLA", "SELLER", "CUSTOMER", "CARRIER"];
 const CLAIM_TYPES: ShippingClaimType[] = ["LOST", "DAMAGED", "SHORTAGE", "DELIVERY_ISSUE", "OTHER"];
 
+/** The query keys the shipping list uses, in one place. */
+const LIST_FILTER_KEYS = [
+  "tab",
+  "status",
+  "carrier",
+  "seller",
+  "billing",
+  "q",
+  "from",
+  "to",
+  "origin",
+  "destination",
+  "tracking",
+  "pickup",
+  "syncErrors",
+] as const;
+
+
 export async function loader({ request, params }: LoaderFunctionArgs) {
+  /*
+   * The list's query string, passed through so the back link returns to the view
+   * the operator left. ALLOWLISTED rather than echoed: this value is
+   * interpolated into a URL a browser follows, and echoing an arbitrary query
+   * would let a crafted link put anything it liked into it.
+   */
+  const incoming = new URL(request.url).searchParams;
+  const returnQuery = new URLSearchParams(
+    LIST_FILTER_KEYS.filter((key) => incoming.get(key)).map((key) => [key, incoming.get(key)!])
+  ).toString();
+
+
   const user = await requirePermission(request, "shipping.view");
   const shipmentId = String(params.shipmentId);
   const shipment = await prisma.shipment.findUnique({
@@ -395,6 +425,7 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
   );
 
   return {
+    returnQuery,
     units,
     bookingParcels: {
       packages: bookingParcels.packages.map((p) => ({
@@ -1109,6 +1140,9 @@ function ProcessShipment({ shipment, paid, packages, selectedQuote, canBook, isO
 
 export default function AdminShipmentDetail() {
   const data = useLoaderData<typeof loader>();
+  // Carried back to the list so the operator lands on the tab and filters they
+  // left, rather than on an unfiltered first page.
+  const returnQuery = data.returnQuery;
   const actionData = useActionData<typeof action>();
   const { shipment, order, items, origin, originReason, quotes, returnQuotes, selectedQuote, billing, eshipper, shopifyFulfillment, trackingEvents, units, pickupPlan, bookingParcels, returnPurchasing, returnRequests, shippingClaims, isOwner, progress, dockIds, now } = data;
   const display = trackingDisplay(shipment.trackingStatus, shipment.status);
@@ -1167,7 +1201,18 @@ export default function AdminShipmentDetail() {
           </p>
         </div>
         <div className="mv-actions">
-          <Link to="/admin/shipping" className="mv-button">&larr; All shipments</Link>
+          {/*
+            BACK TO THE VIEW, NOT TO THE LIST.
+
+            The list hands its query string to this page on the way in, so this
+            returns the operator to the tab, filters and search they actually
+            left — which is what the work order asks for, and what makes a detail
+            page safe to open. A link that dumped them back at an unfiltered
+            first page would make checking one parcel cost the whole search.
+          */}
+          <Link to={`/admin/shipping${returnQuery ? `?${returnQuery}` : ""}`} className="mv-button">
+            &larr; All shipments
+          </Link>
           <Link to={`/admin/orders/${order.id}`} className="mv-button">Open order</Link>
         </div>
       </div>

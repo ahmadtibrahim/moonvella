@@ -13,6 +13,7 @@ import {
 import { acceptMigration, previewCatalogueMigration, reconcileInventory, runCatalogueMigration } from "~/services/inventoryMigration.server";
 import { inventoryReadiness, parseProblems } from "~/services/inventory.server";
 import { permissionsFor } from "~/services/permissions";
+import { formatDateTime } from "~/utils/dates";
 
 /*
  * PENDING_APPROVAL is absent on purpose. Nothing ever read it — there was no
@@ -251,7 +252,7 @@ export default function AdminProducts() {
               <div>
                 Last run: <strong>{data.inventory.preview.run.status}</strong>
                 {data.inventory.preview.run.completedAt
-                  ? ` · ${new Date(data.inventory.preview.run.completedAt).toLocaleString()}`
+                  ? ` · ${formatDateTime(new Date(data.inventory.preview.run.completedAt))}`
                   : ""}
                 {data.inventory.preview.run.reconciledAt ? " · reconciliation accepted" : ""}
               </div>

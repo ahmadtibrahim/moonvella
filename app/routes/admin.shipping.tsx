@@ -70,6 +70,82 @@ const PICKUP_FILTERS = [
   { value: "not_required", label: "Regular or drop-off" },
 ] as const;
 
+/**
+ * The tabs, which are the questions an operator actually arrives with.
+ *
+ * THEY ARE NOT A SECOND STATUS FILTER. "Needs booking" is not a status — it is
+ * "no label exists yet", which spans PENDING, BOOKING_FAILED and
+ * BOOKING_UNKNOWN. "Waiting for pickup" is "a label exists and the box is taped
+ * and the carrier has not collected it", which is a fact about two milestones
+ * and one status. Modelling them as tabs over those combinations is what makes
+ * the counts on the tabs add up to something a person can act on; a tab per
+ * enum value would be a schema with a nicer font.
+ *
+ * `needs_attention` is deliberately the union of everything that has gone wrong
+ * rather than a status of its own, because the question "what is stuck" has one
+ * answer regardless of which subsystem failed.
+ */
+const TABS = [
+  { value: "all", label: "All" },
+  { value: "needs_booking", label: "Needs booking" },
+  { value: "waiting_pickup", label: "Waiting for pickup" },
+  { value: "in_transit", label: "In transit" },
+  { value: "delivered", label: "Delivered" },
+  { value: "needs_attention", label: "Needs attention" },
+] as const;
+type TabValue = (typeof TABS)[number]["value"];
+
+/**
+ * A tab, as a WHERE clause.
+ *
+ * Written as a function so the TAB and the row's own affordances cannot drift:
+ * the same predicate that puts a parcel in "Needs booking" is what decides
+ * whether its Shipping label cell offers "Book shipping".
+ */
+function tabWhere(tab: TabValue): Record<string, unknown> | null {
+  switch (tab) {
+    case "all":
+      return null;
+    case "needs_booking":
+      // No provider identifier means no label, whatever the status word says.
+      // The status list is there because BOOKING_FAILED and BOOKING_UNKNOWN are
+      // the states a label-less parcel reaches after a try.
+      return {
+        providerShipmentId: null,
+        status: { in: ["PENDING", "BOOKING", "BOOKING_FAILED", "BOOKING_UNKNOWN"] },
+      };
+    case "waiting_pickup":
+      return {
+        status: "BOOKED",
+        packedAt: { not: null },
+        handedToCarrierAt: null,
+      };
+    case "in_transit":
+      return {
+        OR: [
+          { status: "SHIPPED" },
+          { trackingStatus: { in: ["PICKED_UP", "IN_TRANSIT", "OUT_FOR_DELIVERY"] } },
+        ],
+      };
+    case "delivered":
+      return { OR: [{ status: "DELIVERED" }, { trackingStatus: "DELIVERED" }] };
+    case "needs_attention":
+      return {
+        OR: [
+          { status: "EXCEPTION" },
+          { status: "BOOKING_FAILED" },
+          { status: "BOOKING_UNKNOWN" },
+          { trackingStatus: "EXCEPTION" },
+          { lastTrackingError: { not: null } },
+          { shopifySyncError: { not: null } },
+          { trackingSyncFailures: { gte: 3 } },
+        ],
+      };
+    default:
+      return null;
+  }
+}
+
 /** How a parcel is meant to leave the dock, in an operator's words. */
 const PICKUP_MODE_LABEL: Record<string, string> = {
   NEEDED: "Pickup needed",
@@ -93,6 +169,22 @@ const PICKUP_STATUS_BADGE: Record<string, string> = {
   MISSED: "mv-badge-warning",
   CANCELLED: "",
 };
+
+/**
+ * "Ottawa, ON" — a city and a two-letter province or state, which is what the
+ * work order asks the Destination column to show.
+ *
+ * IT FALLS BACK RATHER THAN GUESSING. An address with a city and no province
+ * shows the city; one with neither returns an em dash. Joining a missing half as
+ * an empty string would produce "Ottawa, " and one derived from a postcode would
+ * be a claim about a place nobody stated.
+ */
+function shortDestination(addr: Record<string, string>): string {
+  const city = (addr.city || "").trim();
+  const region = (addr.province || addr.provinceCode || "").trim();
+  const joined = [city, region].filter(Boolean).join(", ");
+  return joined || "—";
+}
 
 function parseAddress(raw: string | null): Record<string, string> {
   if (!raw) return {};
@@ -118,9 +210,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const tracking = url.searchParams.get("tracking") || "";
   const pickup = url.searchParams.get("pickup") || "";
   const syncErrors = url.searchParams.get("syncErrors") === "1";
+  const tabParam = url.searchParams.get("tab") || "all";
+  const tab: TabValue = (TABS.some((entry) => entry.value === tabParam) ? tabParam : "all") as TabValue;
   const page = Math.max(1, Number(url.searchParams.get("page") || "1"));
 
   const and: Record<string, unknown>[] = [];
+  // The tab is applied FIRST, so every count and every filter below is read in
+  // the context the operator chose rather than against the whole table.
+  const tabClause = tabWhere(tab);
+  if (tabClause) and.push(tabClause);
   if (STATUSES.includes(status as (typeof STATUSES)[number])) and.push({ status: status as never });
   // "Carrier/service" as one field, because an operator looking for a parcel
   // knows either the name on the truck ("UPS") or the product they bought
@@ -191,7 +289,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   }
   const where = and.length ? { AND: and } : {};
 
-  const [shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, eshipper] = await Promise.all([
+  const [shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, eshipper, tabCountRows] = await Promise.all([
     prisma.shipment.findMany({
       where,
       orderBy: { createdAt: "desc" },
@@ -201,6 +299,9 @@ export async function loader({ request }: LoaderFunctionArgs) {
         id: true,
         trackingNumber: true,
         trackingUrl: true,
+        // The provider's label document, so "Print label" is a real link rather
+        // than a second trip through the detail page.
+        labelUrl: true,
         carrier: true,
         serviceName: true,
         status: true,
@@ -307,7 +408,44 @@ export async function loader({ request }: LoaderFunctionArgs) {
     prisma.order.count({ where: { wholesalePaymentStatus: "SUCCEEDED", fulfillmentStatus: { in: ["PENDING", "PROCESSING", "PARTIAL"] } } }),
     // The host, not the boolean: see eshipperStatus.
     eshipperStatus(),
+    Promise.all(
+      TABS.map(async (entry) => {
+        const clause = tabWhere(entry.value);
+        return [entry.value, await prisma.shipment.count({ where: clause ?? {} })] as const;
+      })
+    ),
   ]);
+
+  const tabCounts = Object.fromEntries(tabCountRows) as Record<TabValue, number>;
+
+  /*
+   * "Shipment 2 of 3", for the ORDER rather than for the page.
+   *
+   * One extra query for the whole page: every shipment of every order that
+   * appears on it, oldest first. Derived from that list rather than from the
+   * page's own rows, because a split order whose second parcel is on a later
+   * page would otherwise read "1 of 1" — a claim about the order that is simply
+   * wrong, and wrong in the direction that makes an operator stop looking.
+   *
+   * Cancelled shipments are counted, not skipped: the customer's order really
+   * did have three parcels, one of which was voided, and hiding it would make
+   * the remaining two renumber themselves between two visits to this page.
+   */
+  const orderIds = [...new Set(shipments.map((row) => row.order.id))];
+  const siblingRows = orderIds.length
+    ? await prisma.shipment.findMany({
+        where: { orderId: { in: orderIds } },
+        select: { id: true, orderId: true },
+        orderBy: { createdAt: "asc" },
+      })
+    : [];
+  const shipmentNumber = new Map<string, { index: number; total: number }>();
+  for (const orderId of orderIds) {
+    const siblings = siblingRows.filter((row) => row.orderId === orderId);
+    siblings.forEach((row, position) => {
+      shipmentNumber.set(row.id, { index: position + 1, total: siblings.length });
+    });
+  }
 
   return {
     shipments,
@@ -327,7 +465,25 @@ export async function loader({ request }: LoaderFunctionArgs) {
      * request, which is how this was found.
      */
     eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
-    filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from, to, origin: originId, destination, tracking, pickup, syncErrors: syncErrors ? "1" : "" },
+    filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from, to, origin: originId, destination, tracking, pickup, syncErrors: syncErrors ? "1" : "", tab },
+    tab,
+    /*
+     * ONE COUNT PER TAB, computed from the tab's own predicate rather than from
+     * the filtered set. A tab that says "Needs booking (4)" and then shows two
+     * rows is worse than no count at all: it teaches the operator that the
+     * numbers on this page are decorative.
+     *
+     * These are counts over the WHOLE table, not the current filter. A badge
+     * that shrank when you typed into the search box would be answering a
+     * different question from the one its label asks.
+     */
+    tabCounts: tabCounts,
+    /*
+     * The index travels as a plain record rather than as a Map: a Map does not
+     * survive the loader's serialization to the browser, and a row that silently
+     * read `undefined` would print "Shipment NaN of 3".
+     */
+    shipmentNumber: Object.fromEntries(shipmentNumber),
     page,
     pageCount: Math.max(1, Math.ceil(total / PAGE_SIZE)),
   };
@@ -466,11 +622,46 @@ function shopifySync(shipment: {
 }
 
 export default function AdminShipping() {
-  const { shipments, total, delivered, pending, exceptions, sellers, origins, awaitingPrep, eshipper, filters, page, pageCount } =
-    useLoaderData<typeof loader>();
+  const {
+    shipments,
+    total,
+    delivered,
+    pending,
+    exceptions,
+    sellers,
+    origins,
+    awaitingPrep,
+    eshipper,
+    filters,
+    tab,
+    tabCounts,
+    shipmentNumber,
+    page,
+    pageCount,
+  } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const loading = navigation.state === "loading";
+
+  /*
+   * The list's own query string, minus the page number, carried on every link
+   * out of a row and back. The work order asks for filters to survive a trip
+   * through a detail page, and the way that actually works is for the list to
+   * hand its state to the detail rather than for the detail to guess it.
+   */
+  /*
+   * Whether anything is narrowing this table. Used to tell an empty result apart
+   * from an empty queue — see the panel below. The tab counts as a narrowing
+   * only when it is not "all", because "All" is the absence of a choice rather
+   * than a choice.
+   */
+  const hasFilters =
+    tab !== "all" ||
+    Object.entries(filters).some(([key, value]) => key !== "tab" && Boolean(value));
+
+  const listQuery = new URLSearchParams(
+    Object.entries(filters).filter(([key, value]) => Boolean(value) && key !== "page") as [string, string][]
+  ).toString();
 
   return (
     <div className="mv-page-wide">
@@ -501,7 +692,42 @@ export default function AdminShipping() {
         <div className="mv-stat"><span>Needs attention</span><strong>{exceptions}</strong></div>
       </div>
 
+      {/*
+        THE TABS, EACH A LINK RATHER THAN A BUTTON IN THE FORM BELOW.
+
+        A tab is a different question about the same table, so it belongs in the
+        URL where it can be shared, bookmarked and returned to — which is also
+        what "preserve filters when returning from details" needs: the detail
+        page links back to the exact query string that produced the row.
+
+        Each tab carries its count over the WHOLE table, not over the currently
+        filtered set. A badge that shrank as you typed into the search box would
+        be answering a different question from the one its label asks.
+      */}
+      <nav className="mv-workspace-nav" aria-label="Shipment queues">
+        {TABS.map((entry) => {
+          const params = new URLSearchParams();
+          for (const [key, value] of Object.entries(filters)) {
+            if (value && key !== "tab" && key !== "page") params.set(key, String(value));
+          }
+          if (entry.value !== "all") params.set("tab", entry.value);
+          const search = params.toString();
+          return (
+            <Link
+              key={entry.value}
+              to={`/admin/shipping${search ? `?${search}` : ""}`}
+              className={tab === entry.value ? "is-active" : ""}
+              aria-current={tab === entry.value ? "page" : undefined}
+            >
+              {entry.label} ({tabCounts[entry.value] ?? 0})
+            </Link>
+          );
+        })}
+      </nav>
+
       <Form method="get" className="mv-filter-bar">
+        {/* The tab survives a filter submit, so refining a tab keeps you in it. */}
+        <input type="hidden" name="tab" value={tab} />
         <label className="mv-field">
           Search
           <input className="mv-input" name="q" defaultValue={filters.q} placeholder="Order, shipment, tracking, seller" style={{ width: 240 }} />
@@ -607,11 +833,35 @@ export default function AdminShipping() {
           <div><h2>Shipment queue</h2><p>{total} shipments</p></div>
           <span className="mv-badge">Page {page} of {pageCount}</span>
         </div>
+        {/*
+          FIVE STATES, AND THEY ARE NOT THE SAME STATE.
+
+          "Nothing matches your filters" and "there are no shipments at all" look
+          identical in an empty table and mean opposite things: the first is a
+          search to widen, the second is a queue that has never had anything in
+          it — and telling somebody to clear filters that are already clear is
+          how a page teaches them to ignore its messages. Loading is its own
+          sentence so a slow query does not read as an empty result.
+        */}
         {loading ? (
-          <p className="mv-panel-body mv-muted">Loading shipments…</p>
+          <p className="mv-panel-body mv-muted" role="status" aria-live="polite">
+            Loading shipments…
+          </p>
+        ) : actionData && "error" in actionData && actionData.error ? (
+          <p className="mv-panel-body" role="alert" style={{ color: "#B91C1C" }}>
+            {actionData.error}
+          </p>
+        ) : shipments.length === 0 && hasFilters ? (
+          <div className="mv-panel-body mv-muted">
+            <p style={{ marginBottom: "0.5rem" }}>
+              No shipments match these filters{tab !== "all" ? ` in “${TABS.find((entry) => entry.value === tab)?.label}”` : ""}.
+            </p>
+            <Link to="/admin/shipping" className="mv-button">Clear all filters</Link>
+          </div>
         ) : shipments.length === 0 ? (
           <p className="mv-panel-body mv-muted">
-            No shipments match. Shipments are created by booking a parcel from an order; none are created to fill this table.
+            No shipments yet. A shipment is created by booking a parcel from an order; nothing is
+            created to fill this table.
           </p>
         ) : (
           /*
@@ -624,12 +874,28 @@ export default function AdminShipping() {
             <table className="mv-table" style={{ minWidth: 1720 }}>
             <thead>
               <tr>
-                <th>Shipment</th>
-                <th>Order / seller</th>
-                <th>From &rarr; to</th>
-                <th>Carrier / service</th>
-                <th>Packages &amp; tracking</th>
+                {/*
+                  THE EIGHT THE WORK ORDER NAMES, IN ITS ORDER, AND THEN THE
+                  OPERATIONAL COLUMNS THIS DEPLOYMENT ALREADY RELIED ON.
+
+                  The eight lead because that is the required reading order — a
+                  person scanning this table is asking what was ordered, who is
+                  carrying it, where it is going, what has been bought for it and
+                  what is left to do. The columns after them are the ones an
+                  operator here uses daily (which dock, whether Shopify has been
+                  told, what the carrier billed); they are kept rather than
+                  deleted, because removing a working surface to satisfy a
+                  column order would cost real information, and the order the
+                  work order specifies is preserved at the front where it matters.
+                */}
+                <th>Order #</th>
+                <th>Courier</th>
+                <th>Tracking #</th>
+                <th>Destination</th>
+                <th>Shipping label</th>
+                <th>Packing list</th>
                 <th>Status</th>
+                <th>Report</th>
                 <th>Est. delivery</th>
                 <th>Pickup</th>
                 <th>Shopify</th>
@@ -649,22 +915,66 @@ export default function AdminShipping() {
                 const latest = s.trackingEvents[0];
                 const latestText = carrierEventText(latest);
                 const sync = shopifySync(s);
+                const numbering = shipmentNumber[s.id];
+                const shipmentIndex = numbering?.index ?? 1;
+                const shipmentTotal = numbering?.total ?? 1;
+                /*
+                 * The words the work order asks the Status column to carry.
+                 *
+                 * These are NOT a second status vocabulary — they are the
+                 * operator's answer to "what is the one thing left to do", read
+                 * from facts the shipment already holds. `packedAt` and
+                 * `handedToCarrierAt` are the warehouse's own milestones, and
+                 * the label half is the provider's identifier, which is the only
+                 * thing that proves a label was actually bought.
+                 */
+                const packingWord = !s.providerShipmentId
+                  ? "Not booked"
+                  : !s.packedAt
+                    ? "Label created — needs packing"
+                    : !s.handedToCarrierAt
+                      ? "Waiting for pickup"
+                      : null;
+                /*
+                 * LATE IS A STORED DEADLINE OR A CARRIER EXCEPTION, never
+                 * elapsed time. The work order is explicit, and it is the right
+                 * rule: a parcel three days into a five-day ground service is
+                 * not late, and a table that paints it red teaches people to
+                 * ignore red. An estimated delivery in the past is the deadline
+                 * we actually have; a carrier exception is the other.
+                 */
+                const isLate =
+                  display === "EXCEPTION" ||
+                  (s.estimatedDelivery != null &&
+                    s.estimatedDelivery.getTime() < Date.now() &&
+                    display !== "DELIVERED" &&
+                    s.status !== "CANCELLED");
                 return (
                   <tr key={s.id}>
-                    <td>
-                      <Link to={`/admin/shipping/${s.id}`}>
-                        {s.returnOfShipmentId ? "Return " : ""}{s.id.slice(0, 8)}
-                      </Link>
-                      <div className="mv-muted">{formatDate(s.createdAt)}</div>
-                    </td>
+                    {/*
+                      ORDER # — a real link, and it names WHICH shipment of the
+                      order this row is.
+
+                      `shipmentIndex` is the order's own shipment number and
+                      `shipmentTotal` its count, both computed in the loader from
+                      the order's shipments ordered by creation — so "Shipment 2
+                      of 3" is a fact about the order, not about the page. A
+                      split order whose second parcel is on page 4 still reads
+                      "2 of 3" rather than "1 of 2".
+                    */}
                     <td>
                       <Link to={`/admin/orders/${s.order.id}`}>{s.order.shopifyOrderName}</Link>
+                      {shipmentTotal > 1 ? (
+                        <div className="mv-muted">Shipment {shipmentIndex} of {shipmentTotal}</div>
+                      ) : null}
+                      <div className="mv-muted">
+                        <Link to={`/admin/shipping/${s.id}?${listQuery}`}>
+                          {s.returnOfShipmentId ? "Return " : ""}{s.id.slice(0, 8)}
+                        </Link>
+                        {" · "}{formatDate(s.createdAt)}
+                      </div>
                       <div className="mv-muted">{s.order.supplierReference}</div>
                       <div className="mv-muted">{s.order.seller.storeName}</div>
-                    </td>
-                    <td>
-                      {originLabel(s)}
-                      <div className="mv-muted">&rarr; {dest}</div>
                     </td>
                     <td>
                       {s.carrier || "—"}
@@ -672,14 +982,59 @@ export default function AdminShipping() {
                     </td>
                     <td>
                       {s.trackingNumber || "—"}
-                      <div className="mv-muted">
-                        {s.packageCount != null ? `${s.packageCount} package${s.packageCount === 1 ? "" : "s"}` : "packages not recorded"}
-                      </div>
                       {s.trackingUrl ? (
                         <div>
                           <a href={s.trackingUrl} target="_blank" rel="noreferrer">Track</a>
                         </div>
                       ) : null}
+                    </td>
+                    {/*
+                      DESTINATION — city and the two-letter province or state, as
+                      the work order specifies. The full address is on the detail
+                      page; a table cell is not where anybody reads a street.
+                    */}
+                    <td>{shortDestination(addr)}</td>
+                    {/*
+                      SHIPPING LABEL — the cell that says what has been bought.
+
+                      Three states, and the difference between them is the
+                      difference between "nothing exists yet", "something is
+                      happening" and "a label exists". The middle one is why this
+                      is not a boolean: a booking in flight must not offer a
+                      second Book button, and a browser-side disable is not
+                      enough — the server refuses the duplicate by idempotency
+                      key, and this is only what the operator sees while it does.
+                    */}
+                    <td>
+                      {s.providerShipmentId ? (
+                        s.labelUrl ? (
+                          <a href={s.labelUrl} target="_blank" rel="noreferrer" className="mv-button">
+                            Print label
+                          </a>
+                        ) : (
+                          <Link to={`/admin/shipping/${s.id}`} className="mv-button">Label</Link>
+                        )
+                      ) : s.status === "BOOKING" ? (
+                        <button type="button" className="mv-button" disabled title="A booking is in progress for this parcel.">
+                          Booking…
+                        </button>
+                      ) : (
+                        <Link to={`/admin/orders/${s.order.id}`} className="mv-button mv-button-dark">
+                          Book shipping
+                        </Link>
+                      )}
+                    </td>
+                    {/*
+                      PACKING LIST — printable as soon as the shipment's contents
+                      are defined, which is BEFORE a label is bought. The work
+                      order is explicit that these are separate rights: a packer
+                      can print what goes in the box while somebody else decides
+                      who carries it.
+                    */}
+                    <td>
+                      <a href={`/admin/packing-list/${s.id}?download=1`} className="mv-button">
+                        Print packing list
+                      </a>
                     </td>
                     <td>
                       {/*
@@ -714,6 +1069,49 @@ export default function AdminShipping() {
                           {formatDateTime(latest.eventAt)}
                         </div>
                       ) : null}
+                      {/*
+                        The warehouse half of the answer, alongside the carrier's
+                        half. "Delivered" and "still on the dock" are both true of
+                        different parcels with the same tracking word, and this is
+                        the line that tells them apart without opening the row.
+                      */}
+                      {packingWord ? <div className="mv-muted">{packingWord}</div> : null}
+                      {/*
+                        LATE SITS BESIDE THE TRUE STATUS, NEVER INSTEAD OF IT.
+                        The carrier's own word stays visible; this is a warning
+                        layered on it, because replacing "In transit" with "Late"
+                        would lose the fact that the carrier has it at all.
+                      */}
+                      {isLate ? (
+                        <div style={{ marginTop: "0.2rem" }}>
+                          <span className="mv-badge mv-badge-danger" title={display === "EXCEPTION" ? "The carrier reported a problem with this parcel." : `The estimated delivery date (${formatDate(s.estimatedDelivery!)}) has passed.`}>
+                            Late
+                          </span>
+                        </div>
+                      ) : null}
+                    </td>
+                    {/*
+                      REPORT — visible on EVERY row, and disabled.
+
+                      It is drawn rather than omitted because its absence is
+                      indistinguishable from a bug, and it is DISABLED with a
+                      reason rather than made a link to nothing because a control
+                      that appears to work and does not is how a page loses its
+                      credibility. Nothing is submitted and nothing is claimed.
+                    */}
+                    <td>
+                      <button
+                        type="button"
+                        className="mv-button"
+                        disabled
+                        title="Reporting is not built yet. Nothing has been submitted."
+                        aria-describedby={`report-soon-${s.id}`}
+                      >
+                        Report
+                      </button>
+                      <div className="mv-muted" id={`report-soon-${s.id}`} style={{ fontSize: "0.68rem" }}>
+                        Coming soon
+                      </div>
                     </td>
                     {/* The carrier states a calendar date, parsed as midnight UTC: read in a
                         western zone it would print the day before. */}
