@@ -66,6 +66,17 @@ const ADVANCE_EVENTS: ShipmentAdvanceEvent[] = ["packed", "handed_to_carrier"];
  * earns its keep: a parcel that needs a truck and does not have a scheduled
  * collection is the parcel that sits on a dock until somebody notices.
  */
+/** The provinces and states this deployment ships between. */
+const PROVINCES = [
+  { code: "AB", name: "Alberta" }, { code: "BC", name: "British Columbia" },
+  { code: "MB", name: "Manitoba" }, { code: "NB", name: "New Brunswick" },
+  { code: "NL", name: "Newfoundland and Labrador" }, { code: "NS", name: "Nova Scotia" },
+  { code: "NT", name: "Northwest Territories" }, { code: "NU", name: "Nunavut" },
+  { code: "ON", name: "Ontario" }, { code: "PE", name: "Prince Edward Island" },
+  { code: "QC", name: "Quebec" }, { code: "SK", name: "Saskatchewan" },
+  { code: "YT", name: "Yukon" },
+] as const;
+
 const PICKUP_FILTERS = [
   { value: "required", label: "Required, not scheduled" },
   { value: "scheduled", label: "Scheduled" },
@@ -174,6 +185,69 @@ const PICKUP_STATUS_BADGE: Record<string, string> = {
 };
 
 /**
+ * The parcel's stage, in ONE word.
+ *
+ * THE SINGLE ANSWER TO "WHERE IS IT". The row used to render a normalized
+ * tracking word, the shipment's own lifecycle status and a warehouse milestone
+ * as three separate badges, so one parcel could read "Booked", "BOOKED" and
+ * "Waiting for pickup" at the same time. Each was true, none was the answer, and
+ * the reader had to decide which of the three was the state.
+ *
+ * THE ORDER OF THESE CHECKS IS THE ARGUMENT. Booking state comes first, because
+ * a parcel with no label has no carrier stage to report; then the warehouse
+ * milestones, because a packed box waiting on a dock is more specific than
+ * "booked"; then the carrier's own progress. A carrier exception outranks the
+ * warehouse words — something has gone wrong and that is the news.
+ *
+ * The carrier's raw wording is not lost: it is the quiet line beneath, and the
+ * full event list is on the detail page.
+ */
+function oneStatus(shipment: {
+  status: string;
+  trackingStatus: string | null;
+  providerShipmentId: string | null;
+  packedAt: Date | string | null;
+  handedToCarrierAt: Date | string | null;
+}): string {
+  const carrier = shipment.trackingStatus;
+  if (carrier === "EXCEPTION") return "Exception";
+  if (carrier === "CANCELLED" || shipment.status === "CANCELLED") return "Cancelled";
+  if (carrier === "RETURNED") return "Returned";
+  if (carrier === "DELIVERED" || shipment.status === "DELIVERED") return "Delivered";
+
+  if (!shipment.providerShipmentId) {
+    return shipment.status === "BOOKING" ? "Booking…" : "Not booked";
+  }
+  if (!shipment.packedAt) return "Label created";
+  if (!shipment.handedToCarrierAt) return "Waiting for pickup";
+
+  if (carrier === "PICKED_UP") return "Picked up";
+  if (carrier === "IN_TRANSIT" || carrier === "OUT_FOR_DELIVERY" || shipment.status === "SHIPPED") {
+    return "In transit";
+  }
+  return "Booked";
+}
+
+/** The badge tone for a stage word. Never the only signal — the word is there. */
+function statusTone(word: string): string {
+  switch (word) {
+    case "Delivered":
+      return "mv-badge-success";
+    case "Exception":
+    case "Cancelled":
+      return "mv-badge-danger";
+    case "In transit":
+    case "Picked up":
+      return "mv-badge-brand";
+    case "Waiting for pickup":
+    case "Label created":
+      return "mv-badge-warning";
+    default:
+      return "";
+  }
+}
+
+/**
  * "Ottawa, ON" — a city and a TWO-LETTER province or state, which is what the
  * work order asks the Destination column to show.
  *
@@ -222,6 +296,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
   const to = url.searchParams.get("to") || "";
   const originId = url.searchParams.get("origin") || "";
   const destination = (url.searchParams.get("destination") || "").trim();
+  const province = (url.searchParams.get("province") || "").trim().toUpperCase();
   const tracking = url.searchParams.get("tracking") || "";
   const pickup = url.searchParams.get("pickup") || "";
   const syncErrors = url.searchParams.get("syncErrors") === "1";
@@ -244,6 +319,26 @@ export async function loader({ request }: LoaderFunctionArgs) {
   if (sellerId) and.push({ order: { sellerId } });
   if (originId) and.push({ originLocationId: originId });
   if (destination) and.push({ order: { shippingAddress: { contains: destination, mode: "insensitive" } } });
+  /*
+   * PROVINCE MATCHES THE STORED JSON KEYS, not the raw text.
+   *
+   * `shippingAddress` is a JSON string, so a bare `contains "ON"` would also
+   * match "London", "Toronto" and any postcode containing those letters — a
+   * filter that quietly returns parcels in another province. Matching the two
+   * keys the address actually stores the region under is precise, and it allows
+   * for either spelling because Shopify writes one and a depot form writes the
+   * other.
+   */
+  if (province) {
+    and.push({
+      order: {
+        OR: [
+          { shippingAddress: { contains: `"province":"${province}"` } },
+          { shippingAddress: { contains: `"provinceCode":"${province}"` } },
+        ],
+      },
+    });
+  }
   if (tracking && TRACKING_DISPLAY_ORDER.includes(tracking as TrackingDisplayStatus)) {
     and.push(trackingDisplayWhere(tracking as TrackingDisplayStatus));
   }
@@ -489,7 +584,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
      * request, which is how this was found.
      */
     eshipper: { ...eshipper, description: describeEshipperStatus(eshipper) },
-    filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from, to, origin: originId, destination, tracking, pickup, syncErrors: syncErrors ? "1" : "", tab },
+    filters: { status, carrier, seller: sellerId, billing: billingStatus, q, from, to, origin: originId, destination, province, tracking, pickup, syncErrors: syncErrors ? "1" : "", tab },
     tab,
     /*
      * ONE COUNT PER TAB, computed from the tab's own predicate rather than from
@@ -754,88 +849,117 @@ export default function AdminShipping() {
       <Form method="get" className="mv-filter-bar">
         {/* The tab survives a filter submit, so refining a tab keeps you in it. */}
         <input type="hidden" name="tab" value={tab} />
+        {/*
+          FOUR VISIBLE FILTERS, AND THE REST ONE CLICK AWAY.
+
+          The bar used to open with twelve controls across three ragged rows, so
+          the two things an operator reaches for constantly — the search box and
+          the courier — were the same size and weight as "Created from" and a
+          sync-error checkbox. The four below are the ones a person uses without
+          thinking: what is it, who is carrying it, what state is it in, and
+          where is it going. Everything else is genuinely occasional, so it lives
+          in More filters rather than in the way.
+        */}
         <label className="mv-field">
           Search
-          <input className="mv-input" name="q" defaultValue={filters.q} placeholder="Order, shipment, tracking, seller" style={{ width: 240 }} />
+          <input
+            className="mv-input"
+            name="q"
+            defaultValue={filters.q}
+            placeholder="Order, tracking, seller"
+            style={{ width: 220 }}
+          />
+        </label>
+        <label className="mv-field">
+          Courier
+          <input className="mv-input" name="carrier" defaultValue={filters.carrier} placeholder="Any" style={{ width: 120 }} />
         </label>
         <label className="mv-field">
           Status
           <select className="mv-input" name="status" defaultValue={filters.status}>
             <option value="">All</option>
             {STATUSES.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </select>
-        </label>
-        <label className="mv-field">
-          Carrier / service
-          <input className="mv-input" name="carrier" defaultValue={filters.carrier} placeholder="Any" style={{ width: 120 }} />
-        </label>
-        <label className="mv-field">
-          Seller
-          <select className="mv-input" name="seller" defaultValue={filters.seller}>
-            <option value="">All</option>
-            {sellers.map((s) => (
-              <option key={s.id} value={s.id}>{s.storeName}</option>
-            ))}
-          </select>
-        </label>
-        <label className="mv-field">
-          Billing
-          <select className="mv-input" name="billing" defaultValue={filters.billing}>
-            <option value="">All</option>
-            {["PENDING", "RECONCILED", "VARIANCE", "NEEDS_RECONCILIATION"].map((s) => (
               <option key={s} value={s}>{s.replace(/_/g, " ")}</option>
             ))}
           </select>
         </label>
         <label className="mv-field">
-          Tracking
-          <select className="mv-input" name="tracking" defaultValue={filters.tracking}>
+          Province
+          <select className="mv-input" name="province" defaultValue={filters.province}>
             <option value="">All</option>
-            {/* The nine words, in movement order. The values are the internal
-                display statuses; the labels are what the rows show. */}
-            {TRACKING_DISPLAY_ORDER.map((s) => (
-              <option key={s} value={s}>{trackingDisplayLabel(s)}</option>
+            {PROVINCES.map((p) => (
+              <option key={p.code} value={p.code}>{p.code} — {p.name}</option>
             ))}
           </select>
         </label>
-        <label className="mv-field">
-          Pickup
-          <select className="mv-input" name="pickup" defaultValue={filters.pickup}>
-            <option value="">All</option>
-            {PICKUP_FILTERS.map((p) => (
-              <option key={p.value} value={p.value}>{p.label}</option>
-            ))}
-          </select>
-        </label>
-        <label className="mv-field">
-          Origin
-          <select className="mv-input" name="origin" defaultValue={filters.origin}>
-            <option value="">Any</option>
-            {origins.map((o) => (
-              <option key={o.id} value={o.id}>{o.code} — {o.name}</option>
-            ))}
-          </select>
-        </label>
-        <label className="mv-field">
-          Destination
-          <input className="mv-input" name="destination" defaultValue={filters.destination} placeholder="City, province or ZIP" style={{ width: 160 }} />
-        </label>
-        <label className="mv-field">
-          Created from
-          <input className="mv-input" type="date" name="from" defaultValue={filters.from} />
-        </label>
-        <label className="mv-field">
-          to
-          <input className="mv-input" type="date" name="to" defaultValue={filters.to} />
-        </label>
-        {/* Unchecked inputs send nothing, which is what "no filter" means; 1 is
-            the only value the loader reads. */}
-        <label className="mv-field" style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: "0.35rem", paddingBottom: "0.4rem" }}>
-          <input type="checkbox" name="syncErrors" value="1" defaultChecked={filters.syncErrors === "1"} />
-          Sync errors
-        </label>
+
+        <details className="mv-more-filters">
+          <summary>More filters</summary>
+          <div className="mv-more-filters-body">
+            <label className="mv-field">
+              Seller
+              <select className="mv-input" name="seller" defaultValue={filters.seller}>
+                <option value="">All</option>
+                {sellers.map((s) => (
+                  <option key={s.id} value={s.id}>{s.storeName}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mv-field">
+              Tracking state
+              <select className="mv-input" name="tracking" defaultValue={filters.tracking}>
+                <option value="">All</option>
+                {TRACKING_DISPLAY_ORDER.map((t) => (
+                  <option key={t} value={t}>{trackingDisplayLabel(t)}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mv-field">
+              Pickup
+              <select className="mv-input" name="pickup" defaultValue={filters.pickup}>
+                <option value="">All</option>
+                {PICKUP_FILTERS.map((p) => (
+                  <option key={p.value} value={p.value}>{p.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mv-field">
+              Origin dock
+              <select className="mv-input" name="origin" defaultValue={filters.origin}>
+                <option value="">Any</option>
+                {origins.map((o) => (
+                  <option key={o.id} value={o.id}>{o.code} — {o.name}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mv-field">
+              Billing
+              <select className="mv-input" name="billing" defaultValue={filters.billing}>
+                <option value="">All</option>
+                {["PENDING", "RECONCILED", "VARIANCE", "NEEDS_RECONCILIATION"].map((b) => (
+                  <option key={b} value={b}>{b.replace(/_/g, " ")}</option>
+                ))}
+              </select>
+            </label>
+            <label className="mv-field">
+              Destination contains
+              <input className="mv-input" name="destination" defaultValue={filters.destination} placeholder="City or postcode" />
+            </label>
+            <label className="mv-field">
+              Created from
+              <input className="mv-input" type="date" name="from" defaultValue={filters.from} />
+            </label>
+            <label className="mv-field">
+              to
+              <input className="mv-input" type="date" name="to" defaultValue={filters.to} />
+            </label>
+            <label className="mv-field mv-check">
+              <input type="checkbox" name="syncErrors" value="1" defaultChecked={filters.syncErrors === "1"} />
+              Sync errors only
+            </label>
+          </div>
+        </details>
+
         <button type="submit" className="mv-button mv-button-dark">Filter</button>
         <Link to="/admin/shipping" className="mv-button">Reset</Link>
         {/*
@@ -897,23 +1021,9 @@ export default function AdminShipping() {
            * section was written to replace. The container scrolls.
            */
           <div className="mv-table-wrap">
-            <table className="mv-table" style={{ minWidth: 1720 }}>
+            <table className="mv-table mv-shipment-table">
             <thead>
               <tr>
-                {/*
-                  THE EIGHT THE WORK ORDER NAMES, IN ITS ORDER, AND THEN THE
-                  OPERATIONAL COLUMNS THIS DEPLOYMENT ALREADY RELIED ON.
-
-                  The eight lead because that is the required reading order — a
-                  person scanning this table is asking what was ordered, who is
-                  carrying it, where it is going, what has been bought for it and
-                  what is left to do. The columns after them are the ones an
-                  operator here uses daily (which dock, whether Shopify has been
-                  told, what the carrier billed); they are kept rather than
-                  deleted, because removing a working surface to satisfy a
-                  column order would cost real information, and the order the
-                  work order specifies is preserved at the front where it matters.
-                */}
                 <th>Order #</th>
                 <th>Courier</th>
                 <th>Tracking #</th>
@@ -922,14 +1032,6 @@ export default function AdminShipping() {
                 <th>Packing list</th>
                 <th>Status</th>
                 <th>Report</th>
-                <th>Est. delivery</th>
-                <th>Pickup</th>
-                <th>Shopify</th>
-                <th>Last refresh</th>
-                <th>Seller charge</th>
-                <th>Carrier cost</th>
-                <th>Billing</th>
-                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -975,6 +1077,20 @@ export default function AdminShipping() {
                     s.estimatedDelivery.getTime() < Date.now() &&
                     display !== "DELIVERED" &&
                     s.status !== "CANCELLED");
+                /*
+                 * WHY it is late, in the tooltip. The badge is a warning layered
+                 * ON the true stage — never instead of it — and "Late" on its own
+                 * invites the question "late against what?". The answer is a
+                 * carrier exception or a passed estimated delivery, and it is
+                 * the only honest answer available: the rule is a STORED deadline
+                 * or the carrier's own report, never elapsed time. A parcel three
+                 * days into a five-day service is not late, and a table that
+                 * paints it red teaches people to ignore red.
+                 */
+                const lateReason =
+                  display === "EXCEPTION"
+                    ? "The carrier reported a problem with this parcel."
+                    : `The estimated delivery date (${s.estimatedDelivery ? formatDate(s.estimatedDelivery) : "—"}) has passed.`;
                 return (
                   <tr key={s.id}>
                     {/*
@@ -988,19 +1104,27 @@ export default function AdminShipping() {
                       split order whose second parcel is on page 4 still reads
                       "2 of 3" rather than "1 of 2".
                     */}
+                    {/*
+                      ORDER # OPENS THE SHIPMENT, which is what the column is
+                      named after and what an operator is looking for when they
+                      click it. It used to open the ORDER, while the row's own
+                      internal shipment id — eight characters of cuid — was the
+                      link to the parcel. The id is gone from this row entirely:
+                      it is an internal identifier, it is not what anybody
+                      searches by, and it was the widest thing in the column.
+                      The seller is kept because a parcel belongs to somebody,
+                      and the supplier reference and creation date moved to the
+                      detail page with the rest of the reference material.
+                    */}
                     <td>
-                      <Link to={`/admin/orders/${s.order.id}`}>{s.order.shopifyOrderName}</Link>
+                      <Link to={`/admin/shipping/${s.id}?${listQuery}`} className="mv-shipment-order">
+                        {s.returnOfShipmentId ? "Return · " : ""}
+                        {s.order.shopifyOrderName}
+                      </Link>
                       {shipmentTotal > 1 ? (
-                        <div className="mv-muted">Shipment {shipmentIndex} of {shipmentTotal}</div>
+                        <div className="mv-muted mv-shipment-sub">Shipment {shipmentIndex} of {shipmentTotal}</div>
                       ) : null}
-                      <div className="mv-muted">
-                        <Link to={`/admin/shipping/${s.id}?${listQuery}`}>
-                          {s.returnOfShipmentId ? "Return " : ""}{s.id.slice(0, 8)}
-                        </Link>
-                        {" · "}{formatDate(s.createdAt)}
-                      </div>
-                      <div className="mv-muted">{s.order.supplierReference}</div>
-                      <div className="mv-muted">{s.order.seller.storeName}</div>
+                      <div className="mv-muted mv-shipment-sub">{s.order.seller.storeName}</div>
                     </td>
                     <td>
                       {s.carrier || "—"}
@@ -1062,57 +1186,31 @@ export default function AdminShipping() {
                         Print packing list
                       </a>
                     </td>
+                    {/*
+                      ONE STATUS. The cell used to stack four things — a
+                      normalized tracking word, a second lifecycle badge, the
+                      carrier's newest event and a warehouse line — which is how
+                      a single parcel came to read "Booked / BOOKED / Waiting for
+                      pickup" on one row. That is four answers to one question,
+                      and an operator has to work out which of them is the state.
+
+                      What is left is the parcel's actual stage in one word, and
+                      the carrier's newest event demoted to a single quiet line
+                      underneath it, because the carrier's own wording is worth
+                      keeping but is not worth a second badge.
+                    */}
                     <td>
-                      {/*
-                        The normalized word, then the carrier's own. The second
-                        line is the shipment's lifecycle status — BOOKING_FAILED
-                        and BOOKED both read as one parcel state or another, and
-                        the difference is the whole reason those states exist. The
-                        third is the newest raw event, which is where the wording
-                        the normalized set flattens survives.
-                      */}
-                      <span
-                        className={`mv-badge ${trackingDisplayBadge[display] ?? ""}`}
-                        // The nine words merge "the carrier tried and failed"
-                        // with "the carrier says it cannot be delivered"; the
-                        // hover keeps that distinction reachable instead of
-                        // dropping it on the way to the screen.
-                        title={s.trackingStatus ? trackingLabel(s.trackingStatus) : undefined}
-                      >
-                        {trackingDisplayLabel(display)}
-                      </span>
-                      <div style={{ marginTop: "0.25rem" }}>
-                        <span className={`mv-badge ${statusBadge[s.status] ?? ""}`}>{s.status}</span>
-                      </div>
-                      {latestText ? (
-                        <div className="mv-muted" title={latestText}>
-                          {latestText.length > 60 ? `${latestText.slice(0, 60)}…` : latestText}
-                        </div>
-                      ) : null}
-                      {latest ? (
-                        <div className="mv-muted">
-                          {latest.location ? `${latest.location} · ` : ""}
-                          {formatDateTime(latest.eventAt)}
-                        </div>
-                      ) : null}
-                      {/*
-                        The warehouse half of the answer, alongside the carrier's
-                        half. "Delivered" and "still on the dock" are both true of
-                        different parcels with the same tracking word, and this is
-                        the line that tells them apart without opening the row.
-                      */}
-                      {packingWord ? <div className="mv-muted">{packingWord}</div> : null}
-                      {/*
-                        LATE SITS BESIDE THE TRUE STATUS, NEVER INSTEAD OF IT.
-                        The carrier's own word stays visible; this is a warning
-                        layered on it, because replacing "In transit" with "Late"
-                        would lose the fact that the carrier has it at all.
-                      */}
+                      <span className={`mv-badge ${statusTone(oneStatus(s))}`}>{oneStatus(s)}</span>
                       {isLate ? (
-                        <div style={{ marginTop: "0.2rem" }}>
-                          <span className="mv-badge mv-badge-danger" title={display === "EXCEPTION" ? "The carrier reported a problem with this parcel." : `The estimated delivery date (${formatDate(s.estimatedDelivery!)}) has passed.`}>
+                        <div className="mv-shipment-late">
+                          <span className="mv-badge mv-badge-danger" title={lateReason}>
                             Late
                           </span>
+                        </div>
+                      ) : null}
+                      {latestText ? (
+                        <div className="mv-muted mv-shipment-sub" title={latestText}>
+                          {latestText.length > 44 ? `${latestText.slice(0, 44)}…` : latestText}
                         </div>
                       ) : null}
                     </td>
@@ -1139,111 +1237,17 @@ export default function AdminShipping() {
                         Coming soon
                       </div>
                     </td>
-                    {/* The carrier states a calendar date, parsed as midnight UTC: read in a
-                        western zone it would print the day before. */}
-                    <td>{s.estimatedDelivery ? formatDate(s.estimatedDelivery, { timeZone: CALENDAR_DATE_TIME_ZONE }) : "—"}</td>
-                    <td>
-                      {s.pickupMode ? (
-                        <div>{PICKUP_MODE_LABEL[s.pickupMode] ?? s.pickupMode}</div>
-                      ) : (
-                        <div className="mv-muted">Not recorded</div>
-                      )}
-                      {s.pickupStatus ? (
-                        <div style={{ marginTop: "0.2rem" }}>
-                          <span className={`mv-badge ${PICKUP_STATUS_BADGE[s.pickupStatus] ?? ""}`}>
-                            {PICKUP_STATUS_LABEL[s.pickupStatus] ?? s.pickupStatus}
-                          </span>
-                        </div>
-                      ) : null}
-                      {s.pickupScheduledFor ? (
-                        <div className="mv-muted">{formatDateTime(s.pickupScheduledFor)}</div>
-                      ) : null}
-                      {s.pickupWindow ? <div className="mv-muted">{s.pickupWindow}</div> : null}
-                    </td>
-                    <td>
-                      <span className={`mv-badge ${sync.badge}`} title={sync.title ?? undefined}>{sync.text}</span>
-                      {s.shopifyNotifiedAt ? (
-                        <div className="mv-muted">customer told {formatDate(s.shopifyNotifiedAt)}</div>
-                      ) : null}
-                    </td>
-                    <td>
-                      {s.lastTrackingSyncAt ? formatDateTime(s.lastTrackingSyncAt) : "—"}
-                      {s.trackingSyncFailures > 0 ? (
-                        <div style={{ marginTop: "0.2rem" }}>
-                          <span className="mv-badge mv-badge-warning">
-                            {s.trackingSyncFailures} failed {s.trackingSyncFailures === 1 ? "attempt" : "attempts"}
-                          </span>
-                        </div>
-                      ) : null}
-                      {s.lastTrackingError ? (
-                        <div style={{ marginTop: "0.2rem" }}>
-                          <span className="mv-badge mv-badge-danger" title={s.lastTrackingError}>sync error</span>
-                        </div>
-                      ) : null}
-                    </td>
-                    <td>{money(s.sellerShippingCharge, s.order.currency)}</td>
-                    <td>
-                      {money(carrierCost, s.order.currency)}
-                      {s.quotedCarrierCost != null && s.bookedCost != null && s.quotedCarrierCost !== s.bookedCost ? (
-                        <div className="mv-muted">quoted {money(s.quotedCarrierCost)}</div>
-                      ) : null}
-                    </td>
-                    <td>
-                      <span className={`mv-badge ${s.billingStatus === "RECONCILED" ? "mv-badge-success" : s.billingStatus === "VARIANCE" ? "mv-badge-warning" : ""}`}>
-                        {s.billingStatus.replace(/_/g, " ")}
-                      </span>
-                    </td>
-                    <td>
-                      <div className="mv-actions" style={{ gap: "0.25rem" }}>
-                        <Link to={`/admin/shipping/${s.id}`} className="mv-button">Open</Link>
-                        {/*
-                          Keyed on the provider shipment id, which is what these
-                          two actions actually need, rather than on PENDING.
-                          Before bookings landed on BOOKED, "PENDING with a
-                          provider id" was the booked-not-yet-shipped state; now
-                          that state has a name of its own, and leaving the old
-                          test here would hide Sync and Cancel on every booked
-                          shipment.
-                        */}
-                        {s.providerShipmentId && ["BOOKED", "SHIPPED", "EXCEPTION", "CANCELLING"].includes(s.status) ? (
-                          <>
-                            <Form method="post">
-                              <input type="hidden" name="intent" value="sync_tracking" />
-                              <input type="hidden" name="shipmentId" value={s.id} />
-                              <button type="submit" className="mv-button">Sync</button>
-                            </Form>
-                            <Form method="post">
-                              <input type="hidden" name="intent" value="cancel_shipment" />
-                              <input type="hidden" name="shipmentId" value={s.id} />
-                              <button type="submit" className="mv-button mv-button-danger">Cancel</button>
-                            </Form>
-                          </>
-                        ) : null}
-                        {/*
-                          ONLY WHAT THE SHIPMENT'S OWN RECORD ALLOWS. The old
-                          guard offered both events on BOOKED, SHIPPED and
-                          EXCEPTION rows — so a shipped or exception parcel
-                          still showed "handed to carrier", which the service
-                          now refuses and which would have regressed the
-                          carrier's own status. The options come from the same
-                          function the server validates with, so a listed event
-                          is an accepted one, and a row with nothing to record
-                          shows no control at all.
-                        */}
-                        {availableWarehouseEvents(s).length > 0 ? (
-                          <Form method="post" className="mv-actions" style={{ gap: "0.25rem" }}>
-                            <input type="hidden" name="intent" value="advance_shipment" />
-                            <input type="hidden" name="shipmentId" value={s.id} />
-                            <select name="event" defaultValue={availableWarehouseEvents(s)[0]} className="mv-input" style={{ padding: "0.15rem 0.25rem", fontSize: "0.62rem", minHeight: "auto" }}>
-                              {availableWarehouseEvents(s).map((ev) => (
-                                <option key={ev} value={ev}>{ev.replace(/_/g, " ")}</option>
-                              ))}
-                            </select>
-                            <button type="submit" className="mv-button mv-button-dark">Go</button>
-                          </Form>
-                        ) : null}
-                      </div>
-                    </td>
+                    {/*
+                      THE EIGHT COLUMNS THE SPECIFICATION NAMES, AND NOTHING
+                      ELSE. Estimated delivery, pickup type, Shopify sync, last
+                      refresh, both costs, the billing state and the inline
+                      operational controls used to follow Report in this row.
+                      They are all still real and all still reachable — they
+                      live on the shipment detail page, which is one click away
+                      through the Order # link — and keeping them here cost the
+                      table a horizontal scrollbar at 1440px, which pushed the
+                      one column an operator needs (the action) off the screen.
+                    */}
                   </tr>
                 );
               })}

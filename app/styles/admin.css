@@ -123,33 +123,194 @@
   color: #64748b;
 }
 
-/* Shared MoonVella admin application shell and page vocabulary. */
+/* ==========================================================================
+   MoonVella admin — the shared design system
+   ==========================================================================
+   THIS FILE IS THE ONE PLACE THE ADMIN'S APPEARANCE IS DECIDED. Everything the
+   operator panel renders goes through these tokens and the `.mv-*` classes
+   below, so a page is corrected by correcting the token rather than by adding a
+   rule to the page. Two token systems used to be loaded into this app — this
+   one and the merchant surface's `moonvilla.css` — with different palettes, and
+   the admin's own was the wrong one.
+
+   WHAT WAS MEASURED BEFORE THIS WAS CHANGED, because "the font looks wrong" is
+   not a diagnosis (see `probe/measure-styles.mjs`):
+
+     body font-family        "Times New Roman"   ← the browser's serif default
+     document.fonts.check('16px Inter')          false — the webfont never loaded
+     button font-family      Arial               ← controls do not inherit
+     sidebar                 #17191d  (near-black)
+     brand accent            #7357d9  (purple)
+     table header            9.92px
+
+   Three separate causes, and all three are fixed here rather than per page:
+
+     1. NO RULE SET A FONT ON THE ADMIN BODY. `admin.css` named a family only on
+        `.admin-login-page`, and `moonvilla.css` — which sets `body` — is
+        imported by the MERCHANT surface, not this one. So the admin inherited
+        nothing and the UA default (a serif) won.
+     2. FORM CONTROLS DO NOT INHERIT FONT. Even with a body family set, buttons,
+        inputs, selects and textareas keep the UA's own — Arial here — unless
+        they are named explicitly. They are named explicitly below.
+     3. THE THEME WAS SOMEONE ELSE'S. The palette below is the approved one;
+        the old values were a near-black sidebar and a purple accent.
+
+   The font STACK is deliberately system-first rather than a remote webfont. The
+   one Inter stylesheet this app loaded came from cdn.shopify.com and, measured
+   on this deployment, did not arrive at all — so the admin panel was one CDN
+   outage away from having no intended typeface, and the operator panel has no
+   business depending on Shopify's CDN. `system-ui` is a genuine sans on every
+   platform this runs on, which is what the specification asks for ("Inter or
+   system sans-serif").
+   ========================================================================== */
 :root {
-  --mv-admin-bg: #f4f5f7;
-  --mv-admin-panel: #ffffff;
-  --mv-admin-panel-soft: #f8f9fb;
-  --mv-admin-text: #18191b;
-  --mv-admin-muted: #68707c;
-  --mv-admin-border: #dfe3e8;
-  --mv-admin-sidebar: #17191d;
-  --mv-admin-sidebar-active: #2a2d34;
-  --mv-admin-brand: #7357d9;
-  --mv-admin-brand-soft: #eeeafe;
-  --mv-admin-success: #18855b;
-  --mv-admin-success-soft: #e8f7f0;
-  --mv-admin-warning: #a86406;
-  --mv-admin-warning-soft: #fff5df;
-  --mv-admin-danger: #b42318;
-  --mv-admin-danger-soft: #fff0ee;
-  --mv-admin-shadow: 0 10px 30px rgba(21, 25, 33, 0.07);
+  /* --- the approved palette ------------------------------------------- */
+  --mv-bg: #f5f7fa;
+  --mv-surface: #ffffff;
+  --mv-border: #dce3eb;
+  --mv-text: #172b4d;
+  --mv-muted: #52627a;
+  --mv-navy: #142440;
+  --mv-primary: #006e67;
+  --mv-primary-hover: #005850;
+  --mv-gold: #eebc3b;
+
+  /* Status: a text colour and its fill, paired so a badge cannot be built from
+     one without the other. Chosen for contrast, and never the only signal —
+     every badge that uses these also carries a word. */
+  --mv-paid-text: #166534;      --mv-paid-fill: #dcfce7;
+  --mv-pending-text: #475569;   --mv-pending-fill: #f1f5f9;
+  --mv-transit-text: #1d4ed8;   --mv-transit-fill: #dbeafe;
+  --mv-waiting-text: #92400e;   --mv-waiting-fill: #fef3c7;
+  --mv-late-text: #b91c1c;      --mv-late-fill: #fee2e2;
+
+  /* --- spacing, radii and control metrics ------------------------------ */
+  --mv-space: 24px;
+  --mv-radius-panel: 12px;
+  --mv-radius-control: 8px;
+  --mv-control-height: 40px;
+  --mv-row-height: 56px;
+  --mv-sidebar-width: 224px;
+  --mv-font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto,
+             "Helvetica Neue", Arial, sans-serif;
+
+  /* --- the old names, re-pointed ---------------------------------------
+     The `.mv-admin-*` names are kept because forty-odd rules below already
+     read them. Re-pointing them is what fixes every page at once; deleting
+     them would have meant editing every rule and getting one wrong. */
+  --mv-admin-bg: var(--mv-bg);
+  --mv-admin-panel: var(--mv-surface);
+  --mv-admin-panel-soft: var(--mv-bg);
+  --mv-admin-text: var(--mv-text);
+  --mv-admin-muted: var(--mv-muted);
+  --mv-admin-border: var(--mv-border);
+  --mv-admin-sidebar: var(--mv-navy);
+  --mv-admin-sidebar-active: var(--mv-primary);
+  --mv-admin-brand: var(--mv-primary);
+  --mv-admin-brand-soft: var(--mv-transit-fill);
+  --mv-admin-success: var(--mv-paid-text);
+  --mv-admin-success-soft: var(--mv-paid-fill);
+  --mv-admin-warning: var(--mv-waiting-text);
+  --mv-admin-warning-soft: var(--mv-waiting-fill);
+  --mv-admin-danger: var(--mv-late-text);
+  --mv-admin-danger-soft: var(--mv-late-fill);
+  --mv-admin-shadow: 0 10px 30px rgba(20, 36, 64, 0.07);
 }
 
 * { box-sizing: border-box; }
 
+/* --------------------------------------------------------------------------
+   Typography, applied rather than hoped for.
+
+   `body` alone is not enough: a heading, a table cell and a form control each
+   have their own UA defaults, and a control that is not named keeps Arial. So
+   the family is set ONCE for the document and then named for every element
+   class that does not inherit by default.
+   -------------------------------------------------------------------------- */
+html {
+  font-family: var(--mv-font);
+  /* `rem` STAYS AT 16px, and this is not a detail. The stylesheets are full of
+     rem-based sizes written against a 16px root; setting the root to the body's
+     15px would rescale every one of them by six per cent as a side effect of a
+     typography decision — paddings, gaps and control heights included. The body
+     TEXT is 15px, which is what the specification asks for; the measuring unit
+     is left where every existing rule already assumes it is. */
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
 body {
   margin: 0;
-  background: var(--mv-admin-bg);
-  color: var(--mv-admin-text);
+  /* Inside the specified 14–16px body range. */
+  font-size: 15px;
+  background: var(--mv-bg);
+  color: var(--mv-text);
+}
+
+/* Form controls DO NOT inherit font-family, font-size or colour from their
+   ancestors — the UA stylesheet for `input`/`button`/`select`/`textarea` wins
+   unless they are named. Measured on this deployment: every button rendered in
+   Arial while the surrounding text was Times New Roman. */
+button,
+input,
+select,
+textarea,
+optgroup {
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--mv-font);
+  color: var(--mv-text);
+  letter-spacing: -0.01em;
+}
+
+/* Page titles: 28px. */
+h1 { font-size: 28px; line-height: 1.2; font-weight: 700; margin: 0 0 0.35rem; }
+h2 { font-size: 18px; line-height: 1.3; font-weight: 600; margin: 0 0 0.5rem; }
+h3 { font-size: 16px; font-weight: 600; }
+h4 { font-size: 15px; font-weight: 600; }
+
+/* Table headings: 13px semibold. This was 9.92px — a size that reads as a
+   footnote rather than as a column label. */
+th {
+  font-family: var(--mv-font);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+/* Rows are at least 56px so a row is a target rather than a line of text. */
+.mv-table tbody tr,
+table tbody tr {
+  min-height: var(--mv-row-height);
+}
+
+/* Every interactive control is at least 40px tall. A 28px button is a button
+   somebody misses on a laptop trackpad. */
+.mv-button,
+button.mv-button,
+a.mv-button,
+.mv-input,
+input.mv-input,
+select.mv-input,
+.mv-field input,
+.mv-field select {
+  min-height: var(--mv-control-height);
+}
+
+/* A visible focus ring, in the approved teal, on everything focusable. The
+   default `outline: none` in some of these rules is what made keyboard
+   navigation invisible. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--mv-primary);
+  outline-offset: 2px;
+  border-radius: var(--mv-radius-control);
 }
 
 .mv-admin-shell {
@@ -161,7 +322,7 @@ body {
   position: fixed;
   inset: 0 auto 0 0;
   z-index: 50;
-  width: 228px;
+  width: var(--mv-sidebar-width);
   padding: 1.4rem 1rem;
   display: flex;
   flex-direction: column;
@@ -243,7 +404,7 @@ body {
   font-weight: 550;
 }
 
-.mv-admin-nav-link:hover { color: white; background: rgba(255, 255, 255, 0.06); }
+.mv-admin-nav-link:hover { color: white; background: rgba(255, 255, 255, 0.10); }
 .mv-admin-nav-link.is-active { color: white; background: var(--mv-admin-sidebar-active); }
 .mv-admin-nav-icon {
   width: 24px;
@@ -364,10 +525,14 @@ body {
 }
 .mv-page-header h1 {
   margin: 0 0 0.3rem;
-  color: var(--mv-admin-text);
-  font-size: 1.75rem;
-  line-height: 1.15;
-  letter-spacing: -0.035em;
+  color: var(--mv-text);
+  /* 28px, in px and not in rem. `1.75rem` is only 28px while the root happens to
+     be 16px, and it was already reading 26.25px once the body settled at the
+     specified 15px — a title that changes size with an unrelated font decision
+     is not a specification. */
+  font-size: 28px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
 }
 .mv-page-header p { margin: 0; color: var(--mv-admin-muted); font-size: 0.82rem; }
 .mv-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
@@ -410,8 +575,8 @@ body {
 }
 .mv-button:hover { border-color: #b9c0ca; background: var(--mv-admin-panel-soft); }
 .mv-button-primary { border-color: var(--mv-admin-brand); color: white; background: var(--mv-admin-brand); }
-.mv-button-primary:hover { border-color: #6348cc; background: #6348cc; }
-.mv-button-dark { border-color: #18191b; color: white; background: #18191b; }
+.mv-button-primary:hover { border-color: var(--mv-primary); background: var(--mv-primary); }
+.mv-button-dark { border-color: var(--mv-text); color: white; background: var(--mv-text); }
 .mv-button-danger { border-color: #efc1bd; color: var(--mv-admin-danger); background: var(--mv-admin-danger-soft); }
 .mv-button:disabled { opacity: 0.45; cursor: not-allowed; }
 
@@ -449,7 +614,7 @@ body {
   font-size: 0.7rem;
   font-weight: 650;
 }
-.mv-workspace-nav a.is-active { border-color: #18191b; color: white; background: #18191b; }
+.mv-workspace-nav a.is-active { border-color: var(--mv-text); color: white; background: var(--mv-text); }
 
 .mv-filter-bar {
   display: flex;
@@ -466,7 +631,7 @@ body {
 .mv-input {
   min-height: 34px;
   padding: 0.43rem 0.55rem;
-  border: 1px solid #cbd1d8;
+  border: 1px solid var(--mv-border);
   border-radius: 8px;
   color: var(--mv-admin-text);
   background: var(--mv-admin-panel);
@@ -478,13 +643,13 @@ body {
 .mv-table-wrap { overflow-x: auto; }
 .mv-table { width: 100%; min-width: 760px; border-collapse: collapse; }
 .mv-table th {
-  padding: 0.7rem 0.8rem;
+  padding: 0.75rem 0.8rem;
   text-align: left;
-  color: var(--mv-admin-muted);
-  background: var(--mv-admin-panel-soft);
-  font-size: 0.62rem;
-  font-weight: 700;
-  letter-spacing: 0.05em;
+  color: var(--mv-muted);
+  background: var(--mv-bg);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
   text-transform: uppercase;
 }
 .mv-table td { padding: 0.78rem 0.8rem; border-top: 1px solid var(--mv-admin-border); font-size: 0.75rem; vertical-align: middle; }
@@ -612,3 +777,180 @@ body {
 }
 
 .mv-panel-title { margin: 0 0 0.6rem; color: var(--mv-admin-text); font-size: 0.9rem; }
+
+/* ==========================================================================
+   The shipping queue
+   ==========================================================================
+   EIGHT COLUMNS, AND THEY FIT AT 1440px.
+
+   The table used to carry sixteen and set `min-width: 1720px`, so on a 1440px
+   desktop it scrolled horizontally and the last column — the action — was off
+   the screen. The eight the specification names are laid out with
+   `table-layout: fixed` and explicit shares, which is what makes the widths
+   predictable instead of a negotiation between the content and the browser.
+
+   The shares add to 100%. They are chosen so the two cells that hold a button
+   get enough to draw one on one line.
+   ========================================================================== */
+.mv-shipment-table {
+  width: 100%;
+  table-layout: fixed;
+}
+.mv-shipment-table th:nth-child(1) { width: 17%; } /* Order #         */
+.mv-shipment-table th:nth-child(2) { width: 11%; } /* Courier         */
+.mv-shipment-table th:nth-child(3) { width: 13%; } /* Tracking #      */
+.mv-shipment-table th:nth-child(4) { width: 12%; } /* Destination     */
+.mv-shipment-table th:nth-child(5) { width: 14%; } /* Shipping label  */
+.mv-shipment-table th:nth-child(6) { width: 14%; } /* Packing list    */
+.mv-shipment-table th:nth-child(7) { width: 10%; } /* Status          */
+.mv-shipment-table th:nth-child(8) { width: 9%; }  /* Report          */
+
+/* Cells wrap rather than overflow, and a long tracking number breaks instead
+   of pushing its column wider than its share. */
+.mv-shipment-table td,
+.mv-shipment-table th {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.mv-shipment-table td { padding-block: 14px; }
+
+.mv-shipment-order {
+  font-weight: 600;
+  color: var(--mv-text);
+  text-decoration: none;
+}
+.mv-shipment-order:hover { color: var(--mv-primary); text-decoration: underline; }
+
+.mv-shipment-sub {
+  font-size: 12px;
+  line-height: 1.4;
+  margin-top: 2px;
+  color: var(--mv-muted);
+}
+
+.mv-shipment-late { margin-top: 6px; }
+
+/* The buttons inside a row are compact, so two of them fit a 14% column. */
+.mv-shipment-table .mv-button {
+  min-height: 34px;
+  padding: 0.3rem 0.6rem;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------------------
+   Below 1200px the deliberate behaviour is a horizontal scroll, not eight
+   crushed columns.
+
+   Squeezing these into a narrow viewport makes every label wrap onto three or
+   four lines, which costs more reading effort than a scroll and hides nothing —
+   whereas a scroll keeps every column legible and the row understandable. The
+   table gets the minimum width it needs, the wrapper scrolls, and the first
+   column stays put so the reader never loses which parcel they are looking at.
+   -------------------------------------------------------------------------- */
+@media (max-width: 1200px) {
+  .mv-shipment-table { table-layout: auto; min-width: 1040px; }
+  .mv-shipment-table th:nth-child(n) { width: auto; }
+  .mv-shipment-table th:first-child,
+  .mv-shipment-table td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--mv-surface);
+  }
+}
+
+/* ==========================================================================
+   The filter bar and its disclosure
+   ========================================================================== */
+.mv-more-filters {
+  position: relative;
+  align-self: flex-end;
+}
+.mv-more-filters > summary {
+  cursor: pointer;
+  list-style: none;
+  min-height: var(--mv-control-height);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 0.9rem;
+  border: 1px solid var(--mv-border);
+  border-radius: var(--mv-radius-control);
+  background: var(--mv-surface);
+  color: var(--mv-text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.mv-more-filters > summary::-webkit-details-marker { display: none; }
+.mv-more-filters > summary::after {
+  content: "▾";
+  margin-left: 0.4rem;
+  font-size: 10px;
+  color: var(--mv-muted);
+}
+.mv-more-filters[open] > summary { border-color: var(--mv-primary); color: var(--mv-primary); }
+.mv-more-filters-body {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(200px, 1fr));
+  gap: 12px 16px;
+  padding: 16px;
+  min-width: 460px;
+  background: var(--mv-surface);
+  border: 1px solid var(--mv-border);
+  border-radius: var(--mv-radius-panel);
+  box-shadow: var(--mv-admin-shadow);
+}
+.mv-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.45rem;
+  align-self: end;
+}
+
+/* ==========================================================================
+   Buttons, at the approved radii and colours
+   ========================================================================== */
+.mv-button {
+  border-radius: var(--mv-radius-control);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 0 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border: 1px solid var(--mv-border);
+  background: var(--mv-surface);
+  color: var(--mv-text);
+  text-decoration: none;
+  cursor: pointer;
+}
+.mv-button:hover { border-color: #c4cedb; background: #fbfcfe; }
+.mv-button-dark,
+.mv-button-primary {
+  background: var(--mv-primary);
+  border-color: var(--mv-primary);
+  color: #ffffff;
+}
+.mv-button-dark:hover,
+.mv-button-primary:hover { background: var(--mv-primary-hover); border-color: var(--mv-primary-hover); }
+.mv-button-danger { color: var(--mv-late-text); border-color: #f2c9c4; }
+.mv-button-danger:hover { background: var(--mv-late-fill); }
+
+/* Cards and panels: 12px radius, the approved border and surface. */
+.mv-panel,
+.mv-stat {
+  border-radius: var(--mv-radius-panel);
+  border: 1px solid var(--mv-border);
+  background: var(--mv-surface);
+}
+
+/* The main column gets the specified 24px gutter. */
+.mv-page,
+.mv-page-wide {
+  padding: var(--mv-space);
+}
