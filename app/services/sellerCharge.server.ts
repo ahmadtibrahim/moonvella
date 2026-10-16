@@ -37,7 +37,12 @@
 
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
-import { chargeWholesaleOrder, getDefaultPaymentMethod, type ChargeResult } from "./sellerBilling.server";
+import {
+  chargeWholesaleOrder,
+  getBillingSettings,
+  getDefaultPaymentMethod,
+  type ChargeResult,
+} from "./sellerBilling.server";
 import { transitionOrder, MONEY_CLEARED, type OrderState, type StateActor } from "./orderState.server";
 import { createSetupSession } from "./sellerBilling.server";
 
@@ -159,6 +164,12 @@ export interface SellerChargeOutcome {
   requiresPaymentMethod?: boolean;
   /** True when the store has not been paid yet, so there is nothing to charge. */
   awaitingCustomerPayment?: boolean;
+  /**
+   * True when the store has switched automatic payment off, so no charge was
+   * attempted and the order is waiting for the store to pay it. Distinct from a
+   * decline: nothing failed, and the order's state is left untouched.
+   */
+  awaitingManualPayment?: boolean;
   /** Where the seller goes to add one. Null unless `requiresPaymentMethod`. */
   setupUrl?: string | null;
   paymentIntentId?: string;
@@ -319,6 +330,38 @@ export async function chargeSellerForOrder(input: {
    * retried by the queue until it burned its attempts and then read as a system
    * fault. Nothing is fulfilled in this state, and nothing is charged.
    */
+  /*
+   * A STORE THAT PAYS ON DEMAND HAS NOT HAD A PAYMENT FAIL.
+   *
+   * The charge itself refuses this case — "Seller has not enabled automatic
+   * payment" — but by the time it does, the order has already been moved to
+   * PAYMENT_PROCESSING and its refusal is handled as a decline, so a deliberate
+   * payment POLICY parked a perfectly good order in PAYMENT_FAILED and told the
+   * seller's page and the owner's queue that the money had failed. It had not:
+   * no attempt was made. Order #1005 was the proof — it sat in PAYMENT_FAILED
+   * with a wholesale payment of REQUIRES_PAYMENT and no payment intent at all.
+   *
+   * The check therefore has to happen BEFORE the transition, which is the one
+   * thing that makes this fix small: PAYMENT_PROCESSING has no edge back to
+   * AWAITING_SELLER_PAYMENT, so an order that reaches it cannot be told "we
+   * never tried". Checked here, the order is never moved and keeps saying what
+   * is true — it is waiting for the store to pay it.
+   */
+  if (input.trigger === "AUTOMATIC") {
+    const settings = await getBillingSettings(order.sellerId);
+    if (!settings.autoPayEnabled || settings.mode !== "AUTOMATIC") {
+      return {
+        ok: false,
+        status: payment.status,
+        state,
+        awaitingManualPayment: true,
+        amountMinor: computation.amountMinor,
+        currency: computation.currency,
+        message: "This store pays MoonVella on demand, so this order is waiting for the store to pay it.",
+      };
+    }
+  }
+
   const method = await getDefaultPaymentMethod(order.sellerId);
   if (!method) {
     const setup = input.setupReturnUrl

@@ -434,6 +434,18 @@ export const jobHandlers: Record<string, JobHandler> = {
         detail: { ...outcome },
       };
     }
+    /*
+     * A store that pays on demand. Nothing was attempted, so this is a hold and
+     * not a decline — the order keeps its state and the seller is asked to pay
+     * it. Reporting it as a failure is what put order #1005 into PAYMENT_FAILED
+     * with no payment intent against it.
+     */
+    if (outcome.awaitingManualPayment) {
+      return {
+        summary: "This store pays on demand; the order waits for the store to pay it.",
+        detail: { ...outcome },
+      };
+    }
     if (outcome.requiresAction) {
       return {
         summary: "The card issuer requires authentication; the order is held until the seller completes it.",
