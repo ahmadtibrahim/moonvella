@@ -31,6 +31,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
 import {
   BRAND_SLOTS,
@@ -468,7 +470,35 @@ async function main() {
   );
 
   /* ------------------------------------------------------------------ */
-  /* 8. The media library is unaffected                                  */
+  /* 8. The route the browser actually asks for                          */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * `/brand/` MUST BE HOST-AGNOSTIC, AND THIS IS NOT A STYLE CHECK.
+   *
+   * `server.js` splits the two surfaces by PATH as well as by hostname, and a
+   * path it does not recognise is treated as a merchant path — which the admin
+   * host answers with a 404. The brand route matches no `/admin/` prefix, so
+   * without an entry in `isHostAgnostic` the operator's own logo 404s on the
+   * operator's own sidebar and sign-in page, and the browser reports it as a
+   * missing file rather than as a routing rule.
+   *
+   * That is exactly what happened on the first deploy of this feature, and it
+   * was found by fetching the URL rather than by any of the checks above.
+   */
+  const serverSource = readFileSync(join(process.cwd(), "server.js"), "utf8");
+  const agnosticBlock = serverSource.slice(
+    serverSource.indexOf("function isHostAgnostic"),
+    serverSource.indexOf("function isProviderCallback")
+  );
+  check(
+    "8  /brand/ is served on BOTH hosts — the sidebar and the sign-in page are on the admin host",
+    agnosticBlock.includes('pathname.startsWith("/brand/")'),
+    agnosticBlock.includes("/brand/") ? "declared" : "MISSING — the logo will 404 on the admin host"
+  );
+
+  /* ------------------------------------------------------------------ */
+  /* 9. The media library is unaffected                                  */
   /* ------------------------------------------------------------------ */
 
   const media = await saveUpload(asFile(png, "image/png", "not-a-logo.png"));

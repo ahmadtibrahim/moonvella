@@ -110,6 +110,26 @@ function surfaceForPath(pathname) {
  * path because without it the owner panel cannot navigate to any route that is
  * not already in its initial bundle.
  */
+/**
+ * Paths that belong to NEITHER surface and are served on both.
+ *
+ * `/brand/` is here, and it has to be. A brand image is the operator's own mark
+ * shown on the operator's own surfaces — and those surfaces live on BOTH hosts:
+ * the sidebar and sign-in page on the admin host, the header of the embedded
+ * Shopify app on the merchant host, and a favicon on whatever host the browser
+ * happens to be showing. Every one of them resolves a single URL that the
+ * database produced.
+ *
+ * Leaving it out is not a small mistake: the path matches no `/admin/` prefix, so
+ * the surface split classified it as a merchant path and the admin host answered
+ * its own logo with a 404 — a broken image on the sign-in page, reported by the
+ * browser as a missing file rather than as a routing rule.
+ *
+ * It is exempt for the same reason `/assets/` is: the bytes are one build's, they
+ * are identical on both hosts, and they carry no session and no surface-specific
+ * data. The route itself still decides what it will serve — a path that does not
+ * name a live row is a 404 there.
+ */
 function isHostAgnostic(pathname) {
   return (
     pathname === "/health" ||
@@ -118,7 +138,8 @@ function isHostAgnostic(pathname) {
     pathname === "/robots.txt" ||
     pathname.startsWith("/assets/") ||
     pathname.startsWith("/build/") ||
-    pathname.startsWith("/uploads/")
+    pathname.startsWith("/uploads/") ||
+    pathname.startsWith("/brand/")
   );
 }
 
