@@ -338,15 +338,27 @@ export const RECURRING_JOBS: readonly RecurringJob[] = [
     everyMs: 15 * 60 * 1000,
     summary: "Register this app's order webhook subscriptions with Shopify.",
   },
-  {
-    kind: JOB_KIND.ODOO_CATALOG_SYNC,
-    // Six hours. A catalogue is not a shipment: prices and stock move in Odoo
-    // over days, and every run reads the whole tagged set. Often enough that a
-    // change made in the morning is on a seller's screen the same afternoon,
-    // rare enough that it is not the busiest thing this app does.
-    everyMs: 6 * 60 * 60 * 1000,
-    summary: "Read the tagged Odoo catalogue and update MoonVella's drafts.",
-  },
+  /*
+   * THE SIX-HOURLY ODOO CATALOGUE SYNC IS GONE FROM THIS LIST, and its absence
+   * is the change rather than an omission.
+   *
+   * It was the last recurring ERP job: the contact sync and the handoff invoice
+   * were removed on 2026-10-16, and the catalogue read survived that wave because
+   * the catalogue was still Odoo's. It is not any more. Products, variants,
+   * prices, packaging, images, stock ownership and warehouse addresses were all
+   * migrated into app-owned records, and a six-hourly read that overwrote those
+   * records from the ERP would undo the migration on its first run — silently,
+   * and in the direction of the figures the owner asked to stop using.
+   *
+   * WHAT NO LONGER HAPPENS, so nobody has to wonder: prices are not repriced from
+   * Odoo, descriptions and draft/published state are not rewritten, tagged
+   * products are not created, and a product that loses its tag is no longer
+   * withdrawn. All of those were this job. The editor is now the only writer.
+   *
+   * The JOB_KIND is kept, and the handler REFUSES rather than being deleted —
+   * see jobHandlers.server.ts. A row queued under the old schedule, or an
+   * operator's retry, must meet a conclusion rather than a missing handler.
+   */
 ];
 
 /** How long a finished recurring job is kept before it is pruned. */

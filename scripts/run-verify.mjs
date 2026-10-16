@@ -267,6 +267,16 @@ const CHECKS = [
   },
   { name: "rankings", kind: "ts", file: "scripts/verify-rankings.ts" },
   { name: "orders", kind: "ts", file: "scripts/verify-orders.ts" },
+  // App-owned inventory: the movement ledger, the reservation lifecycle and the
+  // migration gate that booking reads.
+  //
+  // Registered rather than run by hand because the failures it guards against are
+  // silent — a hold taken twice, or a release that reads as a receipt, leaves
+  // figures that look entirely plausible. It builds its own product, dock and
+  // shipments under a SKU prefix and removes them afterwards, and it snapshots
+  // and restores the shared migration row rather than deleting it. No provider is
+  // reached: the suite pins the provider guard itself.
+  { name: "inventory", kind: "ts", file: "scripts/verify-inventory.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox

@@ -6,6 +6,9 @@ export const AUDIT_ENTITY = {
   APPLICATION: "MerchantApplication",
   SELLER: "Seller",
   PRODUCT: "Product",
+  /** A single sellable unit. A stock adjustment is recorded against the variant,
+   *  not the family, because the quantity belongs to the variant. */
+  PRODUCT_VARIANT: "ProductVariant",
   MEDIA: "MediaAsset",
   SELLER_PRODUCT: "SellerProduct",
   ORDER: "Order",

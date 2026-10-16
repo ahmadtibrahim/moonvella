@@ -1,55 +1,103 @@
 /**
- * The Odoo catalogue: what is connected, what is synced, and what was left out.
+ * The retired Odoo integration, under Advanced settings.
  *
- * TWO CONTROLS, ONE CODE PATH. "Sync now" and the six-hourly scheduled sync run
- * the same function — `syncOdooCatalog` — and both record a row in the job
- * table, so "when did this last run and what did it say" has one answer rather
- * than one per control. The preview above the button is the same read the sync
- * does, rendered before anybody presses anything.
+ * WHERE THIS PAGE CAME FROM. Until 2026-10-16 this was the Odoo catalogue page:
+ * a live preview of the tagged ERP templates, a "Sync now" button, and a
+ * six-hourly job behind both. The owner has moved MoonVella's catalogue and
+ * accounting into this application, so all three of those are gone — and a page
+ * that still showed a green "Connected" badge over a switched-off integration
+ * was the specific complaint that started this work.
  *
- * WHAT THIS PAGE OWES THE OPERATOR. Three things, and each of them is a thing
- * that goes wrong quietly without it: whether Odoo is actually connected (an
- * authenticated read, not "fields are filled in"), what the last run did and
- * when the next one is due, and — for every tagged product that was NOT written
- * — the reason, in the product's own name. A sync that reports "3 products" and
- * silently skips a fourth is worse than one that fails.
+ * WHAT IT IS NOW, AND WHAT IT DELIBERATELY IS NOT.
  *
- * It also shows what Odoo does NOT hold, such as a description on a template
- * that has none, because the alternative is an owner discovering a blank field
- * afterwards and having to guess whether MoonVella lost it or Odoo never had it.
+ *   * It makes NO Odoo request. Not a connection probe, not a preview, not a
+ *     read. `previewOdooImport` is not called, so opening this page cannot
+ *     depend on an ERP being reachable — and the mode gate, which refuses even
+ *     reads while disabled, is never approached.
+ *   * It holds NO control that starts work. There is no sync button and no
+ *     import button, because there is no longer any operation on the other side
+ *     of them.
+ *   * It REPORTS HISTORY. What ran, when, and what it left behind: the job rows
+ *     are kept rather than deleted, which is what the work order requires, and
+ *     the external ids the catalogue was migrated from are still on the records.
+ *
+ * THE BADGE SAYS DISABLED. The state comes from `listIntegrationStates`, which
+ * reports a switched-off integration as DISABLED rather than HEALTHY — the
+ * distinction that a whole migration was needed to make honest. The paragraph
+ * beside it explains what is retained, so "disabled" cannot be read as "your
+ * credentials were thrown away".
+ *
+ * WHY IT IS STILL REACHABLE AT ALL. The credentials, the external id mappings
+ * and the job history are real records that somebody may need to consult — for
+ * an audit, a reconciliation, or the question "what did the old sync actually
+ * do". Deleting the surface would not delete the data; it would only make the
+ * data unreachable.
  */
 
-import { Form, useActionData, useLoaderData, useNavigation } from "react-router";
-import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
-import { requirePermission, assertSameOrigin } from "~/utils/adminAuth.server";
-import { previewOdooImport } from "~/services/odooImport.server";
-import { catalogSyncStatus, runCatalogSyncNow } from "~/services/odooSync.server";
-import { RECURRING_JOBS, JOB_KIND } from "~/services/jobs.server";
+import { useLoaderData } from "react-router";
+import type { LoaderFunctionArgs } from "react-router";
+import { requirePermission } from "~/utils/adminAuth.server";
+import { prisma } from "~/db.server";
+import { maskedOdooConnection, classifyOdooMode } from "~/services/odoo.server";
+import { getCredentials } from "~/services/credentials.server";
+import { listIntegrationStates } from "~/services/integrationHealth.server";
 import { formatDateTime } from "~/utils/dates";
 
-const SYNC_EVERY_MS =
-  RECURRING_JOBS.find((job) => job.kind === JOB_KIND.ODOO_CATALOG_SYNC)?.everyMs ?? 6 * 60 * 60 * 1000;
+/** Job kinds that belonged to the retired integration. History, read only. */
+const RETIRED_KINDS = ["ODOO_CONTACT_SYNC", "ODOO_INVOICE_SYNC", "ODOO_PRODUCT_IMPORT", "ODOO_CATALOG_SYNC"];
 
 export async function loader({ request }: LoaderFunctionArgs) {
   await requirePermission(request, "products.view");
-  const [preview, sync] = await Promise.all([
-    previewOdooImport(),
-    catalogSyncStatus({ everyMs: SYNC_EVERY_MS }),
+
+  // Local reads only. Nothing below reaches Odoo, so this page renders on a host
+  // with no route to the ERP at all.
+  const [masked, stored, states, jobs, mappings] = await Promise.all([
+    maskedOdooConnection(),
+    getCredentials("odoo"),
+    listIntegrationStates(),
+    prisma.backgroundJob.groupBy({
+      by: ["kind", "status"],
+      where: { kind: { in: RETIRED_KINDS } },
+      _count: { _all: true },
+      orderBy: { kind: "asc" },
+    }),
+    Promise.all([
+      prisma.externalProductMapping.count({ where: { provider: "ODOO" } }),
+      prisma.externalVariantMapping.count({ where: { provider: "ODOO" } }),
+      // This table is Odoo-only — it has no `provider` column, because a contact
+      // was never mirrored anywhere else. A null `odooPartnerId` is a mapping
+      // that was never written, so it is counted as a link only once it has one.
+      prisma.externalContactMapping.count({ where: { odooPartnerId: { not: null } } }),
+    ]),
   ]);
-  return { preview, sync, everyMs: SYNC_EVERY_MS };
-}
 
-export async function action({ request }: ActionFunctionArgs) {
-  assertSameOrigin(request);
-  await requirePermission(request, "products.manage");
-  const form = await request.formData();
-  const intent = String(form.get("intent") || "");
+  const mode = classifyOdooMode({
+    configured: Boolean(masked),
+    mode: stored.ODOO_MODE ?? null,
+    // Read from the deployment, never from a form — the same two-key rule the
+    // connector applies, so this page cannot report a mode the connector would
+    // not actually permit.
+    writesAllowed: process.env.ODOO_ALLOW_WRITES?.trim().toLowerCase() === "yes",
+  });
 
-  if (intent !== "sync") return { error: "Unknown action." };
+  const state = states.find((entry) => entry.key === "odoo") ?? null;
 
-  const outcome = await runCatalogSyncNow();
-  if (!outcome.ok) return { error: outcome.error };
-  return { synced: outcome.outcome };
+  return {
+    retained: {
+      url: masked?.url ?? null,
+      database: masked?.database ?? null,
+      username: masked?.username ?? null,
+      apiKeySet: Boolean(masked?.apiKeySet),
+      mode,
+    },
+    state,
+    jobs: jobs.map((row) => ({
+      kind: row.kind,
+      status: row.status,
+      count: row._count._all,
+    })),
+    mappings: { products: mappings[0], variants: mappings[1], contacts: mappings[2] },
+  };
 }
 
 const card: React.CSSProperties = {
@@ -60,432 +108,147 @@ const card: React.CSSProperties = {
   marginBottom: "1.5rem",
 };
 
-function money(value: number, currency: string) {
-  return `${currency} ${value.toFixed(2)}`;
+const heading: React.CSSProperties = {
+  fontSize: "0.95rem",
+  fontWeight: 600,
+  color: "#082a4a",
+  marginBottom: "0.75rem",
+};
+
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div style={{ display: "flex", gap: "0.75rem", fontSize: "0.82rem", padding: "0.2rem 0" }}>
+      <div style={{ color: "#64748b", minWidth: 190 }}>{label}</div>
+      <div style={{ color: "#172B4D" }}>{children}</div>
+    </div>
+  );
 }
 
-/** "in 3 h 20 min", or "now" when the moment has passed. */
-function untilLabel(target: Date | null, now: number): string {
-  if (!target) return "—";
-  const ms = target.getTime() - now;
-  if (ms <= 0) return "due now — the next cron tick picks it up";
-  const minutes = Math.round(ms / 60000);
-  if (minutes < 60) return `in ${minutes} min`;
-  const hours = Math.floor(minutes / 60);
-  return `in ${hours} h ${minutes % 60} min`;
-}
+export default function AdminOdooLegacy() {
+  const { retained, state, jobs, mappings } = useLoaderData<typeof loader>();
 
-function whenLabel(value: Date | null): string {
-  return value ? formatDateTime(value) : "never";
-}
-
-export default function AdminOdooImport() {
-  const { preview, sync, everyMs } = useLoaderData<typeof loader>();
-  const actionData = useActionData<typeof action>();
-  const navigation = useNavigation();
-  const submitting = navigation.state === "submitting";
-
-  const detail = sync.lastRun?.detail as
-    | {
-        blocked?: { odooTemplateId: number; name: string; problems: string[] }[];
-        withdrawn?: { productId: string; name: string; reason: string }[];
-        notes?: string[];
-        created?: number;
-        updated?: number;
-        variants?: number;
-        archived?: number;
-        defaultPickupLocationId?: string | null;
-      }
-    | null
-    | undefined;
+  const isDisabled = retained.mode === "disabled";
 
   return (
     <div style={{ maxWidth: 1000, margin: "0 auto" }}>
-      <h1 style={{ fontSize: "1.6rem", fontWeight: 700, color: "#082a4a", marginBottom: "0.25rem" }}>
-        Odoo catalogue
-      </h1>
-      <p style={{ color: "#64748b", fontSize: "0.82rem", marginBottom: "1.25rem", lineHeight: 1.6 }}>
-        Reads the Odoo products carrying the <strong>MoonVella App</strong> product tag and writes
-        them into this catalogue as <strong>drafts</strong>. Nothing is published by a sync, and
-        nothing in Odoo is changed — inventory and prices are read, never written. A seller is
-        charged each <strong>variant&apos;s effective sales price</strong> in Odoo — the price on the
-        variant&apos;s own form, which is the template&apos;s list price plus that variant&apos;s
-        attribute price extras — and never the product&apos;s cost and never zero. Suggested retail
-        is not imported: it stays MoonVella&apos;s own field, and nothing here writes a
-        seller&apos;s storefront prices.
+      <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
+        <h1 style={{ fontSize: "1.6rem", fontWeight: 700, color: "#142440", margin: 0 }}>
+          Odoo (retired)
+        </h1>
+        <span
+          style={{
+            fontSize: "0.72rem",
+            fontWeight: 600,
+            padding: "0.25rem 0.6rem",
+            borderRadius: 999,
+            background: isDisabled ? "#F1F5F9" : "#FEF3C7",
+            color: isDisabled ? "#475569" : "#92400E",
+            border: `1px solid ${isDisabled ? "#DCE3EB" : "#fcd34d"}`,
+          }}
+        >
+          {isDisabled ? "Disabled" : `Mode: ${retained.mode}`}
+        </span>
+      </div>
+
+      <p style={{ color: "#52627A", fontSize: "0.85rem", marginTop: "0.6rem", lineHeight: 1.7 }}>
+        MoonVella&apos;s catalogue and customer accounting are its own. No product, price, stock
+        figure, customer record or invoice is read from or written to Odoo by this application, and
+        nothing is queued to do so later. This page is kept so the retained records stay reachable.
       </p>
 
-      {actionData && "error" in actionData && actionData.error ? (
-        <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>
-          {actionData.error}
-        </div>
-      ) : null}
-
-      {actionData && "synced" in actionData && actionData.synced ? (
-        <div style={{ ...card, background: "#f0fdf4", borderColor: "#bbf7d0", color: "#065f46" }}>
-          <strong>{actionData.synced.summary}</strong>
-        </div>
-      ) : null}
-
-      {/* Last run, next run and counts. The three questions an operator has
-          about a scheduled job, answered from the job table rather than from a
-          promise that it is running. */}
       <div style={card}>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
+        <h2 style={heading}>What is retained</h2>
+        <div style={{ fontSize: "0.82rem", color: "#334155", lineHeight: 1.8 }}>
           <div>
-            <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
-              Automatic sync
-            </h2>
-            <div style={{ fontSize: "0.82rem", color: "#334155", lineHeight: 1.7 }}>
-              <div>
-                Runs every {Math.round(everyMs / 3600000)} hours through the job worker.{" "}
-                {sync.running ? (
-                  <strong style={{ color: "#b45309" }}>A run is queued or in progress now.</strong>
-                ) : (
-                  <>Next run {untilLabel(sync.nextRunAt, Date.now())}.</>
-                )}
-              </div>
-            </div>
+            · <strong>Credentials</strong> — the saved Odoo URL, database, username and API key are
+            kept, encrypted, exactly as they were. Nothing reads them. They were not deleted,
+            because deleting them was not asked for and a credential that is gone cannot be
+            audited.
           </div>
-
-          <Form method="post">
-            <button
-              type="submit"
-              name="intent"
-              value="sync"
-              disabled={submitting || sync.running || preview.blockers.length > 0}
-              style={{
-                padding: "0.7rem 1.1rem",
-                border: "1px solid #082a4a",
-                borderRadius: 8,
-                background: submitting || sync.running || preview.blockers.length > 0 ? "#f1f5f9" : "#082a4a",
-                color: submitting || sync.running || preview.blockers.length > 0 ? "#94a3b8" : "white",
-                fontWeight: 600,
-                fontSize: "0.82rem",
-                cursor: submitting || sync.running || preview.blockers.length > 0 ? "not-allowed" : "pointer",
-              }}
-            >
-              {submitting ? "Syncing…" : "Sync now"}
-            </button>
-          </Form>
+          <div>
+            · <strong>External id mappings</strong> — {mappings.products} product,{" "}
+            {mappings.variants} variant and {mappings.contacts} contact mapping(s) record which Odoo
+            record each MoonVella row came from. Historical metadata: no decision reads them.
+          </div>
+          <div>
+            · <strong>Job history</strong> — every sync, import and invoice job that ever ran, with
+            what it did and what it said. Retained; a job that was queued but never ran is
+            cancelled with the reason recorded rather than deleted.
+          </div>
         </div>
-
-        <div style={{ marginTop: "0.9rem", fontSize: "0.82rem", color: "#334155", lineHeight: 1.7 }}>
-          {sync.lastRun ? (
-            <>
-              <div>
-                Last run: <strong>{sync.lastRun.status}</strong> · finished{" "}
-                {whenLabel(sync.lastRun.finishedAt ?? sync.lastRun.startedAt)}
-              </div>
-              {sync.lastRun.summary ? <div>{sync.lastRun.summary}</div> : null}
-              {sync.lastRun.status === "FAILED" && sync.lastRun.error ? (
-                <div style={{ color: "#991b1b" }}>{sync.lastRun.error}</div>
-              ) : null}
-              {sync.lastRun.status === "SUCCEEDED" && !sync.lastRun.summary ? (
-                <div style={{ color: "#92400e" }}>
-                  This run predates the current sync report and has no counts recorded.
-                </div>
-              ) : null}
-            </>
-          ) : (
-            <div style={{ color: "#64748b" }}>
-              No sync has run yet. The first one is queued by the next cron tick, or press Sync now.
-            </div>
-          )}
-        </div>
-
-        {detail?.notes?.length ? (
-          <div style={{ marginTop: "0.6rem" }}>
-            {detail.notes.map((note) => (
-              <div key={note} style={{ fontSize: "0.78rem", color: "#475569" }}>
-                · {note}
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {/* A product Odoo cannot describe completely is skipped, not imported at
-            a guess — and the reason belongs on a screen, in the product's name. */}
-        {detail?.blocked?.length ? (
-          <div style={{ marginTop: "0.75rem", background: "#fffbeb", border: "1px solid #fcd34d", borderRadius: 8, padding: "0.7rem" }}>
-            <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#92400e", marginBottom: "0.3rem" }}>
-              {detail.blocked.length} tagged product(s) were left out of the last sync
-            </div>
-            {detail.blocked.map((item) => (
-              <div key={item.odooTemplateId} style={{ fontSize: "0.78rem", color: "#78350f", marginTop: "0.3rem" }}>
-                <strong>{item.name}</strong> (Odoo template {item.odooTemplateId})
-                {item.problems.map((problem) => (
-                  <div key={problem}>· {problem}</div>
-                ))}
-              </div>
-            ))}
-          </div>
-        ) : null}
-
-        {detail?.withdrawn?.length ? (
-          <div style={{ marginTop: "0.75rem", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 8, padding: "0.7rem" }}>
-            <div style={{ fontSize: "0.82rem", fontWeight: 600, color: "#334155", marginBottom: "0.3rem" }}>
-              {detail.withdrawn.length} product(s) withdrawn from sale
-            </div>
-            {detail.withdrawn.map((item) => (
-              <div key={item.productId} style={{ fontSize: "0.78rem", color: "#475569" }}>
-                · <strong>{item.name}</strong> — {item.reason}. Archived, not deleted: existing
-                orders still reference it, and its inventory is left at the last figure read.
-              </div>
-            ))}
-          </div>
-        ) : null}
       </div>
 
       <div style={card}>
-        <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.75rem" }}>
-          Connection
-        </h2>
-        <div style={{ fontSize: "0.82rem", color: "#334155", lineHeight: 1.7 }}>
-          <div>
-            URL: <strong>{preview.connection.url ?? "not configured"}</strong>
-          </div>
-          <div>
-            Database: <strong>{preview.connection.database ?? "not configured"}</strong>
-          </div>
-          <div>
-            Mode: <strong>{preview.connection.mode ?? "unknown"}</strong>
-          </div>
-          <div>
-            Product tag:{" "}
-            <strong>
-              {preview.tag ? `${preview.tag.name} (id ${preview.tag.id})` : "not found in Odoo"}
-            </strong>
-          </div>
-          <div>
-            Fulfillment warehouse:{" "}
-            <strong>
-              {preview.warehouse
-                ? `${preview.warehouse.name} (id ${preview.warehouse.id}) — locations under ${preview.warehouse.rootLocationName}`
-                : "not configured"}
-            </strong>
-          </div>
-          {/* The pricing authority, on the same card as the connection: what a
-              seller is charged is decided by this sentence and by nothing else. */}
-          <div>
-            Sales price charged:{" "}
-            <strong>{preview.pricing.currency}</strong>
-          </div>
-        </div>
-        {preview.pricing.note ? (
-          <p style={{ fontSize: "0.74rem", color: "#64748b", marginTop: "0.5rem" }}>
-            {preview.pricing.note}
+        <h2 style={heading}>Stored connection</h2>
+        {retained.url ? (
+          <>
+            <Row label="URL">{retained.url}</Row>
+            <Row label="Database">{retained.database ?? "not set"}</Row>
+            <Row label="Username">{retained.username ?? "not set"}</Row>
+            <Row label="API key">{retained.apiKeySet ? "set (value not shown)" : "not set"}</Row>
+            <Row label="Mode">{retained.mode}</Row>
+          </>
+        ) : (
+          <p style={{ fontSize: "0.82rem", color: "#52627A", margin: 0 }}>
+            No Odoo connection was ever saved.
           </p>
-        ) : null}
-        {preview.warehouse?.note ? (
-          <p style={{ fontSize: "0.74rem", color: "#64748b", marginTop: "0.5rem" }}>
-            {preview.warehouse.note}
-          </p>
-        ) : null}
+        )}
+        <p style={{ fontSize: "0.75rem", color: "#64748B", marginTop: "0.75rem", marginBottom: 0, lineHeight: 1.6 }}>
+          The mode above is the stored setting, read locally. No connection is attempted from this
+          page, so a saved-but-unreachable ERP is reported here as disabled rather than as an error —
+          which is what it is: switched off, not broken.
+        </p>
       </div>
 
-      {preview.blockers.length > 0 ? (
-        <div style={{ ...card, background: "#fffbeb", borderColor: "#fcd34d" }}>
-          <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#92400e", marginBottom: "0.5rem" }}>
-            The sync cannot run
-          </h2>
-          {preview.blockers.map((blocker) => (
-            <div key={blocker.code} style={{ marginBottom: "0.6rem" }}>
-              <div style={{ fontSize: "0.82rem", color: "#92400e", fontWeight: 600 }}>
-                {blocker.message}
-              </div>
-              <div style={{ fontSize: "0.78rem", color: "#78350f" }}>{blocker.remedy}</div>
-            </div>
-          ))}
-          <p style={{ fontSize: "0.75rem", color: "#78350f" }}>
-            Nothing below runs until these are cleared, and no stock or price figure is substituted
-            while Odoo cannot be read. A number that looks plausible but did not come from the
-            source is worse than a missing one — so a variant whose sales price Odoo will not state
-            is left out of the sync rather than arriving at the product&apos;s cost or at zero, and
-            a failed stock read stops the run rather than being recorded as no stock.
-          </p>
+      {state ? (
+        <div style={card}>
+          <h2 style={heading}>Last recorded health</h2>
+          <Row label="Status">{state.status}</Row>
+          <Row label="Summary">{state.message}</Row>
+          <Row label="Last recorded">
+            {state.lastSuccessAt
+              ? formatDateTime(new Date(state.lastSuccessAt))
+              : state.lastErrorAt
+                ? `${formatDateTime(new Date(state.lastErrorAt))} (failed)`
+                : "never"}
+          </Row>
         </div>
       ) : null}
 
-      {preview.templates.map((template) => (
-        <div key={template.odooTemplateId} style={card}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: "1rem", flexWrap: "wrap" }}>
-            <div>
-              <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a" }}>
-                {template.odooName}
-              </h2>
-              <div style={{ fontSize: "0.75rem", color: "#64748b" }}>
-                Odoo template {template.odooTemplateId} · {template.odooCategory} ·{" "}
-                storefront currency {template.currency}
-              </div>
-            </div>
-            <div style={{ fontSize: "0.75rem", color: "#475569", textAlign: "right" }}>
-              <div>
-                Product Code <strong>{template.productCode}</strong>
-              </div>
-              <div style={{ color: "#94a3b8" }}>{template.codeSource}</div>
-              <div style={{ color: template.existingProductId ? "#059669" : "#94a3b8" }}>
-                {template.existingProductId
-                  ? "already imported — this will update the existing product"
-                  : "not imported yet — this will create a draft"}
-              </div>
-            </div>
-          </div>
-
-          <div style={{ fontSize: "0.78rem", color: "#334155", marginTop: "0.6rem" }}>
-            <div>
-              Description:{" "}
-              {template.description ? (
-                <span>{template.description}</span>
-              ) : (
-                <span style={{ color: "#b45309" }}>
-                  none in Odoo — the draft&apos;s description is left empty
-                </span>
-              )}
-            </div>
-            <div style={{ fontSize: "0.7rem", color: "#94a3b8" }}>{template.descriptionSource}</div>
-          </div>
-
-          {template.problems.length > 0 ? (
-            <div style={{ marginTop: "0.6rem", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "0.6rem" }}>
-              {template.problems.map((problem) => (
-                <div key={problem} style={{ fontSize: "0.76rem", color: "#991b1b" }}>
-                  · {problem}
-                </div>
-              ))}
-            </div>
-          ) : null}
-
-          <table style={{ width: "100%", borderCollapse: "collapse", marginTop: "0.75rem", fontSize: "0.79rem" }}>
+      <div style={card}>
+        <h2 style={heading}>Retired job history</h2>
+        {jobs.length === 0 ? (
+          <p style={{ fontSize: "0.82rem", color: "#52627A", margin: 0 }}>
+            No jobs were ever recorded for the retired flows.
+          </p>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "0.82rem" }}>
             <thead>
-              <tr style={{ textAlign: "left", color: "#64748b", fontSize: "0.7rem" }}>
-                <th style={th}>Variant</th>
-                <th style={th}>SKU</th>
-                <th style={th}>Attributes</th>
-                <th style={th}>Sales price (charged)</th>
-                <th style={th}>Cost</th>
-                <th style={th}>Available</th>
+              <tr style={{ textAlign: "left", color: "#52627A", fontSize: "0.72rem" }}>
+                <th style={th}>Job kind</th>
+                <th style={th}>Status</th>
+                <th style={th}>Rows</th>
               </tr>
             </thead>
             <tbody>
-              {template.variants.map((variant) => (
-                <tr key={variant.odooVariantId} style={{ borderTop: "1px solid #f1f5f9" }}>
-                  <td style={td}>
-                    Odoo {variant.odooVariantId}
-                    {variant.existingVariantId ? (
-                      <span style={{ color: "#059669" }}> (existing)</span>
-                    ) : null}
-                  </td>
-                  <td style={td}>
-                    {variant.sku ?? <span style={{ color: "#b91c1c" }}>missing</span>}
-                  </td>
-                  <td style={td}>
-                    {variant.attributes.length
-                      ? variant.attributes
-                          .map((attribute) => `${attribute.attribute}: ${attribute.value}`)
-                          .join(", ")
-                      : "—"}
-                  </td>
-                  {/* The figure a seller is charged, and where it came from so
-                      it can be traced rather than taken on trust. This is the
-                      variant's own effective sales price — list price plus its
-                      attribute extras — read from Odoo, not computed here. A
-                      variant with no such price shows that instead of a number,
-                      and is left out of the sync. */}
-                  <td style={td}>
-                    {variant.wholesalePrice === null ? (
-                      <span style={{ color: "#b91c1c" }}>no sales price</span>
-                    ) : (
-                      money(variant.wholesalePrice, variant.wholesaleCurrency ?? "")
-                    )}
-                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
-                      Odoo effective sales price
-                    </div>
-                  </td>
-                  <td style={td}>
-                    {variant.cost === null ? "—" : money(variant.cost, template.currency)}
-                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>never charged</div>
-                  </td>
-                  {/* The total, and then every record it is made of. The
-                      breakdown is the answer to "whose stock, and where" — a
-                      total counted across a whole warehouse can be several
-                      owners' goods and the company's own, and a figure nobody
-                      can trace is a figure nobody can check. */}
-                  <td style={td}>
-                    <strong>{variant.available}</strong>
-                    <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
-                      {variant.onHand} on hand − {variant.reserved} reserved
-                    </div>
-                    {variant.stock.length === 0 ? (
-                      <div style={{ fontSize: "0.68rem", color: "#94a3b8" }}>
-                        no stock at this warehouse
-                      </div>
-                    ) : (
-                      variant.stock.map((record) => (
-                        <div
-                          key={`${record.locationId}-${record.ownerId ?? "company"}`}
-                          style={{ fontSize: "0.68rem", color: "#94a3b8" }}
-                        >
-                          {record.quantity} at {record.locationName} ·{" "}
-                          {record.ownerName ?? "company-owned"}
-                        </div>
-                      ))
-                    )}
-                  </td>
+              {jobs.map((row) => (
+                <tr key={`${row.kind}-${row.status}`} style={{ borderTop: "1px solid #DCE3EB" }}>
+                  <td style={td}>{row.kind}</td>
+                  <td style={td}>{row.status}</td>
+                  <td style={td}>{row.count}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-        </div>
-      ))}
-
-      {preview.notes.length > 0 ? (
-        <div style={card}>
-          <h2 style={{ fontSize: "0.95rem", fontWeight: 600, color: "#082a4a", marginBottom: "0.5rem" }}>
-            Notes
-          </h2>
-          {preview.notes.map((note) => (
-            <div key={note} style={{ fontSize: "0.78rem", color: "#475569" }}>
-              · {note}
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      {/* The whole read, before it is written. Everything above this point is a
-          preview of the same call the sync makes; pressing Sync once is the only
-          thing that changes a row. */}
-      <div style={card}>
-        <Form method="post">
-          <button
-            type="submit"
-            name="intent"
-            value="sync"
-            disabled={submitting || sync.running || preview.blockers.length > 0}
-            style={{
-              padding: "0.7rem 1.1rem",
-              border: "1px solid #082a4a",
-              borderRadius: 8,
-              background: submitting || sync.running || preview.blockers.length > 0 ? "#f1f5f9" : "#082a4a",
-              color: submitting || sync.running || preview.blockers.length > 0 ? "#94a3b8" : "white",
-              fontWeight: 600,
-              fontSize: "0.82rem",
-              cursor: submitting || sync.running || preview.blockers.length > 0 ? "not-allowed" : "pointer",
-            }}
-          >
-            {submitting ? "Syncing…" : "Sync now"}
-          </button>
-          <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.5rem" }}>
-            Odoo is read again when this runs, and the same call runs automatically every{" "}
-            {Math.round(everyMs / 3600000)} hours. If anything above has changed for the worse, the
-            sync refuses rather than writing a partially-checked catalogue; if a single product is
-            incomplete, that one is skipped and named.
-          </p>
-        </Form>
+        )}
+        <p style={{ fontSize: "0.75rem", color: "#64748B", marginTop: "0.75rem", marginBottom: 0, lineHeight: 1.6 }}>
+          A cancelled row means the flow it belonged to was removed before the job ran. It is kept as
+          the honest record of that, rather than as a deletion.
+        </p>
       </div>
     </div>
   );
 }
 
-const th: React.CSSProperties = { padding: "0.3rem 0.4rem", fontWeight: 600 };
-const td: React.CSSProperties = { padding: "0.4rem", verticalAlign: "top", color: "#334155" };
+const th: React.CSSProperties = { padding: "0.35rem 0.4rem", fontWeight: 600 };
+const td: React.CSSProperties = { padding: "0.45rem", color: "#172B4D" };

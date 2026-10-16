@@ -103,28 +103,20 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
     ],
   },
   odoo: {
-    label: "Odoo",
+    label: "Odoo (retired)",
     note:
+      "RETIRED 2026-10-16. MoonVella reads nothing from and writes nothing to Odoo. The " +
+      "catalogue, prices, stock ownership and warehouse origins are app-owned, and customer " +
+      "accounting is app-owned, so there is no operation left that would use these values. " +
+      "They are KEPT rather than discarded: the credentials are stored encrypted and are never " +
+      "sent back to this page, the external id mappings still record where each migrated record " +
+      "came from, and every job that ran is retained as history. " +
+      "NOTHING HERE TURNS THE INTEGRATION BACK ON. The mode field is still read by the " +
+      "connector, but no flow in this application calls Odoo any more, so setting it to live " +
+      "would change nothing. Editing these values is only useful for recording what an audit " +
+      "would need. " +
       "Values are encrypted before they are stored and are never sent back to this page. " +
-      "\"Connected\" appears only after MoonVella authenticates against Odoo with these " +
-      "credentials. Leave a field blank to keep the value already saved. " +
-      "The consignment location and owner say WHOSE stock is sellable: an import reads the " +
-      "quantities held at that location for that owner and nothing else, so stock belonging " +
-      "to the company or to another supplier is never offered for sale. Both accept a name " +
-      "or a numeric id, and a name that matches more than one record is refused rather than " +
-      "guessed at. " +
-      "THE PRICE MOONVELLA CHARGES A SELLER IS EACH VARIANT'S EFFECTIVE SALES PRICE IN ODOO — " +
-      "the price on the variant's own form, which is the template's list price plus that " +
-      "variant's attribute price extras. There is nothing to configure for it: it is read as " +
-      "Odoo computes it, never as the product's cost and never as zero, and a variant Odoo " +
-      "cannot price stops the import instead of arriving at a guess. MoonVella bills in CAD and " +
-      "converts nothing, so a product priced in another currency is refused. " +
-      "READ-ONLY IS THE DEFAULT: \"live\" mode alone does not enable writes — they also " +
-      "require ODOO_ALLOW_WRITES=yes in the deployment environment, which this page cannot " +
-      "set, so a form here can never authorise writing to the ERP. The database is reached " +
-      "over JSON-RPC only, never as a PostgreSQL connection, and a database named Prod-db " +
-      "is refused unless a deployment sets ODOO_ALLOW_PROD_DB=yes. Use a dedicated service " +
-      "account — see the connection setup steps in the audit.",
+      "Leave a field blank to keep the value already saved.",
     fields: [
       {
         name: "ODOO_URL",
@@ -178,21 +170,18 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
         label: "Fulfillment warehouse",
         secret: false,
         placeholder: "warehouse name or numeric id",
-        hint: "“Premafirm Inc.” — the warehouse at 994 Westport Cres, Unit 7A, Mississauga. Stock is counted across its locations for every owner (company-owned and consigned alike, less reservations), and its Odoo address becomes the pickup address of every outbound shipment. There is no separate consignment owner to set: adding a vendor never means changing a global.",
+        hint: "“Premafirm Inc.” — the warehouse at 994 Westport Cres, Unit 7A, Mississauga. HISTORICAL. This used to decide where stock was counted and where a shipment was collected from; both are app-owned now, so nothing reads it. The address a parcel is collected from is the one on the Pickup locations page, and the quantity is the one on the variant.",
       },
       {
-        // DORMANT under the draft-only invoice flow (owner instruction
-        // 2026-10-05): the app no longer registers payments in Odoo — posting,
-        // paying and emailing a wholesale invoice are done by hand there — so
-        // nothing reads this field right now. It is kept rather than removed
-        // because the value already stored must not be destroyed, and because
-        // switching automatic payment recording back on should be a code
-        // change, not a re-typed setting.
+        // DORMANT, and now dormant for a second reason. It was kept when the
+        // draft-only flow stopped registering payments; the whole invoice flow
+        // was removed on 2026-10-16, so there is no flow at all behind it. Kept
+        // rather than removed because the stored value must not be destroyed.
         name: "ODOO_INVOICE_JOURNAL",
         label: "Invoice payment journal",
         secret: false,
         placeholder: "MoonVella Stripe",
-        hint: "Not used at present: MoonVella creates DRAFT invoices only, and posting, payment and emailing them is done by hand in Odoo, so no payment is ever registered from here. Kept for when automatic payment recording is switched back on — the name of the bank or cash journal the wholesale invoice's payment would be recorded in.",
+        hint: "HISTORICAL. MoonVella keeps its customer accounting in this application and writes no invoice to Odoo, so nothing reads this. Retained so the saved value is not destroyed.",
       },
     ],
   },

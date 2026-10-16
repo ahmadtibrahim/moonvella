@@ -4,6 +4,9 @@ import { syncShipmentTracking, invalidateQuotes, QUOTE_INVALIDATION } from "./sh
 import { advanceRefusal, isFulfillmentMilestone, PACKABLE_STATES } from "./shippingLogic";
 import { enqueueJob, jobKey, JOB_KIND } from "./jobs.server";
 import { parcelProblems, ParcelValidationError } from "./packaging.server";
+// The hold a booking took becomes a shipment at the dispatch milestone, which is
+// the moment the goods actually leave. See `advanceShipment`.
+import { fulfilHoldsForShipment } from "./inventory.server";
 import { isFulfillmentUnlocked } from "./orderState.server";
 
 export interface ShipmentInput {
@@ -268,6 +271,30 @@ export async function advanceShipment(
      * manual-shipment path above: the handover queues the Shopify push and
      * nothing else.
      */
+
+    /*
+     * THE STOCK LEAVES HERE, because this is the moment it physically does.
+     *
+     * Booking HELD the units; it did not take them off the shelf. Handing the
+     * parcel to the carrier is what converts the hold into a shipment: the
+     * quantity comes off on-hand, the hold becomes FULFILLED rather than
+     * RELEASED, and a FULFILMENT movement records both so the ledger can say
+     * what changed and when.
+     *
+     * Anchored to the milestone and not to the booking, deliberately. Deducting
+     * at booking would report goods as gone while they sit on the dock, and a
+     * customer who checked would be told there is less stock than there is.
+     *
+     * It is idempotent on (shipment, variant): a replayed handoff finds nothing
+     * HELD and deducts nothing, so an out-of-order or duplicated carrier event
+     * cannot remove the same units twice.
+     */
+    await prisma.$transaction(async (tx) => {
+      await fulfilHoldsForShipment(tx, shipmentId, {
+        id: actor.actorId ?? null,
+        name: actor.actorName ?? null,
+      });
+    });
   }
 
   return shipment;

@@ -1,14 +1,13 @@
 /**
- * The scheduled Odoo catalogue sync, and the default pickup location.
+ * The retired Odoo catalogue sync, and the default pickup location.
  *
- * WHAT THIS SUITE IS FOR. The sync has three parts that are not "read the tag
- * and write a draft", and each of them fails quietly if it is wrong:
+ * WHAT THIS SUITE IS FOR, AFTER 2026-10-16. The sync is OFF — the catalogue is
+ * app-owned — so the part of this suite that used to assert the six-hourly
+ * schedule now asserts its removal, and that a job which somehow exists meets a
+ * refusal rather than a live ERP write. The two parts that were never about the
+ * schedule are unchanged and still covered, because the code behind them is
+ * still real code:
  *
- *   • THE SCHEDULE. A recurring job declared twice, or declared with the wrong
- *     bucket key, runs twice an hour or never again. The queue's own rules —
- *     one row per bucket, no retry inside a bucket — are checked here by running
- *     `ensureRecurringJobs` against the isolated database rather than by reading
- *     it.
  *   • WITHDRAWAL. A product whose Odoo template loses the tag must stop being
  *     offered WITHOUT disappearing: an archived row that historical orders still
  *     reference, with its inventory left at the last figure read. This is
@@ -33,7 +32,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { PrismaClient } from "@prisma/client";
-import { JOB_KIND, RECURRING_JOBS, ensureRecurringJobs } from "~/services/jobs.server";
+import { JOB_KIND, RECURRING_JOBS } from "~/services/jobs.server";
 import { jobHandlers } from "~/services/jobHandlers.server";
 import { withdrawUntaggedProducts } from "~/services/odooSync.server";
 import { resolveOriginForVariant, resolveOriginForProduct } from "~/services/origins.server";
@@ -136,62 +135,80 @@ async function makeProduct(withMapping: number | null) {
 
 async function main() {
   /* -------------------------------------------------------------------- */
-  console.log("A. The schedule");
+  console.log("A. The sync is OFF the schedule, and its handler refuses");
   /* -------------------------------------------------------------------- */
 
+  /*
+   * THESE SIX CHECKS ASSERTED THE OPPOSITE UNTIL 2026-10-16, and they are kept
+   * rather than deleted because they are the same coverage read the other way.
+   *
+   * The catalogue became app-owned: variants, prices, packaging, stock ownership
+   * and warehouse addresses were migrated into this application. A six-hourly
+   * read that wrote the ERP's version back over those records would undo the
+   * migration on its first run — silently, and in the direction of the figures
+   * the owner asked to stop using. So the schedule declaration is gone, and what
+   * has to be true now is that nothing re-creates it and that a job which somehow
+   * exists cannot run.
+   *
+   * The library below (part B onwards) is UNCHANGED and still covered: the
+   * withdrawal pass and the catalogue read are real code with real suites. What
+   * is removed is the wiring, not the implementation.
+   */
   const recurring = RECURRING_JOBS.find((job) => job.kind === JOB_KIND.ODOO_CATALOG_SYNC);
   check(
-    "The catalogue sync is a declared recurring job, six-hourly",
-    recurring?.everyMs === 6 * 60 * 60 * 1000 && /Odoo catalogue/.test(recurring?.summary ?? ""),
-    `every ${(recurring?.everyMs ?? 0) / 3600000}h — ${recurring?.summary ?? "not declared"}`
+    "A1 the catalogue sync is NOT a declared recurring job — nothing schedules it",
+    recurring === undefined,
+    recurring ? `still declared every ${recurring.everyMs / 3600000}h` : "not declared"
   );
   check(
-    "And it is the only declaration of its kind, so it cannot run twice a tick",
-    RECURRING_JOBS.filter((job) => job.kind === JOB_KIND.ODOO_CATALOG_SYNC).length === 1,
-    `${RECURRING_JOBS.length} recurring job(s) declared`
+    "A2 and the recurring set no longer contains any Odoo job at all",
+    RECURRING_JOBS.every((job) => !job.kind.startsWith("ODOO_")),
+    `${RECURRING_JOBS.length} recurring job(s) declared: ${RECURRING_JOBS.map((j) => j.kind).join(", ")}`
+  );
+
+  const handler = jobHandlers[JOB_KIND.ODOO_CATALOG_SYNC];
+  let refusal: unknown = null;
+  try {
+    await handler?.({ id: "verify-odoo-sync", kind: JOB_KIND.ODOO_CATALOG_SYNC } as never, { db: prisma });
+  } catch (error) {
+    refusal = error;
+  }
+  check(
+    "A3 its handler still EXISTS and REFUSES — a queued row meets a conclusion, not a missing handler",
+    typeof handler === "function" && refusal instanceof Error,
+    refusal instanceof Error ? refusal.message.slice(0, 80) : "the handler returned instead of refusing"
   );
   check(
-    "A handler is registered for it, and it is the same work the manual control runs",
-    typeof jobHandlers[JOB_KIND.ODOO_CATALOG_SYNC] === "function" &&
-      /\[JOB_KIND\.ODOO_CATALOG_SYNC\]: async \(\) => \{[\s\S]{0,120}syncOdooCatalog\(\)/.test(
-        clean(readFileSync(sourceOf("jobHandlers.server.ts"), "utf8"))
-      ) &&
-      /const outcome = await syncOdooCatalog\(\)/.test(clean(SYNC_SOURCE)),
-    "one implementation behind both controls"
+    "A4 the refusal is PERMANENT, so it is recorded once and never retried to the attempt limit",
+    (refusal as { permanent?: boolean } | null)?.permanent === true,
+    "permanent flag"
+  );
+  check(
+    "A5 the same is true of the import handler — both flows are severed, not one",
+    await (async () => {
+      const importHandler = jobHandlers[JOB_KIND.ODOO_PRODUCT_IMPORT];
+      try {
+        await importHandler?.({ id: "verify-odoo-sync-import", kind: JOB_KIND.ODOO_PRODUCT_IMPORT } as never, { db: prisma });
+        return false;
+      } catch (error) {
+        return (error as { permanent?: boolean }).permanent === true;
+      }
+    })(),
+    "import handler refuses permanently too"
   );
 
   /*
-   * THE PRECONDITION IS "NO ROW FOR THIS BUCKET YET", AND IT IS STATED HERE.
-   * The bucket is wall-clock, so a crashed run — or a second run of this suite
-   * inside the same six hours — leaves behind the very row that says "already
-   * queued". Clearing it is this suite resuming its own precondition, not the
-   * assertion being weakened: the checks below still require that the first
-   * tick creates the row, that it carries the bucket as its key, and that it
-   * does not retry within the bucket.
+   * The database half. A row already queued under the old schedule must be
+   * findable and must not have been silently deleted — the work order requires
+   * the job history to be kept. This does not delete anything.
    */
-  await prisma.backgroundJob.deleteMany({ where: { kind: JOB_KIND.ODOO_CATALOG_SYNC } });
-  const queuedFirst = await ensureRecurringJobs();
-  const queuedAgain = await ensureRecurringJobs();
-  const syncJobs = await prisma.backgroundJob.findMany({
-    where: { kind: JOB_KIND.ODOO_CATALOG_SYNC },
-    select: { idempotencyKey: true, maxAttempts: true, status: true, payload: true },
+  const strayRows = await prisma.backgroundJob.count({
+    where: { kind: JOB_KIND.ODOO_CATALOG_SYNC, status: { in: ["PENDING", "RUNNING"] } },
   });
   check(
-    "A tick queues this bucket's sync once, and a second tick in the same bucket queues nothing",
-    queuedFirst.some((key) => key.includes(JOB_KIND.ODOO_CATALOG_SYNC)) &&
-      !queuedAgain.some((key) => key.includes(JOB_KIND.ODOO_CATALOG_SYNC)),
-    `${queuedFirst.length} queued first, ${queuedAgain.length} on the second call`
-  );
-  check(
-    "Its key is the bucket, so the next tick creates a new row rather than reviving this one",
-    syncJobs.length === 1 &&
-      /^recurring:ODOO_CATALOG_SYNC:\d+$/.test(syncJobs[0]?.idempotencyKey ?? ""),
-    syncJobs[0]?.idempotencyKey ?? "none"
-  );
-  check(
-    "And it does not retry inside its own bucket: the next tick is the retry",
-    syncJobs[0]?.maxAttempts === 1,
-    `maxAttempts ${syncJobs[0]?.maxAttempts}`
+    "A6 no catalogue-sync row is left runnable in the clone",
+    strayRows === 0,
+    `${strayRows} runnable row(s)`
   );
 
   /* -------------------------------------------------------------------- */

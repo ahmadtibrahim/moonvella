@@ -10,6 +10,8 @@ import {
   duplicateProduct,
   type ProductListFilters,
 } from "~/services/products.server";
+import { acceptMigration, previewCatalogueMigration, reconcileInventory, runCatalogueMigration } from "~/services/inventoryMigration.server";
+import { inventoryReadiness, parseProblems } from "~/services/inventory.server";
 import { permissionsFor } from "~/services/permissions";
 
 /*
@@ -47,6 +49,9 @@ const DONE_MESSAGES: Record<string, string> = {
   archive: "Archived. Sellers no longer see it.",
   restore: "Restored as a draft, so it has to pass the publication checks again before sellers see it.",
   delete: "Deleted.",
+  "migrate-inventory":
+    "Inventory migration ran. The counts below are what it saw and wrote; read them before accepting.",
+  "accept-migration": "Migration reconciliation accepted and recorded against your name.",
 };
 
 export async function loader({ request }: LoaderFunctionArgs) {
@@ -63,9 +68,22 @@ export async function loader({ request }: LoaderFunctionArgs) {
     status,
     page: Number(url.searchParams.get("page") || 1),
   });
+  const [preview, reconciliation, readiness] = await Promise.all([
+    previewCatalogueMigration(),
+    reconcileInventory(),
+    inventoryReadiness(),
+  ]);
   const done = url.searchParams.get("done") || "";
   return {
     ...result,
+    inventory: {
+      preview,
+      reconciliation,
+      readiness,
+      // The problems the last run recorded, parsed here so the page does not
+      // have to know the column is a JSON string.
+      problems: preview.run ? parseProblems(preview.run.problems) : [],
+    },
     done: DONE_MESSAGES[done] ?? "",
     // Whether to draw the Publish and Withdraw buttons at all. The control is
     // the check in the action and the service behind it, not this flag.
@@ -99,6 +117,20 @@ export async function action({ request }: ActionFunctionArgs) {
   const productId = String(form.get("productId") || "");
 
   try {
+    /*
+     * Inventory migration. Owner-level, and deliberately not folded into the
+     * product actions: it rewrites the stock figures behind every variant, and
+     * the person who presses it should have chosen to.
+     */
+    if (intent === "migrate-inventory") {
+      await runCatalogueMigration({ id: user.id, name: user.name });
+      return redirect("/admin/products?done=migrate-inventory");
+    }
+    if (intent === "accept-migration") {
+      await acceptMigration({ id: user.id, name: user.name });
+      return redirect("/admin/products?done=accept-migration");
+    }
+
     // Creating a product now means setting up a family and then giving it at
     // least one sellable variant, which needs the tabbed editor rather than one
     // line of form fields. The list only routes there; /admin/products/new
@@ -169,8 +201,128 @@ export default function AdminProducts() {
       <nav className="mv-workspace-nav" aria-label="Catalog">
         <Link to="/admin/products" className="is-active">Products</Link>
         <Link to="/admin/packaging">Packaging library</Link>
-        <Link to="/admin/odoo">Odoo import</Link>
+        <Link to="/admin/odoo">Legacy Odoo (retired)</Link>
       </nav>
+
+      {/*
+        THE INVENTORY MIGRATION, WITH ITS RECONCILIATION BESIDE IT.
+
+        Three separate facts are shown, and they are deliberately not merged into
+        one traffic light. The migration RECORD says what the run did; the
+        RECONCILIATION sums the ledger and compares it with the stored quantity,
+        which is an independent statement; and the booking gate is what the
+        booking path actually reads. Showing only the first would be a page
+        marking its own homework.
+      */}
+      <section
+        className="mv-panel"
+        style={{
+          borderColor: data.inventory.readiness.ok ? "#bbf7d0" : "#fcd34d",
+          background: data.inventory.readiness.ok ? "#f0fdf4" : "#fffbeb",
+        }}
+      >
+        <div className="mv-panel-header">
+          <div>
+            <h2>Inventory migration</h2>
+            <p>
+              {data.inventory.readiness.ok
+                ? "App-owned inventory is in place and booking is not blocked."
+                : data.inventory.readiness.blocker}
+            </p>
+          </div>
+          <span className={data.inventory.readiness.ok ? "mv-badge mv-badge-success" : "mv-badge mv-badge-warning"}>
+            {data.inventory.readiness.ok ? "Ready" : "Blocked"}
+          </span>
+        </div>
+        <div className="mv-panel-body">
+          <div className="mv-muted" style={{ fontSize: "0.82rem", lineHeight: 1.8 }}>
+            <div>
+              Variants: <strong>{data.inventory.preview.variants}</strong> · stock records:{" "}
+              <strong>{data.inventory.preview.stockRecords}</strong> ({data.inventory.preview.unattributed}{" "}
+              not yet attributed to a dock) · pickup locations:{" "}
+              <strong>{data.inventory.preview.locations}</strong> · opening ledger entries written:{" "}
+              <strong>{data.inventory.preview.baseline}</strong>
+            </div>
+            <div>
+              Variants with no pickup location mapped and no default dock:{" "}
+              <strong>{data.inventory.preview.undocked}</strong>
+            </div>
+            {data.inventory.preview.run ? (
+              <div>
+                Last run: <strong>{data.inventory.preview.run.status}</strong>
+                {data.inventory.preview.run.completedAt
+                  ? ` · ${new Date(data.inventory.preview.run.completedAt).toLocaleString()}`
+                  : ""}
+                {data.inventory.preview.run.reconciledAt ? " · reconciliation accepted" : ""}
+              </div>
+            ) : (
+              <div>No migration has run. Booking is refused until one has.</div>
+            )}
+            <div>
+              Ledger reconciliation: checked <strong>{data.inventory.reconciliation.variantsChecked}</strong>{" "}
+              variant(s);{" "}
+              {data.inventory.reconciliation.ok ? (
+                <strong>every ledger sums to the stored quantity.</strong>
+              ) : (
+                <strong style={{ color: "#991b1b" }}>
+                  {data.inventory.reconciliation.mismatches.length} quantity and{" "}
+                  {data.inventory.reconciliation.reservedMismatches.length} reservation mismatch(es).
+                </strong>
+              )}
+            </div>
+          </div>
+
+          {data.inventory.reconciliation.mismatches.length > 0 ? (
+            <ul style={{ fontSize: "0.78rem", color: "#991b1b", marginTop: "0.5rem" }}>
+              {data.inventory.reconciliation.mismatches.map((row) => (
+                <li key={row.sku}>
+                  {row.sku}: ledger sums to {row.ledger}, the variant says {row.stored}.
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          {/* What the run could not do, in the subject's own name. A migration
+              that reports "3 products" and silently leaves a fourth is worse
+              than one that fails, because the fourth is the one that refuses a
+              booking later for a reason nobody can find. */}
+          {data.inventory.problems.length > 0 ? (
+            <div style={{ marginTop: "0.6rem", background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "0.6rem" }}>
+              <div style={{ fontSize: "0.8rem", fontWeight: 600, color: "#991b1b", marginBottom: "0.3rem" }}>
+                {data.inventory.problems.length} record(s) could not be migrated
+              </div>
+              {data.inventory.problems.map((problem) => (
+                <div key={problem.subject} style={{ fontSize: "0.76rem", color: "#7f1d1d" }}>
+                  · <strong>{problem.subject}</strong> {problem.reason}
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.75rem", flexWrap: "wrap" }}>
+            <Form method="post">
+              <button type="submit" name="intent" value="migrate-inventory" className="mv-button mv-button-dark">
+                {data.inventory.preview.run ? "Re-run migration" : "Run migration"}
+              </button>
+            </Form>
+            {data.inventory.preview.run && !data.inventory.preview.run.reconciledAt ? (
+              <Form method="post">
+                <button type="submit" name="intent" value="accept-migration" className="mv-button">
+                  Accept reconciliation
+                </button>
+              </Form>
+            ) : null}
+          </div>
+
+          <p className="mv-muted" style={{ fontSize: "0.74rem", marginTop: "0.6rem", lineHeight: 1.6 }}>
+            The migration adopts the retained product variants, SKUs, prices, packaging and stock
+            ownership into app-owned records. Stock rows are attributed to the dock the item is
+            mapped to leave from; each row keeps its original Odoo location, owner and database as
+            historical metadata. Nothing is guessed: a variant with no dock is reported rather than
+            assigned one, and the run is recorded as incomplete so booking refuses by name.
+          </p>
+        </div>
+      </section>
 
       {actionData?.error ? (
         <div style={{ ...card, background: "#fef2f2", borderColor: "#fecaca", color: "#991b1b" }}>

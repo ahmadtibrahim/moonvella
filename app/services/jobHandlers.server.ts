@@ -10,8 +10,10 @@
 
 import { JOB_KIND, PermanentJobError, type JobHandler } from "./jobs.server";
 import { archiveSellerProducts } from "./productArchive.server";
-import { importOdooProducts } from "./odooImport.server";
-import { syncOdooCatalog } from "./odooSync.server";
+// `odooImport.server` and `odooSync.server` are deliberately NOT imported here
+// any more. Both flows refuse below, and the modules are still covered by their
+// own suites — importing them to call nothing would be a dependency kept alive
+// by a comment.
 import { probeVideoAsset, sweepVideoProbes } from "./mediaProbe.server";
 import { pushVariantInventory } from "./inventoryPush.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
@@ -101,46 +103,44 @@ export const jobHandlers: Record<string, JobHandler> = {
   },
 
   /**
-   * Import (or re-import) the tagged Odoo templates as MoonVella drafts.
+   * THE ODOO CATALOGUE IMPORT IS NO LONGER PART OF THE ACTIVE WORKFLOW.
    *
-   * Idempotent through the external mappings: the same Odoo template and
-   * variant ids always resolve to the same MoonVella rows, so a second run
-   * updates them instead of creating a second copy of the catalogue.
+   * This kind was reachable two ways: the Odoo page's "Import as draft" control,
+   * and a job queued behind it. The control is gone and the catalogue it wrote is
+   * app-owned now, so a run would re-create from the ERP the very records the
+   * migration moved off it.
+   *
+   * PermanentJobError rather than a plain throw: a transient failure would be
+   * retried to the attempt limit and would read as an Odoo problem, when the
+   * truth is that this flow was removed on purpose. Recorded once, with the
+   * reason, never retried. The module itself is kept and still covered by
+   * verify-odoo-import, so removing the flow did not remove the coverage of the
+   * code behind it.
    */
-  [JOB_KIND.ODOO_PRODUCT_IMPORT]: async () => {
-    // A job always imports for real; the preview is the owner's step, not the
-    // queue's. Running a job that quietly did nothing would look like success.
-    const outcome = await importOdooProducts({ confirm: true });
-    if (!("result" in outcome)) {
-      throw new Error("The Odoo import returned a preview while running as a job.");
-    }
-    const { result } = outcome;
-    return {
-      summary: `${result.created} product(s) created, ${result.updated} updated, ${result.variantsWritten} variant(s) written`,
-      detail: {
-        created: result.created,
-        updated: result.updated,
-        variants: result.variantsWritten,
-        blocked: result.blocked,
-        templates: result.templates.map((item) => ({
-          odooTemplateId: item.odooTemplateId,
-          productCode: item.productCode,
-          outcome: item.outcome,
-        })),
-      },
-    };
+  [JOB_KIND.ODOO_PRODUCT_IMPORT]: async (job) => {
+    throw new PermanentJobError(
+      `Job ${job.id} (${job.kind}) refused: the catalogue is app-owned. Odoo product import was ` +
+        `removed from the active workflow on 2026-10-16; this job is kept as history and will not run.`
+    );
   },
 
   /**
-   * The whole Odoo catalogue sync, on its six-hour clock.
+   * THE SIX-HOURLY CATALOGUE SYNC IS NO LONGER PART OF THE ACTIVE WORKFLOW.
    *
-   * Idempotent for the same reason the import is — the external mappings make a
-   * second read an update rather than a second catalogue — and the withdrawal
-   * pass is idempotent on top of that: it skips a product that is already
-   * archived, so a run that repeats does not re-date every withdrawal.
+   * It was the last recurring ERP job, and it read the whole tagged catalogue into
+   * MoonVella every six hours. The catalogue is app-owned now, so that read would
+   * overwrite migrated records from a system they were deliberately moved out of.
+   *
+   * It is also removed from RECURRING_JOBS, so nothing schedules a new one. This
+   * refusal covers what that removal cannot: a row queued under the old schedule,
+   * a retry an operator triggered before the deploy, or a replay.
    */
-  [JOB_KIND.ODOO_CATALOG_SYNC]: async () => {
-    return syncOdooCatalog();
+  [JOB_KIND.ODOO_CATALOG_SYNC]: async (job) => {
+    throw new PermanentJobError(
+      `Job ${job.id} (${job.kind}) refused: the catalogue is app-owned. The Odoo catalogue sync ` +
+        `was removed from the active workflow on 2026-10-16; this job is kept as history and will ` +
+        `not run. Products are edited in the catalogue, not read from the ERP.`
+    );
   },
 
   /**

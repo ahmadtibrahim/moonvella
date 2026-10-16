@@ -656,58 +656,260 @@ model ProductVariant {
   mediaAssignments MediaAssetAssignment[]
   externalMappings ExternalVariantMapping[]
   stockRecords     VariantStockRecord[]
+  stockMovements   StockMovement[]
+  stockReservations StockReservation[]
   sellerPrices     SellerVariantPrice[]
 
   @@index([productId, sortOrder])
 }
 
 /// One stock record behind a variant's on-hand figure: how much of it sits at
-/// one Odoo location, and whose it is.
+/// one location, and whose it is.
 ///
 /// WHY THIS IS A TABLE AND NOT A NUMBER. A variant's `inventory` is a total, and
 /// a total on its own cannot answer the two questions that come next: where the
-/// goods are, and who owns them. The catalogue now counts every shelf inside the
-/// fulfillment warehouse, which means one figure can be two vendors' stock and
-/// the company's own — so the parts are kept, not just the sum. Ownership here
-/// is about the goods on the shelf (Odoo's `stock.quant.owner_id`), which is a
-/// different fact from the product's supplier: the supplier is who MoonVella
-/// buys from, the owner is whose boxes these are.
+/// goods are, and who owns them. One shelf can hold two vendors' stock and the
+/// company's own — so the parts are kept, not just the sum. Ownership here is
+/// about the goods on the shelf, which is a different fact from the product's
+/// supplier: the supplier is who MoonVella buys from, the owner is whose boxes
+/// these are.
 ///
-/// The rows are REPLACED on every sync, never appended to, so a sync that runs
-/// every six hours cannot accumulate history that reads like current stock.
-/// `odooOwnerId` is null for company-owned stock — Odoo writes `false` there,
-/// and "the company owns it" is a real answer that must not be confused with
-/// "nobody knows".
+/// APP-OWNED SINCE 2026-10-16. This table used to be an Odoo quant mirror: its
+/// keys were `odooLocationId` / `odooOwnerId` / `odooDatabase`, its location
+/// name was whatever Odoo called it, and the only writer was the six-hourly
+/// catalogue sync. The owner's instruction is that MoonVella's inventory is its
+/// own, so the keys are now app-owned — `locationId` points at a PickupLocation
+/// this application owns, and `ownerName` is typed here. The Odoo columns are
+/// KEPT and now nullable: they are historical metadata recording where the row
+/// came from, nothing reads them to decide anything, and `source` says which
+/// kind of row this is so a migrated one is never mistaken for a live mirror.
+///
+/// A variant with no rows here is not an error. It means "no per-location
+/// breakdown has been recorded", and the variant's own `inventory` is then the
+/// whole answer — which is the case for every product created in this app
+/// rather than imported.
 model VariantStockRecord {
-  id       String         @id @default(cuid())
+  id        String         @id @default(cuid())
   variantId String
-  variant  ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
 
-  /// The Odoo location this stock sits at, and its name as Odoo shows it
-  /// ("WH/Stock/EcoComfort Consignment"), kept because a location can be
-  /// renamed or archived in Odoo and the record should still read as it did.
-  odooLocationId Int
-  locationName   String
+  /// The app-owned dock this stock sits at. Nullable only for rows that have
+  /// not been attributed to one yet; the migration reports those rather than
+  /// inventing a dock for them.
+  locationId String?
+  location   PickupLocation? @relation("PickupLocationStock", fields: [locationId], references: [id])
 
-  /// The Odoo partner that owns the goods, null when the company does.
-  odooOwnerId Int?
-  ownerName   String?
+  /// The location's name as it read when the row was written, kept so the record
+  /// still reads correctly after the dock is renamed or retired.
+  locationName String
+
+  /// Who owns the goods, typed here. Null means the company owns them, which is
+  /// a real answer and is never confused with "nobody knows".
+  ownerName String?
 
   quantity         Int
   reservedQuantity Int
 
-  /// Which Odoo database these ids belong to. MoonVella can be pointed at more
-  /// than one, and an id without its database is not an identifier.
-  odooDatabase String
+  /// Where this row came from: MIGRATION (converted from an Odoo mirror),
+  /// APP (entered here), or ODOO (written by the retired import before it was
+  /// switched off). Nothing decides anything from this — it exists so a record
+  /// can be explained.
+  source String @default("APP")
+
+  // --- historical metadata, preserved deliberately -------------------------
+  // The Odoo ids the row was migrated from. Never read to make a decision.
+  odooLocationId Int?
+  odooOwnerId    Int?
+  odooDatabase   String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  /// One row per location and owner. PostgreSQL treats NULLs as distinct, so
-  /// this binds the owned rows and leaves company-owned ones to the replace
-  /// -never-append rule that writes them.
-  @@unique([variantId, odooLocationId, odooOwnerId])
+  /// One row per dock and owner. PostgreSQL treats NULLs as distinct, so this
+  /// binds the owned rows and leaves the unattributed ones to the
+  /// replace-never-append rule that writes them.
+  @@unique([variantId, locationId, ownerName])
   @@index([variantId])
+  @@index([locationId])
+}
+
+/// An app-owned change to a variant's ON-HAND quantity. Append-only.
+///
+/// WHY A LEDGER AT ALL. `ProductVariant.inventory` is a single number, and a
+/// number that only ever moves has no explanation: when a count disagrees with
+/// the shelf, the question is always "what changed it, and when", and a number
+/// cannot answer that. Every write to inventory now writes a row here in the
+/// same transaction, so the figure is the sum of its recorded history.
+///
+/// RESERVATIONS ARE NOT HERE. Holding stock for a shipment does not change how
+/// much exists, only how much is already spoken for. Those are
+/// StockReservation rows, and the two are deliberately separate: a released
+/// reservation must never read as a receipt, and a fulfilment must never look
+/// like a release.
+///
+/// `idempotencyKey` is what makes the ledger safe against a replayed webhook or
+/// a double-submitted booking. A movement that must happen at most once carries
+/// a key, the column is UNIQUE, and the second attempt inserts nothing.
+model StockMovement {
+  id        String         @id @default(cuid())
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  /// Signed change to on-hand. Never zero: a row that changed nothing is not a
+  /// movement.
+  delta Int
+
+  reason StockMovementReason
+
+  /// What caused it — "Shipment", "Order", "Migration", "Manual" — with the row
+  /// it happened on. Kept as loose text rather than a foreign key because the
+  /// referent differs by reason and a movement outlives nothing.
+  refType String?
+  refId   String?
+  note    String?
+
+  /// The on-hand figure after this movement, so a ledger row is readable on its
+  /// own instead of only as a delta against rows the reader has to find.
+  balanceAfter Int
+
+  actorType ActorType @default(SYSTEM)
+  actorId   String?
+  actorName String?
+
+  /// Set when this movement must happen at most once. NULL for a movement that
+  /// is legitimately repeatable (an operator adjusting a count twice).
+  idempotencyKey String? @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([variantId, createdAt])
+  @@index([refType, refId])
+  @@index([reason])
+}
+
+enum StockMovementReason {
+  /// The opening entry for a variant whose quantity was migrated into this
+  /// ledger. One per variant, and the baseline every later delta is against.
+  MIGRATION_BASELINE
+  /// Stock arriving: a replenishment, a purchase receipt, a count upward.
+  RECEIPT
+  /// An operator correcting a count in either direction.
+  ADJUSTMENT
+  /// Stock leaving because it shipped. The reservation that preceded it is
+  /// consumed in the same transaction.
+  FULFILMENT
+  /// Stock coming back from a customer.
+  CUSTOMER_RETURN
+  /// A booking was voided and the stock it consumed is returned.
+  VOID_CORRECTION
+}
+
+/// Stock held for a shipment that has not shipped yet.
+///
+/// WHY THIS IS NOT JUST A NUMBER ON THE VARIANT. `ProductVariant.reserved` is a
+/// rollup maintained from these rows, and the rollup is what pages read — but
+/// the rollup cannot be released correctly. A cancelled shipment has to release
+/// exactly the quantity it held, once, even if the cancellation is replayed;
+/// and a fulfilled shipment has to CONSUME its hold rather than release it, or
+/// the goods are counted twice — once as shipped and once as available.
+/// Per-shipment rows make both operations answerable.
+///
+/// `idempotencyKey` carries the shipment and variant, so a replayed booking
+/// finds the existing hold instead of taking a second one. That is the whole of
+/// the overselling guard across double-clicks, workers and webhooks.
+model StockReservation {
+  id        String         @id @default(cuid())
+  variantId String
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  quantity Int
+
+  status ReservationStatus @default(HELD)
+
+  shipmentId String?
+  orderId    String?
+  note       String?
+
+  idempotencyKey String @unique
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  /// When the hold stopped being HELD. Null while it is still held.
+  settledAt DateTime?
+
+  @@index([variantId, status])
+  @@index([shipmentId])
+  @@index([orderId])
+  @@index([status])
+}
+
+enum ReservationStatus {
+  /// The quantity is spoken for and is subtracted from what is available.
+  HELD
+  /// The hold was given back — a cancelled or voided shipment. The stock is
+  /// available again and no movement was written.
+  RELEASED
+  /// The hold became a shipment. A FULFILMENT movement took the stock out of
+  /// on-hand in the same transaction.
+  FULFILLED
+}
+
+/// The record of migrating Odoo-owned catalogue data into app-owned records.
+///
+/// WHY THIS IS A TABLE. The migration moved variants, prices, packaging, stock
+/// ownership and warehouse addresses out of Odoo's shape and into this
+/// application's. It cannot be assumed to have worked: a variant whose dock
+/// could not be resolved, or a warehouse address that arrived half-filled, is a
+/// product that cannot be quoted or booked. Recording the run — what was seen,
+/// what was written, and what could not be — is what lets the catalogue and the
+/// booking gate refuse with a SPECIFIC reason instead of failing somewhere
+/// later with a number that looks plausible.
+///
+/// `status` is COMPLETE only when nothing was left behind. Anything else is a
+/// blocker the booking path reads, because booking against a half-migrated
+/// catalogue is how an order gets taken for goods whose dock nobody knows.
+model StockMigration {
+  id  String @id @default(cuid())
+  /// Stable identifier for the run, so re-running is idempotent and the row can
+  /// be found without guessing a date.
+  key String @unique
+
+  status MigrationStatus @default(PENDING)
+
+  variantsSeen         Int @default(0)
+  variantsMigrated     Int @default(0)
+  stockRecordsSeen     Int @default(0)
+  stockRecordsMigrated Int @default(0)
+  locationsSeen        Int @default(0)
+  locationsMigrated    Int @default(0)
+  movementsWritten     Int @default(0)
+
+  /// What could not be migrated, as a JSON array of {subject, reason}. Never
+  /// empty-and-silent: an empty array with status COMPLETE means there was
+  /// nothing to report.
+  problems String @default("[]")
+
+  startedAt    DateTime  @default(now())
+  completedAt  DateTime?
+  /// Set when a person has read the reconciliation and accepted it. A run can
+  /// be COMPLETE and still await this; the blocker is on COMPLETE, not on it.
+  reconciledAt DateTime?
+  reconciledBy String?
+
+  notes String?
+
+  @@index([status])
+}
+
+enum MigrationStatus {
+  PENDING
+  RUNNING
+  /// Every retained record was migrated; `problems` is empty.
+  COMPLETE
+  /// Finished, but something could not be migrated. The booking gate refuses
+  /// and names it.
+  INCOMPLETE
+  FAILED
 }
 
 model PackagingPreset {
@@ -2638,6 +2840,7 @@ model PickupLocation {
   variants        ProductVariant[] @relation("VariantPickupLocation")
   shipmentOrigins Shipment[]
   quotedFrom      ShippingQuote[]  @relation("QuoteOrigin")
+  stockRecords    VariantStockRecord[] @relation("PickupLocationStock")
   createdAt       DateTime         @default(now())
   updatedAt       DateTime         @updatedAt
 

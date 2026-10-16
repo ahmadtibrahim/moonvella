@@ -43,7 +43,10 @@
 
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
-import { searchRead, type OdooRecord } from "./odoo.server";
+// The stock figures now come from this application's own records. There was an
+// Odoo JSON-RPC read here until 2026-10-16 — see `stockAtOrigin` below for why a
+// dock no longer has to exist in an ERP to be collected from.
+import { stockAtLocation } from "./inventory.server";
 // Imported for use here as well as re-exported below: the fields a location must
 // carry, and the check that decides whether it can be collected from.
 import { missingOriginFields, type OriginLocation } from "~/utils/originFields";
@@ -858,33 +861,49 @@ export interface OriginStock {
   available: number | null;
   onHand: number;
   reserved: number;
-  locationId: number | null;
-  ownerId: number | null;
+  /**
+   * The app-owned dock these figures are about.
+   *
+   * These two were Odoo ids until 2026-10-16, and the rename is the whole point
+   * of the change: the stock they describe is MoonVella's own, so naming it with
+   * a foreign key into an ERP this application no longer reads was a claim about
+   * where the number came from that stopped being true. The Odoo ids are still
+   * available on the location row as history.
+   */
+  locationId: string | null;
+  ownerName: string | null;
+  /**
+   * Which question was answered — see `StockPosition.source`. "LOCATION_RECORDS"
+   * and "VARIANT_TOTAL" are both real answers and mean different things; a
+   * reader is entitled to know which one they are looking at.
+   */
+  source: "LOCATION_RECORDS" | "VARIANT_TOTAL" | "OTHER_LOCATIONS" | "NONE";
   /** Set when stock could not be read, so absence is never shown as zero. */
   reason: string | null;
 }
 
 /**
  * Read on-hand stock for a variant at the location it is actually collected
- * from, for the owner whose stock is sellable there.
+ * from.
  *
- * THE LOCATION IS THE MAPPED ONE, NOT THE CONFIGURED ONE. The import module
- * counts the whole fulfillment warehouse, because a catalogue figure answers
+ * APP-OWNED. This used to issue a `stock.quant` search over JSON-RPC against
+ * Odoo, behind two gates that had nothing to do with stock — the dock had to
+ * carry an `odooLocationId`, and the variant had to carry an ODOO
+ * ExternalVariantMapping. Neither is required now: a dock is an address this
+ * application owns, and the quantity is a column on the variant plus whatever
+ * per-dock breakdown has been recorded. A store with no ERP at all is a
+ * completely normal store.
+ *
+ * THE DOCK IS THE MAPPED ONE, NOT THE CONFIGURED ONE. A catalogue figure answers
  * "how much do we have anywhere we ship from"; a shipment is a different
- * question, because a product mapped to a second warehouse must be filled from
- * that warehouse. So the mapping decides the location.
+ * question, because an item mapped to a second dock must be filled from that
+ * dock. So the mapping decides which stock rows count.
  *
- * THE OWNER IS THE LOCATION'S, WHEN IT HAS ONE. `PickupLocation.odooPartnerId`
- * is the owner of the goods at that dock, and it is the only owner consulted:
- * there used to be a global "consignment owner" setting behind it, and a global
- * default that silently applied to every dock is exactly what made adding a
- * vendor a whole-catalogue decision. With no owner on the location, every quant
- * at it is counted — which for a dock holding one vendor's consignment is that
- * vendor's stock, and for the company's own dock is the company's.
- *
- * An unreadable stock figure is null with a reason, never 0. Zero and "we
- * could not ask" look identical in a number field and mean opposite things:
- * one refuses a sale correctly, the other refuses a sale that was possible.
+ * AN UNREADABLE FIGURE IS NULL WITH A REASON, NEVER 0. Zero and "we could not
+ * say" look identical in a number field and mean opposite things: one correctly
+ * refuses a sale, the other refuses a sale that was possible. `available` is
+ * null whenever `reason` is set, and the two are refused differently by the
+ * booking path.
  */
 export async function stockAtOrigin(variantId: string): Promise<OriginStock> {
   const origin = await resolveOriginForVariant(variantId);
@@ -894,78 +913,20 @@ export async function stockAtOrigin(variantId: string): Promise<OriginStock> {
       onHand: 0,
       reserved: 0,
       locationId: null,
-      ownerId: null,
+      ownerName: null,
+      source: "NONE",
       reason: origin.reason ?? MISSING_ORIGIN_REASON,
     };
   }
-  const odooLocationId = origin.location.odooLocationId;
-  if (odooLocationId === null) {
-    return {
-      available: null,
-      onHand: 0,
-      reserved: 0,
-      locationId: null,
-      ownerId: null,
-      reason: `Pickup location "${origin.location.name}" has no Odoo location id, so stock cannot be read from it.`,
-    };
-  }
 
-  // The Odoo mapping is the ExternalVariantMapping row the import writes, keyed
-  // by provider ODOO. A variant with no such row has never been in Odoo, so it
-  // has no quant to read and saying "0 available" would be a claim about a
-  // record that does not exist.
-  const mapping = await prisma.externalVariantMapping.findFirst({
-    where: { variantId, provider: "ODOO" },
-    select: { externalVariantId: true },
-  });
-  const odooProductId = mapping?.externalVariantId ? Number(mapping.externalVariantId) : NaN;
-  if (!Number.isInteger(odooProductId)) {
-    return {
-      available: null,
-      onHand: 0,
-      reserved: 0,
-      locationId: odooLocationId,
-      ownerId: null,
-      reason: "This item has no Odoo product mapping, so its stock cannot be read.",
-    };
-  }
-
-  // The location's own owner, or null for "every owner at this dock". There is
-  // no global fallback: the dock says whose stock it holds, or the dock holds
-  // everybody's.
-  const ownerId = origin.location.odooPartnerId;
-
-  try {
-    const domain: unknown[] = [
-      ["product_id", "=", odooProductId],
-      ["location_id", "=", odooLocationId],
-    ];
-    if (ownerId !== null) domain.push(["owner_id", "=", ownerId]);
-    const quants = await searchRead<OdooRecord>("stock.quant", domain, [
-      "id",
-      "quantity",
-      "reserved_quantity",
-    ]);
-    const onHand = quants.reduce((sum, quant) => sum + Number(quant.quantity ?? 0), 0);
-    const reserved = quants.reduce((sum, quant) => sum + Number(quant.reserved_quantity ?? 0), 0);
-    return {
-      available: onHand - reserved,
-      onHand,
-      reserved,
-      locationId: odooLocationId,
-      ownerId,
-      reason: null,
-    };
-  } catch (error) {
-    return {
-      available: null,
-      onHand: 0,
-      reserved: 0,
-      locationId: odooLocationId,
-      ownerId,
-      reason: `Stock could not be read from Odoo: ${
-        error instanceof Error ? error.message : "unknown error"
-      }`,
-    };
-  }
+  const position = await stockAtLocation(variantId, origin.location.id);
+  return {
+    available: position.reason ? null : position.available,
+    onHand: position.onHand,
+    reserved: position.reserved,
+    locationId: origin.location.id,
+    ownerName: origin.location.name,
+    source: position.source,
+    reason: position.reason,
+  };
 }

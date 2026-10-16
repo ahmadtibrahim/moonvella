@@ -1,6 +1,11 @@
 import { prisma } from "~/db.server";
 import { recordAudit, AUDIT_ENTITY, type AuditActorType } from "./audit.server";
 import { setIntegrationState } from "./integrationHealth.server";
+// The stock gate and the hold. Imported here because booking is where an order
+// becomes a promise on real goods — see `bookShipmentForOrder` below. Fulfilment
+// consumes the hold and lives in fulfillment.server.ts, at the dispatch
+// milestone; nothing in this module ships anything.
+import { inventoryReadiness, holdForShipment, releaseHoldsForShipment } from "./inventory.server";
 import {
   getRates,
   bookShipment,
@@ -1057,6 +1062,51 @@ export async function bookShipmentForOrder(
    */
   assertCarrierAddressesReady(carrierShipFrom(origin.snapshot), order);
 
+  /*
+   * The stock, before the money and before the shipment row.
+   *
+   * TWO SEPARATE REFUSALS, and they are different questions:
+   *
+   *   `inventoryReadiness` asks whether this catalogue's quantities mean
+   *   anything at all. A catalogue that has not been migrated still carries
+   *   figures read from an ERP MoonVella no longer opens, so booking against it
+   *   takes an order for goods whose dock nobody recorded here. That is a
+   *   catalogue problem, and the message says so by name.
+   *
+   *   The per-line check below asks whether THIS order can be filled from THIS
+   *   dock. It is the overselling guard, and it is why the hold is taken.
+   *
+   * Neither was asked before this change. The booking path read Shopify's
+   * fulfillment-order remaining quantities, which answer "how much of this order
+   * is left to ship" and not "is there anything on the shelf" — so an order for
+   * ten of something with four in the building booked a label and found out at
+   * packing time.
+   */
+  const readiness = await inventoryReadiness();
+  if (!readiness.ok) throw new Error(readiness.blocker ?? "Inventory is not ready for booking.");
+
+  // The variant behind each order line being shipped. Read from the order, which
+  // is already loaded, rather than re-queried — the lines and the shipment must
+  // agree about what is moving.
+  const orderItemById = new Map(order.items.map((item) => [item.id, item]));
+  const holdLines = toShip.map((line) => {
+    const item = orderItemById.get(line.orderItemId);
+    return { variantId: item?.variantId ?? "", sku: item?.sku ?? "", quantity: line.quantity };
+  });
+  const unknown = holdLines.filter((line) => !line.variantId);
+  if (unknown.length > 0) {
+    throw new Error(
+      "Cannot book: an order line in this shipment has no catalogue variant behind it, so its " +
+        "stock cannot be checked or held."
+    );
+  }
+
+  // Captured here rather than read inside the transaction below: `origin.location`
+  // is narrowed by the guard above, and that narrowing does not survive into a
+  // callback. The dock is decided once, and the hold is taken against the same
+  // one the quote came from.
+  const originLocationId = origin.location.id;
+
   const quote = opts.quoteId
     ? await prisma.shippingQuote.findUnique({ where: { id: opts.quoteId } })
     : await prisma.shippingQuote.findFirst({
@@ -1089,28 +1139,59 @@ export async function bookShipmentForOrder(
 
   let shipment;
   try {
-    shipment = await prisma.shipment.create({
-      data: {
+    /*
+     * The shipment row and the stock hold are ONE transaction, deliberately.
+     *
+     * Taking the hold afterwards would leave a window in which a shipment exists
+     * with its quantity still showing as available, and a second booking — a
+     * double-click, a retried worker, a replayed webhook — would take the same
+     * units. Creating the row first and holding in the same transaction means the
+     * hold either happened with the shipment or neither did.
+     *
+     * The hold itself is idempotent on (shipment, variant), so the duplicate
+     * booking that the idempotency key above catches and a genuine second
+     * shipment for different units are told apart by the database rather than by
+     * a check that two concurrent requests could both pass.
+     */
+    shipment = await prisma.$transaction(async (tx) => {
+      const created = await tx.shipment.create({
+        data: {
+          orderId,
+          status: "PENDING",
+          provider: "eshipper",
+          bookingIdempotencyKey: bookingKey,
+          carrier: quote.carrier,
+          serviceCode: quote.serviceCode,
+          serviceName: quote.serviceName,
+          providerQuoteId: quote.providerQuoteId,
+          quotedCarrierCost: quote.totalAmount,
+          sellerShippingCharge: allocateSellerShippingCharge(order.moonvellaShipping, shipQuantity, orderQuantity),
+          // The cartons resolved above for THIS booking, not every parcel row on
+          // the order. The two are the same number on a one-shipment order and
+          // differ on a split one, which is the whole point.
+          packageCount: parcels.packages.reduce((s, p) => s + p.count, 0),
+          items: { create: toShip.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
+        },
+      });
+
+      await holdForShipment(tx, {
+        shipmentId: created.id,
         orderId,
-        status: "PENDING",
-        provider: "eshipper",
-        bookingIdempotencyKey: bookingKey,
-        carrier: quote.carrier,
-        serviceCode: quote.serviceCode,
-        serviceName: quote.serviceName,
-        providerQuoteId: quote.providerQuoteId,
-        quotedCarrierCost: quote.totalAmount,
-        sellerShippingCharge: allocateSellerShippingCharge(order.moonvellaShipping, shipQuantity, orderQuantity),
-        // The cartons resolved above for THIS booking, not every parcel row on
-        // the order. The two are the same number on a one-shipment order and
-        // differ on a split one, which is the whole point.
-        packageCount: parcels.packages.reduce((s, p) => s + p.count, 0),
-        items: { create: toShip.map((i) => ({ orderItemId: i.orderItemId, quantity: i.quantity })) },
-      },
+        lines: holdLines,
+        locationId: originLocationId,
+        actorId: actor.actorId ?? null,
+        actorName: actor.actorName ?? null,
+      });
+
+      return created;
     });
-  } catch {
+  } catch (error) {
+    // The hold refusing for want of stock arrives here, and it is NOT the
+    // duplicate case — so the duplicate lookup must not swallow it. Only a
+    // genuine unique violation on the booking key is a duplicate.
     const existing = await prisma.shipment.findUnique({ where: { bookingIdempotencyKey: bookingKey } });
     if (existing) return { shipment: existing, sync: { pushed: false, reason: "duplicate_request" } };
+    if (error instanceof Error) throw error;
     throw new Error("Could not create shipment booking record.");
   }
 
@@ -2022,14 +2103,39 @@ export async function voidShipment(shipmentId: string, actor: Actor) {
   }
 
   const status = cancelled ? "CANCELLED" : "EXCEPTION";
-  await prisma.shipment.update({
-    where: { id: shipmentId },
-    data: {
-      status,
-      trackingStatus: cancelled ? TRACKING_STATE.cancelled : "CANCEL_REJECTED",
-      cancelledAt: cancelled ? new Date() : null,
-      lastTrackingError: providerMessage,
-    },
+
+  /*
+   * A CONFIRMED cancellation gives the stock back; a refusal does not.
+   *
+   * The distinction is the whole reason this is here rather than earlier. While
+   * the provider has not confirmed, the parcel's fate is unknown — the label may
+   * still be live and the goods may still be leaving — so releasing the hold at
+   * the moment the button was pressed would put units back on the shelf that
+   * could still walk out of the door. Only `cancelled` releases.
+   *
+   * Doing it in one transaction with the status write means the shipment and the
+   * shelf cannot disagree: there is no state in which the row says CANCELLED and
+   * the stock is still held, or the reverse. The release is idempotent, so a
+   * second cancellation of the same shipment releases nothing.
+   */
+  await prisma.$transaction(async (tx) => {
+    await tx.shipment.update({
+      where: { id: shipmentId },
+      data: {
+        status,
+        trackingStatus: cancelled ? TRACKING_STATE.cancelled : "CANCEL_REJECTED",
+        cancelledAt: cancelled ? new Date() : null,
+        lastTrackingError: providerMessage,
+      },
+    });
+
+    if (cancelled) {
+      await releaseHoldsForShipment(
+        tx,
+        shipmentId,
+        `Shipment cancelled with the carrier${actor.actorName ? ` by ${actor.actorName}` : ""}.`
+      );
+    }
   });
 
   await recordAudit({

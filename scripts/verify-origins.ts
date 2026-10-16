@@ -22,6 +22,7 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
 import {
   REQUIRED_ORIGIN_FIELDS,
+  OPTIONAL_ORIGIN_FIELDS,
   allocateSellerShippingCharge,
   groupOrderLinesByOrigin,
   missingOriginFields,
@@ -435,14 +436,25 @@ async function originChecks() {
   await prisma.productVariant.update({ where: { id: variants[1].id }, data: { pickupLocationId: dockB.id } });
 
   const labels = REQUIRED_ORIGIN_FIELDS.map((entry) => entry.label);
+
+  /*
+   * WHAT A DOCK MUST CARRY, AND WHAT IT MUST NOT.
+   *
+   * This check used to require four Odoo ids — company, warehouse, location and
+   * address record — and a dock missing any of them was unusable for booking.
+   * That made the ERP a hard prerequisite for collecting a parcel from an address
+   * MoonVella had been told about, which is the dependency the owner removed on
+   * 2026-10-16. The ids are still stored on migrated rows and still shown; they
+   * are history.
+   *
+   * REPLACED, NOT DELETED, and the second half is the half that matters now — an
+   * id must NOT be required. Asserting only that the carrier fields are present
+   * would leave the old rule free to creep back one field at a time.
+   */
   check(
-    "5  every field the work order requires is actually required",
+    "5  every field a CARRIER needs is actually required",
     [
       "location name",
-      "Odoo company id",
-      "Odoo warehouse id",
-      "Odoo location id",
-      "Odoo address record id",
       "contact name",
       "contact phone",
       "contact email",
@@ -456,6 +468,17 @@ async function originChecks() {
       "pickup closing time",
     ].every((label) => labels.includes(label)),
     `${labels.length} required fields`
+  );
+  check(
+    "5b and no Odoo identifier is required — an ERP is not a prerequisite for a dock",
+    REQUIRED_ORIGIN_FIELDS.every((entry) => !entry.label.startsWith("Odoo")),
+    labels.filter((label) => label.startsWith("Odoo")).join(", ") || "none required"
+  );
+  check(
+    "5c the Odoo ids are still carried, as history rather than as a requirement",
+    ["odooCompanyId", "odooWarehouseId", "odooLocationId", "odooPartnerId"].every((field) =>
+      (OPTIONAL_ORIGIN_FIELDS as readonly string[]).includes(field)
+    )
   );
   check(
     "6  a pickup window that closes before it opens is rejected",

@@ -44,6 +44,10 @@ import {
   schedulePickupForShipment,
 } from "../app/services/shipping.server";
 import { addOrderPackage, advanceShipment, removeOrderPackage } from "../app/services/fulfillment.server";
+// Booking holds stock and refuses when the catalogue has not been migrated, so
+// this suite establishes that precondition in `main`.
+import { inventoryReadiness } from "../app/services/inventory.server";
+import { runCatalogueMigration } from "../app/services/inventoryMigration.server";
 import {
   addressGate,
   addressMateriallyDiffers,
@@ -3609,6 +3613,29 @@ function sourceLinesMatching(pattern: RegExp): string[] {
 }
 
 async function main() {
+  /*
+   * THE INVENTORY PRECONDITION, STATED RATHER THAN ASSUMED.
+   *
+   * Booking refuses when the catalogue has not been migrated to app-owned
+   * inventory — see `inventoryReadiness`. That is the intended behaviour, and it
+   * is exactly what this suite hit the first time it ran after the migration
+   * landed: every booking check failed against a gate that was working correctly.
+   *
+   * A clone that mirrors a deployed application HAS a completed migration, so the
+   * honest thing is to establish one here rather than to weaken the gate. The call
+   * is idempotent and it is the same function the Catalogue page's button runs.
+   */
+  const readiness = await inventoryReadiness();
+  if (!readiness.ok) {
+    console.log(`(establishing the inventory migration precondition: ${readiness.status})`);
+    await runCatalogueMigration({ id: "verify-booking", name: "Booking suite" });
+    const after = await inventoryReadiness();
+    if (!after.ok) {
+      console.error(`verify-booking cannot run: ${after.blocker}`);
+      return 1;
+    }
+  }
+
   await quoteInvalidationChecks();
   await quoteWithdrawalWiringChecks();
   await addressChangeChecks();

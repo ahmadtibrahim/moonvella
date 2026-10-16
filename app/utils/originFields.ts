@@ -103,10 +103,6 @@ export interface OriginLocation {
  */
 export const REQUIRED_ORIGIN_FIELDS: { field: keyof OriginLocation; label: string }[] = [
   { field: "name", label: "location name" },
-  { field: "odooCompanyId", label: "Odoo company id" },
-  { field: "odooWarehouseId", label: "Odoo warehouse id" },
-  { field: "odooLocationId", label: "Odoo location id" },
-  { field: "odooPartnerId", label: "Odoo address record id" },
   { field: "contactName", label: "contact name" },
   { field: "contactPhone", label: "contact phone" },
   { field: "contactEmail", label: "contact email" },
@@ -123,11 +119,27 @@ export const REQUIRED_ORIGIN_FIELDS: { field: keyof OriginLocation; label: strin
 /**
  * Fields that are genuinely optional for some docks, listed here so the
  * exclusion is a decision on the record rather than an oversight.
+ *
+ * THE FOUR ODOO IDS ARE HERE, AND THAT IS A CHANGE. Until 2026-10-16 they were
+ * REQUIRED — a dock was unusable unless it carried an Odoo company, warehouse,
+ * location and partner id. That made MoonVella unable to collect a parcel from
+ * an address it had been told about but had not mirrored into an ERP it no
+ * longer needs: a carrier asks for a street, a city, a province, a postal code
+ * and a country, and has never once asked for `odooLocationId` 8.
+ *
+ * The columns are untouched. A migrated location still stores them, the form
+ * still shows them as historical reference, and nothing decides anything from
+ * them.
  */
 export const OPTIONAL_ORIGIN_FIELDS: (keyof OriginLocation)[] = [
   "street2",
   "instructions",
   "accessRequirements",
+  "odooDatabase",
+  "odooCompanyId",
+  "odooWarehouseId",
+  "odooLocationId",
+  "odooPartnerId",
 ];
 
 /**
