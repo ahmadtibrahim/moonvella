@@ -704,6 +704,46 @@ export async function applyStripeEvent(event: StripeEvent): Promise<ApplyStripeE
     );
   });
 
+  /*
+   * THE INVOICE, ONCE THE CHARGE IS A FACT.
+   *
+   * OUTSIDE the transaction above, on purpose. That transaction records what the
+   * provider said, and it has already committed by the time this runs — so a
+   * failure here cannot roll back the payment record. Losing the money event
+   * because a document could not be numbered would be a far worse trade than a
+   * missing invoice, which is recoverable in one press.
+   *
+   * NOTHING IS SENT. Issuing is bookkeeping; the work order forbids treating a
+   * successful charge as authorisation to email anybody, and `issueInvoiceForOrder`
+   * does not send. The document is available to the operator and to the statement.
+   *
+   * Idempotent twice over: the invoice is keyed on the order, and the allocation
+   * converges on (payment, invoice). A redelivered webhook reaches the same two
+   * rows.
+   */
+  if (status === "SUCCEEDED" && payment) {
+    try {
+      const { issueInvoiceForOrder, allocatePaymentToInvoice } = await import("./invoicing.server");
+      const actor = {
+        id: "stripe",
+        name: "Stripe",
+        ipAddress: null,
+        userAgent: "stripe-webhook",
+      };
+      const issued = await issueInvoiceForOrder(payment.orderId, actor);
+      await allocatePaymentToInvoice(payment.id, issued.invoice.id, actor);
+    } catch (error) {
+      // Recorded, not thrown. See above: the payment is the authority and this
+      // is bookkeeping that a person can redo.
+      const message = error instanceof Error ? error.message : "unknown error";
+      await setIntegrationState("stripe", {
+        status: "DELAYED",
+        detail: `The charge was recorded but its invoice could not be issued: ${message}`,
+        error: message,
+      }).catch(() => {});
+    }
+  }
+
   await setIntegrationState("stripe", {
     status: "HEALTHY",
     detail: `Processed Stripe event ${event.type}.`,

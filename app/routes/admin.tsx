@@ -59,6 +59,22 @@ const NAV_GROUPS: NavGroup[] = [
       { href: "/admin/orders", label: "Orders", icon: "O", permission: "orders.view", activePrefixes: ["/admin/fulfillment"] },
       { href: "/admin/shipping", label: "Shipping", icon: "H", permission: "shipping.view", activePrefixes: ["/admin/pickups", "/admin/origins"] },
       { href: "/admin/returns", label: "Returns & claims", icon: "R", permission: "shipping.view", activePrefixes: ["/admin/claims"] },
+      /*
+       * ACCOUNTING IS THREE PAGES, AND THEY ARE ONE SECTION.
+       *
+       * Invoices are what MoonVella billed; Customers is who owes it and how old
+       * it is; Bills is what MoonVella itself owes. They are separate routes
+       * because they answer different questions, and one entry because an
+       * operator moving between them is doing one job.
+       *
+       * `finance.view` rather than `orders.view`: balances and statements are
+       * financial data, and the roles that see orders are not all roles that
+       * should see the ledger. The old Billing entry pointed at
+       * `/admin/payments`, which still exists for the Stripe charge history —
+       * it is listed under it rather than replacing it.
+       */
+      { href: "/admin/invoices", label: "Invoices", icon: "I", permission: "finance.view", activePrefixes: ["/admin/customers"] },
+      { href: "/admin/bills", label: "Bills & expenses", icon: "E", permission: "finance.view" },
       { href: "/admin/payments", label: "Billing", icon: "B", permission: "orders.view" },
     ],
   },

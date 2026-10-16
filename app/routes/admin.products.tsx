@@ -386,7 +386,21 @@ export default function AdminProducts() {
                 <td><Link to={`/admin/products/${p.id}`}>{p.name}</Link><div className="mv-muted mv-mono">{p.productCode}</div></td>
                 <td className="mv-muted">{p.category}</td>
                 <td className="mv-muted">{p._count.variants === 0 ? "None" : p._count.variants}</td>
-                <td className="mv-muted">{p._count.mediaAssets}</td>
+                {/*
+                  WHAT THE NUMBER COUNTS, which is the whole point of the cell.
+                  A bare asset count cannot answer the question the column is
+                  asked — "is every size pictured?" — because three files on one
+                  variant is the same number as one file on each of three, and
+                  only one of those is a product a seller can list.
+                */}
+                <td className="mv-muted">
+                  {p._count.mediaAssets} file{p._count.mediaAssets === 1 ? "" : "s"}
+                  <div style={{ fontSize: "0.72rem", color: "#94a3b8" }}>
+                    {p._count.variants === 0
+                      ? "no variants yet"
+                      : `${p.picturedVariants} of ${p._count.variants} variants with pictures`}
+                  </div>
+                </td>
                 <td><span className={p.packaging.complete ? "mv-badge mv-badge-success" : "mv-badge mv-badge-warning"}>
                   {p.packaging.complete ? "Ready" : p.packaging.totalVariants === 0 ? "No variants" : `${p.packaging.packagedVariants}/${p.packaging.totalVariants}`}
                 </span></td>

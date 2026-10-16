@@ -1752,6 +1752,23 @@ export default function AdminOrderDetail() {
         )}
 
         {/*
+          WHAT DOES *NOT* HOLD THE BOOKING, said in as many words.
+
+          The address was once a gate: booking waited on a Google verdict for
+          both ends, and an operator looking at a perfectly sendable address was
+          sent to satisfy a validator the carrier never asked about. That rule is
+          gone — booking takes the seller's address as supplied and requires only
+          the fields a carrier actually reads — but its absence is invisible. A
+          page that simply does not mention addresses leaves the reader to guess
+          whether they are waiting on something, so it says so.
+        */}
+        <p style={{ fontSize: "0.75rem", color: "#52627A", marginTop: "0.5rem", marginBottom: 0 }}>
+          These checks do not block booking. The carrier is sent the address as supplied, and only
+          the fields it needs — a missing verdict, or an address Google has not seen, is not a
+          reason to hold a parcel.
+        </p>
+
+        {/*
           THE CARRIER'S ONE MISSING FIELD, AND THE PLACE TO FIX IT.
 
           Booking is refused when the recipient has no phone, and the refusal

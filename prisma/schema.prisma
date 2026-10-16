@@ -329,6 +329,8 @@ model Seller {
   products           SellerProduct[]
   orders             Order[]
   wholesalePayments  WholesalePayment[]
+  invoices           Invoice[]
+  creditNotes        CreditNote[]
   billingSettings    SellerBillingSettings?
   paymentMethods     SellerPaymentMethod[]
   bankAccounts       SellerBankAccount[]
@@ -1129,6 +1131,8 @@ model Order {
   packages                  OrderPackage[]
   returnRequests            ReturnRequest[]
   stateTransitions          OrderStateTransition[]
+  /// The invoice MoonVella issued this seller for this order.
+  invoice                   Invoice?
   /// When the order's quotes stopped describing it, and why.
   ///
   /// A quote prices the parcels that existed when it was asked for. Change the
@@ -1370,6 +1374,10 @@ model Refund {
   reviewedAt      DateTime?
 
   items           RefundItem[]
+  /// The credit notes raised out of this refund. A refund moves cash; a credit
+  /// reduces what is owed. They can come from one complaint and are still two
+  /// different facts, so the link is kept without merging the rows.
+  creditNotes     CreditNote[]
   createdAt       DateTime     @default(now())
 
   @@unique([orderId, shopifyRefundId])
@@ -1574,6 +1582,9 @@ model Shipment {
   items                   ShipmentItem[]
   trackingEvents          ShipmentTrackingEvent[]
   returnRequests          ReturnRequest[]          @relation("OriginalShipmentReturns")
+  /// Carrier invoices recorded against this parcel, so a quoted cost, a booked
+  /// cost and what the carrier actually billed are readable side by side.
+  supplierBills           SupplierBill[]
   shippingClaims          ShippingClaim[]
   createdAt               DateTime                @default(now())
   updatedAt               DateTime                @updatedAt
@@ -1956,6 +1967,10 @@ model WholesalePayment {
   createdAt               DateTime               @default(now())
   updatedAt               DateTime               @updatedAt
   events                  PaymentEvent[]
+  /// Where this payment was applied. A payment is one event; an invoice is
+  /// another; this is the link, and it is what makes a partial payment
+  /// expressible.
+  allocations             PaymentAllocation[]
   attempts                PaymentAttempt[]
 
   @@index([sellerId])
@@ -3090,4 +3105,327 @@ enum BrandSlot {
   /// What prints on invoices and statements. Falls back to PRIMARY when empty,
   /// which is why it is a slot rather than a copy of the primary asset.
   INVOICE
+}
+
+/* ==========================================================================
+   CUSTOMER ACCOUNTING
+   ==========================================================================
+   MoonVella bills its sellers and records what it owes its own suppliers. All
+   of it is app-owned: no invoice, payment or contact is written to an ERP, and
+   nothing is queued to be.
+
+   THE THREE IDEAS THIS SECTION IS BUILT AROUND, because they are what make an
+   accounting module correct rather than merely present:
+
+     1. AN INVOICE IS A DOCUMENT, NOT A VIEW. Once issued it has a number, a
+        snapshot of who it was sent to and what it said, and it is never
+        recomputed. A catalogue changes, an address is corrected, a company is
+        renamed — none of that may rewrite a document somebody has already been
+        sent. Corrections are recorded as credits or as a new invoice, which is
+        why `Invoice.billTo` is a JSON snapshot and `InvoiceLine` copies its
+        description and price instead of pointing at an order line.
+
+     2. MONEY IS ALLOCATED, NOT ACCUMULATED. A payment is one event and an
+        invoice is another; the link between them is a `PaymentAllocation` row.
+        Summing "payments for this seller" against "invoices for this seller"
+        answers a different question and gets the split-payment case wrong. Each
+        allocation carries a unique idempotency key, so a replayed Stripe event
+        allocates once.
+
+     3. A CREDIT IS NOT A REFUND. A refund moves money back to a card; a credit
+        reduces what is owed. They are different amounts to different parties and
+        only one of them is cash, so they are separate tables and a statement
+        shows them on separate lines. Recording one does not create the other.
+
+   AMOUNTS ARE MINOR UNITS (cents), integers, with an explicit currency on every
+   row. Nothing here uses a float, and nothing converts between currencies.
+*/
+
+/// A customer invoice: what MoonVella billed one seller for one order.
+model Invoice {
+  id String @id @default(cuid())
+
+  /// Stable, unique, human-quotable — "MV-2026-000123". Assigned ONCE, at issue,
+  /// from a sequence row, and never reused or renumbered. A number that can move
+  /// is a number that cannot be quoted in a dispute.
+  number String @unique
+
+  orderId String @unique
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  sellerId String
+  seller   Seller @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  status   InvoiceStatus @default(DRAFT)
+  currency String        @default("CAD")
+
+  issuedAt DateTime?
+  /// When payment is due. Nullable because a due date is a TERM, and an invoice
+  /// with no agreed term has none rather than one somebody invented.
+  dueDate  DateTime?
+  voidedAt DateTime?
+  voidReason String?
+
+  // --- the money, frozen at issue -----------------------------------------
+  /// Sum of the lines, in minor units.
+  subtotal    Int
+  /// Discounts and surcharges, signed. Kept apart from the subtotal so a reader
+  /// can see that the total is not simply the lines added up.
+  adjustments Int @default(0)
+  /// Tax as actually charged. Zero is a real value here and is NOT a policy:
+  /// presentation is made conditional on the transaction, never on a hard-coded
+  /// zero-tax rule.
+  taxTotal    Int @default(0)
+  /// subtotal + adjustments + taxTotal. Stored rather than computed on read, so
+  /// a document cannot change its own total if a line is ever edited.
+  total       Int
+
+  /// WHO IT WAS SENT TO, as it read at issue: company, contact, billing and
+  /// delivery addresses. A snapshot because a renamed or re-addressed company
+  /// must not rewrite a document that has already gone out.
+  billTo Json
+  shipTo Json?
+
+  lines       InvoiceLine[]
+  allocations PaymentAllocation[]
+  credits     CreditNote[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([sellerId, issuedAt])
+  @@index([status])
+  @@index([dueDate])
+}
+
+enum InvoiceStatus {
+  /// Built, not yet numbered or issued. Editable; nothing has been sent.
+  DRAFT
+  /// Issued and outstanding. The only state an allocation may be made against.
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  /// Withdrawn. Kept, with its number and its reason — a voided invoice is a
+  /// fact about the account and deleting it would erase the fact.
+  VOID
+}
+
+/// One line on an issued invoice.
+///
+/// IT COPIES, IT DOES NOT POINT. `orderItemId` records where the line came from
+/// so a reader can trace it, but the description, quantity and price are copied
+/// at issue. An order line whose price is later re-derived from a catalogue that
+/// has moved on must not change a document that has been sent.
+model InvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  description String
+  sku         String?
+  quantity    Int
+  /// Price per unit, minor units. Signed for a discount line.
+  unitAmount  Int
+  /// quantity × unitAmount, stored so a reader never has to re-multiply.
+  amount      Int
+
+  /// Where it came from. Loose text plus an optional id: an invoice may also
+  /// carry a line that came from nowhere in particular (a freight charge).
+  sourceType String?
+  sourceId   String?
+
+  sortOrder Int @default(0)
+
+  @@index([invoiceId])
+}
+
+/// A payment applied to an invoice.
+///
+/// WHY THIS IS ITS OWN TABLE. One payment can settle part of an invoice, all of
+/// it, or — after a credit — more than one. "How much has been paid" is the sum
+/// of the allocations, and the alternative (comparing a payment's order to an
+/// invoice's order) cannot express a partial payment at all.
+///
+/// `idempotencyKey` is UNIQUE in the database, which is what makes a replayed
+/// Stripe webhook allocate once rather than twice. A check-then-write in
+/// application code cannot do that: two concurrent deliveries both pass the
+/// check.
+model PaymentAllocation {
+  id String @id @default(cuid())
+
+  paymentId String
+  payment   WholesalePayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  amount   Int
+  currency String @default("CAD")
+
+  allocatedAt   DateTime @default(now())
+  allocatedById String?
+  /// Why this allocation exists, when it was made by a person rather than by the
+  /// charge itself.
+  note String?
+
+  idempotencyKey String @unique
+
+  @@index([invoiceId])
+  @@index([paymentId])
+}
+
+/// A credit note: money owed BACK to the customer, or applied against an invoice.
+///
+/// A CREDIT IS NOT A REFUND, and keeping them apart is the point of this table.
+/// A refund moves money out to a card; a credit reduces what is owed. They can
+/// arise from the same complaint and are still different amounts to different
+/// parties. `stripeRefundId` links the two when both happened WITHOUT merging
+/// them, so a statement can show cash and credit on their own lines and nobody
+/// has to guess which one reduced the balance.
+model CreditNote {
+  id     String @id @default(cuid())
+  number String @unique
+
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  sellerId String
+  seller   Seller @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  currency String @default("CAD")
+  /// Positive minor units. A credit reduces what is owed; the sign is a
+  /// presentation decision, not a stored one.
+  amount Int
+  reason String
+
+  status CreditStatus @default(ISSUED)
+  issuedAt DateTime @default(now())
+  issuedById String?
+  appliedAt  DateTime?
+
+  /// The Stripe refund this credit corresponds to, when there is one. Null for a
+  /// credit given for a reason that moved no cash.
+  stripeRefundId String?
+  refundId String?
+  refund   Refund? @relation(fields: [refundId], references: [id], onDelete: SetNull)
+
+  @@index([sellerId, issuedAt])
+  @@index([invoiceId])
+  @@index([status])
+}
+
+enum CreditStatus {
+  /// Recorded and owed. Reduces the balance.
+  ISSUED
+  /// Consumed against an invoice.
+  APPLIED
+  VOID
+}
+
+/// A supplier bill or expense MoonVella owes — carrier invoices, packaging,
+/// software. The other side of the ledger from a customer invoice.
+model SupplierBill {
+  id String @id @default(cuid())
+
+  supplier String
+  /// The supplier's OWN document number, which is not our identifier for the
+  /// bill and is not required to be unique — the same supplier can legitimately
+  /// reuse a number across years.
+  reference String?
+  /// What kind of cost this is: "Shipping", "Packaging", "Software"…
+  category  String
+
+  currency String @default("CAD")
+  /// The full amount billed, minor units.
+  total    Int
+  issuedOn DateTime
+  dueDate  DateTime?
+
+  status SupplierBillStatus @default(OPEN)
+  notes  String?
+
+  /// When the bill is a carrier's invoice for a shipment, the shipment it
+  /// reconciles. This is the link the work order asks for between a quoted cost,
+  /// a booked cost and what was actually billed.
+  shipmentId String?
+  shipment   Shipment? @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+
+  /// The stored document, in the same backend as media. Never fetched from a URL
+  /// the user typed.
+  documentKey  String?
+  documentName String?
+
+  payments  SupplierBillPayment[]
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([dueDate])
+  @@index([supplier])
+}
+
+enum SupplierBillStatus {
+  OPEN
+  PARTIAL
+  PAID
+  VOID
+}
+
+/// A payment against a supplier bill.
+///
+/// LOGGING IS NOT CHARGING, and the work order is explicit that recording a
+/// payment must distinguish the two. `method` is that distinction:
+///
+///   LOGGED — the money already left by some other route (a bank transfer, a
+///            card the operator holds, a cheque). This only records the fact.
+///   CARD   — charge it now, through the payment provider.
+///
+/// A table with one "record payment" action and no way to tell them apart is how
+/// an operator logs a bank transfer and charges a card a second time.
+model SupplierBillPayment {
+  id     String       @id @default(cuid())
+  billId String
+  bill   SupplierBill @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  amount   Int
+  currency String @default("CAD")
+
+  method    SupplierBillPaymentMethod
+  /// A bank reference, a cheque number, a card charge id — whatever identifies
+  /// this payment to somebody else.
+  reference String?
+  paidAt    DateTime @default(now())
+  recordedById String?
+  note String?
+
+  /// Set when the payment must happen at most once (a card charge).
+  idempotencyKey String? @unique
+
+  @@index([billId])
+}
+
+enum SupplierBillPaymentMethod {
+  /// Money already moved; this row records it.
+  LOGGED
+  /// Charge the card now.
+  CARD
+}
+
+/// The counter behind invoice and credit numbers.
+///
+/// WHY A ROW AND NOT `MAX(number) + 1`. Two invoices issued in the same second
+/// would read the same maximum and be handed the same number, and the unique
+/// index would then refuse one of them — an operator seeing "could not issue
+/// invoice" for a reason that has nothing to do with the invoice. The counter is
+/// incremented and read in one statement, inside the issuing transaction, so the
+/// number is allocated exactly once even under concurrency.
+model NumberSequence {
+  id        String @id @default(cuid())
+  /// "invoice" | "credit"
+  key       String @unique
+  /// The NEXT number to hand out. Incremented before use.
+  nextValue Int    @default(1)
+  updatedAt DateTime @updatedAt
 }

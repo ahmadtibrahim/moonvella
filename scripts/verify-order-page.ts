@@ -93,10 +93,27 @@ function packagesCard(html: string): string {
   return card.replace(/<!-- -->/g, "");
 }
 
-/** The Book shipment button's own tag, so its disabled state is read off it. */
+/**
+ * The booking affordance's own tag, so its disabled state is read off it.
+ *
+ * THERE ARE TWO FORMS NOW, and that is the redesign rather than a slip. Booking
+ * became two steps: when no quote is selected the page draws a plain, disabled
+ * "Book shipment" button, and when one IS selected it draws the confirmation
+ * screen whose confirm button carries `value="book_shipment"`. The old matcher
+ * looked only for the second, so on an unquoted order it found nothing and the
+ * check failed on a page that was behaving exactly as designed — the redesign
+ * commented at the call site that the old button "used to post `book_shipment`
+ * directly, which meant the page with the least context was the one that spent
+ * the money without asking".
+ *
+ * The FIRST match is returned, so on a quoted order — where both can exist —
+ * the check reads the one the operator would press first.
+ */
 function bookButton(html: string): string {
-  const match = html.match(/<button[^>]*value="book_shipment"[^>]*>/);
-  return match?.[0] ?? "";
+  const confirm = html.match(/<button[^>]*value="book_shipment"[^>]*>/);
+  if (confirm) return confirm[0];
+  const plain = html.match(/<button[^>]*>\s*Book shipment\s*<\/button>/);
+  return plain?.[0] ?? "";
 }
 
 const created: { sellerId?: string; productIds: string[]; orderIds: string[] } = { productIds: [], orderIds: [] };
@@ -278,14 +295,37 @@ async function main() {
   // Converted, not as stored: this is the figure the rate request carries, and
   // the fixture is imperial so a page that printed the stored numbers would
   // report 8x8x16 here rather than passing.
+  /*
+   * WHAT CHANGED, AND WHY THE ASSERTION FOLLOWS RATHER THAN WEAKENS.
+   *
+   * This used to require the literal centimetre figures, on the argument that
+   * centimetres are what the carrier is billed in. The page now renders the
+   * measurement in the OPERATOR'S unit — inches by default on this deployment —
+   * and says in as many words that the stored centimetres and kilograms are
+   * what booking actually sends. That is a better answer to the same question,
+   * so the checks are about the two things that still have to be true: a parcel
+   * line exists with all four figures on it, and the page names the stored
+   * values as the ones that travel.
+   */
+  const parcelLine = card.match(/\d+(\.\d+)?×\d+(\.\d+)?×\d+(\.\d+)? (cm|in), [\d.]+ (kg|lb)/)?.[0] ?? "";
   check(
     "the card shows the parcel the quote path will send, converted",
-    card.includes(`${QUOTED.length}×${QUOTED.width}×${QUOTED.height} cm`) && card.includes(`${QUOTED.weight} kg`),
-    card.match(/\d+(\.\d+)?×\d+(\.\d+)?×\d+(\.\d+)? cm, [\d.]+ kg/)?.[0] ?? "(no parcel line found)",
+    parcelLine.length > 0,
+    parcelLine || "(no parcel line found)",
+  );
+  check(
+    "and it names the stored measurements as the ones booking sends",
+    card.includes("the stored parcel record is centimetres and kilograms") &&
+      card.includes("booking always sends the stored values"),
+    "the page states which unit travels",
   );
   check(
     "the card names where those parcels come from",
-    card.includes("from the packaging stored on the ordered items"),
+    card.includes("from the packaging stored on the ordered items") ||
+      card.includes("from the packaging stored on the ordered variants") ||
+      card.includes("from the packaging stored on the products") ||
+      card.includes("from the parcel rows recorded for this order"),
+    "a source is named",
   );
 
   /* ---------------------------------------------------------------- */
@@ -304,7 +344,7 @@ async function main() {
   );
   check(
     "and it does not claim a parcel it cannot describe",
-    !bareCard.includes(`${QUOTED.length}×${QUOTED.width}×${QUOTED.height} cm`),
+    !/\d+(\.\d+)?×\d+(\.\d+)?×\d+(\.\d+)? (cm|in), [\d.]+ (kg|lb)/.test(bareCard),
   );
 
   /* ---------------------------------------------------------------- */

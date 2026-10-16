@@ -113,3 +113,47 @@ export function rateCaption(usdRate: number, asOf: string | null): string {
   const when = asOf ? ` as of ${asOf}` : "";
   return `USD shown at 1 CAD = ${usdRate.toFixed(4)} USD${when}. Prices are stored and charged in CAD.`;
 }
+
+/**
+ * "114.40" → 11440. Null when the text is not an amount.
+ *
+ * PARSED FROM THE STRING, NEVER VIA A FLOAT. `Math.round(114.40 * 100)` is
+ * 11439, because 114.40 is not exactly representable — and a bill recorded one
+ * cent light is a reconciliation nobody can close. The integer part and the
+ * fraction are read separately and combined in integers.
+ *
+ * This is the ONE place a human-typed amount becomes minor units, so the whole
+ * accounting module can assume everything downstream is an integer.
+ */
+export function parseMajorUnits(raw: string): number | null {
+  const match = /^-?\d+(\.\d{1,2})?$/.exec(String(raw ?? "").replace(/,/g, "").trim());
+  if (!match) return null;
+  const [whole, fraction = ""] = match[0].split(".");
+  const negative = whole.startsWith("-");
+  const cents = Math.abs(Number(whole)) * 100 + Number((fraction + "00").slice(0, 2));
+  return negative ? -cents : cents;
+}
+
+/**
+ * Minor units to a display string: 123456 → "CAD 1,234.56".
+ *
+ * LIVES HERE, NOT IN THE PDF RENDERER, AND THE BUILD DECIDES THAT. It was
+ * written beside the PDF code because that is where it was first needed — and
+ * then a route's COMPONENT used it for a table cell, which pulled a
+ * `.server` module into the client bundle. React Router strips server code only
+ * from `loader`, `action`, `middleware` and `headers`; anything else a route
+ * exports that reaches a server module fails the build with
+ * "Server-only module referenced by client". `tsc` does not see it — a
+ * `.server` import is perfectly well-typed — so only the build catches it.
+ *
+ * Thousands separators are inserted by hand rather than through
+ * `toLocaleString`, so the server and the browser cannot disagree about them
+ * and produce a hydration mismatch.
+ */
+export function money(minor: number | null | undefined, currency: string): string {
+  if (minor === null || minor === undefined) return "—";
+  const sign = minor < 0 ? "-" : "";
+  const abs = Math.abs(Math.round(minor));
+  const whole = String(Math.floor(abs / 100)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${sign}${currency} ${whole}.${String(abs % 100).padStart(2, "0")}`;
+}

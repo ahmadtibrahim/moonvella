@@ -301,7 +301,11 @@ export async function listProducts(filters: ProductListFilters = {}) {
         variants: {
           select: {
             id: true,
-            _count: { select: { packages: true } },
+            // Packages for the readiness column, and media assignments for the
+            // Media column. The second is why the number beside it can say what
+            // it is: a bare asset count does not tell an operator whether every
+            // size has a picture, which is the question the column is asked.
+            _count: { select: { packages: true, mediaAssignments: true } },
           },
         },
       },
@@ -321,8 +325,19 @@ export async function listProducts(filters: ProductListFilters = {}) {
       const packagedVariants = variants.filter(
         (variant) => variant._count.packages > 0 || hasProductFallback
       ).length;
+      /*
+       * How many SIZES have a picture, not just how many files exist.
+       *
+       * The column is asked "is this product ready to show" and a count of
+       * assets cannot answer it: three files on one variant is the same number
+       * as one file on each of three, and only one of those is finished.
+       */
+      const picturedVariants = variants.filter(
+        (variant) => variant._count.mediaAssignments > 0
+      ).length;
       return {
         ...summary,
+        picturedVariants,
         packaging: {
           complete: variants.length > 0 && packagedVariants === variants.length,
           packagedVariants,

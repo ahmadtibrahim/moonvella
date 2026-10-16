@@ -285,6 +285,15 @@ const CHECKS = [
   // least once — a decision suite that never runs the encoder proves nothing
   // about the encoder. It removes every row and object it creates.
   { name: "branding", kind: "ts", file: "scripts/verify-branding.ts" },
+  // Customer accounting: document immutability, replay-safe allocation, credits
+  // kept apart from refunds, statements that balance, and supplier bills whose
+  // "logged" and "card" payment methods are not the same act.
+  //
+  // The failures it guards against do not throw — an invoice issued twice, an
+  // allocation applied twice by a redelivered webhook, a credit counted twice —
+  // so they are asserted rather than eyeballed. It builds its own seller, orders
+  // and charge, and removes them. No provider is contacted.
+  { name: "accounting", kind: "ts", file: "scripts/verify-accounting.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox
