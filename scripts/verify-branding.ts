@@ -416,6 +416,32 @@ async function main() {
   /* 6. The fallback chain                                               */
   /* ------------------------------------------------------------------ */
 
+  /*
+   * THE FALLBACK CHAIN IS TESTED FROM A KNOWN STATE, not from whatever the
+   * clone happens to hold.
+   *
+   * This section used to assert that DARK, SQUARE and INVOICE were empty and
+   * therefore resolved to PRIMARY — which passed on a freshly cloned database
+   * and failed the moment anything else had put a logo in one of those slots.
+   * It broke exactly that way, on a fixture another tool had left behind, and a
+   * check that depends on unrelated state is a check that will fail for reasons
+   * that have nothing to do with the code.
+   *
+   * So every slot is superseded first, the chain is asserted against a state the
+   * suite owns, and the previous state is restored afterwards.
+   */
+  const liveBefore = await prisma.brandAsset.findMany({
+    where: { supersededAt: null, slot: { in: ["DARK", "SQUARE", "INVOICE"] } },
+    select: { id: true, slot: true },
+  });
+  // ONLY the three slots the chain is about. PRIMARY is left alone because it is
+  // the fallback every one of these resolves TO — superseding it too would leave
+  // nothing to fall back to and turn three correct answers into three nulls.
+  await prisma.brandAsset.updateMany({
+    where: { supersededAt: null, slot: { in: ["DARK", "SQUARE", "INVOICE"] } },
+    data: { supersededAt: new Date() },
+  });
+
   check(
     "an empty INVOICE slot resolves to PRIMARY",
     (await effectiveSlot("INVOICE")) === "PRIMARY",
@@ -428,6 +454,21 @@ async function main() {
   check(
     "an empty SQUARE slot resolves to PRIMARY",
     (await effectiveSlot("SQUARE")) === "PRIMARY"
+  );
+  check(
+    "and with nothing live at all, no slot resolves — the chain terminates",
+    await (async () => {
+      const primaryLive = await prisma.brandAsset.findMany({
+        where: { slot: "PRIMARY", supersededAt: null },
+        select: { id: true },
+      });
+      await prisma.brandAsset.updateMany({ where: { slot: "PRIMARY", supersededAt: null }, data: { supersededAt: new Date() } });
+      const resolved = await effectiveSlot("PRIMARY");
+      for (const row of primaryLive) {
+        await prisma.brandAsset.update({ where: { id: row.id }, data: { supersededAt: null } });
+      }
+      return resolved === null;
+    })()
   );
   check(
     "the invoice PDF gets bytes, through the fallback",
@@ -508,6 +549,14 @@ async function main() {
   );
 
   await cleanup();
+  /*
+   * Put back the slots this suite hid. The suite's own rows are deleted by
+   * `cleanup`; this restores anything that was live BEFORE it ran, so running
+   * the suite does not leave the clone's branding reset for whatever runs next.
+   */
+  for (const row of liveBefore) {
+    await prisma.brandAsset.update({ where: { id: row.id }, data: { supersededAt: null } }).catch(() => {});
+  }
 
   console.log(`\n=== ${total - failures}/${total} checks passed ===`);
   await prisma.$disconnect();

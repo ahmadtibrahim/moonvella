@@ -215,7 +215,28 @@ async function main() {
       // anything, so it is stored readable. ODOO_WHOLESALE_PRICELIST used to sit
       // in this list; it is gone with the pricing decision, and removing it here
       // is what would catch it coming back as a field nobody decided about.
-      .every((field) => ["STRIPE_PUBLISHABLE_KEY", "ESHIPPER_BASE_URL", "ESHIPPER_USERNAME", "ESHIPPER_ACCOUNT_ID", "ODOO_URL", "ODOO_DATABASE", "ODOO_USERNAME", "ODOO_MODE", "ODOO_WAREHOUSE", "GOOGLE_MAPS_BROWSER_KEY"].includes(field.name))
+      .every((field) =>
+        [
+          "STRIPE_PUBLISHABLE_KEY",
+          "ESHIPPER_BASE_URL",
+          "ESHIPPER_USERNAME",
+          "ESHIPPER_ACCOUNT_ID",
+          "ODOO_URL",
+          "ODOO_DATABASE",
+          "ODOO_USERNAME",
+          "ODOO_MODE",
+          "ODOO_WAREHOUSE",
+          // Reached this list late, and its absence was the check working: the
+          // field was added to the Odoo form without anybody deciding here
+          // whether it is a secret. It is not one — it names a journal inside the
+          // ERP, which identifies a record rather than authenticating anything,
+          // exactly like ODOO_WAREHOUSE. Since 2026-10-16 it is historical: the
+          // app writes no invoice to Odoo, and the field is kept so the stored
+          // value is not destroyed.
+          "ODOO_INVOICE_JOURNAL",
+          "GOOGLE_MAPS_BROWSER_KEY",
+        ].includes(field.name)
+      )
   );
 
   // 1. Encryption -------------------------------------------------------------
@@ -840,6 +861,12 @@ async function main() {
           "GOOGLE_MAPS_SERVER_KEY",
           "ODOO_API_KEY",
           "ODOO_DATABASE",
+          // It carries a hint because a value is not guessable from its name, and
+          // it is kept for the same reason the whole Odoo block is: the stored
+          // value must not be discarded. See the note on the identifier list
+          // above — this list and that one are meant to be extended together, and
+          // this is that extension rather than a relaxation.
+          "ODOO_INVOICE_JOURNAL",
           "ODOO_MODE",
           "ODOO_URL",
           "ODOO_USERNAME",

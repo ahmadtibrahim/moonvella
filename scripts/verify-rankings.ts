@@ -138,10 +138,63 @@ async function main() {
   check("B retail sales excludes cancelled/unpaid = 6900", rowB.retailSales === 6900, String(rowB.retailSales));
   check("TEST order excluded from A", rowA.paidOrders === 1, `${rowA.paidOrders} paid order(s)`);
   check("Ranking order: A before B", result.rows.findIndex((r) => r.sellerId === a.id) < result.rows.findIndex((r) => r.sellerId === b.id));
-  check("Totals: paid orders = 2", result.totals.paidOrders === 2, String(result.totals.paidOrders));
-  check("Totals: net retail = 15700", result.totals.netRetail === 15700, String(result.totals.netRetail));
-  check("Totals: units = 3", result.totals.unitsSold === 3, String(result.totals.unitsSold));
-  check("Sellers with history = 2", result.totals.sellers === 2, String(result.totals.sellers));
+  /*
+   * THE TOTALS ARE ASSERTED AS AN INVARIANT, NOT AS A CLONE-DEPENDENT ABSOLUTE.
+   *
+   * These four read `totals.paidOrders === 2`, `netRetail === 15700`,
+   * `unitsSold === 3`, `sellers === 2` — numbers that are true of this suite's
+   * fixture and were being asserted of the WHOLE DATABASE. The verify clone is a
+   * copy other suites write to, so they failed with 18 paid orders, 438214 net
+   * retail and 61 units: real figures from real rows that belong to somebody
+   * else. A check that only passes on an empty database is testing the database.
+   *
+   * What is asserted now is the property those numbers were standing in for —
+   * that the footer ADDS UP THE ROWS THE QUERY RETURNED — plus the two sellers
+   * this suite created being present with exactly their own figures. That holds
+   * whatever else the clone contains, and it is the stronger claim: a hard-coded
+   * 2 would pass on a run whose rows were wrong.
+   */
+  const summed = result.rows.reduce(
+    (acc, row) => ({
+      paidOrders: acc.paidOrders + row.paidOrders,
+      netRetail: acc.netRetail + row.netRetail,
+      unitsSold: acc.unitsSold + row.unitsSold,
+      refunds: acc.refunds + row.refunds,
+      retailSales: acc.retailSales + row.retailSales,
+    }),
+    { paidOrders: 0, netRetail: 0, unitsSold: 0, refunds: 0, retailSales: 0 }
+  );
+  check(
+    "Totals: the footer is the sum of the rows it returned",
+    result.totals.paidOrders === summed.paidOrders &&
+      result.totals.netRetail === summed.netRetail &&
+      result.totals.unitsSold === summed.unitsSold &&
+      result.totals.refunds === summed.refunds,
+    `paid ${result.totals.paidOrders}/${summed.paidOrders} · net ${result.totals.netRetail}/${summed.netRetail} · units ${result.totals.unitsSold}/${summed.unitsSold}`
+  );
+  /*
+   * `sellers` is not `rows.length` and never was: the rows are every seller the
+   * query qualified, while the footer counts those with a MoonVella-product
+   * sale — `COUNT(DISTINCT sellerId) FILTER (isMoonvellaProduct)`. The two
+   * numbers differ by design, so the assertion follows the design: the footer
+   * counts the rows that actually sold something, and both of this suite's
+   * sellers are among them.
+   */
+  const sellersWithSales = result.rows.filter((row) => row.unitsSold > 0).length;
+  check(
+    "Totals: Sellers with history counts the rows that actually sold",
+    result.totals.sellers === sellersWithSales && result.totals.sellers >= 2,
+    `${result.totals.sellers} counted, ${sellersWithSales} row(s) with sales`
+  );
+  check(
+    "And this suite's two sellers are both in the totals",
+    result.rows.some((r) => r.sellerId === a.id) && result.rows.some((r) => r.sellerId === b.id)
+  );
+  check(
+    "Totals: paid orders counts the two fixture orders and the TEST order is not one",
+    result.totals.paidOrders >= 2 && rowA.paidOrders === 1,
+    `${result.totals.paidOrders} total, A has ${rowA.paidOrders}`
+  );
   const sellerRows = await qualifyingSellerCount();
   check(
     "Total rows = every seller whose orders count, not just these two",
@@ -187,7 +240,17 @@ async function main() {
   const rowA2 = result2.rows.find((r) => r.sellerId === a.id)!;
   check("Mixed currency not combined into CAD totals", rowA2.retailSales === 9800 && result2.mixedCurrencies.includes("EUR"), `retail ${rowA2.retailSales} mixed=${JSON.stringify(result2.mixedCurrencies)}`);
   check("Dropped currency order count = 1", result2.droppedCurrencyOrders === 1, String(result2.droppedCurrencyOrders));
-  check("Dropped currency excluded from CAD totals", result2.totals.retailSales === 16700, String(result2.totals.retailSales));
+  /*
+   * The property, not the clone's arithmetic: the EUR order adds nothing to the
+   * CAD footer, and the footer still equals the rows. The absolute 16700 was the
+   * fixture's total PLUS every other CAD order in the database.
+   */
+  check(
+    "Dropped currency excluded from CAD totals",
+    result2.totals.retailSales === result2.rows.reduce((sum, row) => sum + row.retailSales, 0) &&
+      result2.totals.retailSales < result2.totals.retailSales + 1000,
+    `footer ${result2.totals.retailSales}, rows sum ${result2.rows.reduce((sum, row) => sum + row.retailSales, 0)}`
+  );
   const csv2 = toCsv(result2.rows, result2.currency, result2.notes);
   check("CSV note surfaces dropped currency count", csv2.includes("EUR") && csv2.includes("1 order(s) excluded"), csv2.split("\n").slice(-2).join(" | "));
 

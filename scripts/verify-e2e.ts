@@ -487,6 +487,25 @@ async function main() {
   const packing = await createPackingShipment(order.id, [{ orderItemId: orderItem.id, quantity: QTY }], actor);
   check("packing Shipment created PENDING", packing.status === "PENDING", packing.status);
   check("packing ShipmentItem allocated", (await prisma.shipmentItem.count({ where: { shipmentId: packing.id } })) === 1);
+  /*
+   * THE LABEL COMES FIRST, AND THIS FIXTURE USED TO SKIP IT.
+   *
+   * Packing is recorded only for a parcel whose carrier label has been bought —
+   * `advanceRefusal` refuses a `packedAt` on anything not in PACKABLE_STATES, and
+   * the reason is that a parcel "packed" before a label existed is what let the
+   * packing control stand above a box with nothing bought for it. The scenario
+   * therefore packed a PENDING shipment, which the service correctly refused, and
+   * the whole end-to-end run died on a fixture that predated the rule.
+   *
+   * Booking needs a provider, and this suite is offline by construction, so the
+   * booked state is SIMULATED with a direct write — the same thing the provider
+   * call would have left behind. What the section then exercises is packing, which
+   * is what it was always about. Nothing here claims a real label.
+   */
+  await prisma.shipment.update({
+    where: { id: packing.id },
+    data: { status: "BOOKED", providerShipmentId: `e2e-sim-${Date.now()}`, trackingNumber: "E2E000000000" },
+  });
   const packed = await markShipmentPacked(packing.id, actor);
   check("packing Shipment packedAt stamped", !!packed.packedAt);
   const orderPackage = await addOrderPackage(order.id, { count: 1, length: 40, width: 30, height: 20, weight: 2.5 }, actor);

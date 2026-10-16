@@ -315,8 +315,11 @@ async function main() {
   );
   check(
     "and it names the stored measurements as the ones booking sends",
-    card.includes("the stored parcel record is centimetres and kilograms") &&
-      card.includes("booking always sends the stored values"),
+    // Matched case-insensitively because the page starts the sentence with a
+    // capital — the first version of this assertion looked for a lower-case
+    // "the" and failed on a page that said exactly the right thing.
+    /the stored parcel record is centimetres and kilograms/i.test(card) &&
+      /booking always sends the stored values/i.test(card),
     "the page states which unit travels",
   );
   check(
@@ -375,7 +378,8 @@ async function main() {
   );
   check(
     "and the address card says in as many words that it does not block booking",
-    page.html.includes("these checks do not block booking"),
+    // Case-insensitive for the same reason as the parcel line above.
+    /these checks do not block booking/i.test(page.html),
   );
   check(
     "and no address verdict is described as holding the button",

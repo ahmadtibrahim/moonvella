@@ -94,6 +94,10 @@ const PACKAGING_ROWS = clean(readSource("app/components/product/packagingRows.ts
 const PACKS_ROUTE = clean(readSource("app/routes/admin.packaging.tsx"));
 const AUDIT_SERVICE = clean(readSource("app/services/audit.server.ts"));
 const ADMIN_LAYOUT = clean(readSource("app/routes/admin.tsx"));
+// The catalogue's own workspace nav. This app's navigation is TWO levels — a
+// sidebar of sections and a workspace bar inside one — and the packaging library
+// is deliberately on the second: it is part of the catalogue, not a peer of it.
+const CATALOG_ROUTE = clean(readSource("app/routes/admin.products.tsx"));
 
 /**
  * The body of the branch that handles one intent.
@@ -431,10 +435,27 @@ async function main(): Promise<number> {
         "assertSameOrigin(request)",
       ),
   );
+  /*
+   * REACHED FROM THE NAVIGATION, WHICH HERE IS TWO LEVELS DEEP.
+   *
+   * This asserted `href: "/admin/packaging"` in the SIDEBAR, and that stopped
+   * being true when the catalogue was reorganised: packaging is part of the
+   * catalogue, so it moved into the catalogue's own workspace bar rather than
+   * sitting beside it as a peer section. The page is still one click from the
+   * sidebar — Products, then Packaging library — and the check now follows that
+   * path instead of insisting on the shape it used to have.
+   *
+   * The claim being pinned is unchanged: an operator can REACH this page from
+   * the navigation. It is not weakened, because the alternative reading — accept
+   * either form — would pass on a page that had been dropped from the navigation
+   * entirely.
+   */
   check(
-    "a pack change is audited against its own entity, and the page is in the navigation",
+    "a pack change is audited against its own entity, and the page is reachable from the navigation",
     AUDIT_SERVICE.includes('PACKAGING_PRESET: "PackagingPreset"') &&
-      ADMIN_LAYOUT.includes('href: "/admin/packaging"'),
+      ADMIN_LAYOUT.includes('href: "/admin/products"') &&
+      CATALOG_ROUTE.includes('to="/admin/packaging"'),
+    `sidebar→catalog: ${ADMIN_LAYOUT.includes('href: "/admin/products"')}, catalog→packaging: ${CATALOG_ROUTE.includes('to="/admin/packaging"')}`,
   );
 
   /* -------------------------------------------------------------------------- */
