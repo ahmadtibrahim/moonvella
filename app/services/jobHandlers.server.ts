@@ -16,7 +16,7 @@ import { syncOdooCatalog } from "./odooSync.server";
 import { probeVideoAsset, sweepVideoProbes } from "./mediaProbe.server";
 import { pushVariantInventory } from "./inventoryPush.server";
 import { syncShipmentTracking, sweepShipmentTracking, flagMissedPickups } from "./shipping.server";
-import { intakeOrder } from "./orderIntake.server";
+import { intakeOrder, subjectOfDelivery } from "./orderIntake.server";
 import { chargeSellerForOrder } from "./sellerCharge.server";
 import {
   routeFulfillmentOrdersToMoonvella,
@@ -805,6 +805,43 @@ export function intakeJobHandler(adminOverride?: AdminClient): JobHandler {
  * delivery and the delivery ends FAILED — the truth, and a state that does not
  * claim work is outstanding.
  */
+/**
+ * Which order a fulfillment order belongs to, asked of Shopify.
+ *
+ * The numeric id the rest of the pipeline keys on comes back out, because the
+ * hydration below builds `gid://shopify/Order/<id>` from it. A routing delivery
+ * whose payload names only the fulfillment order is resolved here rather than
+ * being refused as "missing order id" — which is what happened to every routing
+ * event this deployment ever received, and what made the failure permanent:
+ * refusing a delivery rewrites its stored body, so there was nothing left to
+ * retry from.
+ */
+async function resolveOrderIdFromFulfillmentOrder(
+  admin: AdminClient,
+  fulfillmentOrderId: string
+): Promise<string | null> {
+  const gid = fulfillmentOrderId.startsWith("gid://")
+    ? fulfillmentOrderId
+    : `gid://shopify/FulfillmentOrder/${fulfillmentOrderId}`;
+  const res = await admin.graphql(
+    `#graphql
+      query MoonVellaOrderForRouting($id: ID!) {
+        fulfillmentOrder(id: $id) {
+          id
+          order { id }
+        }
+      }`,
+    { variables: { id: gid } }
+  );
+  const json = (await res.json()) as {
+    data?: { fulfillmentOrder?: { order?: { id?: string } | null } | null };
+    errors?: { message: string }[];
+  };
+  const orderGid = json?.data?.fulfillmentOrder?.order?.id;
+  if (!orderGid) return null;
+  return numericId(orderGid);
+}
+
 async function hydrateOrderPayload(input: {
   topic: string;
   shop: string;
@@ -812,7 +849,11 @@ async function hydrateOrderPayload(input: {
   /** The store's client, when the caller already has one. See `intakeJobHandler`. */
   adminOverride?: AdminClient;
 }): Promise<{ payload: Record<string, unknown>; failure: string | null }> {
-  const { topic, shop, payload } = input;
+  const { topic, shop } = input;
+  // Reassignable: a routing delivery that names only a fulfillment order has
+  // the resolved order id written back onto it, so everything downstream sees
+  // the same shape it sees for an `orders/*` delivery.
+  let payload = input.payload;
   /*
    * TWO REASONS TO GO AND FETCH THE ORDER.
    *
@@ -834,8 +875,20 @@ async function hydrateOrderPayload(input: {
   const carriesTheOrder = Array.isArray(payload.line_items);
   if (!isRefundOrRouting && carriesTheOrder) return { payload, failure: null };
 
-  const orderId = isRefundOrRouting ? payload.order_id : (payload.id ?? payload.order_id);
-  if (orderId === undefined || orderId === null) return { payload, failure: null };
+  const subject = subjectOfDelivery(topic, payload);
+  let orderId = subject.orderId;
+  /*
+   * A ROUTING DELIVERY MAY NAME ONLY THE FULFILLMENT ORDER.
+   *
+   * Shopify's payload reference wraps the fulfillment order in
+   * `fulfillment_order`, and the resource it wraps is the one that carries
+   * `order_id` — but a delivery that arrives with nothing but the fulfillment
+   * order's own id is not an error to give up on. This is the one place in the
+   * pipeline with an authenticated client, so the order is resolved through
+   * Shopify rather than the delivery being written off as naming no order.
+   */
+  const needsFulfillmentLookup = !orderId && subject.fulfillmentOrderId !== null;
+  if (!orderId && !needsFulfillmentLookup) return { payload, failure: null };
 
   try {
     const seller = await prisma.seller.findUnique({ where: { shopDomain: shop } });
@@ -846,6 +899,16 @@ async function hydrateOrderPayload(input: {
         const { unauthenticated } = await import("~/shopify.server");
         return (await unauthenticated.admin(seller.shopDomain)).admin as unknown as AdminClient;
       })());
+
+    if (needsFulfillmentLookup) {
+      orderId = await resolveOrderIdFromFulfillmentOrder(admin, subject.fulfillmentOrderId as string);
+      if (!orderId) {
+        return { payload, failure: `Fulfillment order ${subject.fulfillmentOrderId} did not name an order.` };
+      }
+      // The rest of the pipeline keys on `order_id`, so the resolved id is
+      // written back onto a copy rather than being special-cased downstream.
+      payload = { ...payload, order_id: orderId, id: payload.id ?? orderId };
+    }
 
     /*
      * THE ORDER NUMBER IS `number`, AND ASKING FOR `orderNumber` BROKE EVERY

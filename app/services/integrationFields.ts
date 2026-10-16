@@ -119,11 +119,17 @@ export const CREDENTIAL_INTEGRATIONS: Record<CredentialKey, CredentialIntegratio
       "Odoo computes it, never as the product's cost and never as zero, and a variant Odoo " +
       "cannot price stops the import instead of arriving at a guess. MoonVella bills in CAD and " +
       "converts nothing, so a product priced in another currency is refused. " +
-      "READ-ONLY IS THE DEFAULT: \"live\" mode alone does not enable writes — they also " +
-      "require ODOO_ALLOW_WRITES=yes in the deployment environment, which this page cannot " +
-      "set, so a form here can never authorise writing to the ERP. The database is reached " +
+      "READ-ONLY IS THE DEFAULT, BUT IT IS ONLY A DEFAULT: \"live\" mode alone does not " +
+      "enable writes — they also require ODOO_ALLOW_WRITES=yes in the deployment " +
+      "environment, which this page cannot set, so this form cannot authorise a write by " +
+      "itself. THAT SECOND SWITCH IS DEPLOYMENT STATE THIS PAGE CANNOT SEE, and the two " +
+      "sentences are not the same claim: when a deployment has set both, saving \"live\" here " +
+      "does permit MoonVella to write to the named database, a production one included. Read " +
+      "the Odoo row on this page for the mode actually in force rather than reading this " +
+      "paragraph as \"writes are impossible\". The database is reached " +
       "over JSON-RPC only, never as a PostgreSQL connection, and a database named Prod-db " +
-      "is refused unless a deployment sets ODOO_ALLOW_PROD_DB=yes. Use a dedicated service " +
+      "is refused unless a deployment sets ODOO_ALLOW_PROD_DB=yes — which is another switch a " +
+      "deployment can and does set. Use a dedicated service " +
       "account — see the connection setup steps in the audit.",
     fields: [
       {

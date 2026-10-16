@@ -581,6 +581,88 @@ async function main() {
       "an unreachable host is NOT reported as ok",
       unreachableAuth.ok === false,
     );
+
+    /* ---------------------------------------------------------------- */
+    /* 12. THE DOMAIN resolvePartner SENDS IS A LIST OF LEAVES.           */
+    /*                                                                    */
+    /* This is the check the suite did not have, and the defect it missed */
+    /* is the one that stopped every contact sync. With an EMAIL AND NO   */
+    /* VAT the domain was built as a BARE LEAF — ["email","=ilike",x] —   */
+    /* instead of a list containing one leaf. A domain's top level is a   */
+    /* list of leaves, so Odoo read the three strings as three leaves and */
+    /* called tuple("email") on the first, which raises "too many values  */
+    /* to unpack (expected 3)" — a message about string length that names */
+    /* nothing about domains.                                             */
+    /*                                                                    */
+    /* Why nothing caught it: `decidePartnerAction` below is pure and is  */
+    /* tested exhaustively, while `resolvePartner` — the half that builds */
+    /* the request — was only asserted to BE a function. And the domain   */
+    /* is built from the identifiers a seller happens to have, so the bug */
+    /* needs a seller with an email and no tax id, which no fixture here  */
+    /* has ever been.                                                     */
+    /* ---------------------------------------------------------------- */
+    await clearOdooStore();
+    configureOdoo({ ODOO_URL: "https://odoo.invalid", ODOO_MODE: "readonly" });
+
+    const rpcCalls: unknown[][] = [];
+    const realFetch = globalThis.fetch;
+    // Answers Odoo's JSON-RPC envelope and records the positional args Odoo
+    // would have received. Nothing leaves the process: the host is
+    // odoo.invalid and does not resolve, and the stub answers first anyway.
+    globalThis.fetch = (async (_url: unknown, init: { body?: string } = {}) => {
+      let args: unknown[] = [];
+      let method: unknown;
+      try {
+        const body = JSON.parse(String(init.body ?? "{}")) as { params?: { args?: unknown[] } };
+        args = body.params?.args ?? [];
+        method = args[4];
+      } catch {
+        args = [];
+      }
+      rpcCalls.push(args);
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: method === "search_read" ? [] : 1 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof globalThis.fetch;
+    /** The domain of the most recent res.partner search_read, as Odoo sees it. */
+    const domainSent = () => {
+      for (let i = rpcCalls.length - 1; i >= 0; i -= 1) {
+        const args = rpcCalls[i];
+        if (args[3] === "res.partner" && args[4] === "search_read") {
+          return (args[5] as unknown[])?.[0] as unknown;
+        }
+      }
+      return undefined;
+    };
+
+    try {
+      const emailOnly = await odoo.resolvePartner({ name: "Acme", email: "a@acme.test" });
+      const domain = domainSent();
+      check(
+        "email-only partner search sends a LIST-OF-LEAVES domain",
+        Array.isArray(domain) && (domain as unknown[]).length === 1 && Array.isArray((domain as unknown[])[0]),
+        `domain=${JSON.stringify(domain)}`,
+      );
+      check(
+        "the email-only search reaches a decision rather than throwing",
+        typeof (emailOnly as { action?: string }).action === "string",
+        `action=${(emailOnly as { action?: string }).action}`,
+      );
+
+      await odoo.resolvePartner({ name: "Acme", email: "a@acme.test", vat: "123456789" });
+      const both = domainSent();
+      check(
+        "email+vat partner search sends an OR-domain whose operands are leaves",
+        Array.isArray(both) &&
+          (both as unknown[]).length === 3 &&
+          (both as unknown[])[0] === "|" &&
+          (both as unknown[]).slice(1).every((leaf) => Array.isArray(leaf)),
+        `domain=${JSON.stringify(both)}`,
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   } finally {
     /* ------------------------------------------------------------------ */
     /* Restore whatever the clone had before this suite ran.               */

@@ -15,6 +15,46 @@ export async function loader({ request }: LoaderFunctionArgs) {
       role: user.role,
       isPrimaryOwner: user.isPrimaryOwner,
     },
+    environment: await describeEnvironment(),
+  };
+}
+
+/**
+ * WHAT THIS DEPLOYMENT ACTUALLY DOES, PER INTEGRATION — COMPUTED, NOT ASSERTED.
+ *
+ * The banner above the owner's screens was the literal string "TEST MODE — no
+ * real payment or fulfillment". That is true of the card gateway and the
+ * carrier and FALSE OF THE ERP: the effective Odoo mode is `live` against the
+ * production database with writes permitted, because the stored credential
+ * says so and ODOO_ALLOW_WRITES is set. A fixed sentence cannot be right about
+ * a deployment whose integrations disagree, and the one it got wrong is the
+ * one that can post to production accounting.
+ *
+ * So the sentence is derived from the switches the code itself enforces — the
+ * connector's own mode classifier, the card key's own live/test prefix, the
+ * carrier host actually configured — and it names the integration that is NOT
+ * in test mode. A banner that cannot disagree with enforcement is the only kind
+ * worth putting in front of an operator.
+ */
+async function describeEnvironment() {
+  const { odooMode } = await import("~/services/odoo.server");
+  const { stripeSecretKey, getCredentials } = await import("~/services/credentials.server");
+
+  const [mode, stripeKey, eship] = await Promise.all([
+    odooMode().catch(() => "disabled" as const),
+    stripeSecretKey().catch(() => null),
+    getCredentials("eshipper").catch(() => ({}) as Record<string, string>),
+  ]);
+
+  const carrierHost = (eship.ESHIPPER_BASE_URL ?? process.env.ESHIPPER_BASE_URL ?? "")
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+
+  return {
+    erpMode: mode,
+    erpLive: mode === "live",
+    stripeLive: (stripeKey ?? "").trim().startsWith("sk_live_"),
+    carrierHost: carrierHost || null,
   };
 }
 
@@ -69,7 +109,7 @@ function navItemIsActive(pathname: string, item: NavItem) {
 }
 
 export default function AdminLayout() {
-  const { user } = useLoaderData<typeof loader>();
+  const { user, environment } = useLoaderData<typeof loader>();
   const { pathname } = useLocation();
 
   return (
@@ -132,13 +172,28 @@ export default function AdminLayout() {
             <span>Manage catalog, orders, shipping and seller payments</span>
           </div>
           <div className="mv-admin-environment" role="status">
-            <span aria-hidden="true" /> TEST MODE
+            <span aria-hidden="true" /> {environment.erpLive ? "ERP LIVE" : "TEST MODE"}
           </div>
         </header>
         <div className="mv-admin-content">
-          <div className="mv-admin-test-banner" role="status">
-            TEST MODE — no real payment or fulfillment
-          </div>
+          {environment.erpLive ? (
+            /*
+             * The ERP is the one integration that is NOT sandboxed, and it is
+             * the one whose mistake is a posted accounting entry. So the banner
+             * leads with it rather than burying it under a blanket "TEST MODE"
+             * that the reader would take as covering everything on the page.
+             */
+            <div className="mv-admin-test-banner" role="status" data-tone="warning">
+              Odoo is <strong>LIVE</strong> — database {environment.erpMode === "live" ? "and" : ""} writes permitted.
+              {environment.stripeLive ? " The card gateway is LIVE too." : " Card payments are test mode."}
+              {environment.carrierHost ? ` Carrier host: ${environment.carrierHost}.` : " No carrier host is configured."}
+              {" "}Anything created here can reach production accounting.
+            </div>
+          ) : (
+            <div className="mv-admin-test-banner" role="status">
+              TEST MODE — no real payment or fulfillment
+            </div>
+          )}
           <Outlet />
         </div>
       </main>

@@ -943,7 +943,19 @@ export async function resolvePartner(input: {
   if (vat) leaves.push(["vat", "=ilike", vat]);
   if (leaves.length === 0) return decidePartnerAction(input, []);
 
-  const domain: unknown[] = leaves.length === 1 ? leaves[0] : ["|", ...leaves];
+  /*
+   * A DOMAIN IS A LIST OF LEAVES, ALWAYS — INCLUDING WHEN THERE IS ONE LEAF.
+   *
+   * This read `leaves.length === 1 ? leaves[0] : ["|", ...leaves]`, which for a
+   * seller with an email and no VAT sent a BARE leaf: `["email","=ilike",x]`
+   * instead of `[["email","=ilike",x]]`. Odoo iterates a domain's top level, so
+   * it read the three strings as three leaves and called `tuple("email")` on the
+   * first — which raises "too many values to unpack (expected 3)", a message
+   * about string length that says nothing about domains. The whole contact sync
+   * failed on it, and only for sellers with an email and no tax id, which is why
+   * the two-identifier branch worked and hid the mistake.
+   */
+  const domain: unknown[] = leaves.length === 1 ? [leaves[0]] : ["|", ...leaves];
   const matches = await searchRead<PartnerCandidate>(
     PARTNER_MODEL,
     domain,

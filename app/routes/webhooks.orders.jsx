@@ -1,7 +1,8 @@
 import { authenticate } from "../shopify.server";
 import { prisma } from "../db.server";
 import { enqueueJob, JOB_KIND } from "../services/jobs.server";
-import { WEBHOOK_TOPICS } from "../services/orderIntake.server";
+import http from "node:http";
+import { WEBHOOK_TOPICS, orderIdFromDelivery } from "../services/orderIntake.server";
 
 /**
  * The Shopify order webhook endpoint: POST /webhooks/orders
@@ -124,22 +125,95 @@ export const action = async ({ request }) => {
     return new Response(null, { status: 200 });
   }
 
+  /*
+   * ASK THE QUEUE TO RUN NOW, AND DO NOT WAIT FOR THE ANSWER.
+   *
+   * Recording the delivery is not taking the order in — the row is PENDING and
+   * the work happens when `/jobs/run` drains the queue. That endpoint is called
+   * by cron every five minutes, and NOTHING ELSE CALLS IT, so an order placed
+   * just after a tick sat invisible to both the seller's order list and the
+   * owner's queue for the rest of the interval. That is what "the order never
+   * appeared" turned out to mean: order #1005's deliveries arrived at 06:12:25
+   * and the supplier order was not created until 06:17:02, because the tick
+   * before it had already run.
+   *
+   * So the delivery kicks the queue itself. Three things make this safe:
+   *
+   *   • it is NOT awaited. Shopify is still answered in microseconds, which is
+   *     the whole reason intake is not done inline here, and a slow or absent
+   *     runner cannot delay a delivery.
+   *   • `/jobs/run` claims each job with a conditional update, so a kick that
+   *     overlaps the cron tick (or another delivery's kick) drains the queue
+   *     once and the extra caller claims nothing.
+   *   • every failure is swallowed. A missing secret, a refused host or a dead
+   *     socket leaves the delivery exactly where it was — recorded, PENDING, and
+   *     picked up by cron. This is an optimisation of the wait, never a
+   *     dependency of correctness.
+   */
+  kickJobQueue(request);
+
   return new Response(null, { status: 200 });
 };
 
 /**
+ * Nudge the queue runner, fire-and-forget.
+ *
+ * Loops back over the container's own listener with the app's own Host header,
+ * because the server refuses any other name with a 421 — the same control that
+ * keeps the owner panel from being reached by a different name. `fetch` cannot
+ * be used: Host is a forbidden header name and undici silently drops it, so the
+ * request would arrive under the wrong name and be refused.
+ */
+function kickJobQueue(request) {
+  const secret = (process.env.MV_JOB_RUNNER_SECRET ?? "").trim();
+  if (!secret) return;
+
+  const port = Number(process.env.PORT ?? 3000);
+  let host;
+  try {
+    host = new URL(request.url).host;
+  } catch {
+    return;
+  }
+
+  try {
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: "/jobs/run",
+        method: "POST",
+        headers: {
+          Host: host,
+          "Content-Type": "application/json",
+          "x-moonvella-job-secret": secret,
+        },
+      },
+      (res) => res.resume()
+    );
+    req.setTimeout(30_000, () => req.destroy());
+    req.on("error", () => {});
+    req.end("{}");
+  } catch {
+    // Nothing to do: cron still drains the queue.
+  }
+}
+
+/**
  * Which order a delivery is about.
  *
- * Orders carry their own id. A refund carries the order it belongs to under
- * `order_id`, and a fulfillment-order routing event carries a fulfillment order
- * whose order has to be fetched — which the intake job does, because it is the
- * only place with an authenticated client. Returns null when the payload has no
- * order in it at all, which is not an error: the job resolves it.
+ * This is `orderIdFromDelivery` from `orderIntake.server`, called rather than
+ * re-implemented: it was written out again here, slightly differently, and the
+ * two copies disagreed about a routing delivery — which is the topic that
+ * broke. One definition now, so the delivery key this route composes and the
+ * anchor intake files the event against cannot drift apart.
+ *
+ * It returns null when the payload names no order at all, which is not an
+ * error: the delivery id header carries the dedupe for those, and the intake
+ * job resolves the order through Shopify.
  */
 function resolveOrderId(topic, payload) {
-  if (payload?.order_id) return String(payload.order_id);
-  if (payload?.id && topic !== "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE") return String(payload.id);
-  return null;
+  return orderIdFromDelivery(topic, payload);
 }
 
 /** The version of an order payload, matching what `intakeOrder` keys on. */

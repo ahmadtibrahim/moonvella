@@ -31,7 +31,7 @@
  */
 
 import { PrismaClient } from "@prisma/client";
-import { intakeOrder } from "../app/services/orderIntake.server";
+import { intakeOrder, subjectOfDelivery } from "../app/services/orderIntake.server";
 import { computeSellerCharge, chargeSellerForOrder, ChargeRefused } from "../app/services/sellerCharge.server";
 import { createOrReuseWholesalePayment, applyStripeEvent, refundSellerCharge } from "../app/services/payments.server";
 import { savePaymentMethodFromSetupIntent } from "../app/services/sellerBilling.server";
@@ -1968,6 +1968,113 @@ async function main() {
     hydrationQuery.includes("orderNumber") ? "still asks for orderNumber" : "asks for number",
   );
 
+
+  /* ====================================================================== */
+  /* ROUTING DELIVERIES NAME THEIR ORDER IN TWO PLACES, AND THE ENVELOPE THE */
+  /* DOCS SHOW IS THE ONE THIS CODE COULD NOT READ.                          */
+  /*                                                                         */
+  /* A routing payload is a FULFILLMENT ORDER, so its `id` is not the order  */
+  /* id — and Shopify's payload reference wraps it as                        */
+  /* `{ "fulfillment_order": { … } }`, so the order id is not at the root    */
+  /* either. Reading `payload.order_id` alone meant every routing delivery   */
+  /* this deployment received failed with "missing order id", and because a  */
+  /* refusal rewrites the stored body, each one became permanently           */
+  /* unrecoverable: two live deliveries were lost this way on 2026-10-16.    */
+  /* ====================================================================== */
+  console.log("\n--- routing deliveries name their order ---------------------------");
+  check(
+    "a routing delivery wrapped in fulfillment_order still names its order",
+    subjectOfDelivery("FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE", {
+      fulfillment_order: { id: 99, order_id: 450789469, status: "open" },
+    }).orderId === "450789469",
+  );
+  check(
+    "a routing delivery with a root-level order_id still names its order",
+    subjectOfDelivery("FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE", { id: 99, order_id: 450789469 }).orderId ===
+      "450789469",
+  );
+  check(
+    "a routing delivery naming only the fulfillment order carries it out for lookup",
+    (() => {
+      const s = subjectOfDelivery("FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE", {
+        fulfillment_order: { id: 8594586632438, status: "open" },
+      });
+      return s.orderId === null && s.fulfillmentOrderId === "8594586632438";
+    })(),
+  );
+  check(
+    "a refund names the order it belongs to, never the refund's own id",
+    subjectOfDelivery("REFUNDS_CREATE", { id: 555, order_id: 450789469 }).orderId === "450789469",
+  );
+  check(
+    "an orders/* delivery still names its order with its own id",
+    subjectOfDelivery("ORDERS_PAID", { id: 450789469 }).orderId === "450789469",
+  );
+
+  /*
+   * The end-to-end half, and it is the half that was actually broken: a wrapped
+   * routing delivery for an order this app already holds must be FILED AGAINST
+   * THAT ORDER. Asserting only "not refused" would pass even when nothing was
+   * matched, because a routing event for an unknown order is also a success —
+   * so the check is on the order id it resolved to.
+   */
+  const routingOrderId = toCancel.order!.id;
+  const routingResult = await intakeOrder({
+    topic: "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE",
+    shop: OTHER_SHOP,
+    payload: {
+      fulfillment_order: { id: 8594586632438, order_id: ORDER_ID + 11, status: "open" },
+    } as never,
+    source: "WEBHOOK",
+  });
+  check(
+    "a wrapped routing delivery is filed against the order it names",
+    routingResult.ok === true && (routingResult as { orderId?: string }).orderId === routingOrderId,
+    JSON.stringify(routingResult),
+  );
+  check(
+    "…and is not refused as naming no order",
+    routingResult.reason !== "missing order id",
+  );
+
+  /* ====================================================================== */
+  /* A REVIVED JOB MUST GET A FRESH ATTEMPT BUDGET.                          */
+  /*                                                                        */
+  /* The runner refuses a job whose count has reached its limit BEFORE it    */
+  /* runs it, so a job revived with a spent budget fails on its first step   */
+  /* however many times an operator presses Retry. That is what made the     */
+  /* store's contact sync report "Failed after 6/5 attempts": five real      */
+  /* attempts, then a manual retry counted as a sixth against a budget of    */
+  /* five. An operator's "try again" has to be able to succeed.              */
+  /* ====================================================================== */
+  const reviveKey = jobKey(JOB_KIND.SHOPIFY_ORDER_INTAKE, SHOP, `verify-revive-${suffix}`);
+  const firstEnqueue = await enqueueJob({
+    kind: JOB_KIND.SHOPIFY_ORDER_INTAKE,
+    idempotencyKey: reviveKey,
+    payload: { webhookEventId: "verify", topic: "ORDERS_PAID", shop: SHOP },
+    maxAttempts: 1,
+  });
+  await prisma.backgroundJob.update({
+    where: { id: firstEnqueue.id },
+    data: { status: "FAILED", attempts: 1, lastError: "the first run failed" },
+  });
+  const revived = await enqueueJob({
+    kind: JOB_KIND.SHOPIFY_ORDER_INTAKE,
+    idempotencyKey: reviveKey,
+    payload: { webhookEventId: "verify", topic: "ORDERS_PAID", shop: SHOP },
+    maxAttempts: 1,
+  });
+  check(
+    "a revived failed job gets its attempt budget back",
+    revived.attempts === 0 && revived.status === "PENDING",
+    `attempts=${revived.attempts} status=${revived.status} maxAttempts=${revived.maxAttempts}`,
+  );
+  check(
+    "…and the retry is not refused on arrival for having spent its budget",
+    revived.attempts < revived.maxAttempts,
+    `attempts=${revived.attempts} maxAttempts=${revived.maxAttempts}`,
+  );
+  await prisma.backgroundJob.deleteMany({ where: { idempotencyKey: reviveKey } });
 
   /* ====================================================================== */
   /* Done                                                                    */

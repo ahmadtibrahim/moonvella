@@ -236,10 +236,20 @@ export interface EnqueueInput {
  *
  * The states that make a re-enqueue a no-op are PENDING and RUNNING and
  * SUCCEEDED. A FAILED or CANCELLED job is revived in place: the same row, the
- * same idempotency key, with its attempt count kept so an operator can see it
- * has failed before. Creating a second row for the same key is impossible
+ * same idempotency key. Creating a second row for the same key is impossible
  * anyway — the column is unique — so the only question is what the existing row
  * becomes, and the answer for a failed job is "try again".
+ *
+ * A REVIVED JOB ALSO GETS ITS ATTEMPT BUDGET BACK, and that is a correction,
+ * not a detail. This used to keep `attempts`, on the reasoning that an operator
+ * should see the job had failed before — but the runner refuses a job whose
+ * count has reached the limit BEFORE it runs it (`attempts >= maxAttempts`),
+ * so a job that failed at 5 of 5 was revived at 5 of 5 and failed again on its
+ * first step. The Retry button was a no-op that reported a number nobody could
+ * act on; that is where "Failed after 6/5 attempts" came from — an operator's
+ * retry, counted as a sixth attempt against a budget of five. The history the
+ * old comment wanted is not lost by this: the failure is on the row's own
+ * `lastError` and in the audit log, which is where a person reads it.
  */
 export async function enqueueJob(input: EnqueueInput) {
   const db = input.db ?? prisma;
@@ -264,6 +274,8 @@ export async function enqueueJob(input: EnqueueInput) {
         lastError: null,
         finishedAt: null,
         startedAt: null,
+        // A fresh budget, so "try again" can actually succeed. See above.
+        attempts: 0,
         payload: (input.payload ?? existing.payload ?? undefined) as never,
         sellerAccessVersion: input.sellerAccessVersion ?? existing.sellerAccessVersion,
       },

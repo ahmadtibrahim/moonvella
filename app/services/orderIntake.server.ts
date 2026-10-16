@@ -47,6 +47,54 @@ export const WEBHOOK_TOPICS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * WHICH ORDER A DELIVERY IS ABOUT — ONE DEFINITION, BECAUSE THERE ARE THREE
+ * SPELLINGS OF IT AND THEY WERE WRITTEN IN THREE PLACES.
+ *
+ * An `orders/*` payload IS the order, so its own `id` is the order id. A
+ * `refunds/create` payload is a REFUND, and a
+ * `fulfillment_orders/order_routing_complete` payload is a FULFILLMENT ORDER;
+ * neither carries the order in `id`, and reading it there files the delivery
+ * against an id that belongs to something else — which finds nothing, writes
+ * nothing, and records a successful no-op.
+ *
+ * The routing envelope is the one that actually broke: Shopify's payload
+ * reference shows the fulfillment order WRAPPED in `fulfillment_order`, and
+ * this code read `order_id` at the root only. A routing delivery therefore
+ * arrived with no order it could name, was refused as "missing order id", and
+ * — because a refusal rewrites the stored body — became unrecoverable. Both
+ * spellings are read here rather than betting on one, and the fulfillment
+ * order's own id is carried out too so a caller that has an authenticated
+ * client can resolve the order through Shopify when the payload names only
+ * that.
+ */
+export interface DeliverySubject {
+  orderId: string | null;
+  fulfillmentOrderId: string | null;
+}
+
+export function subjectOfDelivery(topic: string, payload: unknown): DeliverySubject {
+  const body = (payload ?? {}) as Record<string, unknown>;
+  const nested = (body.fulfillment_order ?? null) as Record<string, unknown> | null;
+  const str = (v: unknown) => (v === undefined || v === null || v === "" ? null : String(v));
+
+  if (topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE") {
+    return {
+      orderId: str(body.order_id) ?? str(nested?.order_id),
+      fulfillmentOrderId: str(nested?.id) ?? str(body.id),
+    };
+  }
+  if (topic === "REFUNDS_CREATE") {
+    return { orderId: str(body.order_id), fulfillmentOrderId: null };
+  }
+  return { orderId: str(body.id), fulfillmentOrderId: null };
+}
+
+/** The order id alone, for callers that only need the anchor. */
+export function orderIdFromDelivery(topic: string, payload: unknown): string | null {
+  return subjectOfDelivery(topic, payload).orderId;
+}
+
+/**
  * Where a delivery came from.
  *
  * A REPLAY is an operator asking the system to take in an order Shopify has
@@ -540,10 +588,24 @@ function addressJson(value: unknown): string | null {
  * three facts that say whether the payload was about money and fulfilment. All
  * of it is identifiers and states — no names, no addresses, no contact details.
  */
-function redactedSummary(payload: OrderPayload): string {
+function redactedSummary(payload: OrderPayload, topic?: string): string {
+  /*
+   * THE ORDER ANCHOR SURVIVES, WHATEVER THE TOPIC.
+   *
+   * `id` is only the order id for an `orders/*` delivery. For a refund it is
+   * the refund, and for a routing event it is the fulfillment order — so a
+   * summary built from `id` alone leaves those two deliveries saying which
+   * refund or which fulfillment order they concerned and NOT which order, which
+   * is the one thing an operator needs to look anything up. `order_id` is
+   * carried explicitly for exactly that reason, and it is an identifier, not
+   * customer data.
+   */
+  const subject = topic ? subjectOfDelivery(topic, payload) : null;
   return JSON.stringify({
     redacted: true,
     id: payload?.id ?? null,
+    order_id: subject?.orderId ?? (payload as { order_id?: unknown })?.order_id ?? null,
+    fulfillment_order_id: subject?.fulfillmentOrderId ?? null,
     name: payload?.name ?? null,
     order_number: payload?.order_number ?? null,
     financial_status: payload?.financial_status ?? null,
@@ -560,11 +622,11 @@ function redactedSummary(payload: OrderPayload): string {
 async function finishEvent(id: string, status: "SUCCESS" | "FAILED", errorMessage?: string | null) {
   const current = await prisma.webhookEvent.findUnique({
     where: { id },
-    select: { payload: true, retryCount: true },
+    select: { payload: true, retryCount: true, topic: true },
   });
   let summary = "{}";
   try {
-    summary = current ? redactedSummary(JSON.parse(current.payload) as OrderPayload) : "{}";
+    summary = current ? redactedSummary(JSON.parse(current.payload) as OrderPayload, current.topic) : "{}";
   } catch {
     // A body that will not parse is exactly the body not to keep a copy of.
     summary = JSON.stringify({ redacted: true, unparseable: true });
@@ -639,20 +701,7 @@ export async function intakeOrder(input: {
   const isRefund = topic === "REFUNDS_CREATE";
   const isRouting = topic === "FULFILLMENT_ORDERS_ORDER_ROUTING_COMPLETE";
 
-  /*
-   * WHICH ORDER THIS EVENT IS ABOUT.
-   *
-   * Three of the six topics carry an order as their subject and their `id` IS
-   * the order id. The other three do not: a refund's `id` is the refund, and a
-   * routing event's `id` is the fulfillment order. Both name the order they
-   * belong to in `order_id`.
-   *
-   * Reading `payload.id` unconditionally — which is what this did — meant a
-   * refund or a routing event would be filed against an order whose id was
-   * really a refund id. Nothing would be found, nothing would be written, and
-   * the event would be recorded as a successful no-op.
-   */
-  const orderId = isRefund || isRouting ? payload?.order_id : payload?.id;
+  const orderId = orderIdFromDelivery(topic, payload);
   if (!orderId) {
     /*
      * The delivery row was written by the route before it knew what it had, so
