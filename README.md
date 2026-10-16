@@ -448,3 +448,64 @@ PostgreSQL is `prisma/migrations/`. Do not move them back.
   absent — that is what makes the suites runnable without live keys.
 - Never commit a secret. Configuration values live in
   `/etc/moonvella/moonvella.env` or the encrypted credential store, never here.
+
+---
+
+## 11. Backlog — the final-phase cancellation workflow
+
+**NOT IMPLEMENTED. This section exists so it is not lost, and so nobody builds
+half of it and reports the other half done.**
+
+### What exists now
+
+An admin can cancel an order **that has no booked shipment**. That path is built
+(`app/services/orderCancellation.server.ts`, the order page and the orders list)
+and it handles the three payment positions — nothing captured, an authorisation
+to void, a captured charge to refund — plus the inventory hold and the invoice
+credit. It refuses, with an explanation, anything with a label against it.
+
+### What does not
+
+Cancelling an order whose parcel has a **label**, a **scheduled pickup** or a
+**carrier handoff** requires six things to be coordinated, and doing some of them
+is worse than doing none:
+
+1. Order cancellation in MoonVella and in Shopify.
+2. eShipper shipment/label cancellation.
+3. Pickup cancellation **where applicable** — and never when the collection is
+   shared, because cancelling a truck that is also collecting somebody else's
+   parcel is not a cancellation, it is a second failure.
+4. Payment: authorisation cancellation, or a wholesale refund when captured.
+5. An invoice credit note — never a silent rewrite of an issued invoice.
+6. Release of the inventory reservation.
+
+### The rules that have to hold
+
+**Automatic cancellation is allowed only before actual carrier handoff.** A
+scheduled pickup time is NOT evidence that the parcel has left, and treating it
+as such cancels a label for goods already on a truck. Handoff is the boundary,
+and it is a recorded event, not a clock.
+
+**Payment, shipment and invoice outcomes are tracked separately**, with explicit
+states: `Cancellation requested` → `Cancellation processing` → `Cancelled`, or
+`Needs attention`. The last one is not a failure state to be hidden — it is the
+one that says a provider operation is pending or failed and a person has to look.
+
+**Never report everything cancelled while a provider operation is outstanding.**
+A label that eShipper has not confirmed cancelled is a live label, and a refund
+Stripe has not confirmed is not money returned. The interface must be able to say
+"the order is cancelled, the label is not".
+
+**A credit note is not a refund.** Reducing what a seller owes and returning cash
+to their card are different acts to different parties; a credit note alone must
+never be rendered as a completed refund.
+
+**Nonrefundable carrier charges need a business decision.** Do not invent a fee
+policy — some carriers bill a cancelled label, some do not, and the answer is the
+owner's.
+
+### The trigger
+
+The seller can cancel an order in their Shopify admin, and MoonVella can cancel
+for unavailable stock. Both arrive as the same problem and must take the same
+path. Nothing in that path exists yet beyond the no-label case.

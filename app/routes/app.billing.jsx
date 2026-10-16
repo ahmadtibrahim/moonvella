@@ -63,9 +63,13 @@ export const loader = async ({ request }) =>
       autoPayEnabled: settings.autoPayEnabled,
       maxAmountPerOrder: settings.maxAmountPerOrder,
       maxShippingCharge: settings.maxShippingCharge,
-      preferredShippingPolicy: settings.preferredShippingPolicy,
       holdForReview: settings.holdForReview,
-      autoBookShipment: settings.autoBookShipment,
+      // `preferredShippingPolicy` and `autoBookShipment` are NOT sent to the
+      // seller page any more. Cartier and service selection and shipment booking
+      // are MoonVella's decisions, made in the operator panel; a merchant form
+      // must not be able to state a preference for either, and the quickest way
+      // to be sure of that is not to put the values in front of the form at all.
+      // The columns remain on the row for the history that is already in them.
     },
     // Only masked identifiers ever leave the server.
     methods: methods.map((m) => ({
@@ -140,9 +144,7 @@ export const action = async ({ request }) => {
         autoPayEnabled: mode === "AUTOMATIC" && form.get("autoPayEnabled") === "on",
         maxAmountPerOrder: form.get("maxAmountPerOrder") ? Math.round(Number(form.get("maxAmountPerOrder")) * 100) : null,
         maxShippingCharge: form.get("maxShippingCharge") ? Math.round(Number(form.get("maxShippingCharge")) * 100) : null,
-        preferredShippingPolicy: String(form.get("preferredShippingPolicy") || "") || null,
         holdForReview: form.get("holdForReview") === "on",
-        autoBookShipment: form.get("autoBookShipment") === "on",
       });
       return { ok: true, message: "Billing settings saved." };
     }
@@ -319,27 +321,30 @@ export default function BillingPage() {
                     <input style={input} name="maxShippingCharge" type="number" min="0" step="0.01" defaultValue={settings.maxShippingCharge ? settings.maxShippingCharge / 100 : ""} />
                   </div>
                   <div>
-                    <span style={label}>Preferred shipping policy</span>
-                    <select name="preferredShippingPolicy" defaultValue={settings.preferredShippingPolicy ?? "cheapest"} style={input}>
-                      <option value="cheapest">Cheapest eligible</option>
-                      <option value="fastest">Fastest with known estimate</option>
-                      <option value="manual">Always wait for owner selection</option>
-                    </select>
-                  </div>
-                  <div>
                     <span style={label}>Hold for review when limits exceeded</span>
                     <label className="mv-settings-checkbox">
                       <input type="checkbox" name="holdForReview" defaultChecked={settings.holdForReview} />
                       <span>Hold the order for owner review</span>
                     </label>
                   </div>
-                  <div>
-                    <span style={label}>Automatic shipment booking (separate)</span>
-                    <label className="mv-settings-checkbox">
-                      <input type="checkbox" name="autoBookShipment" defaultChecked={settings.autoBookShipment} />
-                      <span>Let MoonVella book the shipment automatically after payment</span>
-                    </label>
-                  </div>
+                  {/*
+                    THE SHIPPING CONTROLS USED TO BE HERE: a preferred-service
+                    policy and a separate "book the shipment automatically after
+                    payment" switch.
+
+                    They are gone because they were never the seller's to decide.
+                    Which carrier and service an order ships on, and whether a
+                    label is bought at all, are MoonVella's operational
+                    decisions — and offering them as merchant preferences split
+                    one decision across two panels, with the seller's copy
+                    sitting behind a payment setting that reads as if paying
+                    authorises shipping. Authorising a charge is not authorising
+                    a purchase from a carrier.
+
+                    Nothing is left behind that a merchant can reach: the two
+                    fields are not rendered, not posted, and not accepted by the
+                    service behind this form.
+                  */}
                 </>
               )}
             </div>

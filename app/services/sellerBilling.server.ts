@@ -76,12 +76,36 @@ export async function updateBillingSettings(
     autoPayEnabled?: boolean;
     maxAmountPerOrder?: number | null;
     maxShippingCharge?: number | null;
-    preferredShippingPolicy?: string | null;
     holdForReview?: boolean;
-    autoBookShipment?: boolean;
   },
   actor?: BillingActor
 ) {
+  /*
+   * THE SHIPPING SETTINGS ARE REFUSED HERE, NOT MERELY ABSENT FROM THE FORM.
+   *
+   * Removing the two inputs from the seller page stops a merchant editing them
+   * in the UI. It does not stop a merchant POSTING them — the form's action is a
+   * public endpoint, and anyone who has ever loaded the page knows its field
+   * names. `preferredShippingPolicy` and `autoBookShipment` decide which carrier
+   * an order ships on and whether a label is bought, both of which are
+   * MoonVella's decisions, so a request that carries either one is refused
+   * rather than quietly ignored: silently dropping the field would let a seller
+   * believe a preference had been recorded.
+   *
+   * The row's existing values are untouched. They are history, and a column that
+   * nobody may write is not a reason to destroy what is already in it.
+   */
+  const forged = ["preferredShippingPolicy", "autoBookShipment"].filter(
+    (field) => Object.prototype.hasOwnProperty.call(input, field)
+  );
+  if (forged.length > 0) {
+    throw new Error(
+      `Shipping is controlled by MoonVella, not by the store: ${forged.join(" and ")} cannot be set ` +
+        `from here. Service selection and shipment booking are operational decisions, and a seller ` +
+        `preferences form is not where they are made.`
+    );
+  }
+
   const before = await prisma.sellerBillingSettings.findUnique({ where: { sellerId } });
   const settings = await prisma.sellerBillingSettings.upsert({
     where: { sellerId },
