@@ -331,6 +331,7 @@ model Seller {
   wholesalePayments  WholesalePayment[]
   invoices           Invoice[]
   creditNotes        CreditNote[]
+  cancellations      OrderCancellation[]
   billingSettings    SellerBillingSettings?
   paymentMethods     SellerPaymentMethod[]
   bankAccounts       SellerBankAccount[]
@@ -1133,6 +1134,8 @@ model Order {
   stateTransitions          OrderStateTransition[]
   /// The invoice MoonVella issued this seller for this order.
   invoice                   Invoice?
+  /// The admin's cancellation of this order, with each side's outcome.
+  cancellation              OrderCancellation?
   /// When the order's quotes stopped describing it, and why.
   ///
   /// A quote prices the parcels that existed when it was asked for. Change the
@@ -3428,4 +3431,120 @@ model NumberSequence {
   /// The NEXT number to hand out. Incremented before use.
   nextValue Int    @default(1)
   updatedAt DateTime @updatedAt
+}
+
+/// An admin's cancellation of an order, and what each side of it actually did.
+///
+/// WHY THIS IS A ROW AND NOT A STATUS ON `Order`. Cancelling an order touches
+/// four systems that fail independently — the payment provider, the inventory
+/// holds, the invoice ledger and (in the final phase) the carrier. `Order.state`
+/// can say CANCELLED the moment the decision is taken, and for a long time after
+/// that the money may not have moved and a label may still be live. One status
+/// column cannot express "the order is cancelled, the refund is pending and the
+/// label is still open", and the version of that which reports everything done
+/// is the version that loses money.
+///
+/// So the decision and its outcomes are separate facts on one row, one column
+/// per system, and the row is never deleted.
+model OrderCancellation {
+  id      String @id @default(cuid())
+  orderId String @unique
+  order   Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  sellerId String
+  seller   Seller @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+
+  reason      CancellationReason
+  /// Required when the reason is OTHER — "other" with no explanation is not a
+  /// reason, it is a refusal to give one, and this is the field somebody will
+  /// read in a month to understand why goods were written off.
+  explanation String?
+
+  status      CancellationStatus @default(REQUESTED)
+  requestedAt DateTime           @default(now())
+  completedAt DateTime?
+  requestedById   String?
+  requestedByName String?
+
+  // --- what each side did, tracked apart on purpose ------------------------
+  /// What was attempted with the payment: nothing, stopping a pending attempt,
+  /// voiding an authorisation, or refunding a captured charge.
+  paymentAction  PaymentCancellationAction @default(NONE)
+  paymentOutcome ProviderOutcome          @default(NOT_APPLICABLE)
+  /// The provider's refund id, when a refund was initiated. The OUTCOME is
+  /// confirmed by the webhook, not by this row — see `paymentOutcome`.
+  stripeRefundId String?
+  paymentNote    String?
+
+  /// The holds released. Idempotent: releasing twice releases nothing the second
+  /// time, so this records what happened rather than guarding it.
+  inventoryOutcome ProviderOutcome @default(NOT_APPLICABLE)
+
+  /// Whether a shipment stood in the way. `REQUIRES_SHIPMENT_CANCELLATION` is
+  /// the state that refuses to complete — a label is live until the carrier says
+  /// otherwise, and this action does not talk to the carrier.
+  shipmentOutcome ShipmentCancellationOutcome @default(NOT_APPLICABLE)
+
+  /// The credit note raised, if any. A credit is NOT a refund: it reduces what
+  /// the seller owes and moves no money, and the two are recorded separately.
+  invoiceOutcome ProviderOutcome @default(NOT_APPLICABLE)
+  creditNoteId   String?
+
+  lastError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([sellerId, requestedAt])
+  @@index([orderId])
+}
+
+enum CancellationReason {
+  OUT_OF_STOCK
+  PRODUCT_UNAVAILABLE
+  SELLER_REQUEST
+  DUPLICATE_ORDER
+  OTHER
+}
+
+enum CancellationStatus {
+  /// Recorded, and the work has not finished.
+  REQUESTED
+  PROCESSING
+  /// Every side reached a terminal, successful state.
+  CANCELLED
+  /// Something is pending or failed and a person has to look. Not an error to be
+  /// hidden — it is the state that exists so a live label or an unconfirmed
+  /// refund cannot be reported as finished.
+  NEEDS_ATTENTION
+}
+
+/// One provider's outcome, in the same vocabulary every time, so a reader does
+/// not have to learn a different one per system.
+enum ProviderOutcome {
+  NOT_APPLICABLE
+  NOT_ATTEMPTED
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum PaymentCancellationAction {
+  NONE
+  /// Nothing was captured; a pending attempt had to be stopped.
+  STOP_PENDING
+  /// An authorisation exists and was not captured.
+  VOID_AUTHORIZATION
+  /// Money was taken and has to go back.
+  REFUND_CAPTURED
+}
+
+enum ShipmentCancellationOutcome {
+  /// No shipment, so there was nothing in the way.
+  NOT_APPLICABLE
+  /// A label, a pickup or a handoff exists. This action refuses to complete —
+  /// see README §11 for the final-phase workflow that will.
+  REQUIRES_SHIPMENT_CANCELLATION
+  CANCELLED
 }

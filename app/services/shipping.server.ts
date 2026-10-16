@@ -1082,6 +1082,28 @@ export async function bookShipmentForOrder(
    * ten of something with four in the building booked a label and found out at
    * packing time.
    */
+  /*
+   * A CANCELLED ORDER CANNOT BUY A LABEL, AND THE CHECK IS HERE RATHER THAN IN
+   * THE STATE MACHINE ALONE.
+   *
+   * The transition to CANCELLED is the primary gate, and this is the second one:
+   * a booking request that was already in flight when the cancellation was
+   * taken — a double-click, a retried worker, a page loaded before the decision
+   * — arrives with an order whose state has moved underneath it, and spending
+   * money for a cancelled order is the exact outcome the cancellation was taken
+   * to prevent.
+   */
+  const cancellation = await prisma.orderCancellation.findUnique({
+    where: { orderId },
+    select: { status: true, reason: true },
+  });
+  if (cancellation || order.state === "CANCELLED") {
+    throw new Error(
+      "This order has been cancelled, so no label can be bought for it. Booking a cancelled order " +
+        "would spend money on goods nobody is going to ship."
+    );
+  }
+
   const readiness = await inventoryReadiness();
   if (!readiness.ok) throw new Error(readiness.blocker ?? "Inventory is not ready for booking.");
 

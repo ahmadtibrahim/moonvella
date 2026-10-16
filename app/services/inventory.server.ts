@@ -492,6 +492,42 @@ export async function fulfilHoldsForShipment(
   return { shipped };
 }
 
+/**
+ * Give back every hold an ORDER took.
+ *
+ * A cancellation is about an order, and an order can have more than one
+ * shipment — a split, or a packing shipment created and abandoned. Releasing by
+ * shipment would leave the second parcel's units held by a cancelled order, and
+ * the symptom of that is stock that exists and cannot be sold.
+ *
+ * Exactly once, by the same rule as the per-shipment release: only rows that are
+ * still HELD are moved, and the rollup comes down in the same conditional
+ * update, so a second call releases nothing.
+ */
+export async function releaseHoldsForOrder(
+  tx: Tx,
+  orderId: string,
+  note: string
+): Promise<{ released: { variantId: string; quantity: number }[] }> {
+  const rows = await tx.stockReservation.findMany({ where: { orderId, status: "HELD" } });
+  const released: { variantId: string; quantity: number }[] = [];
+
+  for (const row of rows) {
+    const moved = await tx.stockReservation.updateMany({
+      where: { id: row.id, status: "HELD" },
+      data: { status: "RELEASED", settledAt: new Date(), note },
+    });
+    if (moved.count === 0) continue;
+    await tx.productVariant.update({
+      where: { id: row.variantId },
+      data: { reserved: { decrement: row.quantity } },
+    });
+    released.push({ variantId: row.variantId, quantity: row.quantity });
+  }
+
+  return { released };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Operator adjustment                                                        */
 /* -------------------------------------------------------------------------- */

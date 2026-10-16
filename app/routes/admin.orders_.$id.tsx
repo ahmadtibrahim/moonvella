@@ -1,6 +1,8 @@
 import { Link, useLoaderData, useActionData, Form, redirect } from "react-router";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta, userCan } from "~/utils/adminAuth.server";
+import { CANCELLATION_REASONS } from "~/utils/cancellationFields";
+import { cancelOrder, cancellationPreview } from "~/services/orderCancellation.server";
 import { prisma } from "~/db.server";
 import { formatDateTime } from "~/utils/dates";
 import {
@@ -321,7 +323,16 @@ export async function loader({ request, params }: LoaderFunctionArgs) {
     if (docks.size === 1) shipmentOrigins[shipment.id] = [...docks.values()][0];
   }
 
+  /*
+   * The cancellation preview travels with the page, because the confirmation
+   * has to state the consequence BEFORE the operator agrees to it — and it is
+   * computed by the same function that will carry it out, so the sentence and
+   * the action cannot drift apart.
+   */
+  const cancellation = await cancellationPreview(String(params.id));
+
   return {
+    cancellation,
     order,
     shipmentOrigins,
     /*
@@ -414,6 +425,21 @@ export async function action({ request, params }: ActionFunctionArgs) {
    * request: the same operator who may charge this order may start it, and the
    * capability is the one the role table already grants for this action.
    */
+  if (intent === "cancel_order") {
+    // Its own permission, checked on the server. The button being drawn or not
+    // is not the guard: the action is a public endpoint.
+    await requirePermission(request, "orders.manage");
+    try {
+      const result = await cancelOrder(
+        orderId,
+        { reason: String(form.get("reason") || ""), explanation: String(form.get("explanation") || "") },
+        { id: user.id, name: user.name, ...getRequestMeta(request) }
+      );
+      return { cancelled: result };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "The order could not be cancelled." };
+    }
+  }
   if (intent === "fulfill") await requirePermission(request, "orders.fulfill");
 
   try {
@@ -908,7 +934,7 @@ function importantDetail(raw: string | null): string | null {
 }
 
 export default function AdminOrderDetail() {
-  const { order, shipmentOrigins, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress } =
+  const { order, shipmentOrigins, recipientPhone, collection, parcels, units, mode, eshipper, billing, shopifyFulfillment, canFulfill, machine, refund, chargeBlock, timeline, progress, cancellation } =
     useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const paid = order.wholesalePaymentStatus === "SUCCEEDED";
@@ -1145,6 +1171,103 @@ export default function AdminOrderDetail() {
       </div>
 
       <div className="mv-panel mv-panel-body" style={{ marginBottom: "1.5rem", marginTop: 0 }}>
+        {/*
+          CANCEL ORDER — the primary destructive action, and the last card on
+          the page, because it is the one nobody should reach by accident.
+
+          THE BUTTON IS NOT THE GUARD. The action re-checks the permission and
+          the eligibility on the server; hiding a control stops nobody who can
+          read this page's HTML, and this page has already told them the endpoint.
+        */}
+        <h2 className="mv-panel-title">Cancel order</h2>
+        {actionData && "cancelled" in actionData && actionData.cancelled ? (
+          <div role="status" style={{ background: "#f0fdf4", border: "1px solid #bbf7d0", color: "#065f46", borderRadius: 8, padding: "0.6rem 0.75rem", fontSize: "0.8rem", marginBottom: "0.6rem" }}>
+            {actionData.cancelled.message}
+            {actionData.cancelled.status === "NEEDS_ATTENTION" ? (
+              <div style={{ marginTop: "0.3rem" }}>
+                Payment: {actionData.cancelled.paymentOutcome} · Stock: {actionData.cancelled.inventoryOutcome} · Invoice: {actionData.cancelled.invoiceOutcome}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+        {cancellation.existing ? (
+          <div style={{ fontSize: "0.8rem", color: "#334155", lineHeight: 1.6 }}>
+            <div><strong>Cancelled</strong> on {cancellation.existing.requestedAt.slice(0, 10)} — {cancellation.existing.reason}</div>
+            {/* The three outcomes are listed separately because they are
+                separate facts: a refund that is pending is NOT a refund that
+                happened, and this is where that distinction is visible. */}
+            <div style={{ marginTop: "0.3rem", color: "#64748b" }}>
+              Payment: {cancellation.existing.paymentOutcome}
+              {cancellation.existing.paymentOutcome === "PENDING" ? " (refund awaiting confirmation)" : ""} · Stock:{" "}
+              {cancellation.existing.inventoryOutcome} · Invoice: {cancellation.existing.invoiceOutcome}
+            </div>
+            {cancellation.existing.lastError ? (
+              <div style={{ marginTop: "0.3rem", color: "#b91c1c" }}>{cancellation.existing.lastError}</div>
+            ) : null}
+          </div>
+        ) : !cancellation.allowed ? (
+          <>
+            <p style={{ fontSize: "0.8rem", color: "#b45309", lineHeight: 1.6 }}>{cancellation.blocker}</p>
+            <button type="button" className="mv-button" disabled style={{ borderColor: "#f2c9c4", color: "#b91c1c" }}>
+              Cancel order
+            </button>
+            <p style={{ fontSize: "0.72rem", color: "#64748b", marginTop: "0.4rem" }}>
+              Shipment cancellation first. README §11 records the workflow that will coordinate the
+              label, the pickup and the refund together; until it exists, cancelling a booked parcel
+              from here would leave a live label behind a cancelled order.
+            </p>
+          </>
+        ) : (
+          <details>
+            <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, color: "#b91c1c" }}>
+              Cancel order…
+            </summary>
+            {/*
+              THE CONFIRMATION STATES THE CONSEQUENCE before it is agreed to, and
+              every sentence below comes from `cancellationPreview` — the same
+              function `cancelOrder` calls — so the paragraph and the action
+              cannot disagree.
+            */}
+            <div style={{ marginTop: "0.6rem", fontSize: "0.8rem", color: "#334155", lineHeight: 1.7 }}>
+              <div><strong>Order</strong> {cancellation.orderNumber} · {cancellation.seller}</div>
+              <div><strong>Payment now</strong> {cancellation.payment.status}{cancellation.payment.captured ? " (captured)" : ""}</div>
+              <div><strong>Shipments</strong> {cancellation.shipment.description}</div>
+            </div>
+            <Form method="post" style={{ marginTop: "0.6rem" }}>
+              <input type="hidden" name="intent" value="cancel_order" />
+              <label className="mv-field" htmlFor="cancel-reason">
+                Reason
+                <select id="cancel-reason" className="mv-input" name="reason" required defaultValue="">
+                  <option value="" disabled>Choose a reason</option>
+                  {CANCELLATION_REASONS.map((r) => (
+                    <option key={r.value} value={r.value}>{r.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="mv-field" htmlFor="cancel-explanation" style={{ marginTop: "0.4rem" }}>
+                Explanation (required for Other)
+                <textarea id="cancel-explanation" className="mv-input" name="explanation" rows={2} />
+              </label>
+              <div style={{ fontSize: "0.78rem", color: "#334155", lineHeight: 1.7, marginTop: "0.5rem" }}>
+                <div><strong>Payment</strong> {cancellation.payment.description}</div>
+                <div><strong>Stock</strong> {cancellation.inventory.description}</div>
+                <div><strong>Invoice</strong> {cancellation.invoice.description}</div>
+                <div style={{ marginTop: "0.3rem", color: "#64748b" }}>
+                  The retail customer&apos;s payment in Shopify is separate from MoonVella&apos;s wholesale
+                  charge and is not touched by this action.
+                </div>
+              </div>
+              <button
+                type="submit"
+                className="mv-button mv-button-danger"
+                style={{ marginTop: "0.6rem", borderColor: "#b91c1c", color: "#b91c1c" }}
+              >
+                Cancel order
+              </button>
+            </Form>
+          </details>
+        )}
+
         <h2 className="mv-panel-title">Wholesale payment</h2>
         <p style={{ fontSize: "0.82rem", color: "#64748b", marginBottom: "0.5rem" }}>
           Provider mode: {STRIPE_MODE_LABEL[mode] ?? mode} · Billing mode: {billing.mode}

@@ -74,6 +74,10 @@ export async function loader({ request }: LoaderFunctionArgs) {
             // Read by `nextQueueAction`'s milestone facts: "a label has been
             // bought" is a provider identifier, not only a status.
             providerShipmentId: true,
+            // Read by the row's cancel offer: a collection already arranged is
+            // the other thing this action refuses, because cancelling a truck is
+            // not something a cancellation can do.
+            pickupStatus: true,
           },
         },
         // The amount actually charged, beside the status. A status alone cannot
@@ -81,13 +85,27 @@ export async function loader({ request }: LoaderFunctionArgs) {
         // row to find out is how a list page becomes slow enough to stop being
         // read.
         wholesalePayment: { select: { amount: true, currency: true, status: true } },
+        // Enough to decide whether the row may OFFER a cancel: a label or an
+        // arranged pickup is what makes it refuse, and an existing cancellation
+        // means the offer is spent. The server decides again when the action
+        // runs — this only keeps the list from offering something that cannot
+        // happen.
+        cancellation: { select: { status: true } },
       },
     }),
     prisma.seller.findMany({ select: { id: true, storeName: true }, orderBy: { storeName: "asc" } }),
   ]);
 
+  const withCancel = orders.map((order) => ({
+    ...order,
+    cancellationAllowed:
+      !order.cancellation &&
+      !order.shipments.some((s) => Boolean(s.providerShipmentId)) &&
+      !order.shipments.some((s) => s.pickupStatus === "SCHEDULED"),
+  }));
+
   return {
-    orders,
+    orders: withCancel,
     sellers,
     states,
     filters: { state, seller: sellerId, payment },
@@ -262,9 +280,36 @@ export default function AdminOrders() {
                         )}
                       </td>
                       <td>
-                        <Link to={`/admin/orders/${o.id}`} className="mv-button mv-button-dark">
-                          Open
-                        </Link>
+                        <div className="mv-actions">
+                          <Link to={`/admin/orders/${o.id}`} className="mv-button mv-button-dark">
+                            Open
+                          </Link>
+                          {/*
+                            THE SECONDARY CANCEL ACTION SENDS THE OPERATOR TO THE
+                            ONE PLACE THE DECISION IS TAKEN, rather than opening a
+                            second copy of it here.
+
+                            A list row cannot show the consequence — the payment
+                            position, what happens to the stock, which invoice gets
+                            credited — and a confirmation that states less than the
+                            action does is worse than no confirmation. So this is a
+                            link to the panel, not a form: the list offers the
+                            action, and the order page owns the decision.
+
+                            It is drawn only where cancelling is possible, and the
+                            server refuses regardless — the button is a courtesy,
+                            not the guard.
+                          */}
+                          {o.cancellationAllowed ? (
+                            <Link
+                              to={`/admin/orders/${o.id}#cancel-order`}
+                              className="mv-button mv-button-danger"
+                              style={{ borderColor: "#b91c1c", color: "#b91c1c" }}
+                            >
+                              Cancel
+                            </Link>
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                   );
