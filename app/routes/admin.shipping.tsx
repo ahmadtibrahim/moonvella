@@ -21,6 +21,9 @@ import {
   type TrackingDisplayStatus,
 } from "~/services/shippingLogic";
 import { describeEshipperStatus, eshipperStatus } from "~/services/eshipper.server";
+// The region table the address validator already keeps, so "Ontario" and "ON"
+// are one value in the Destination column and there is only one such table.
+import { regionCodeFor } from "~/services/addressValidation.server";
 import { ShippingOperationsNav } from "~/components/ShippingOperationsNav";
 
 /**
@@ -171,17 +174,29 @@ const PICKUP_STATUS_BADGE: Record<string, string> = {
 };
 
 /**
- * "Ottawa, ON" — a city and a two-letter province or state, which is what the
+ * "Ottawa, ON" — a city and a TWO-LETTER province or state, which is what the
  * work order asks the Destination column to show.
  *
- * IT FALLS BACK RATHER THAN GUESSING. An address with a city and no province
- * shows the city; one with neither returns an em dash. Joining a missing half as
- * an empty string would produce "Ottawa, " and one derived from a postcode would
- * be a claim about a place nobody stated.
+ * THE FOLDING IS THE POINT. A Shopify address stores "Ontario" and a depot form
+ * stores "ON", and the same place arriving two ways in one column is a column
+ * nobody can filter or scan. `regionCodeFor` is the table the address validator
+ * already uses for exactly this reason, reused rather than re-typed.
+ *
+ * IT FALLS BACK RATHER THAN GUESSING. An unrecognised region keeps the text that
+ * was stored rather than becoming blank — a country this deployment does not
+ * ship to is no worse off, it simply gets no folding. A city with no region
+ * shows the city; neither shows an em dash. Joining a missing half as an empty
+ * string would produce "Ottawa, ", and deriving one from a postcode would be a
+ * claim about a place nobody stated.
+ *
+ * COMPUTED IN THE LOADER, not in the render: the region table lives in a server
+ * module, and the render would otherwise pull several hundred place names into
+ * the browser bundle to draw one line of a table cell.
  */
 function shortDestination(addr: Record<string, string>): string {
   const city = (addr.city || "").trim();
-  const region = (addr.province || addr.provinceCode || "").trim();
+  const raw = (addr.province || addr.provinceCode || "").trim();
+  const region = raw ? regionCodeFor(raw) || raw : "";
   const joined = [city, region].filter(Boolean).join(", ");
   return joined || "—";
 }
@@ -439,6 +454,15 @@ export async function loader({ request }: LoaderFunctionArgs) {
         orderBy: { createdAt: "asc" },
       })
     : [];
+  /*
+   * One destination string per row, folded to a two-letter region here rather
+   * than in the render. See `shortDestination`.
+   */
+  const destinations: Record<string, string> = {};
+  for (const row of shipments) {
+    destinations[row.id] = shortDestination(parseAddress(row.order.shippingAddress));
+  }
+
   const shipmentNumber = new Map<string, { index: number; total: number }>();
   for (const orderId of orderIds) {
     const siblings = siblingRows.filter((row) => row.orderId === orderId);
@@ -484,6 +508,7 @@ export async function loader({ request }: LoaderFunctionArgs) {
      * read `undefined` would print "Shipment NaN of 3".
      */
     shipmentNumber: Object.fromEntries(shipmentNumber),
+    destinations,
     page,
     pageCount: Math.max(1, Math.ceil(total / PAGE_SIZE)),
   };
@@ -636,6 +661,7 @@ export default function AdminShipping() {
     tab,
     tabCounts,
     shipmentNumber,
+    destinations,
     page,
     pageCount,
   } = useLoaderData<typeof loader>();
@@ -993,7 +1019,7 @@ export default function AdminShipping() {
                       the work order specifies. The full address is on the detail
                       page; a table cell is not where anybody reads a street.
                     */}
-                    <td>{shortDestination(addr)}</td>
+                    <td>{destinations[s.id] ?? "—"}</td>
                     {/*
                       SHIPPING LABEL — the cell that says what has been bought.
 
