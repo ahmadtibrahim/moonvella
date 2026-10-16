@@ -209,7 +209,28 @@ export async function odooWriteBlockReason(): Promise<string | null> {
   const state = await loadOdooState();
   if (state.mode === "live") return null;
   if (state.mode === "disabled") {
-    return "Odoo is not configured. Save the URL, database, username and API key in Settings.";
+    /*
+     * "DISABLED" IS TWO DIFFERENT SITUATIONS AND THIS SAID ONLY ONE OF THEM.
+     *
+     * `classifyOdooMode` returns `disabled` both when nothing is configured and
+     * when an operator has switched a configured connection off, and this
+     * sentence assumed the first. On the owner's instance all seven credential
+     * fields are stored and the mode is `disabled`, so the health row read
+     * "Authenticated against Odoo database Prod-db as admin … Odoo is not
+     * configured. Save the URL, database, username and API key in Settings." —
+     * a sentence that contradicts itself in one line and tells an operator to
+     * enter credentials they already have.
+     *
+     * The credentials are what `state.config` is built from, so the two cases
+     * are already distinguishable here without another read.
+     */
+    if (!state.config) {
+      return "Odoo is not configured. Save the URL, database, username and API key in Settings.";
+    }
+    return (
+      "The Odoo connection is switched off, so nothing is written to the ERP. " +
+      "The saved credentials are kept — this is a setting, not a configuration gap."
+    );
   }
   const requestedLive = (await getCredentials("odoo")).ODOO_MODE === "live";
   if (requestedLive && !state.writesAllowed) {

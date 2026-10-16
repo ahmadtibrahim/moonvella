@@ -1,0 +1,26 @@
+-- An integration that has been switched OFF is not a healthy one.
+--
+-- ADDITIVE ONLY, one enum value, so the deployed image keeps working against
+-- this schema for the window between `prisma migrate deploy` and the new
+-- container taking traffic.
+--
+-- WHY THIS VALUE IS NEEDED. `IntegrationStatus` had NOT_CONFIGURED, NEVER_SYNCED,
+-- HEALTHY, DELAYED and FAILED, and the Odoo health check picked its status from
+-- the AUTHENTICATION result alone — so an integration the owner had deliberately
+-- switched off still reported HEALTHY, and HEALTHY is what the owner's screen
+-- renders as "CONNECTED — VERIFIED". The row's own sentence said "MoonVella is
+-- in disabled mode" while the badge beside it said Connected, about the same
+-- integration on the same screen.
+--
+-- NOT_CONFIGURED would have been the wrong repair: the credentials are present
+-- and deliberately retained, so the truth is "switched off", which is neither
+-- "connected" nor "unconfigured". Reporting it as NOT_CONFIGURED would have
+-- replaced one wrong statement with another and invited an operator to re-enter
+-- credentials that are already saved.
+--
+-- `ADD VALUE IF NOT EXISTS` is idempotent, and the new value is not USED in this
+-- transaction — PostgreSQL allows adding an enum value in a transaction on 12+,
+-- but not using it there. Nothing below writes 'DISABLED'.
+
+-- AlterEnum
+ALTER TYPE "IntegrationStatus" ADD VALUE IF NOT EXISTS 'DISABLED';

@@ -1685,6 +1685,9 @@ enum IntegrationStatus {
   HEALTHY
   DELAYED
   FAILED
+  /// Switched off on purpose, with credentials retained. Distinct from
+  /// NOT_CONFIGURED, which means there is nothing to connect with.
+  DISABLED
 }
 
 enum BillingMode {

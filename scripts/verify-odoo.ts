@@ -581,6 +581,80 @@ async function main() {
       "an unreachable host is NOT reported as ok",
       unreachableAuth.ok === false,
     );
+
+    /* ---------------------------------------------------------------- */
+    /* 12. A SWITCHED-OFF CONNECTION IS NOT "CONNECTED — VERIFIED".       */
+    /*                                                                    */
+    /* The owner's instance had all seven credential fields stored and the */
+    /* mode set to disabled, and its screen reported BOTH "Odoo CONNECTED  */
+    /* — VERIFIED" and "Odoo is not configured. Save the URL, database,    */
+    /* username and API key in Settings." — about the same integration, on */
+    /* the same page, in the same render.                                 */
+    /*                                                                    */
+    /* Two causes, and this checks both. The status came from the          */
+    /* AUTHENTICATION result alone, so a deliberately switched-off         */
+    /* integration was HEALTHY and the badge rendered it as Connected; and */
+    /* `odooWriteBlockReason` returned the "not configured" sentence for   */
+    /* every `disabled` mode, including one whose credentials are present  */
+    /* and deliberately kept.                                              */
+    /* ---------------------------------------------------------------- */
+    await clearOdooStore();
+    configureOdoo({ ODOO_URL: "https://odoo.invalid", ODOO_MODE: "disabled" });
+
+    check(
+      "a disabled-but-configured connection still reports the disabled mode",
+      (await odoo.odooMode()) === "disabled",
+      await odoo.odooMode(),
+    );
+
+    const disabledReason = await odoo.odooWriteBlockReason();
+    check(
+      "the disabled write reason does NOT claim the connection is unconfigured",
+      typeof disabledReason === "string" && !/not configured/i.test(disabledReason),
+      disabledReason ?? "(null)",
+    );
+    check(
+      "…and it says the credentials are retained rather than missing",
+      typeof disabledReason === "string" && /credential/i.test(disabledReason),
+    );
+
+    // The badge follows the integration row, so the row is what is asserted.
+    // The store is stubbed the same way section 11 stubs it: nothing leaves
+    // the process, and the host does not resolve.
+    const rpcFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init: { body?: string } = {}) => {
+      let method: unknown;
+      try {
+        method = (JSON.parse(String(init.body ?? "{}")) as { params?: { args?: unknown[] } }).params?.args?.[4];
+      } catch {
+        method = undefined;
+      }
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: method === "search_read" ? [] : 1 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof globalThis.fetch;
+    try {
+      const { checkIntegration } = await import("~/services/integrationHealth.server");
+      const health = await checkIntegration("odoo");
+      check(
+        "a disabled integration is not reported HEALTHY",
+        health.status !== "HEALTHY",
+        `status=${health.status}`,
+      );
+      check(
+        "…it is reported as DISABLED, not as unconfigured",
+        health.status === "DISABLED",
+        `status=${health.status}`,
+      );
+      check(
+        "…and its badge text is not the Connected one",
+        !/not configured|save the url/i.test(health.detail ?? ""),
+        (health.detail ?? "").slice(0, 160),
+      );
+    } finally {
+      globalThis.fetch = rpcFetch;
+    }
   } finally {
     /* ------------------------------------------------------------------ */
     /* Restore whatever the clone had before this suite ran.               */

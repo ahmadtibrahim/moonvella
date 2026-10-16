@@ -86,8 +86,19 @@ export const DEFAULTS: Record<
       "Odoo is not configured. Set ODOO_URL, ODOO_DATABASE, ODOO_USERNAME and ODOO_API_KEY with a dedicated API service account. MoonVella reaches Odoo only over JSON-RPC and never through its PostgreSQL database; writes additionally require ODOO_MODE=live.",
     // Values for the fields themselves are written on the fields. This is the
     // deployment-side half, which the page cannot set and must not imply it can.
+    /*
+     * THIS TEXT USED TO ASSERT A DEPLOYMENT FACT THAT WAS NOT TRUE OF THIS
+     * DEPLOYMENT. It said "ODOO_ALLOW_WRITES — never set for MoonVella", while
+     * both the running container and /etc/moonvella/moonvella.env set it to
+     * `yes`. A help string may describe the RULE — a write needs two
+     * independent switches — but it must not claim the state of the second one,
+     * because it cannot read it. It asserted the safe thing about a deployment
+     * that was not safe, which is the one direction this must never be wrong in.
+     */
     credentialHints:
-      "Not settable from this page, and both live in the deployment environment:\nODOO_ALLOW_PROD_DB=yes — Prod-db is refused by name without it, which is the guard against pointing a read at the wrong database.\nODOO_ALLOW_WRITES — never set for MoonVella: the catalogue sync reads and writes nothing back to the ERP, and no form here can authorise it.",
+      "Not settable from this page, and both live in the deployment environment:\n" +
+      "ODOO_ALLOW_PROD_DB — Prod-db is refused by name unless a deployment sets this, which is the guard against pointing a read at the wrong database.\n" +
+      "ODOO_ALLOW_WRITES — the second of the two switches a write needs. Setting the mode to live in this form is NOT enough on its own; a write also requires this deployment flag, and whether it is set is deployment state this page cannot read. Read the integration row above for the mode actually in force.",
   },
   shopify_analytics: {
     status: "NOT_CONFIGURED",
@@ -556,6 +567,36 @@ export async function checkIntegration(
       // be shown as Connected.
       const { testOdooConnection } = await import("./odoo.server");
       const result = await testOdooConnection();
+
+      /*
+       * A SWITCHED-OFF CONNECTION IS NOT "CONNECTED — VERIFIED".
+       *
+       * `result.ok` answers "did Odoo accept the credentials", and it is set
+       * from the authentication call alone. The mode was written into the
+       * sentence below but never gated the status, so an integration the owner
+       * had deliberately switched off still reported HEALTHY — and HEALTHY is
+       * what the badge renders as "CONNECTED — VERIFIED". The row said
+       * "MoonVella is in disabled mode" and the badge beside it said Connected,
+       * about the same integration, on the same screen.
+       *
+       * The credentials surviving is not a contradiction and must not be
+       * presented as one: they are kept on purpose, the connection is still
+       * verifiable, and the mode is the thing that changed. So the status
+       * reports the mode, and the detail says which half is off.
+       */
+      if (result.ok && result.mode === "disabled") {
+        return {
+          status: "DISABLED",
+          detail: [
+            `The Odoo connection is switched off. Credentials for "${result.database}" are still saved`,
+            "and are kept deliberately; nothing is written to the ERP.",
+            "Writes are refused because the mode is disabled — this is a choice, not a configuration gap.",
+            "To use Odoo again, set the mode on the Integrations page.",
+          ].join(" "),
+          error: null,
+        };
+      }
+
       if (result.ok) {
         return {
           status: "HEALTHY",
