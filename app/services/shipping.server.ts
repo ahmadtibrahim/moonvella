@@ -372,6 +372,7 @@ import {
   pickFastestQuote,
   normalizeTrackingState,
   coarseStatusFor,
+  coarseStatusAfterTracking,
   isPartialDelivery,
   partialDeliverySummary,
   trackingDisplay,
@@ -2159,7 +2160,29 @@ export async function syncTrackingForShipment(shipmentId: string, actor: Actor):
     incomingState === TRACKING_STATE.returned ||
     incomingState === TRACKING_STATE.cancelled;
   const nextState = allowed && incoming >= 0 ? incomingState : shipment.trackingStatus;
-  const nextCoarse = coarseStatusFor(nextState ?? incomingState);
+
+  /*
+   * A TRACKING POLL MUST NOT UN-BOOK A LABEL.
+   *
+   * `coarseStatusFor` maps a tracking vocabulary onto the shipment's coarse
+   * status, and the two are not the same list: it knows PICKED_UP, IN_TRANSIT,
+   * DELIVERED, EXCEPTION and CANCELLED, and everything else — `LABEL_CREATED`
+   * included — falls through its `default` to PENDING. So the FIRST poll after
+   * a successful booking wrote PENDING over BOOKED.
+   *
+   * The damage was not cosmetic. The label survived (provider id, label URL and
+   * cost are written by the booking, not the poll), so the row read as unbooked
+   * while carrying a real, paid-for label — and because the packing and handoff
+   * milestones are gated on the coarse status, the handoff became unreachable
+   * rather than merely hidden. Order #1005's shipment is the live example:
+   * booked 06:50:20, packed 06:51:52, and PENDING again by 06:52:04.
+   *
+   * `LABEL_CREATED` is a BOOKING fact, not a transport one — the label exists
+   * and nothing has moved — so it says nothing about the coarse status and must
+   * leave it exactly as the booking left it. The tracking state itself is still
+   * recorded in `trackingStatus` below; only the coarse status is held.
+   */
+  const nextCoarse = coarseStatusAfterTracking(shipment.status, nextState ?? incomingState);
 
   const updated = await prisma.shipment.update({
     where: { id: shipmentId },

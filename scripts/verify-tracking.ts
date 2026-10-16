@@ -52,6 +52,7 @@ import {
   trackingPollPolicy,
   zoneOffsetMs,
   type TrackingDisplayStatus,
+  coarseStatusAfterTracking,
 } from "../app/services/shippingLogic";
 import { flagMissedPickups, sweepShipmentTracking, syncTrackingForShipment } from "../app/services/shipping.server";
 import type { TrackingResult } from "../app/services/eshipper.server";
@@ -222,6 +223,58 @@ function displayVocabularyChecks() {
     check(`${internal} displays as ${word}`, trackingDisplay(internal, "SHIPPED") === word, trackingDisplay(internal, "SHIPPED"));
   }
   check("LABEL_CREATED displays as Booked, not as a shipment", trackingDisplay("LABEL_CREATED", "BOOKED") === "BOOKED");
+
+  /*
+   * AND THE COARSE STATUS MUST AGREE WITH THAT DISPLAY.
+   *
+   * The two disagreed, and the disagreement is the whole defect. `trackingDisplay`
+   * says a LABEL_CREATED parcel that is BOOKED reads as "Booked" — and it did,
+   * on the page — while `coarseStatusFor` mapped the same tracking state to
+   * PENDING and the poll wrote it over the booking. So the screen said Booked
+   * and the row said PENDING, and the milestones that hang off the row went
+   * unreachable. Order #1005's shipment is the live example.
+   *
+   * These are the assertions that were missing. There are no fixtures, no
+   * database and no stubbed provider because the rule is pure — which is also
+   * why it went unnoticed for so long: the decision used to live inline in a
+   * function that needs all three.
+   */
+  check(
+    "a tracking poll that only confirms the label leaves BOOKED alone",
+    coarseStatusAfterTracking("BOOKED", "LABEL_CREATED") === "BOOKED",
+    coarseStatusAfterTracking("BOOKED", "LABEL_CREATED"),
+  );
+  check(
+    "…and it does not invent a booking for an unbooked parcel either",
+    coarseStatusAfterTracking("PENDING", "LABEL_CREATED") === "PENDING",
+  );
+  check(
+    "a carrier pickup still moves the coarse status forward",
+    coarseStatusAfterTracking("BOOKED", "PICKED_UP") === "SHIPPED",
+    coarseStatusAfterTracking("BOOKED", "PICKED_UP"),
+  );
+  check(
+    "in transit still does", coarseStatusAfterTracking("BOOKED", "IN_TRANSIT") === "SHIPPED",
+  );
+  check(
+    "a delivery still does", coarseStatusAfterTracking("SHIPPED", "DELIVERED") === "DELIVERED",
+  );
+  check(
+    "a carrier exception still does", coarseStatusAfterTracking("SHIPPED", "EXCEPTION") === "EXCEPTION",
+  );
+  check(
+    "a carrier word we cannot map does not silently un-book a label",
+    coarseStatusAfterTracking("BOOKED", "SOMETHING_NEW") === "BOOKED",
+    coarseStatusAfterTracking("BOOKED", "SOMETHING_NEW"),
+  );
+  check(
+    "…nor does an empty poll result",
+    coarseStatusAfterTracking("BOOKED", null) === "BOOKED",
+  );
+  check(
+    "a timeout leaves the booking alone too",
+    coarseStatusAfterTracking("BOOKED", undefined) === "BOOKED",
+  );
   check("EXCEPTION displays as Exception/Delayed", trackingDisplay("EXCEPTION", "EXCEPTION") === "EXCEPTION");
   check("UNDELIVERED shares that word", trackingDisplay("UNDELIVERED", "EXCEPTION") === "EXCEPTION");
 

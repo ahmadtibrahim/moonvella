@@ -139,6 +139,82 @@ export const TRACKING_RANK: Record<string, number> = {
 };
 
 /**
+ * The coarse status a shipment should carry AFTER a tracking poll.
+ *
+ * `coarseStatusFor` answers "which coarse status does this tracking state
+ * imply", and for everything it does not recognise — `LABEL_CREATED` included —
+ * it answers PENDING. That answer is deliberate and stays: a label is not a
+ * shipment. But it is the answer to a different question than the one a poll
+ * has, because a poll result is not a status — it is evidence about a shipment
+ * that already has one, and one that may already have been booked.
+ *
+ * A `LABEL_CREATED` response says the label exists and nothing has moved. That
+ * is a BOOKING fact, it implies nothing about the coarse status, and so the
+ * booking's own answer stands. Overwriting BOOKED with PENDING is how order
+ * #1005's shipment came to read as unbooked while carrying a real, paid-for
+ * label — and because the packing and handoff milestones are gated on the
+ * coarse status, the handoff became unreachable rather than merely hidden.
+ *
+ * Everything else maps through `coarseStatusFor` unchanged: a carrier that has
+ * picked the parcel up really does move the coarse status forward.
+ *
+ * Pure, and here rather than inline in the sync, so the rule can be pinned
+ * without a database, a provider or a stubbed response — which is why the
+ * defect survived as long as it did.
+ */
+export type CoarseShipmentStatus =
+  | "PENDING"
+  | "BOOKING"
+  | "BOOKED"
+  | "BOOKING_FAILED"
+  | "BOOKING_UNKNOWN"
+  | "CANCELLING"
+  | "SHIPPED"
+  | "DELIVERED"
+  | "EXCEPTION"
+  | "CANCELLED";
+
+export function coarseStatusAfterTracking(
+  currentCoarse: CoarseShipmentStatus,
+  trackingState: string | null | undefined,
+): CoarseShipmentStatus {
+  /*
+   * THE COARSE STATUS ONLY MOVES ON A CARRIER EVENT WE RECOGNISE.
+   *
+   * Written as an allowlist rather than "map it and hold the label case",
+   * because the failure mode is the same for every word this code does not
+   * know: an unrecognised state is evidence that something EXISTS, never
+   * evidence that anything MOVED. A carrier vocabulary this app has not seen —
+   * a new status a provider adds, a word that arrives unmapped — must not be
+   * able to park a booked parcel back at PENDING, which is exactly what the
+   * `default: PENDING` in `coarseStatusFor` did when its answer was written to
+   * a shipment that had already been booked.
+   *
+   * `coarseStatusFor` itself is unchanged and keeps its deliberate answer for
+   * the question IT is asked. This is the different question — what should the
+   * shipment say now — and the honest answer for anything not listed is
+   * "whatever it already said".
+   */
+  switch (trackingState) {
+    case TRACKING_STATE.picked_up:
+    case TRACKING_STATE.in_transit:
+    case TRACKING_STATE.out_for_delivery:
+      return "SHIPPED";
+    case TRACKING_STATE.delivered:
+    case TRACKING_STATE.returned:
+      return "DELIVERED";
+    case TRACKING_STATE.exception:
+    case TRACKING_STATE.undelivered:
+      return "EXCEPTION";
+    case TRACKING_STATE.cancelled:
+      return "CANCELLED";
+    default:
+      // LABEL_CREATED, an unmapped carrier word, or nothing at all.
+      return currentCoarse;
+  }
+}
+
+/**
  * The coarse ShipmentStatus the rest of the app reads. "Label created" is
  * deliberately PENDING: a label is not a shipment, and an estimated delivery
  * date passing is not a delivery.
