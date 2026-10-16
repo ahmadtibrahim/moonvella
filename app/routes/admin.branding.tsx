@@ -158,12 +158,24 @@ function Preview({
   background,
   tone,
   height = 84,
+  whiteBacking = false,
 }: {
   url: string | null;
   alt: string;
   background: string;
   tone: "light" | "dark";
   height?: number;
+  /**
+   * Draw the image on a white chip inside the box.
+   *
+   * THE PREVIEW HAS TO SHOW WHAT THE APP ACTUALLY DOES. On the navy sidebar a
+   * logo with no dark-background variant is drawn on a white backing — see the
+   * admin shell — and a preview that drew the WORDMARK instead would be telling
+   * the operator one thing while the sidebar did another. It matters because the
+   * whole point of the dark-background slot is that a navy mark on a navy bar
+   * disappears, and the preview is where that is discovered.
+   */
+  whiteBacking?: boolean;
 }) {
   return (
     <div
@@ -182,7 +194,18 @@ function Preview({
         <img
           src={url}
           alt={alt}
-          style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+          style={
+            whiteBacking
+              ? {
+                  maxWidth: "100%",
+                  maxHeight: "100%",
+                  objectFit: "contain",
+                  background: "#FFFFFF",
+                  padding: 4,
+                  borderRadius: 6,
+                }
+              : { maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }
+          }
         />
       ) : (
         <span
@@ -321,16 +344,33 @@ export default function AdminBranding() {
               </div>
               <div>
                 <div style={{ ...label, color: "#52627A" }}>On the navy sidebar</div>
-                <Preview
-                  url={state?.slot === "DARK" ? state.live?.url ?? null : null}
-                  alt={brand.displayName}
-                  background="#142440"
-                  tone="dark"
-                />
+                {state?.slot === "DARK" && state.live ? (
+                  <Preview
+                    url={state.live.url}
+                    alt={brand.displayName}
+                    background="#142440"
+                    tone="dark"
+                  />
+                ) : (
+                  /*
+                   * No dark-background variant: the app draws THIS slot's image on
+                   * a white chip inside the navy bar, so that is what is previewed.
+                   * A square slot shows its square mark, not the primary logo —
+                   * the fallback is per slot, and drawing the primary here would
+                   * misrepresent the other three.
+                   */
+                  <Preview
+                    url={shown}
+                    alt={brand.displayName}
+                    background="#142440"
+                    tone="dark"
+                    whiteBacking
+                  />
+                )}
                 <p style={{ fontSize: "0.7rem", color: "#64748B", margin: "0.3rem 0 0" }}>
                   {state?.slot === "DARK" && state.live
                     ? "A dark-background logo is set, so it is used as-is."
-                    : "No dark-background logo is set, so the primary logo is shown on a white backing."}
+                    : "No dark-background logo is set, so this image is shown on a white backing — the sidebar draws it exactly like this."}
                 </p>
               </div>
             </div>
