@@ -1143,3 +1143,34 @@ body {
   .mv-owned-product-prices { grid-template-columns:1fr; }
   .mv-owned-product-actions,.mv-owned-product-actions form,.mv-owned-product-actions .mv-btn { width:100%; }
 }
+
+/* ---------------------------------------------------------------------------
+   The brand band inside the embedded app.
+
+   Sits at the top of MoonVella's own content and above nothing that Shopify
+   owns. It is a small strip rather than a header bar on purpose: the embedded
+   frame already has Shopify's chrome around it, and a second full-height bar
+   inside would read as a competing admin. `contain` keeps the wordmark's
+   proportions, so a wide logo and a square one both sit on the same baseline.
+--------------------------------------------------------------------------- */
+.mv-embedded-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0 0.9rem;
+  margin-bottom: 0.4rem;
+  border-bottom: 1px solid #DCE3EB;
+}
+
+.mv-embedded-brand-logo {
+  height: 28px;
+  max-width: 180px;
+  object-fit: contain;
+}
+
+.mv-embedded-brand-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #142440;
+  letter-spacing: -0.01em;
+}

@@ -291,6 +291,29 @@ export default function AdminSettings() {
         Account and system configuration
       </p>
 
+      {/*
+        BRANDING IS ITS OWN PAGE, and this link is drawn only for the roles that
+        may open it. The brand is global — the operator's own mark on the
+        operator's own surfaces — so it belongs with system settings and not with
+        anything a merchant can reach.
+      */}
+      {canChangeUnits ? (
+        <section style={card}>
+          <h2 style={{ fontSize: "1rem", fontWeight: 600, color: "#082a4a", marginTop: 0 }}>
+            Branding
+          </h2>
+          <p style={{ fontSize: "0.85rem", color: "#64748b", marginTop: 0, lineHeight: 1.6 }}>
+            The logo and the name MoonVella shows on the admin sidebar and sign-in page, in the
+            embedded Shopify app, on invoices and statements, and as the favicon. Every upload is
+            re-encoded on the server, and every previous version is kept so a change can be rolled
+            back.
+          </p>
+          <Link to="/admin/branding" className="mv-button mv-button-dark">
+            Open branding
+          </Link>
+        </section>
+      ) : null}
+
       {forcedChange ? (
         <div
           role="alert"

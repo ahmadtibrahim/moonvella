@@ -277,6 +277,14 @@ const CHECKS = [
   // and restores the shared migration row rather than deleting it. No provider is
   // reached: the suite pins the provider guard itself.
   { name: "inventory", kind: "ts", file: "scripts/verify-inventory.ts" },
+  // Brand images: what is refused, what is actually stored (a re-encode, not the
+  // upload), and what is served (a checksummed URL, one live version per slot,
+  // and the fallback chain that stops an empty slot printing a blank space).
+  //
+  // It needs ffmpeg, which is in the image, and it drives the real encoder at
+  // least once — a decision suite that never runs the encoder proves nothing
+  // about the encoder. It removes every row and object it creates.
+  { name: "branding", kind: "ts", file: "scripts/verify-branding.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox

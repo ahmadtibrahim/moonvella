@@ -3033,3 +3033,61 @@ model AdminPreference {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/// One uploaded MoonVella brand image, at one version.
+///
+/// WHY VERSIONS RATHER THAN ONE ROW PER SLOT. The owner asked for a logo that can
+/// be replaced and rolled back. A single row per slot can be replaced but not
+/// rolled back — the bytes are gone the moment the new file is written, and the
+/// only way back is the owner finding the old file again. Keeping every version
+/// and marking the one in use makes "previous version available for rollback" a
+/// fact about the data rather than a promise about a backup.
+///
+/// `supersededAt` is what says which version is IN USE: exactly one row per slot
+/// has it null. A version is never deleted by a replacement.
+model BrandAsset {
+  id  String    @id @default(cuid())
+  slot BrandSlot
+  /// 1, 2, 3… per slot, so "the one before this" is a query and not a guess.
+  version Int
+
+  /// The object key in the same storage backend as media. Generated from
+  /// randomness and the VERIFIED type, never from the uploaded filename.
+  storageKey   String
+  contentType  String
+  width        Int
+  height       Int
+  bytes        Int
+  /// SHA-256 of the STORED bytes — the re-encoded ones, not the upload — so a
+  /// cache-busting URL changes whenever the bytes do and not merely when the
+  /// version number does.
+  checksum     String
+  /// What it was called, sanitised, for the operator's own reference. Never used
+  /// to build a path.
+  originalName String?
+
+  createdById   String?
+  createdByName String?
+  createdAt     DateTime  @default(now())
+  /// Set when a newer version replaces this one. Null means this IS the version
+  /// in use. Cleared again if an older version is restored.
+  supersededAt  DateTime?
+
+  @@unique([slot, version])
+  @@index([slot, supersededAt])
+}
+
+/// Where a brand image is used. Four slots, and they are not interchangeable:
+/// a wordmark is wide, an icon is square, and a dark-background variant is the
+/// same mark drawn for a navy sidebar where a navy logo would vanish.
+enum BrandSlot {
+  /// The horizontal logo, with the wordmark. The default everywhere.
+  PRIMARY
+  /// The variant for dark backgrounds — the admin sidebar and the navy headers.
+  DARK
+  /// The square icon: favicon, and the 1200×1200 source for the Shopify app icon.
+  SQUARE
+  /// What prints on invoices and statements. Falls back to PRIMARY when empty,
+  /// which is why it is a slot rather than a copy of the primary asset.
+  INVOICE
+}

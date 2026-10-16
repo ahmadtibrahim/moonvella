@@ -3,10 +3,21 @@ import { Form, Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { LoaderFunctionArgs } from "react-router";
 import { requireAuth } from "~/utils/adminAuth.server";
 import { can, type Permission } from "~/services/permissions";
+import { getBrandView } from "~/services/branding.server";
 import type { AdminRole } from "@prisma/client";
 
 export async function loader({ request }: LoaderFunctionArgs) {
   const user = await requireAuth(request);
+  /*
+   * The brand, on every admin request.
+   *
+   * Two small indexed reads, and deliberately NOT cached in a module-level
+   * variable: a logo replaced five seconds ago has to be what the next page load
+   * shows, or the operator presses Replace, still sees the old mark, and
+   * concludes the upload failed. The URL carries the checksum of its bytes, so
+   * the BROWSER still caches the images — only the lookup repeats.
+   */
+  const brand = await getBrandView();
   return {
     user: {
       id: user.id,
@@ -14,6 +25,16 @@ export async function loader({ request }: LoaderFunctionArgs) {
       email: user.email,
       role: user.role,
       isPrimaryOwner: user.isPrimaryOwner,
+    },
+    brand: {
+      displayName: brand.displayName,
+      // The square icon, when there is one, is the right shape for the sidebar's
+      // mark slot; otherwise the typographic initial stands in.
+      mark: brand.slots.find((entry) => entry.slot === "SQUARE")?.live?.url ?? null,
+      // The dark-background variant, which is the whole reason the slot exists:
+      // a navy logo on the navy sidebar is an invisible logo.
+      dark: brand.slots.find((entry) => entry.slot === "DARK")?.live?.url ?? null,
+      primary: brand.slots.find((entry) => entry.slot === "PRIMARY")?.live?.url ?? null,
     },
   };
 }
@@ -69,16 +90,34 @@ function navItemIsActive(pathname: string, item: NavItem) {
 }
 
 export default function AdminLayout() {
-  const { user } = useLoaderData<typeof loader>();
+  const { user, brand } = useLoaderData<typeof loader>();
   const { pathname } = useLocation();
 
   return (
     <div className="mv-admin-shell">
       <aside className="mv-admin-sidebar">
-        <Link to="/admin" className="mv-admin-brand" aria-label="MoonVella admin home">
-          <span className="mv-admin-brand-mark">M</span>
+        <Link to="/admin" className="mv-admin-brand" aria-label={`${brand.displayName} admin home`}>
+          {/*
+            The uploaded mark when there is one, the initial when there is not.
+            Both live in the same box so the sidebar's layout does not shift when
+            a logo is uploaded — a nav that reflows on a branding change is a nav
+            that looks broken at the moment the operator is looking at it.
+
+            The dark-background variant is used when it exists; otherwise the
+            primary logo goes on a white backing, because a navy mark on a navy
+            bar is a blank space.
+          */}
+          <span className="mv-admin-brand-mark">
+            {brand.dark ? (
+              <img src={brand.dark} alt="" className="mv-admin-brand-img" />
+            ) : brand.mark ? (
+              <img src={brand.mark} alt="" className="mv-admin-brand-img mv-admin-brand-img-backing" />
+            ) : (
+              brand.displayName.slice(0, 1).toUpperCase()
+            )}
+          </span>
           <span className="mv-admin-brand-copy">
-            <strong>MoonVella</strong>
+            <strong>{brand.displayName}</strong>
             <small>Operations</small>
           </span>
         </Link>

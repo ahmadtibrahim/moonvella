@@ -3,6 +3,7 @@ import {
   Form,
   redirect,
   useActionData,
+  useLoaderData,
   useNavigation,
   useSearchParams,
   type ActionFunctionArgs,
@@ -28,6 +29,8 @@ import {
   revokeSessionByToken,
 } from "~/services/adminAuth.server";
 import { recordAudit, SECURITY_ACTION, AUDIT_ENTITY } from "~/services/audit.server";
+import { prisma } from "~/db.server";
+import { brandAssetPath, effectiveSlot, getBrandView } from "~/services/branding.server";
 
 /**
  * One message for every failure.
@@ -45,7 +48,27 @@ export async function loader({ request }: LoaderFunctionArgs) {
   if (user) {
     throw redirect("/admin");
   }
-  return null;
+  /*
+   * The sign-in page shows the brand, and it is the one page that cannot rely on
+   * a session to fetch it. The logo comes from the same rows the admin shell
+   * reads, served by the public `/brand/...` route — the route exists for this
+   * page and for the favicon, and for nothing else.
+   *
+   * No session and no permission check, deliberately: a logo behind a sign-in
+   * gate is a logo that cannot appear on the thing that precedes signing in.
+   */
+  const brand = await getBrandView();
+  const logoSlot = (await effectiveSlot("PRIMARY")) ?? (await effectiveSlot("SQUARE"));
+  const logo = logoSlot
+    ? await prisma.brandAsset.findFirst({
+        where: { slot: logoSlot, supersededAt: null },
+        select: { slot: true, version: true, checksum: true },
+      })
+    : null;
+  return {
+    displayName: brand.displayName,
+    logoUrl: logo ? brandAssetPath(logo.slot, logo.version, logo.checksum) : null,
+  };
 }
 
 export async function action({ request }: ActionFunctionArgs) {
@@ -138,6 +161,7 @@ export async function action({ request }: ActionFunctionArgs) {
 }
 
 export default function AdminLogin() {
+  const { displayName, logoUrl } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const [searchParams] = useSearchParams();
@@ -156,9 +180,13 @@ export default function AdminLogin() {
     <div className="admin-login-page">
       <div className="admin-login-card">
         <div className="admin-login-header">
-          <div className="admin-login-logo">MoonVella</div>
+          {logoUrl ? (
+            <img src={logoUrl} alt={displayName} className="admin-login-logo-img" />
+          ) : (
+            <div className="admin-login-logo">{displayName}</div>
+          )}
           <h1 className="admin-login-title">Admin Login</h1>
-          <p className="admin-login-subtitle">MoonVella Administration Panel</p>
+          <p className="admin-login-subtitle">{displayName} Administration Panel</p>
         </div>
 
         <Form method="post" noValidate>

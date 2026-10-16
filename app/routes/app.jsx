@@ -12,6 +12,10 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
 import { resolveSellerContext } from "../services/seller.server";
+// The brand, so the seller surface carries MoonVella's identity. Read-only and
+// global: a merchant cannot replace it. Their own logo is SellerBrandKit, a
+// separate tenant-owned setting, and the two are never merged.
+import { brandImageUrl, getBrandView } from "../services/branding.server";
 import { CurrencyProvider, CurrencyToggle } from "../components/CurrencyDisplay";
 // From the shared module, not from seller.server: the error boundary below
 // renders in the browser, and a `.server` import reaching client code fails the
@@ -61,6 +65,14 @@ export const loader = async ({ request }) => {
   const showBusiness = context.access === "APPROVED";
   const showOrders = context.canViewOrders;
 
+  /*
+   * The brand, on every request under this layout. A logo and a name, resolved
+   * through the same fallback chain the admin uses, so a slot left empty shows
+   * the wordmark rather than a gap.
+   */
+  const brand = await getBrandView();
+  const brandLogo = await brandImageUrl("PRIMARY");
+
   return {
     // eslint-disable-next-line no-undef
     apiKey: process.env.SHOPIFY_API_KEY || "",
@@ -69,6 +81,7 @@ export const loader = async ({ request }) => {
     showApplication,
     showBusiness,
     showOrders,
+    brand: { displayName: brand.displayName, logoUrl: brandLogo },
   };
 };
 
@@ -80,6 +93,7 @@ export default function App() {
     showApplication,
     showBusiness,
     showOrders,
+    brand,
   } = useLoaderData();
   const revalidator = useRevalidator();
 
@@ -129,6 +143,24 @@ export default function App() {
         <s-link href="/app/shipping">Shipping</s-link>
         <s-link href="/app/settings">Settings</s-link>
       </s-app-nav>
+      {/*
+        THE BRAND BAND.
+
+        Inside the app content, and deliberately NOT a restyled Shopify admin or
+        a second sidebar: Shopify owns the frame and its own navigation, and an
+        embedded app that repaints them is an app that breaks when Shopify
+        changes them. What this does is put MoonVella's own mark at the top of
+        MoonVella's own content, which is the part that is ours.
+
+        The title is a real heading, not decoration, so a screen reader
+        announces the app name once rather than finding an unlabelled image.
+      */}
+      <div className="mv-embedded-brand">
+        {brand.logoUrl ? (
+          <img src={brand.logoUrl} alt="" className="mv-embedded-brand-logo" />
+        ) : null}
+        <span className="mv-embedded-brand-name">{brand.displayName}</span>
+      </div>
       {/*
         Every price under this layout is rendered through the provider, so a
         seller who reads in US dollars reads the whole app that way. It sits
