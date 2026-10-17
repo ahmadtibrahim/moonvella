@@ -373,11 +373,72 @@ export const loader = async ({ request }) =>
     }
 
     const sellerId = context.seller.id;
-    const [rows, method] = await Promise.all([
+
+    /*
+     * FILTERS, SORT AND PAGINATION, ALL ON THE SERVER.
+     *
+     * The list used to read the newest hundred orders and nothing else, so a
+     * seller looking for one order scrolled. The pieces a seller actually asks by
+     * are the ones offered below: the order number or the customer, the SKU they
+     * recognise, the tracking number on the box, a date range, and the two states
+     * that decide what they have to do.
+     *
+     * Paging is a fixed window rather than an infinite scroll: a list that keeps
+     * growing under the thumb cannot be returned to, and the result count is
+     * worth more than another twenty rows.
+     */
+    const url = new URL(request.url);
+    const q = (url.searchParams.get("q") || "").trim();
+    const paymentFilter = url.searchParams.get("payment") || "";
+    const fulfilmentFilter = url.searchParams.get("fulfillment") || "";
+    const from = url.searchParams.get("from") || "";
+    const to = url.searchParams.get("to") || "";
+    const sort = url.searchParams.get("sort") === "oldest" ? "asc" : "desc";
+    const page = Math.max(1, Number(url.searchParams.get("page") || "1"));
+    const PAGE_SIZE = 25;
+
+    const and = [{ sellerId }];
+    if (q) {
+      and.push({
+        OR: [
+          { shopifyOrderName: { contains: q, mode: "insensitive" } },
+          { customerName: { contains: q, mode: "insensitive" } },
+          { items: { some: { sku: { contains: q, mode: "insensitive" } } } },
+          { shipments: { some: { trackingNumber: { contains: q, mode: "insensitive" } } } },
+        ],
+      });
+    }
+    // The four payment filters are STATES, not bill statuses: a bill left FAILED
+    // under an order since paid is an old attempt, and "Payment failed" as a
+    // filter would return orders nobody owes anything on.
+    const PAYMENT_STATES = {
+      awaiting: ["RECEIVED", "AWAITING_SELLER_PAYMENT", "PAYMENT_ACTION_REQUIRED"],
+      failed: ["PAYMENT_FAILED"],
+      paid: ["PAID", "READY_FOR_FULFILLMENT", "FULFILLMENT_REQUESTED", "IN_FULFILLMENT", "SHIPPED", "DELIVERED"],
+      cancelled: ["CANCELLED", "REFUND_REVIEW"],
+    };
+    if (PAYMENT_STATES[paymentFilter]) and.push({ state: { in: PAYMENT_STATES[paymentFilter] } });
+    if (fulfilmentFilter) and.push({ fulfillmentStatus: fulfilmentFilter });
+
+    const created = {};
+    if (from) {
+      const start = new Date(`${from}T00:00:00.000Z`);
+      if (!Number.isNaN(start.getTime())) created.gte = start;
+    }
+    if (to) {
+      const end = new Date(`${to}T23:59:59.999Z`);
+      if (!Number.isNaN(end.getTime())) created.lte = end;
+    }
+    if (Object.keys(created).length) and.push({ shopifyCreatedAt: created });
+
+    const where = { AND: and };
+
+    const [rows, method, total] = await Promise.all([
       prisma.order.findMany({
-        where: { sellerId },
-        orderBy: { shopifyCreatedAt: "desc" },
-        take: 100,
+        where,
+        orderBy: { shopifyCreatedAt: sort },
+        skip: (page - 1) * PAGE_SIZE,
+        take: PAGE_SIZE,
         select: {
           id: true,
           shopifyOrderName: true,
@@ -415,6 +476,9 @@ export const loader = async ({ request }) =>
         },
       }),
       getDefaultPaymentMethod(sellerId),
+      // The count is what makes paging honest: "25 of 3" is a different page
+      // from "25 of 300", and only one of them is worth a Next button.
+      prisma.order.count({ where }),
     ]);
 
     const hasMethod = Boolean(method);
@@ -435,6 +499,10 @@ export const loader = async ({ request }) =>
        * do, and it is one more thing in a payload that a screenshot can carry.
        */
       fulfillmentScopes: { missing: fulfillmentScopes.missing },
+      filters: { q, payment: paymentFilter, fulfillment: fulfilmentFilter, from, to, sort },
+      total,
+      page,
+      pageCount: Math.max(1, Math.ceil(total / PAGE_SIZE)),
       orders: rows.map((order) => ({
         id: order.id,
         // Shopify's own name for the order is "#1001"; the number is the
@@ -734,6 +802,10 @@ export default function OrdersPage() {
     paymentMethod,
     setupNotice,
     fulfillmentScopes,
+    filters = { q: "", payment: "", fulfillment: "", from: "", to: "", sort: "newest" },
+    total = 0,
+    page = 1,
+    pageCount = 1,
   } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
@@ -908,6 +980,65 @@ export default function OrdersPage() {
           </p>
         </div>
 
+        {/*
+          THE FILTER BAR. Every control here narrows the server's query; none of
+          them is decorative. A seller looks for one order by the number they
+          quoted to a customer, the SKU they recognise, or the tracking number on
+          the box — and by whether they owe money or are waiting for the post.
+
+          Date inputs are a range on the ORDER's date, not on when we imported it,
+          because that is the date the seller thinks in.
+        */}
+        <Form method="get" className="mv-seller-filter-bar">
+          <label className="mv-field">
+            Search
+            <input className="mv-input" name="q" defaultValue={filters.q} placeholder="Order, customer, SKU or tracking" />
+          </label>
+          <label className="mv-field">
+            Payment
+            <select className="mv-input" name="payment" defaultValue={filters.payment}>
+              <option value="">All</option>
+              <option value="awaiting">Awaiting payment</option>
+              <option value="paid">Paid</option>
+              <option value="failed">Payment failed</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </label>
+          <label className="mv-field">
+            Fulfillment
+            <select className="mv-input" name="fulfillment" defaultValue={filters.fulfillment}>
+              <option value="">All</option>
+              <option value="PENDING">Not shipped yet</option>
+              <option value="PROCESSING">Being prepared</option>
+              <option value="SHIPPED">Shipped</option>
+              <option value="DELIVERED">Delivered</option>
+              <option value="CANCELLED">Cancelled</option>
+            </select>
+          </label>
+          <label className="mv-field">
+            From
+            <input className="mv-input" type="date" name="from" defaultValue={filters.from} />
+          </label>
+          <label className="mv-field">
+            To
+            <input className="mv-input" type="date" name="to" defaultValue={filters.to} />
+          </label>
+          <label className="mv-field">
+            Sort
+            <select className="mv-input" name="sort" defaultValue={filters.sort}>
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+            </select>
+          </label>
+          <button type="submit" className="mv-btn mv-btn-primary">Filter</button>
+          <Link to="/app/orders" className="mv-btn mv-btn-secondary">Clear</Link>
+        </Form>
+
+        <p className="mv-page-subtitle" style={{ fontSize: "0.8rem" }}>
+          {total} order{total === 1 ? "" : "s"}
+          {total > 0 ? ` · showing ${(page - 1) * 25 + 1}–${Math.min(page * 25, total)}` : ""} · All amounts are shown in CAD.
+        </p>
+
         {/* First, because it is the one thing on this page that stops the rest
             of it from working. */}
         {grantPermissions}
@@ -1074,6 +1205,16 @@ export default function OrdersPage() {
                       </button>
                     </Form>
                   ) : null}
+                  {/* Every row reaches its own page. The card carries the
+                      summary; the details belong to a page, because a list that
+                      expands into everything stops being scannable. */}
+                  <Link
+                    to={`/app/orders/${order.id}`}
+                    className="mv-btn mv-btn-secondary"
+                    style={{ marginLeft: "0.4rem" }}
+                  >
+                    View details
+                  </Link>
                 </div>
 
                 <div>
@@ -1126,6 +1267,29 @@ export default function OrdersPage() {
             </div>
           ))
         )}
+        {pageCount > 1 ? (
+          <div style={{ display: "flex", justifyContent: "center", gap: "0.5rem", marginTop: "1rem", flexWrap: "wrap" }}>
+            {page > 1 ? (
+              <Link
+                className="mv-btn mv-btn-secondary"
+                to={`/app/orders?${new URLSearchParams({ ...filters, page: String(page - 1) }).toString()}`}
+              >
+                ← Newer
+              </Link>
+            ) : null}
+            <span className="mv-page-subtitle" style={{ alignSelf: "center", fontSize: "0.8rem" }}>
+              Page {page} of {pageCount}
+            </span>
+            {page < pageCount ? (
+              <Link
+                className="mv-btn mv-btn-secondary"
+                to={`/app/orders?${new URLSearchParams({ ...filters, page: String(page + 1) }).toString()}`}
+              >
+                Older →
+              </Link>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </s-page>
   );

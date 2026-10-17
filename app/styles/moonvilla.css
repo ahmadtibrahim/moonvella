@@ -1174,3 +1174,29 @@ body {
   color: #142440;
   letter-spacing: -0.01em;
 }
+
+/* ---------------------------------------------------------------------------
+   The seller filter bar.
+
+   A grid rather than a wrapping flex row: with flex, the controls end up in
+   ragged lines whose widths depend on the labels, and "From" drifting next to
+   "Sort" reads as one control. The grid gives every field the same share and
+   collapses to a single column on a narrow viewport, which is what the mobile
+   list needs.
+--------------------------------------------------------------------------- */
+.mv-seller-filter-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px 14px;
+  align-items: end;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  background: #ffffff;
+  border: 1px solid #dce3eb;
+  border-radius: 12px;
+}
+.mv-seller-filter-bar .mv-btn { min-height: 40px; }
+
+@media (max-width: 640px) {
+  .mv-seller-filter-bar { grid-template-columns: 1fr; }
+}
