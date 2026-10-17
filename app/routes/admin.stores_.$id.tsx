@@ -561,34 +561,7 @@ export default function AdminStoreDetail() {
               <span style={keyStyle}>Auto pay</span>
               <span>{seller.billingSettings.autoPayEnabled ? "On" : "Off"}</span>
             </div>
-            <div style={rowStyle}>
-              <span style={keyStyle}>Hold for review</span>
-              <span>{seller.billingSettings.holdForReview ? "On" : "Off"}</span>
-            </div>
-            {/*
-              "Auto book shipment" was shown here as an On/Off fact. It is gone
-              with the seller-side control it reported: nothing reads the column,
-              nothing may write it, and a row stating the value of a retired
-              switch is a row an operator would reasonably try to act on.
-              Shipment booking is MoonVella's decision and it is made by booking
-              the shipment, not by a preference on a store record.
-            */}
-            <div style={rowStyle}>
-              <span style={keyStyle}>Max amount per order</span>
-              <span>
-                {seller.billingSettings.maxAmountPerOrder != null
-                  ? money(seller.billingSettings.maxAmountPerOrder, seller.currency)
-                  : "—"}
-              </span>
-            </div>
-            <div style={rowStyle}>
-              <span style={keyStyle}>Max shipping charge</span>
-              <span>
-                {seller.billingSettings.maxShippingCharge != null
-                  ? money(seller.billingSettings.maxShippingCharge, seller.currency)
-                  : "—"}
-              </span>
-            </div>
+            
           </>
         ) : (
           <p style={{ fontSize: "0.82rem", color: "#64748b" }}>No billing settings saved yet.</p>

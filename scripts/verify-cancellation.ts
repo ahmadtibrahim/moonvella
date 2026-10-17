@@ -184,7 +184,19 @@ async function main() {
   /* 1. The seller cannot set shipping, by any route                      */
   /* ------------------------------------------------------------------ */
 
-  await updateBillingSettings(seller.id, { mode: "AUTOMATIC", autoPayEnabled: true, maxAmountPerOrder: 50000, maxShippingCharge: 10000, holdForReview: true }, BILL_ACTOR);
+  await updateBillingSettings(seller.id, { mode: "AUTOMATIC", autoPayEnabled: true }, BILL_ACTOR);
+
+  /* The three limit settings are retired; a forged POST of any of them is
+     refused rather than ignored. */
+  for (const field of ["maxAmountPerOrder", "maxShippingCharge", "holdForReview"]) {
+    let refused = false;
+    try {
+      await updateBillingSettings(seller.id, { [field]: 1 } as never, BILL_ACTOR);
+    } catch {
+      refused = true;
+    }
+    check(`retired setting ${field} is REFUSED by the endpoint`, refused);
+  }
 
   for (const field of ["preferredShippingPolicy", "autoBookShipment"]) {
     let refused = false;
@@ -206,16 +218,8 @@ async function main() {
   const afterForgery = await prisma.sellerBillingSettings.findUniqueOrThrow({ where: { sellerId: seller.id } });
   check(
     "and the payment preferences the seller DOES own survived it untouched",
-    afterForgery.mode === "AUTOMATIC" &&
-      afterForgery.autoPayEnabled === true &&
-      afterForgery.maxAmountPerOrder === 50000 &&
-      afterForgery.maxShippingCharge === 10000 &&
-      afterForgery.holdForReview === true,
-    `mode=${afterForgery.mode} autoPay=${afterForgery.autoPayEnabled} hold=${afterForgery.holdForReview}`
-  );
-  check(
-    "and those five are what the seller page is offered",
-    Object.keys(await getBillingSettings(seller.id)).filter((k) => ["mode", "autoPayEnabled", "maxAmountPerOrder", "maxShippingCharge", "holdForReview"].includes(k)).length === 5
+    afterForgery.mode === "AUTOMATIC" && afterForgery.autoPayEnabled === true,
+    `mode=${afterForgery.mode} autoPay=${afterForgery.autoPayEnabled}`
   );
 
   /* ------------------------------------------------------------------ */

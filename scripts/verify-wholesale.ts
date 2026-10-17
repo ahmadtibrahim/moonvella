@@ -307,15 +307,34 @@ async function main() {
   }
   check("expired quote cannot be selected", expiredBlocked);
 
-  // Automatic payment limits
-  await updateBillingSettings(seller.id, { mode: "AUTOMATIC", autoPayEnabled: true, maxAmountPerOrder: 5000, maxShippingCharge: 100000 });
+  /*
+   * THE PER-ORDER AND PER-SHIPPING MAXIMUMS ARE RETIRED, so the two checks that
+   * pinned them are replaced rather than deleted. What is left to prove is that
+   * automatic payment is gated on the seller's AUTHORISATION and nothing else —
+   * there is no amount ceiling any more, because shipping is inside the partner
+   * price and the total maximum was the seller's own ceiling on a bill MoonVella
+   * sets.
+   */
+  await updateBillingSettings(seller.id, { mode: "AUTOMATIC", autoPayEnabled: true });
   const order2 = await makeOrder(seller.id, 2598);
   const autoOk = await chargeWholesaleOrder(order2.id, { trigger: "AUTOMATIC", actor });
-  check("automatic charge within limits allowed", autoOk.ok === true, autoOk.status);
+  check("automatic charge allowed once authorised", autoOk.ok === true, autoOk.status);
 
   const order3 = await makeOrder(seller.id, 900000);
-  const autoHeld = await chargeWholesaleOrder(order3.id, { trigger: "AUTOMATIC", actor });
-  check("automatic charge over limit held for review", autoHeld.heldForReview === true && autoHeld.ok === false, autoHeld.error ?? "");
+  const autoBig = await chargeWholesaleOrder(order3.id, { trigger: "AUTOMATIC", actor });
+  check(
+    "and a LARGE order is charged too — there is no amount ceiling any more",
+    autoBig.ok === true,
+    autoBig.status
+  );
+
+  let retiredRefused = false;
+  try {
+    await updateBillingSettings(seller.id, { maxAmountPerOrder: 5000 } as never);
+  } catch {
+    retiredRefused = true;
+  }
+  check("and the retired limit setting is REFUSED, not silently ignored", retiredRefused);
 
   // Auto payment disabled → refused
   await updateBillingSettings(seller.id, { autoPayEnabled: false });

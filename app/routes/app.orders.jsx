@@ -59,7 +59,10 @@ import { readFulfillmentScopes, forgetFulfillmentScopes } from "../services/shop
  * substitutes for any of them when there is no card to charge.
  */
 const PAYMENT_ACTION_LABEL = {
-  pay: "Pay this order",
+  // The brief's wording. "Pay now" is the phrase the seller's own instructions
+  // use, and matching it means the Billing page can say "select Pay now" and be
+  // describing a button that exists under that name.
+  pay: "Pay now",
   verify: "Complete verification",
   retry: "Try the payment again",
   setup: "Add a payment method",

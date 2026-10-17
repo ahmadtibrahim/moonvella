@@ -74,9 +74,6 @@ export async function updateBillingSettings(
   input: {
     mode?: "MANUAL" | "AUTOMATIC";
     autoPayEnabled?: boolean;
-    maxAmountPerOrder?: number | null;
-    maxShippingCharge?: number | null;
-    holdForReview?: boolean;
   },
   actor?: BillingActor
 ) {
@@ -95,6 +92,30 @@ export async function updateBillingSettings(
    * The row's existing values are untouched. They are history, and a column that
    * nobody may write is not a reason to destroy what is already in it.
    */
+  /*
+   * THE THREE LIMIT SETTINGS ARE RETIRED, and refused here rather than merely
+   * removed from the form.
+   *
+   * Shipping is inside MoonVella's partner price, so a separate maximum-shipping
+   * limit described a cost that does not exist — and it was unenforceable for
+   * most of its life, because the amount it compared against was not recorded.
+   * With no shipping maximum and no total maximum there is nothing left for
+   * "hold for review when limits are exceeded" to mean, so it goes too.
+   *
+   * A forged POST carrying any of them is refused rather than ignored: a
+   * silently dropped field would let a seller believe a limit had been set.
+   */
+  const retired = ["maxAmountPerOrder", "maxShippingCharge", "holdForReview"].filter(
+    (field) => Object.prototype.hasOwnProperty.call(input, field)
+  );
+  if (retired.length > 0) {
+    throw new Error(
+      `${retired.join(" and ")} no longer exist: MoonVella's partner price includes shipping, so there ` +
+        `is no separate shipping maximum, and with no limits there is nothing to hold for review. ` +
+        `Choose Automatic or Manual payment instead.`
+    );
+  }
+
   const forged = ["preferredShippingPolicy", "autoBookShipment"].filter(
     (field) => Object.prototype.hasOwnProperty.call(input, field)
   );
@@ -490,32 +511,12 @@ export async function chargeWholesaleOrder(
     if (!settings.autoPayEnabled || settings.mode !== "AUTOMATIC") {
       return { ok: false, status: "REQUIRES_PAYMENT", error: "Seller has not enabled automatic payment." };
     }
-    if (settings.maxAmountPerOrder && payment.amount > settings.maxAmountPerOrder) {
-      await prisma.sellerBillingSettings.update({ where: { sellerId: order.sellerId }, data: { holdForReview: true } });
-      return { ok: false, status: "REQUIRES_PAYMENT", heldForReview: true, error: "Order total exceeds the authorized maximum; held for review." };
-    }
     /*
-     * THIS GUARD NOW ACTUALLY RUNS, AND IT DID NOT BEFORE.
-     *
-     * `shippingAmount` used to be null on every payment row, so this compared 0
-     * against the limit and let everything through — a seller who set a maximum
-     * shipping charge had a limit that could never be reached and never held
-     * anything. The column is now written when the bill is made (see
-     * `orderIntake.server.ts`), so an order whose seller shipping charge is over
-     * the seller's own limit is HELD FOR REVIEW instead of charged automatically.
-     *
-     * Holding is the safe direction and the one the setting asks for: nothing is
-     * charged, an operator is told why, and a person decides. The seller can
-     * still pay it manually.
-     *
-     * Rows written before the column was populated keep their null and read as
-     * zero here, exactly as they did — an old order is not retroactively held
-     * for a limit it was never measured against.
+     * THE PER-ORDER AND PER-SHIPPING MAXIMUMS ARE GONE. There is no amount to
+     * compare against any more: shipping is inside the partner price, and the
+     * total maximum was the seller's own ceiling on a bill MoonVella sets.
+     * Automatic payment now either is authorised or is not.
      */
-    if (settings.maxShippingCharge && (payment.shippingAmount ?? 0) > settings.maxShippingCharge) {
-      await prisma.sellerBillingSettings.update({ where: { sellerId: order.sellerId }, data: { holdForReview: true } });
-      return { ok: false, status: "REQUIRES_PAYMENT", heldForReview: true, error: "Shipping exceeds the authorized maximum; held for review." };
-    }
   }
 
   const method = await getDefaultPaymentMethod(order.sellerId);

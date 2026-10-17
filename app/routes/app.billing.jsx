@@ -61,9 +61,8 @@ export const loader = async ({ request }) =>
     settings: {
       mode: settings.mode,
       autoPayEnabled: settings.autoPayEnabled,
-      maxAmountPerOrder: settings.maxAmountPerOrder,
-      maxShippingCharge: settings.maxShippingCharge,
-      holdForReview: settings.holdForReview,
+      // The order/shipping maximums and "hold for review" are retired; the
+      // seller page no longer receives them.
       // `preferredShippingPolicy` and `autoBookShipment` are NOT sent to the
       // seller page any more. Cartier and service selection and shipment booking
       // are MoonVella's decisions, made in the operator panel; a merchant form
@@ -142,9 +141,6 @@ export const action = async ({ request }) => {
       await updateBillingSettings(context.seller.id, {
         mode,
         autoPayEnabled: mode === "AUTOMATIC" && form.get("autoPayEnabled") === "on",
-        maxAmountPerOrder: form.get("maxAmountPerOrder") ? Math.round(Number(form.get("maxAmountPerOrder")) * 100) : null,
-        maxShippingCharge: form.get("maxShippingCharge") ? Math.round(Number(form.get("maxShippingCharge")) * 100) : null,
-        holdForReview: form.get("holdForReview") === "on",
       });
       return { ok: true, message: "Billing settings saved." };
     }
@@ -257,9 +253,12 @@ export default function BillingPage() {
                     {m.isDefault ? " · default" : ""}
                   </span>
                   <span style={{ display: "flex", gap: "0.4rem" }}>
-                    <Link to="#" onClick={(e) => e.preventDefault()} className="mv-btn mv-btn-secondary" style={{ fontSize: "0.7rem", padding: "0.25rem 0.5rem" }}>
+                    <span
+                      className={`mv-badge ${m.authorizedAt ? "mv-badge-success" : ""}`}
+                      title={m.authorizedAt ? "This card is authorised for automatic charges." : "Not authorised for automatic charges."}
+                    >
                       {m.authorizedAt ? "Authorized" : "Not authorized"}
-                    </Link>
+                    </span>
                     <Form method="post" style={{ display: "inline" }}>
                       <input type="hidden" name="intent" value="set_default" />
                       <input type="hidden" name="methodId" value={m.id} />
@@ -296,37 +295,95 @@ export default function BillingPage() {
           <Form method="post">
             <input type="hidden" name="intent" value="update_settings" />
             <div className="mv-settings-grid">
-              <div>
-                <span style={label}>Mode</span>
-                <select name="mode" value={mode} onChange={(e) => setMode(e.target.value)} style={input}>
-                  <option value="MANUAL">Manual — I approve and pay each order</option>
-                  <option value="AUTOMATIC">Automatic — charge within my authorization</option>
-                </select>
+              {/*
+                TWO MODES, CHOSEN AS CARDS RATHER THAN A DROPDOWN.
+
+                A select hides the choice that matters most on this page behind a
+                click, and the two options are not a preference — they change when
+                money leaves the seller's account. Cards keep both consequences on
+                screen while the choice is made, which is the whole point of the
+                helper text inside them.
+              */}
+              <div style={{ gridColumn: "1 / -1", display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "0.75rem" }}>
+                {[
+                  {
+                    value: "AUTOMATIC",
+                    title: "Automatic payment",
+                    body:
+                      "MoonVella will automatically charge your saved payment method when an eligible " +
+                      "MoonVella order is received. Fulfillment begins after payment succeeds. If payment " +
+                      "fails, the order will remain awaiting payment and you will be notified.",
+                  },
+                  {
+                    value: "MANUAL",
+                    title: "Manual payment",
+                    body:
+                      "MoonVella will not charge you automatically. When a MoonVella order is received, " +
+                      "open the order and select “Pay now.” MoonVella will begin fulfillment only after " +
+                      "payment is completed.",
+                  },
+                ].map((option) => {
+                  const selected = mode === option.value;
+                  return (
+                    <label
+                      key={option.value}
+                      style={{
+                        display: "block",
+                        border: `1px solid ${selected ? "#006E67" : "#DCE3EB"}`,
+                        background: selected ? "#F0FAF8" : "#FFFFFF",
+                        borderRadius: 12,
+                        padding: "0.85rem 0.95rem",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <span style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontWeight: 600 }}>
+                        <input
+                          type="radio"
+                          name="mode"
+                          value={option.value}
+                          checked={selected}
+                          onChange={(e) => setMode(e.target.value)}
+                        />
+                        {option.title}
+                      </span>
+                      <span style={{ display: "block", marginTop: "0.4rem", fontSize: "0.8rem", color: "#52627A", lineHeight: 1.55 }}>
+                        {option.body}
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
               {mode === "AUTOMATIC" && (
                 <>
-                  <div>
-                    <span style={label}>Authorize automatic payment</span>
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <span style={label}>Authorisation</span>
                     <label className="mv-settings-checkbox">
                       <input type="checkbox" name="autoPayEnabled" defaultChecked={settings.autoPayEnabled} />
-                      <span>I authorize MoonVella to charge my saved method for wholesale orders</span>
+                      <span>
+                        I authorize MoonVella to charge my saved payment method for eligible MoonVella
+                        product orders.
+                      </span>
                     </label>
+                    <p style={{ fontSize: "0.78rem", color: "#52627A", margin: "0.35rem 0 0" }}>
+                      Required for automatic payment. If a charge fails, the order stays{" "}
+                      <strong>Awaiting payment</strong> and you will be notified — MoonVella does not retry
+                      silently, and fulfilment does not begin. You can also pay any order by hand with{" "}
+                      <strong>Pay now</strong>, whether this mode is Automatic or Manual.
+                    </p>
                   </div>
-                  <div>
-                    <span style={label}>Max total per order (CAD)</span>
-                    <input style={input} name="maxAmountPerOrder" type="number" min="0" step="0.01" defaultValue={settings.maxAmountPerOrder ? settings.maxAmountPerOrder / 100 : ""} />
-                  </div>
-                  <div>
-                    <span style={label}>Max shipping per order (CAD)</span>
-                    <input style={input} name="maxShippingCharge" type="number" min="0" step="0.01" defaultValue={settings.maxShippingCharge ? settings.maxShippingCharge / 100 : ""} />
-                  </div>
-                  <div>
-                    <span style={label}>Hold for review when limits exceeded</span>
-                    <label className="mv-settings-checkbox">
-                      <input type="checkbox" name="holdForReview" defaultChecked={settings.holdForReview} />
-                      <span>Hold the order for owner review</span>
-                    </label>
-                  </div>
+                  {/*
+                    THE THREE LIMIT SETTINGS ARE GONE, and the reason is a single
+                    fact: shipping is inside MoonVella's partner price. A
+                    "maximum shipping charge" therefore capped a cost that no
+                    bill contains, and in practice never held anything because
+                    the figure it compared against was not recorded. With no
+                    shipping maximum and no per-order maximum there is nothing
+                    left for "hold for review when limits are exceeded" to mean.
+
+                    Automatic payment is now a single decision: either the seller
+                    has authorised charges on the saved method, or they pay each
+                    order by hand.
+                  */}
                   {/*
                     THE SHIPPING CONTROLS USED TO BE HERE: a preferred-service
                     policy and a separate "book the shipment automatically after
