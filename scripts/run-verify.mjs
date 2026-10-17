@@ -307,6 +307,9 @@ const CHECKS = [
   // verbatim as the Shopify product TYPE and TAG, so "MoonVella Consignment"
   // appeared in a merchant's public filters.
   { name: "public-labels", kind: "ts", file: "scripts/verify-public-labels.ts" },
+  // The clean baseline after the authorized demo cleanup: no demo store, product,
+  // order or orphan left behind, and idempotent on rerun. Named identifiers only.
+  { name: "cleanup-baseline", kind: "ts", file: "scripts/verify-cleanup-baseline.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox
