@@ -303,6 +303,10 @@ const CHECKS = [
   // orders, charge and reservations, touches no provider and never goes near
   // #1005.
   { name: "cancellation", kind: "ts", file: "scripts/verify-cancellation.ts" },
+  // Nothing internal may reach a storefront. The category label used to be sent
+  // verbatim as the Shopify product TYPE and TAG, so "MoonVella Consignment"
+  // appeared in a merchant's public filters.
+  { name: "public-labels", kind: "ts", file: "scripts/verify-public-labels.ts" },
   // Simulated Stripe, pinned. These three assert the internal payment logic
   // against local records; none of them is a provider test, so none of them may
   // reach Stripe. Pinning the mode is what keeps that true when a real sandbox

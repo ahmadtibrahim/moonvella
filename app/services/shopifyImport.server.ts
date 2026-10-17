@@ -1,4 +1,5 @@
 import { prisma } from "~/db.server";
+import { publicCategoryLabel } from "~/utils/publicCategory";
 import { loadSellerRetailPrices } from "./sellerPricing.server";
 import { recordImageOutcomes, resolveImagesForImport } from "./importMediaSelection.server";
 import { recordAudit, AUDIT_ENTITY } from "./audit.server";
@@ -976,8 +977,15 @@ function productInput(product: ImportableProduct, opts: ResolvedPricing, include
     title: product.name,
     descriptionHtml: product.description ?? "",
     status: opts.publish === false ? "DRAFT" : "ACTIVE",
-    tags: ["MoonVella", product.category],
-    productType: product.category,
+    /*
+     * THE CATEGORY GOES OUT SANITISED, AND THE INTERNAL ONE DOES NOT GO OUT AT
+     * ALL. `product.category` held "All / MoonVella Consignment Bedding", which
+     * reached a shopper as the product's TYPE and as a visible TAG. Ownership is
+     * a fact about our warehouse; it belongs in app-owned records, not on a
+     * storefront. See `publicCategoryLabel`.
+     */
+    tags: ["MoonVella", publicCategoryLabel(product.category)],
+    productType: publicCategoryLabel(product.category),
     vendor: MOONVELLA_VENDOR,
     seo: {
       title: product.name,
