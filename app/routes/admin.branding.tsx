@@ -30,7 +30,6 @@ import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
 import { requirePermission, assertSameOrigin, getRequestMeta } from "~/utils/adminAuth.server";
 import {
   BRAND_SLOT_SPECS,
-  buildShopifyAppIcon,
   getBrandView,
   replaceBrandSlot,
   resetBrandSlot,
@@ -83,24 +82,6 @@ export async function action({ request }: ActionFunctionArgs) {
     const version = Number(form.get("version"));
     const result = await restoreBrandVersion(slot, version, actor);
     return result.ok ? { ok: `${slot} restored to version ${version}.` } : { error: result.error };
-  }
-
-  if (intent === "app-icon") {
-    const icon = await buildShopifyAppIcon();
-    if (!icon) {
-      return {
-        error:
-          "No square logo is uploaded, so a 1200 × 1200 app icon cannot be built. Upload the " +
-          "square slot first.",
-      };
-    }
-    return new Response(new Uint8Array(icon), {
-      headers: {
-        "Content-Type": "image/png",
-        "Content-Disposition": 'attachment; filename="moonvella-app-icon-1200.png"',
-        "Cache-Control": "no-store",
-      },
-    });
   }
 
   return { error: "Unknown action." };
@@ -228,6 +209,9 @@ export default function AdminBranding() {
   const navigation = useNavigation();
   const busy = navigation.state === "submitting";
   const [showHistory, setShowHistory] = useState<string | null>(null);
+  // Which slot's reset is armed. One at a time, so a stray second press cannot
+  // reset a different logo than the one being confirmed.
+  const [armedReset, setArmedReset] = useState<string | null>(null);
 
   return (
     <div className="mv-page-wide">
@@ -402,12 +386,41 @@ export default function AdminBranding() {
 
             <div style={{ display: "flex", gap: "0.5rem", marginTop: "0.6rem", flexWrap: "wrap" }}>
               {state?.live ? (
+                /*
+                 * RESET ASKS FIRST, INSIDE THE PAGE. Not `window.confirm` — a
+                 * browser dialog can be suppressed permanently by "prevent this
+                 * page from creating additional dialogs", after which the button
+                 * silently stops working and reports nothing. The arming press is
+                 * local state, so it cannot be switched off.
+                 *
+                 * It resets THIS slot only, and the slot is the hidden field, so
+                 * the request says exactly which one it is about.
+                 */
                 <Form method="post">
                   <input type="hidden" name="intent" value="reset" />
                   <input type="hidden" name="slot" value={spec.slot} />
-                  <button type="submit" style={button()} disabled={busy}>
-                    Reset to default
-                  </button>
+                  {armedReset === spec.slot ? (
+                    <>
+                      <span role="status" style={{ fontSize: "0.75rem", color: "#92400E", marginRight: "0.4rem" }}>
+                        Reset {spec.label.toLowerCase()} to the default?
+                      </span>
+                      <button type="submit" style={button()} disabled={busy}>
+                        Yes, reset
+                      </button>
+                      <button
+                        type="button"
+                        style={button()}
+                        onClick={() => setArmedReset(null)}
+                        disabled={busy}
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <button type="button" style={button()} onClick={() => setArmedReset(spec.slot)} disabled={busy}>
+                      Reset to default
+                    </button>
+                  )}
                 </Form>
               ) : null}
               {state && state.history.length > 0 ? (
@@ -474,16 +487,27 @@ export default function AdminBranding() {
           Download the square logo prepared at 1200 × 1200, then upload it there. The mark is
           padded onto a white square rather than stretched, so it keeps its proportions.
         </p>
-        <Form method="post" style={{ marginTop: "0.5rem" }}>
-          <input type="hidden" name="intent" value="app-icon" />
-          <button
-            type="submit"
-            style={button()}
-            disabled={busy || !brand.slots.find((entry) => entry.slot === "SQUARE")?.live}
-          >
-            Download 1200 × 1200 PNG
-          </button>
-        </Form>
+        {/*
+          A LINK, NOT A FORM. This control used to POST an `intent` whose action
+          returned the PNG bytes — and React Router treats an action's return
+          value as page data, so the page received an image where it expected a
+          result, threw `Cannot use 'in' operator to search for 'error' in <PNG>`,
+          and rendered the artwork as garbled text under "Application Error!".
+          The download is a resource route now and this navigates to it.
+        */}
+        <a
+          href="/admin/branding/icon.png"
+          download
+          className="mv-button"
+          style={{
+            marginTop: "0.5rem",
+            display: "inline-flex",
+            ...(brand.slots.find((entry) => entry.slot === "SQUARE")?.live ? {} : { pointerEvents: "none", opacity: 0.5 }),
+          }}
+          aria-disabled={!brand.slots.find((entry) => entry.slot === "SQUARE")?.live}
+        >
+          Download 1200 × 1200 PNG
+        </a>
         {!brand.slots.find((entry) => entry.slot === "SQUARE")?.live ? (
           <p style={{ fontSize: "0.74rem", color: "#92400E", marginTop: "0.4rem" }}>
             Upload the square icon first.

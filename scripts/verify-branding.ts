@@ -526,6 +526,64 @@ async function main() {
    * That is exactly what happened on the first deploy of this feature, and it
    * was found by fetching the URL rather than by any of the checks above.
    */
+  /* ------------------------------------------------------------------ */
+  /* 10. No mutation on this page may return binary.                      */
+  /* ------------------------------------------------------------------ */
+
+  /*
+   * THE DEFECT THIS EXISTS FOR. The page's action returned
+   * `new Response(pngBytes)` for the app-icon download. React Router treats an
+   * action's return value as DATA for the document it is about to re-render, so
+   * the page received a PNG where it expected a result, ran its own
+   * `"error" in actionData` against the bytes, and threw
+   * `TypeError: Cannot use 'in' operator to search for 'error' in <PNG IHDR…>`
+   * — "Application Error!" with the artwork rendered as garbled text.
+   *
+   * A source check is the right shape here: the defect is not a value the code
+   * computes, it is the TYPE of thing the action is allowed to return, and no
+   * fixture can make an action return a Response.
+   */
+  const wiring = readFileSync(join(process.cwd(), "app/routes/admin.branding.tsx"), "utf8");
+  check(
+    "10  no branding ACTION returns a Response — that is page data, not a file",
+    !/export async function action[\s\S]{0,4000}?return new Response\(/.test(wiring),
+    /return new Response\(/.test(wiring) ? "an action still returns a Response" : "actions return data only"
+  );
+  check(
+    "10b the app-icon download is a RESOURCE ROUTE with a loader",
+    (() => {
+      const route = readFileSync(join(process.cwd(), "app/routes/admin.branding_.icon[.]png.tsx"), "utf8");
+      return route.includes("export async function loader") && !route.includes("export async function action");
+    })()
+  );
+  check(
+    "10c and the page LINKS to it rather than posting for it",
+    wiring.includes("/admin/branding/icon.png") && !wiring.includes('intent" value="app-icon"')
+  );
+  check(
+    "10d the download route is gated on the same permission as the page",
+    /requirePermission\(request, "settings\.general"\)/.test(
+      readFileSync(join(process.cwd(), "app/routes/admin.branding_.icon[.]png.tsx"), "utf8")
+    )
+  );
+  check(
+    "10e a reset asks for confirmation inside the page, never window.confirm",
+    /*
+     * COMMENTS ARE STRIPPED FIRST. The page documents this rule in prose that
+     * contains the literal `window.confirm`, so asserting on the raw source
+     * failed on code that was correct — twice, once for a regex matching the
+     * word "confirmation". The question is what the CODE does, and the code is
+     * what is left after the comments come out.
+     */
+    (() => {
+      const code = wiring
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "");
+      return code.includes("armedReset") && !code.includes("window.confirm") && !code.includes("confirm(");
+    })(),
+    "no browser dialog can be suppressed and leave a dead button"
+  );
+
   const serverSource = readFileSync(join(process.cwd(), "server.js"), "utf8");
   const agnosticBlock = serverSource.slice(
     serverSource.indexOf("function isHostAgnostic"),
